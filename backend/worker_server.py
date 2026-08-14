@@ -39,6 +39,8 @@ LOG_DIR = BACKEND_DIR / "logs"
 BACKOFF_SECONDS = (5, 10, 20)
 MAX_CONSECUTIVE_CRASHES = len(BACKOFF_SECONDS)
 
+from rotating_log import open_rotating  # noqa: E402  (DISK-06: 5 MB x 3 rotation)
+
 
 def _log(logf, msg: str) -> None:
     line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
@@ -84,11 +86,14 @@ def _singleton_mutex_held() -> bool:
 def main() -> int:
     LOG_DIR.mkdir(exist_ok=True)
     if _singleton_mutex_held():
-        _log(open(LOG_DIR / "worker.log", "a", encoding="utf-8", errors="replace"),
-             "another worker supervisor already owns the mutex — exiting")
+        logf = open_rotating(LOG_DIR / "worker.log")
+        try:
+            _log(logf, "another worker supervisor already owns the mutex — exiting")
+        finally:
+            logf.close()
         return 0
     log_path = LOG_DIR / "worker.log"
-    logf = open(log_path, "a", encoding="utf-8", errors="replace", buffering=1)
+    logf = open_rotating(log_path)
     _log(logf, f"VOD.RIP archive worker supervisor starting (log {log_path})")
 
     # First-wins guard BEFORE spawning: a fresh worker heartbeat means the

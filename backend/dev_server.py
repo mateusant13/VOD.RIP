@@ -45,6 +45,8 @@ LOG_DIR = BACKEND_DIR / "logs"
 BACKOFF_SECONDS = (5, 10, 20)
 MAX_CONSECUTIVE_CRASHES = len(BACKOFF_SECONDS)
 
+from rotating_log import open_rotating  # noqa: E402  (DISK-06: 5 MB x 3 rotation)
+
 
 def _log(logf, msg: str) -> None:
     line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
@@ -69,7 +71,7 @@ def main() -> int:
 
     LOG_DIR.mkdir(exist_ok=True)
     log_path = LOG_DIR / f"server-{args.port}.log"
-    logf = open(log_path, "a", encoding="utf-8", errors="replace", buffering=1)
+    logf = open_rotating(log_path)
 
     # First-wins pre-check BEFORE spawning the child (fast path; the child
     # re-checks inside run.py — a racing healthy instance can still win).

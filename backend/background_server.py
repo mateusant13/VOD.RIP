@@ -28,6 +28,7 @@ Stdlib only.
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import os
 import subprocess
 import sys
@@ -191,9 +192,13 @@ def main() -> int:
     if _singleton_mutex_held():
         return 0  # another daemon owns the machine — dedupe, don't stack
     logging.basicConfig(
-        filename=str(LOG_PATH),
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[
+            logging.handlers.RotatingFileHandler(
+                str(LOG_PATH), maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+            ),
+        ],
     )
     _log.info("background daemon starting (log %s)", LOG_PATH)
 
