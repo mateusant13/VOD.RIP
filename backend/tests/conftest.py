@@ -61,6 +61,26 @@ REAL_APPDATA_DB_SHA256 = _sha256_or_none(
     Path(os.environ.get("APPDATA", "")) / "VOD.RIP" / "archive.db"
 )
 
+
+@pytest.fixture(autouse=True)
+def _restore_vodrip_env():
+    """Safety net: revert any VODRIP_* env var a test body leaves behind to
+    its value at the start of that test.
+
+    Kills the whole class of os.environ leaks (a *_real* suite hard-setting
+    VODRIP_WHISPER_DEVICE/cache dirs and forgetting to restore). Module-
+    scoped env fixtures (scratch-DB rebinds) are unaffected: they set up
+    before this function-scoped fixture snapshots, so their values are part
+    of the baseline and survive each per-test restore. Collection-time
+    module-level writes are fixed at the root (moved into fixtures), so they
+    never appear here."""
+    saved = {k: v for k, v in os.environ.items() if k.startswith("VODRIP_")}
+    yield
+    for k in [k for k in os.environ if k.startswith("VODRIP_")]:
+        os.environ.pop(k, None)
+    os.environ.update(saved)
+
+
 __all__ = ["purge_download_manager", "REAL_APPDATA_DB_SHA256"]
 
 
