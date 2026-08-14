@@ -285,6 +285,7 @@ def _backfill_outward(
     page_size: int,
     progress_cb: Optional[Callable[[float], None]],
     *, interactive: bool = False,
+    heartbeat_cb: Optional[Callable[[], None]] = None,
 ) -> tuple[float, int, int, int]:
     """Playhead-first sweep for the preview backfill (Chatterino-style).
 
@@ -306,6 +307,8 @@ def _backfill_outward(
     seed = max(0.0, float(seed_offset_sec))
 
     # Phase 1 — seed page: what the viewer is about to see, in ~1 s.
+    if heartbeat_cb is not None:
+        heartbeat_cb()  # P2-3: keep the job row fresh during the sweep
     nodes, backoff_retries = _fetch_page_with_backoff(
         vid, seed, page_size, backoff_retries, interactive=interactive,
     )
@@ -337,6 +340,8 @@ def _backfill_outward(
     stride = 1.0
     while lo > 0 and inserted < max_messages:
         target = max(0.0, lo - stride)
+        if heartbeat_cb is not None:
+            heartbeat_cb()  # P2-3: keep the job row fresh during the sweep
         nodes, backoff_retries = _fetch_page_with_backoff(
             vid, target, page_size, backoff_retries, interactive=interactive,
         )
@@ -563,9 +568,17 @@ def _backfill_locked(
             page_size,
             progress_cb,
             interactive=interactive,
+            heartbeat_cb=lambda: archive_db.update_job(job_id),
         )
     try:
         while inserted < max_messages:
+            # P2-3: a 429-stormed page (backoff sleeps inside
+            # _fetch_page_with_backoff) can take minutes with NO stored-row
+            # progress — heartbeat BEFORE the fetch so a stormed page can
+            # never push the row past _CHAT_HEARTBEAT_STALE and let a
+            # second lane claim the job mid-sweep (two concurrent
+            # backfills of the same VOD).
+            archive_db.update_job(job_id)
             nodes, backoff_retries = _fetch_page_with_backoff(
                 vid, last_seen, page_size, backoff_retries, interactive=interactive,
             )

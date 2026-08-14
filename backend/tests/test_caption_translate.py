@@ -108,6 +108,107 @@ def test_kill_switch(monkeypatch):
     assert ct.enabled() is True
 
 
+def test_translate_dir_memoized_per_env(tmp_path, monkeypatch):
+    """P2-7: the env-keyed resolution is cached — the disk_inventory syscall
+    ladder under whisper_cache_dir runs ONCE per env value, never on every
+    ~2 s caption flush; an override key bypasses it entirely."""
+    import services.disk_hygiene as dh
+
+    ct._resolve_translate_dir.cache_clear()
+    calls = {"n": 0}
+    real = dh.whisper_cache_dir
+
+    def counting_cache_dir():
+        calls["n"] += 1
+        return real()
+
+    monkeypatch.setattr(dh, "whisper_cache_dir", counting_cache_dir)
+    monkeypatch.delenv("VODRIP_TRANSLATE_MODEL_DIR", raising=False)
+
+    assert ct.translate_dir() == real() / "translate"
+    assert ct.translate_dir() == real() / "translate"
+    assert calls["n"] == 1, (
+        "repeated translate_dir() must hit the cache, not the syscall ladder"
+    )
+
+    monkeypatch.setenv("VODRIP_TRANSLATE_MODEL_DIR", str(tmp_path / "m"))
+    assert ct.translate_dir() == tmp_path / "m"
+    assert calls["n"] == 1, "the override path must not touch whisper_cache_dir"
+
+
+def test_nllb_cuda_failure_falls_back_to_cpu(tmp_path, monkeypatch):
+    """P2-5: CUDA load fails (VRAM already held by whisper/parakeet) — the
+    translator must fall back to CPU with a log, NOT flip the component
+    broken for LOAD_RETRY_SEC (raw captions for 5 min)."""
+    import sys
+    import types
+
+    devices_seen = []
+
+    class _FakeTranslator:
+        def __init__(self, path, device="cpu", compute_type=None):
+            devices_seen.append(device)
+            if device == "cuda":
+                raise RuntimeError("CUDA out of memory: 0 bytes available")
+
+    fake_ct2 = types.SimpleNamespace(
+        get_cuda_device_count=lambda: 1,  # CUDA is "available"...
+        Translator=_FakeTranslator,  # ...but the load fails
+    )
+    monkeypatch.setitem(sys.modules, "ctranslate2", fake_ct2)
+    monkeypatch.setitem(
+        sys.modules, "tokenizers",
+        types.SimpleNamespace(
+            Tokenizer=types.SimpleNamespace(from_file=lambda p: "tok")
+        ),
+    )
+    d = tmp_path / ct.NLLB_SUBDIR
+    d.mkdir()
+    for f in ct._NLLB_FILES:
+        (d / f).write_text("x")
+    monkeypatch.setenv("VODRIP_TRANSLATE_MODEL_DIR", str(tmp_path))
+
+    t = ct._CaptionTranslator()
+    nllb = t._ensure_nllb()
+
+    assert devices_seen == ["cuda", "cpu"], "CUDA tried first, CPU is the fallback"
+    assert nllb is not None and nllb[2] == "cpu", (
+        "the CPU fallback must succeed — not degrade to raw captions"
+    )
+    assert t._nllb_broken_at == 0.0, "no broken-state cooldown after a CUDA-only miss"
+
+
+def test_nllb_cpu_failure_still_degrades(tmp_path, monkeypatch):
+    """A CPU load failure (missing libs / corrupt checkpoint) is still a
+    hard degrade — the fallback must not loop or mask real errors."""
+    import sys
+    import types
+
+    class _FakeTranslator:
+        def __init__(self, path, device="cpu", compute_type=None):
+            raise OSError("libcudnn not found")
+
+    monkeypatch.setitem(
+        sys.modules, "ctranslate2",
+        types.SimpleNamespace(get_cuda_device_count=lambda: 0, Translator=_FakeTranslator),
+    )
+    monkeypatch.setitem(
+        sys.modules, "tokenizers",
+        types.SimpleNamespace(
+            Tokenizer=types.SimpleNamespace(from_file=lambda p: "tok")
+        ),
+    )
+    d = tmp_path / ct.NLLB_SUBDIR
+    d.mkdir()
+    for f in ct._NLLB_FILES:
+        (d / f).write_text("x")
+    monkeypatch.setenv("VODRIP_TRANSLATE_MODEL_DIR", str(tmp_path))
+
+    t = ct._CaptionTranslator()
+    assert t._ensure_nllb() is None
+    assert t._nllb_broken_at > 0.0, "CPU failure must arm the LOAD_RETRY_SEC cooldown"
+
+
 # --- translator cache + degrade ---------------------------------------------
 
 

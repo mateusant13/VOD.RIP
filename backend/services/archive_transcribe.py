@@ -1212,6 +1212,18 @@ _WHISPER_ONLY_LANGS = frozenset({"ja", "ko", "zh", "ar"})
 # threads never leak each other's override). _job_engine consults it first.
 _engine_override_tls = threading.local()
 
+# The job id currently running on this thread — set by _process_job so the
+# long silent phases (ffmpeg HLS fetch, yt-dlp download) can refresh the
+# job row's heartbeat from inside (P1-2: a throttled fetch must never let
+# the stale-reclaim window fire mid-download and hand the job to a second
+# lane — both would download + transcribe the same VOD).
+_job_id_tls = threading.local()
+
+
+def _current_job_id() -> Optional[str]:
+    """The job id being processed on this thread, or None."""
+    return getattr(_job_id_tls, "job_id", None)
+
 
 def _engine_override() -> Optional[str]:
     """Forced engine for the current thread (parakeet-failure fallback)."""
@@ -2369,6 +2381,7 @@ def _transcribe_youtube_captionless(
     language: Optional[str] = None,
     progress_cb: Optional[Callable[[float, float, int, int], None]] = None,
     events_cb: Optional[Callable[..., Optional[dict]]] = None,
+    audio_stash: Optional[dict] = None,
 ) -> dict:
     """ASR for a captionless YouTube video (archived metadata-only, no
     local archive_path).
@@ -2380,6 +2393,14 @@ def _transcribe_youtube_captionless(
     _transcribe_audio_source (speech fraction below VODRIP_MUSIC_SPEECH_FRAC
     -> transcript_kind='music', done, no ASR).
 
+    *audio_stash* is the P2-4 retry cache: a dict the caller passes to
+    EVERY engine attempt. The first call downloads the audio, stashes the
+    wav path + its owning temp dir, and keeps the dir alive; the retry
+    call (parakeet -> whisper) finds the stash and REUSES the download —
+    no 350 MB re-fetch for an engine retry. The retry call (the last
+    consumer) removes the stashed dir. A direct call with no stash keeps
+    the old create-and-clean behavior.
+
     Download failures:
       - bot-gate classified -> _YoutubeGateRequeue (caller requeues the
         job, never fails — no retry storm),
@@ -2387,37 +2408,63 @@ def _transcribe_youtube_captionless(
         videos.transcript_kind='blocked' (terminal — the scheduler never
         re-enqueues) and a yt_dlp DownloadError with the real reason
         (update_job treats DownloadError as terminal: no auto-retry),
-      - anything else propagates to the normal job retry machinery."""
+      - _YtDownloadTimedOut (wall-clock cap) / anything else propagates to
+        the normal job retry machinery (transient -> requeue with backoff)."""
     t0 = time.monotonic()
-    outdir = Path(tempfile.mkdtemp(prefix=f"yt-transcribe-{video_id}-"))
+    cached = (audio_stash or {}).get("wav")
+    outdir = None
     try:
-        from services.archive_ytdlp import (
-            _is_gate_error,
-            _is_permanent_download_error,
-            download_bestaudio,
-        )
+        if cached is not None:
+            path = str(cached)
+        else:
+            from services.archive_ytdlp import (
+                _is_gate_error,
+                _is_permanent_download_error,
+                download_bestaudio,
+            )
 
-        try:
-            path = download_bestaudio(video_id, outdir)
-        except Exception as exc:
-            # Permanent FIRST: an age-gate error ("Sign in to confirm your
-            # age") contains the IP-gate marker "sign in to confirm" — a
-            # per-video verdict must not be misread as the IP-level freeze.
-            if _is_permanent_download_error(exc):
-                archive_db.mark_video_transcript_kind("youtube", video_id, "blocked")
-                logger.warning(
-                    "youtube %s audio unavailable (terminal, marked blocked): %s",
-                    video_id, exc,
+            def _dl_progress(_d: dict) -> None:
+                # P1-2: yt-dlp bytes flowing (or not) — refresh the job row
+                # so the stale-reclaim window never fires mid-download.
+                job_id = _current_job_id()
+                if job_id is not None:
+                    try:
+                        archive_db.update_job(job_id)
+                    except Exception:
+                        logger.debug(
+                            "yt-dlp heartbeat failed for %s", job_id, exc_info=True
+                        )
+
+            try:
+                path = download_bestaudio(
+                    video_id, outdir := Path(tempfile.mkdtemp(prefix=f"yt-transcribe-{video_id}-")),
+                    progress_hook=_dl_progress,
                 )
-                from yt_dlp.utils import DownloadError
+            except Exception as exc:
+                # Permanent FIRST: an age-gate error ("Sign in to confirm
+                # your age") contains the IP-gate marker "sign in to
+                # confirm" — a per-video verdict must not be misread as the
+                # IP-level freeze.
+                if _is_permanent_download_error(exc):
+                    archive_db.mark_video_transcript_kind("youtube", video_id, "blocked")
+                    logger.warning(
+                        "youtube %s audio unavailable (terminal, marked blocked): %s",
+                        video_id, exc,
+                    )
+                    from yt_dlp.utils import DownloadError
 
-                raise DownloadError(
-                    f"youtube audio download failed permanently for {video_id}: {exc}"
-                ) from exc
-            if _is_gate_error(exc):
-                raise _YoutubeGateRequeue(str(exc)[:400]) from exc
-            raise
-        logger.info("youtube %s audio downloaded for ASR: %s", video_id, path)
+                    raise DownloadError(
+                        f"youtube audio download failed permanently for {video_id}: {exc}"
+                    ) from exc
+                if _is_gate_error(exc):
+                    raise _YoutubeGateRequeue(str(exc)[:400]) from exc
+                raise
+            logger.info("youtube %s audio downloaded for ASR: %s", video_id, path)
+            if audio_stash is not None:
+                # P2-4: keep the wav alive for the engine retry; the caller
+                # (or the retry call) cleans it up.
+                audio_stash["wav"] = Path(path)
+                audio_stash["dir"] = outdir
         if _should_shard(str(path)):
             # Bounded-RAM path (same route as transcribe_video): decode ONCE
             # into fixed-duration PCM shards and consume them one window at
@@ -2437,7 +2484,15 @@ def _transcribe_youtube_captionless(
             sharded=False, shard_dir=None,
         )
     finally:
-        shutil.rmtree(outdir, ignore_errors=True)
+        if cached is not None and audio_stash is not None:
+            # P2-4 retry call — the last consumer: release the stashed wav.
+            shutil.rmtree(str(audio_stash.pop("dir", "")), ignore_errors=True)
+        elif outdir is not None and (audio_stash is None or "wav" not in audio_stash):
+            # No stash (direct call) OR the download failed before stashing
+            # — the temp dir is ours to remove.
+            shutil.rmtree(outdir, ignore_errors=True)
+        # else: first call with a stash — the dir stays alive for the retry
+        # (the caller's job-level finally removes it).
 
 
 # Wall-clock bound for an at-transcribe-time HLS audio fetch: a 6h VOD is
@@ -2445,6 +2500,10 @@ def _transcribe_youtube_captionless(
 # failure propagates to the job retry machinery (transient -> retry with
 # backoff; permanent -> 'blocked' verdict + failed job).
 _REMOTE_AUDIO_FETCH_TIMEOUT_S = 30 * 60.0
+# Watchdog cadence for the fetch heartbeat (P1-2): refresh the job row every
+# 5 min while the blocking ffmpeg run is in flight, far under the 45 min
+# reclaim window. Tests shrink this to make the watchdog observable.
+_FETCH_HEARTBEAT_INTERVAL_S = 300.0
 
 
 def _is_remote_permanent_error(exc: Exception) -> bool:
@@ -2516,6 +2575,30 @@ def _fetch_remote_audio_wav(platform: str, video_id: str, channel: str, out_wav:
         cmd += ["-headers", f"{key}: {value}"]
     cmd += ["-i", audio_url, "-vn", "-ac", "1", "-ar", "16000",
             "-f", "wav", str(out_wav)]
+    # P1-2: sp.run is ONE blocking call with no progress signal — a slow/
+    # throttled CDN would let the job's heartbeat go stale (the fetch
+    # timeout == the 30 min reclaim window) and a second lane would claim
+    # the row, downloading + transcribing the same VOD twice. A daemon
+    # watchdog refreshes the job row every 5 min while the fetch is in
+    # flight, so the reclaim window never fires mid-download; the fetch
+    # itself stays bounded by _REMOTE_AUDIO_FETCH_TIMEOUT_S.
+    watchdog_stop = threading.Event()
+
+    def _fetch_heartbeat(job_id: Optional[str]) -> None:
+        # job_id is passed in, NOT re-read from _job_id_tls: threading.local
+        # is per-thread, so the watchdog's own thread would always see None.
+        while not watchdog_stop.wait(_FETCH_HEARTBEAT_INTERVAL_S):
+            if job_id:
+                try:
+                    archive_db.update_job(job_id)
+                except Exception:
+                    logger.debug("fetch heartbeat failed for %s", job_id, exc_info=True)
+
+    watchdog = threading.Thread(
+        target=_fetch_heartbeat, args=(_current_job_id(),),
+        name="fetch-heartbeat", daemon=True,
+    )
+    watchdog.start()
     try:
         proc = sp.run(cmd, capture_output=True, timeout=_REMOTE_AUDIO_FETCH_TIMEOUT_S)
     except sp.TimeoutExpired as exc:
@@ -2523,6 +2606,9 @@ def _fetch_remote_audio_wav(platform: str, video_id: str, channel: str, out_wav:
             f"{platform} VOD audio fetch exceeded "
             f"{int(_REMOTE_AUDIO_FETCH_TIMEOUT_S)}s for {video_id}"
         ) from exc
+    finally:
+        watchdog_stop.set()
+        watchdog.join(timeout=2.0)
     if proc.returncode != 0:
         stderr = (proc.stderr or b"").decode("utf-8", "replace")[-400:]
         raise RuntimeError(
@@ -2554,6 +2640,7 @@ def _transcribe_remote_twitch_kick(
     language: Optional[str] = None,
     progress_cb: Optional[Callable[[float, float, int, int], None]] = None,
     events_cb: Optional[Callable[..., Optional[dict]]] = None,
+    audio_stash: Optional[dict] = None,
 ) -> dict:
     """ASR for a Twitch/Kick VOD archived metadata-only (no local file).
 
@@ -2565,6 +2652,10 @@ def _transcribe_remote_twitch_kick(
     so the scheduler never re-enqueues it (same contract as YouTube's
     captionless route). The temp dir is removed in finally — also on
     failure.
+
+    *audio_stash* is the P2-4 retry cache (see _transcribe_youtube_captionless):
+    the first call downloads + stashes the wav, the parakeet->whisper retry
+    reuses it — no second 350 MB HLS fetch for an engine retry.
     """
     rows = archive_db.query(
         "SELECT channel FROM videos WHERE platform = ? AND video_id = ?",
@@ -2573,20 +2664,28 @@ def _transcribe_remote_twitch_kick(
     if not rows:
         raise FileNotFoundError(f"no archived video {platform}/{video_id}")
     channel = rows[0]["channel"] or ""
-    outdir = Path(tempfile.mkdtemp(prefix=f"{platform}-transcribe-{video_id}-"))
+    cached = (audio_stash or {}).get("wav")
+    outdir = None
     try:
-        wav = outdir / "audio.wav"
-        try:
-            _fetch_remote_audio_wav(platform, video_id, channel, wav)
-        except Exception as exc:
-            if _is_remote_permanent_error(exc):
-                archive_db.mark_video_transcript_kind(platform, video_id, "blocked")
-                logger.warning(
-                    "%s %s audio unavailable (terminal, marked blocked): %s",
-                    platform, video_id, exc,
-                )
-            raise
-        logger.info("%s %s audio downloaded for ASR: %s", platform, video_id, wav)
+        if cached is not None:
+            wav = cached
+        else:
+            outdir = Path(tempfile.mkdtemp(prefix=f"{platform}-transcribe-{video_id}-"))
+            wav = outdir / "audio.wav"
+            try:
+                _fetch_remote_audio_wav(platform, video_id, channel, wav)
+            except Exception as exc:
+                if _is_remote_permanent_error(exc):
+                    archive_db.mark_video_transcript_kind(platform, video_id, "blocked")
+                    logger.warning(
+                        "%s %s audio unavailable (terminal, marked blocked): %s",
+                        platform, video_id, exc,
+                    )
+                raise
+            logger.info("%s %s audio downloaded for ASR: %s", platform, video_id, wav)
+            if audio_stash is not None:
+                audio_stash["wav"] = wav
+                audio_stash["dir"] = outdir
         t0 = time.monotonic()
         if _should_shard(str(wav)):
             shard_dir = Path(tempfile.mkdtemp(prefix="vodrip-shards-"))
@@ -2604,7 +2703,13 @@ def _transcribe_remote_twitch_kick(
             sharded=False, shard_dir=None,
         )
     finally:
-        shutil.rmtree(outdir, ignore_errors=True)
+        if cached is not None and audio_stash is not None:
+            # P2-4 retry call — the last consumer: release the stashed wav.
+            shutil.rmtree(str(audio_stash.pop("dir", "")), ignore_errors=True)
+        elif outdir is not None and (audio_stash is None or "wav" not in audio_stash):
+            # No stash (direct call) OR the download failed before stashing.
+            shutil.rmtree(outdir, ignore_errors=True)
+        # else: first call with a stash — kept alive for the engine retry.
 
 
 def transcribe_video(
@@ -2965,19 +3070,26 @@ def _transcribe_audio_source(
 
 # --- queue worker ---------------------------------------------------------
 
-_STALE_JOB_TIMEDELTA = timedelta(minutes=30)
+# Reclaim window for a 'running' transcribe job: 45 min. The max silent
+# phase is bounded by the 30 min audio-fetch timeout (_REMOTE_AUDIO_FETCH_
+# TIMEOUT_S — ffmpeg/yt-dlp downloads now heartbeat during the fetch, P1-2)
+# and by a single CPU decode chunk (~30 min); 45 min sits comfortably past
+# both, so the boundary-instant race (fetch exactly at the window edge)
+# cannot hand a live job to a second lane.
+_STALE_JOB_TIMEDELTA = timedelta(minutes=45)
 # Chat-history backfills run one yt-dlp/GQL pass per video; a 13.5h VOD's
-# live-chat replay can legitimately exceed the 30min transcribe reclaim
-# window, so 'chat' jobs get a 2h grace before a dead executor is assumed.
+# live-chat replay can legitimately exceed the transcribe reclaim window,
+# so 'chat' jobs get a 2h grace before a dead executor is assumed.
 _CHAT_STALE_TIMEDELTA = timedelta(hours=2)
-# Twitch chat backfills heartbeat their job row after every stored page
-# (backfill_chat's progress_cb), so a live executor's heartbeat is seconds
-# old. A running job whose heartbeat stalls past this window is a dead or
-# wedged fetch (urllib timeouts bound a single page to ~20s + the 429
-# backoff chain) — reclaim it instead of letting it hold the row for the
-# flat 2h _CHAT_STALE_TIMEDELTA. The YouTube leg never heartbeats during
-# its long yt-dlp download (heartbeat stays NULL) and keeps the 2h window.
-_CHAT_HEARTBEAT_STALE = timedelta(minutes=10)
+# Twitch chat backfills heartbeat their job row before every page fetch
+# and after every stored page (P2-3), so a live executor's heartbeat is
+# at most one stormed page old (~4-5 min of 429 backoff). A running job
+# whose heartbeat stalls past this window is a dead or wedged executor —
+# reclaim it instead of letting it hold the row for the flat 2h
+# _CHAT_STALE_TIMEDELTA. 20 min = margin over a multi-page storm plus
+# clock skew. The YouTube leg never heartbeats during its long yt-dlp
+# download (heartbeat stays NULL) and keeps the 2h window.
+_CHAT_HEARTBEAT_STALE = timedelta(minutes=20)
 
 # YouTube chat-backfill pacing: min gap between chat video STARTS. A single
 # worker starts ≤5/min (burst 2 requests each: extract + chat download); the
@@ -3035,13 +3147,15 @@ def _claim_next_job() -> Optional[dict]:
     """Atomically claim the newest queued transcribe/events/chat job (crash-stale too).
 
     A 'running' job is reclaimed only if untouched past its kind's stale
-    window: 30 min for transcribe/events (a single chunk can legitimately
-    take that long on CPU), 2 h for 'chat' on YouTube (a 13.5h VOD's
-    live-chat replay download heartbeats nothing mid-run). Twitch 'chat'
-    jobs heartbeat after every stored page, so a running one whose
-    heartbeat went stale past _CHAT_HEARTBEAT_STALE (10 min) is a dead or
-    wedged executor — reclaimed long before the flat 2h window; NULL
-    heartbeats (pre-heartbeat rows, YouTube) fall back to updated_at."""
+    window: 45 min for transcribe/events (a single decode chunk can take
+    ~30 min on CPU, and the audio fetch is bounded by its own 30 min
+    timeout with a heartbeat watchdog — P1-2), 2 h for 'chat' on YouTube
+    (a 13.5h VOD's live-chat replay download heartbeats nothing mid-run).
+    Twitch 'chat' jobs heartbeat before every page fetch and after every
+    stored page, so a running one whose heartbeat went stale past
+    _CHAT_HEARTBEAT_STALE (20 min) is a dead or wedged executor —
+    reclaimed long before the flat 2h window; NULL heartbeats
+    (pre-heartbeat rows, YouTube) fall back to updated_at."""
     now = datetime.now(timezone.utc)
     transcribe_cutoff = (now - _STALE_JOB_TIMEDELTA).isoformat(timespec="seconds")
     twitch_chat_cutoff = (now - _CHAT_HEARTBEAT_STALE).isoformat(timespec="seconds")
@@ -3302,9 +3416,13 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
     callers and tests."""
     job_id = job["id"]
     platform, video_id = job["platform"], job["video_id"]
+    # P2-4 retry cache (see _run_transcribe): the audio download functions
+    # stash the wav path + owner dir here; the job-level finally releases it.
+    audio_stash: dict = {}
     if multi:
         _multi_tls.active = True
     try:
+        _job_id_tls.job_id = job_id
         archive_db.update_job(job_id, status="running", progress=0.0)
 
         if job.get("kind") == "events":
@@ -3442,6 +3560,12 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
             pref = "parakeet"
         _engine_override_tls.engine = "whisper" if pref == "whisper" else None
 
+        # P2-4: the parakeet->whisper fallback re-runs _run_transcribe — the
+        # downloaded audio must be fetched ONCE and reused (an engine retry
+        # must not re-download ~350 MB). The download functions stash the
+        # wav path + owner dir here; the retry call finds the stash and the
+        # job-level finally releases whatever is left.
+
         def _run_transcribe() -> dict:
             if platform == "youtube":
                 # Captionless YouTube (no archive_path): download bestaudio
@@ -3450,6 +3574,7 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
                     video_id,
                     language=resolved_lang,
                     progress_cb=_progress, events_cb=events_cb,
+                    audio_stash=audio_stash,
                 )
             if not _has_local_archive(platform, video_id):
                 # FIX A: Twitch/Kick VODs archived metadata-only (no local
@@ -3460,6 +3585,7 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
                     platform, video_id,
                     language=resolved_lang,
                     progress_cb=_progress, events_cb=events_cb,
+                    audio_stash=audio_stash,
                 )
             return transcribe_video(
                 platform, video_id,
@@ -3492,10 +3618,19 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
                 # itself fails (decode error, recognizer crash) — retry the SAME
                 # job once with whisper before giving up. Terminal failures
                 # (missing archive file, yt-dlp download error) are NOT retried:
-                # they cannot succeed on the other engine.
+                # they cannot succeed on the other engine. A wall-clock download
+                # timeout (_YtDownloadTimedOut) is also not retried with whisper
+                # — the failure is in the FETCH phase, not the engine; the normal
+                # retry machinery requeues the job with backoff instead.
                 from yt_dlp.utils import DownloadError as _DLError
 
+                try:
+                    from services.archive_ytdlp import _YtDownloadTimedOut as _DLTimeout
+                except Exception:
+                    _DLTimeout = None  # pragma: no cover — archive_ytdlp is importable
                 if engine != "parakeet" or isinstance(exc, (FileNotFoundError, _DLError)):
+                    raise
+                if _DLTimeout is not None and isinstance(exc, _DLTimeout):
                     raise
                 logger.warning(
                     "parakeet failed for %s/%s (%s: %s) — retrying job with whisper",
@@ -3560,6 +3695,11 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
                               error=f"{type(exc).__name__}: {exc}"[:400])
         return {"job_id": job_id, "error": str(exc)}
     finally:
+        _job_id_tls.job_id = None
+        # P2-4: the first engine attempt's download dir is kept alive for a
+        # possible retry — release it here if no retry consumed it.
+        if audio_stash.get("dir"):
+            shutil.rmtree(str(audio_stash.pop("dir")), ignore_errors=True)
         if multi:
             _multi_tls.active = False
 

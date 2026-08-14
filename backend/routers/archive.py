@@ -45,6 +45,14 @@ _AUTO_KICK_LIMIT = 2                  # newest chat-less videos per search
 # auto-kick skips them for a while. Manual backfill is never throttled.
 _backfill_attempted_at: dict[str, float] = {}
 _BACKFILL_COOLDOWN_S = 600.0
+# P2-6: consecutive failed resume attempts per video (interactive lane).
+# A permanently-unresumable tail (the API answers the same service error
+# at the same offset forever) must not re-kick every _BACKFILL_COOLDOWN_S
+# indefinitely — after the limit the panel status goes 'idle' and the
+# auto-kicks stop (manual backfill stays available). Reset on any fetch
+# that actually made progress or reached a terminal state.
+_backfill_failed_resumes: dict[str, int] = {}
+_BACKFILL_FAILED_RESUME_LIMIT = 3
 
 # Transcript enrichment (search-v2): same global-throttle + per-video
 # cooldown shape as chat backfill, on its OWN clock so the two halves never
@@ -105,8 +113,9 @@ async def _run_backfill(
     """Background task: run backfill_chat in a worker thread; drop the
     in-flight marker and stamp the completion time on exit."""
     _set_backfill_progress(video_id, 0.0)
+    result = None
     try:
-        await asyncio.to_thread(
+        result = await asyncio.to_thread(
             archive_twitch.backfill_chat,
             channel, video_id,
             max_messages=_BACKFILL_MAX_MESSAGES,
@@ -120,6 +129,18 @@ async def _run_backfill(
             _backfill_inflight.discard(video_id)
             _backfill_attempted_at[video_id] = time.monotonic()
             _backfill_progress.pop(video_id, None)
+            if result is None:
+                # The resume fetch failed — count it (P2-6); after
+                # _BACKFILL_FAILED_RESUME_LIMIT consecutive failures the
+                # panel stops polling and the auto-kicks stop.
+                _backfill_failed_resumes[video_id] = (
+                    _backfill_failed_resumes.get(video_id, 0) + 1
+                )
+            elif result.get("stopped") in ("end_of_chat", "max_messages", "already"):
+                # The tail is resumable after all (or terminal) — clear the
+                # failure streak. 'busy'/'queued' leave it unchanged (no
+                # fetch actually ran).
+                _backfill_failed_resumes[video_id] = 0
         # Bulk chat inserts leave the FTS index fragmented; merge after every
         # completed backfill (manual or auto) so searches stay fast.
         try:
@@ -197,6 +218,8 @@ def kick_preview_backfill(
             return ""
         if now - _backfill_attempted_at.get(video_id, 0.0) < _BACKFILL_COOLDOWN_S:
             return ""
+        if _backfill_failed_resumes.get(video_id, 0) >= _BACKFILL_FAILED_RESUME_LIMIT:
+            return ""  # P2-6: N failed resumes — no more auto-kicks
     status = _kick_backfill(video_id, row[0]["channel"], seed_offset_sec=offset_sec)
     if status == "queued":
         with _backfill_lock:
@@ -246,6 +269,11 @@ def preview_backfill_status(platform: str, video_id: str) -> tuple[str, float]:
     # it keeps the panel polling and the kick's own throttle + cooldown
     # clocks bound the retry rate, so a partial capture self-heals once the
     # API recovers instead of freezing on the head window forever.
+    # P2-6: EXCEPT after _BACKFILL_FAILED_RESUME_LIMIT consecutive failed
+    # resumes on the same tail — the API is not recovering; stop the loop
+    # (idle = the panel stops polling, auto-kicks stop).
+    if _backfill_failed_resumes.get(video_id, 0) >= _BACKFILL_FAILED_RESUME_LIMIT:
+        return "idle", 0.0
     return "running", 0.0
 
 
@@ -357,6 +385,8 @@ def _maybe_auto_backfill(
                 continue
             if now - _backfill_attempted_at.get(vid, 0.0) < _BACKFILL_COOLDOWN_S:
                 continue
+            if _backfill_failed_resumes.get(vid, 0) >= _BACKFILL_FAILED_RESUME_LIMIT:
+                continue  # P2-6: N failed resumes — no more auto-kicks
             _backfill_inflight.add(vid)
             kicked.append(r)
         asyncio.get_running_loop().create_task(_run_backfill(vid, r["channel"] or ""))
