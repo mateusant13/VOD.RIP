@@ -1,12 +1,21 @@
-"""Whisper model settings — /api/settings roundtrip, model/cache resolution,
-and inactive-model cache pruning (guard included). Scratch env only: the
-real %APPDATA%/VOD.RIP/whisper-models dir and the shared backend are never
-touched, and no model is ever downloaded (WhisperModel is patched).
+"""ASR settings after the parakeet-only migration.
+
+  * the whisper_model setting is GONE (the engine is fixed) — only
+    whisper_model_cache (the AI-models root) remains in /api/settings;
+  * the models root resolves the same way it always did (env ->
+    settings -> auto best-ROI drive -> appdata) and the sherpa parakeet
+    cache is a subdir of it;
+  * no whisper download default: the fixed parakeet model id is
+    PARAKEET_MODEL and _job_engine() is a clean-failure router
+    (_AsrUnsupportedLanguage for uncovered languages — no whisper
+    fallback).
+
+Scratch env only: the real %APPDATA%/VOD.RIP/whisper-models dir and the
+shared backend are never touched, and nothing is ever downloaded.
 """
 
 from __future__ import annotations
 
-import os
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +28,12 @@ from app import app
 from deps import settings_mgr
 from models.schemas import AppSettings
 from services import archive_transcribe, disk_hygiene
+from services.archive_transcribe import (
+    PARAKEET_LANG_CANDIDATES,
+    PARAKEET_MODEL,
+    _AsrLaneUnavailable,
+    _AsrUnsupportedLanguage,
+)
 from services.settings import recommended_resource_defaults
 
 
@@ -45,35 +60,44 @@ async def client():
         yield ac
 
 
-# --- /api/settings roundtrip ------------------------------------------------
+# --- /api/settings roundtrip (parakeet-only reality) -----------------------
 
 @pytest.mark.asyncio
-async def test_whisper_settings_roundtrip(client):
+async def test_settings_roundtrip_models_root(client):
+    """whisper_model_cache (the AI-models root) still roundtrips."""
     resp = await client.post("/api/settings", json={
-        "whisper_model": "Systran/faster-whisper-medium",
         "whisper_model_cache": "I:/produtos202608/BrandOps/dashboard/cache/huggingface/hub",
     })
     assert resp.status_code == 200
     data = resp.json()
-    assert data["whisper_model"] == "Systran/faster-whisper-medium"
     assert data["whisper_model_cache"] == "I:/produtos202608/BrandOps/dashboard/cache/huggingface/hub"
 
     resp = await client.get("/api/settings")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["whisper_model"] == "Systran/faster-whisper-medium"
     assert data["whisper_model_cache"] == "I:/produtos202608/BrandOps/dashboard/cache/huggingface/hub"
 
 
 @pytest.mark.asyncio
-async def test_whisper_settings_blank_model_falls_back_to_default(client):
-    resp = await client.post("/api/settings", json={"whisper_model": "   "})
+async def test_settings_whisper_model_field_is_gone(client):
+    """The engine-selection setting no longer exists: the field is absent
+    from GET and a stray POST key is ignored (no download default to set)."""
+    resp = await client.post("/api/settings", json={
+        "whisper_model": "Systran/faster-whisper-medium",
+    })
     assert resp.status_code == 200
-    assert resp.json()["whisper_model"] == "small"
+    data = resp.json()
+    assert "whisper_model" not in data
+
+    resp = await client.get("/api/settings")
+    data = resp.json()
+    assert "whisper_model" not in data
+    # The model itself is no longer configurable in the schema either.
+    assert not hasattr(AppSettings(), "whisper_model")
 
 
 @pytest.mark.asyncio
-async def test_whisper_cache_empty_cleared_to_none(client):
+async def test_settings_cache_blank_cleared_to_none(client):
     resp = await client.post("/api/settings", json={"whisper_model_cache": "C:/some/cache"})
     assert resp.status_code == 200
     assert resp.json()["whisper_model_cache"] == "C:/some/cache"
@@ -83,167 +107,87 @@ async def test_whisper_cache_empty_cleared_to_none(client):
     assert resp.json()["whisper_model_cache"] is None
 
 
-# --- model/cache resolution (settings -> env -> default) --------------------
+# --- models-root resolution (settings -> env -> default) -------------------
 
-def test_transcribe_resolution_from_settings(monkeypatch):
-    monkeypatch.delenv("VODRIP_WHISPER_MODEL", raising=False)
+def test_cache_dir_resolution_from_settings(monkeypatch):
     monkeypatch.delenv("VODRIP_WHISPER_CACHE", raising=False)
     with patch("deps.settings_mgr") as mgr:
-        mgr.get.return_value = SimpleNamespace(
-            whisper_model="Systran/faster-whisper-medium",
-            whisper_model_cache="I:/cache/hub",
-        )
-        assert archive_transcribe.model_name() == "Systran/faster-whisper-medium"
+        mgr.get.return_value = SimpleNamespace(whisper_model_cache="I:/cache/hub")
         assert archive_transcribe._cache_dir() == Path("I:/cache/hub")
+        assert disk_hygiene.whisper_cache_dir() == Path("I:/cache/hub")
 
 
-def test_transcribe_resolution_env_fallback(monkeypatch):
-    monkeypatch.setenv("VODRIP_WHISPER_MODEL", "small")
+def test_cache_dir_env_beats_settings(monkeypatch):
+    monkeypatch.setenv("VODRIP_WHISPER_CACHE", "Z:/env-cache")
+    with patch("deps.settings_mgr") as mgr:
+        mgr.get.return_value = SimpleNamespace(whisper_model_cache="I:/settings-cache")
+        assert archive_transcribe._cache_dir() == Path("Z:/env-cache")
+
+
+def test_cache_dir_appdata_fallback(monkeypatch):
+    """No env, no setting, no usable drive -> appdata whisper-models root
+    (keeps the test hermetic: the auto pick probes real disks)."""
     monkeypatch.delenv("VODRIP_WHISPER_CACHE", raising=False)
-    # No usable drive -> appdata fallback (keeps the test hermetic: the real
-    # auto pick probes actual disks via best_model_cache_drive()).
     monkeypatch.setattr("services.disk_hygiene.best_model_cache_drive", lambda: None)
     with patch("deps.settings_mgr") as mgr:
-        mgr.get.return_value = SimpleNamespace(whisper_model="", whisper_model_cache="")
-        assert archive_transcribe.model_name() == "small"
+        mgr.get.return_value = SimpleNamespace(whisper_model_cache=None)
         assert str(archive_transcribe._cache_dir()).endswith("whisper-models")
 
 
-def test_transcribe_resolution_defaults(monkeypatch):
-    monkeypatch.delenv("VODRIP_WHISPER_MODEL", raising=False)
+def test_parakeet_cache_lives_under_models_root(monkeypatch, tmp_path):
+    """Every weight lives under the AI-models root: the sherpa parakeet
+    cache is <models root>/parakeet-models (nothing downloads at settings
+    level)."""
     monkeypatch.delenv("VODRIP_WHISPER_CACHE", raising=False)
+    monkeypatch.delenv("VODRIP_SHERRPA_CACHE", raising=False)
     with patch("deps.settings_mgr") as mgr:
-        mgr.get.return_value = SimpleNamespace(whisper_model="", whisper_model_cache="")
-        assert archive_transcribe.model_name() == "small"
+        mgr.get.return_value = SimpleNamespace(whisper_model_cache=str(tmp_path / "models"))
+        assert archive_transcribe._parakeet_cache_dir() == tmp_path / "models" / "parakeet-models"
+        assert archive_transcribe._parakeet_resolve_dir() is None  # nothing seeded -> None
 
 
-def test_transcribe_env_override_beats_settings(monkeypatch):
-    """The env knob stays the per-process override (pinned by
-    test_disk_router.py::test_cleanup_whisper_models_env_active_wins)."""
-    monkeypatch.setenv("VODRIP_WHISPER_MODEL", "small")
-    with patch("deps.settings_mgr") as mgr:
-        mgr.get.return_value = SimpleNamespace(whisper_model="Systran/faster-whisper-medium")
-        assert archive_transcribe.model_name() == "small"
+# --- no whisper download default (engine reality) --------------------------
+
+def test_fixed_engine_model_is_parakeet():
+    """The engine model id is the fixed sherpa int8 parakeet repo — no
+    faster-whisper id anywhere near the default."""
+    assert PARAKEET_MODEL == "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
+    assert "faster-whisper" not in PARAKEET_MODEL
+    assert archive_transcribe._asr_model_name() == PARAKEET_MODEL
 
 
-def test_transcribe_load_passes_resolved_id_and_cache(monkeypatch, tmp_path):
-    """WhisperModel receives the settings-driven id + cache dir — the
-    BrandOps HF hub reuse path (Systran CT2 checkpoints load directly)."""
-    cache = tmp_path / "cache"
-    (cache / "models--Systran--faster-whisper-medium").mkdir(parents=True)
-    (cache / "models--Systran--faster-whisper-medium" / "model.bin").write_bytes(b"x")
-    monkeypatch.setenv("VODRIP_WHISPER_DEVICE", "cpu")
-    monkeypatch.delenv("VODRIP_WHISPER_MODEL", raising=False)
-    monkeypatch.delenv("VODRIP_WHISPER_CACHE", raising=False)
-    archive_transcribe._model = None
-    archive_transcribe._model_name = None
-    try:
-        with patch("deps.settings_mgr") as mgr, patch("faster_whisper.WhisperModel") as WM:
-            mgr.get.return_value = SimpleNamespace(
-                whisper_model="Systran/faster-whisper-medium",
-                whisper_model_cache=str(cache),
-            )
-            archive_transcribe._get_model()
-    finally:
-        archive_transcribe._model = None
-        archive_transcribe._model_name = None
-    assert WM.call_count == 1
-    args, kwargs = WM.call_args
-    assert args[0] == "Systran/faster-whisper-medium"
-    assert kwargs.get("download_root") == str(cache)
+def test_job_engine_parakeet_for_covered_and_unknown(monkeypatch):
+    monkeypatch.setattr(archive_transcribe, "_parakeet_available", lambda: True)
+    monkeypatch.setattr(archive_transcribe, "_parakeet_langs",
+                        lambda: PARAKEET_LANG_CANDIDATES)
+    assert archive_transcribe._job_engine("pt") == "parakeet"
+    assert archive_transcribe._job_engine("es") == "parakeet"
+    assert archive_transcribe._job_engine(None) == "parakeet"  # auto-detect
+    assert archive_transcribe._job_engine("") == "parakeet"  # auto-detect
 
 
-def test_get_model_reloads_when_device_override_flips(monkeypatch):
-    """After a CUDA OOM the override flips to CPU — the cached CUDA model is
-    broken, so _get_model must reload instead of returning it (it previously
-    compared only the model name, so the retry re-ran on the corrupted
-    context: cudaErrorInvalidDevice)."""
-    # _get_model resolves the cache dir; pin the ROI auto-pick to keep the
-    # test hermetic (no real-disk PowerShell probe, no real drive writes).
-    monkeypatch.setattr(disk_hygiene, "best_model_cache_drive", lambda: None)
-    archive_transcribe._model = object()
-    archive_transcribe._model_name = "large-v3-turbo"
-    archive_transcribe._model_device = "cuda"
-    archive_transcribe._device_override = None
-    monkeypatch.setattr(archive_transcribe, "model_name", lambda: "large-v3-turbo")
+def test_job_engine_uncovered_language_is_clean_failure(monkeypatch):
+    """ja/ko/zh/ar are KNOWN but outside parakeet's 26 European languages —
+    a clean _AsrUnsupportedLanguage ('ASR unsupported'), never a fallback."""
+    monkeypatch.setattr(archive_transcribe, "_parakeet_available", lambda: True)
+    monkeypatch.setattr(archive_transcribe, "_parakeet_langs",
+                        lambda: PARAKEET_LANG_CANDIDATES)
+    for lang in ("ja", "ko", "zh", "ar"):
+        with pytest.raises(_AsrUnsupportedLanguage) as ei:
+            archive_transcribe._job_engine(lang)
+        assert "ASR unsupported" in str(ei.value)
+    assert "ja" not in PARAKEET_LANG_CANDIDATES
+    assert {"pt", "en", "es"} <= PARAKEET_LANG_CANDIDATES
+
+
+def test_job_engine_lane_unavailable_is_clean_failure(monkeypatch):
+    """No parakeet at all -> _AsrLaneUnavailable ('ASR unavailable')."""
+    monkeypatch.setattr(archive_transcribe, "_thread_pin", lambda: None)
     monkeypatch.setattr(archive_transcribe, "_effective_device", lambda: ("cpu", "int8"))
-    try:
-        with patch("faster_whisper.WhisperModel") as WM:
-            archive_transcribe._get_model()
-        assert WM.call_count == 1, "override flip must trigger a reload"
-        assert WM.call_args.kwargs["device"] == "cpu"
-        assert archive_transcribe._model_device == "cpu"
-    finally:
-        archive_transcribe._model = None
-        archive_transcribe._model_name = None
-        archive_transcribe._model_device = None
-
-
-# --- pruning (disk_hygiene) -------------------------------------------------
-
-def _mk_model(cache: Path, name: str, size: int) -> None:
-    d = cache / f"models--{name.replace('/', '--')}"
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "model.bin").write_bytes(b"x" * size)
-
-
-def test_prune_keeps_active_deletes_other_hf_dirs(tmp_path):
-    cache = tmp_path / "whisper-cache"
-    _mk_model(cache, "Systran/faster-whisper-medium", 2048)
-    _mk_model(cache, "Systran/faster-whisper-small", 1024)
-    _mk_model(cache, "Systran/faster-whisper-large-v3-turbo", 8192)
-    (cache / "not-a-model").mkdir()
-    (cache / "not-a-model" / "user-file.txt").write_text("x")
-
-    freed = disk_hygiene.prune_inactive_whisper_models(cache, "Systran/faster-whisper-medium")
-
-    assert freed == 1024 + 8192
-    assert (cache / "models--Systran--faster-whisper-medium").is_dir()
-    assert (cache / "models--Systran--faster-whisper-small").exists() is False
-    assert (cache / "models--Systran--faster-whisper-large-v3-turbo").exists() is False
-    assert (cache / "not-a-model").is_dir(), "unknown dirs must be left alone"
-
-
-def test_prune_active_dir_missing_deletes_nothing(tmp_path):
-    """Guard: active model not in the cache yet -> pruning would brick the
-    next transcription, so NOTHING is deleted."""
-    cache = tmp_path / "whisper-cache"
-    _mk_model(cache, "Systran/faster-whisper-medium", 2048)
-    _mk_model(cache, "Systran/faster-whisper-large-v3-turbo", 8192)
-
-    freed = disk_hygiene.prune_inactive_whisper_models(cache, "Systran/faster-whisper-small")
-
-    assert freed == 0
-    assert (cache / "models--Systran--faster-whisper-medium").is_dir()
-    assert (cache / "models--Systran--faster-whisper-large-v3-turbo").is_dir()
-
-
-def test_prune_missing_cache_is_noop(tmp_path):
-    assert disk_hygiene.prune_inactive_whisper_models(tmp_path / "nope", "small") == 0
-
-
-def test_startup_hygiene_prunes_with_settings_active(monkeypatch, tmp_path):
-    """Live-ish: startup hygiene + fake cache dirs -> only the settings-active
-    model survives (scratch APPDATA, never the real profile)."""
-    cache = tmp_path / "cache"
-    _mk_model(cache, "Systran/faster-whisper-medium", 2048)
-    _mk_model(cache, "Systran/faster-whisper-small", 1024)
-    scratch_tmp = tmp_path / "tmp"
-    scratch_tmp.mkdir()
-
-    monkeypatch.setenv("VODRIP_WHISPER_CACHE", str(cache))
-    monkeypatch.delenv("VODRIP_WHISPER_MODEL", raising=False)
-    monkeypatch.setattr("services.disk_hygiene._get_appdata_dir", lambda: tmp_path / "appdata")
-    monkeypatch.setattr(tempfile, "tempdir", str(scratch_tmp))
-    with patch("deps.settings_mgr") as mgr:
-        mgr.get.return_value = SimpleNamespace(
-            whisper_model="Systran/faster-whisper-medium", whisper_model_cache=None
-        )
-        stats = disk_hygiene.run_startup_hygiene()
-
-    assert stats.get("whisper_models") == 1024
-    assert (cache / "models--Systran--faster-whisper-medium").is_dir()
-    assert (cache / "models--Systran--faster-whisper-small").exists() is False
+    monkeypatch.setattr(archive_transcribe, "_parakeet_available", lambda: False)
+    with pytest.raises(_AsrLaneUnavailable) as ei:
+        archive_transcribe._job_engine("pt")
+    assert "ASR unavailable" in str(ei.value)
 
 
 # --- model-cache auto pick (Settings > Disk "AI Models Folder" Auto) --------

@@ -6,8 +6,8 @@ SAME audio through BOTH decode paths of transcribe_video:
 
   * sharded (VODRIP_TRANSCRIBE_SHARD_SEC=5, VODRIP_TRANSCRIBE_SHARD_MIN_SEC=5):
     PCM spilled to 5 s disk shards, VAD per shard with overlap + cross-shard
-    merge, whisper fed from concatenated clip shards, events hook handed the
-    shards instead of a full array;
+    merge, the ASR engine fed from concatenated clip shards, events hook
+    handed the shards instead of a full array;
   * non-sharded (VODRIP_TRANSCRIBE_SHARD_MIN_SEC=3600): the legacy full-array
     path.
 
@@ -15,7 +15,7 @@ Asserts:
   (a) bounded RAM — shard files are fixed-duration (each <= 5 s * 16k * 4 B,
       only the tail may be short) and the decode iterator yields one array
       per shard;
-  (b) joined transcript TEXT is identical on both paths (whisper output must
+  (b) joined transcript TEXT is identical on both paths (ASR output must
       not depend on the decode strategy);
   (c) cleanup — no vodrip-shards-* temp dir survives the job, on the success
       AND the failure path; the events stage scores shard-fed regions with
@@ -48,7 +48,6 @@ os.environ["TMP"] = os.environ["TEMP"] = str(
 tempfile.tempdir = os.environ["TMP"]
 _TMP = pathlib.Path(tempfile.mkdtemp(prefix="vodrip-shardtest-"))
 os.environ["VODRIP_ARCHIVE_DB"] = str(_TMP / "archive.db")
-os.environ.setdefault("VODRIP_WHISPER_MODEL", "small")
 os.environ.setdefault("VODRIP_WHISPER_IDLE_CLOSE", "60")
 # Events are default-on now; this test exercises sharding, not the PANNs
 # stage (the fake-SED comparisons at the bottom pin the shard-fed path).
@@ -141,6 +140,11 @@ def _transcribe(video_id: str) -> dict:
 
 
 def _run() -> None:
+    # Suite-order robustness: a stale probe cache (a transient nvidia-smi
+    # failure earlier in this process, or a hermetic test that patched the
+    # gates) must not fail the REAL routing below — re-probe fresh.
+    archive_transcribe._parakeet_ok = None
+    archive_transcribe._parakeet_cuda_ok = None
     fixture = _build_fixture()
     full_shard_bytes = int(SHARD_SEC * SAMPLE_RATE) * 4
 
