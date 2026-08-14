@@ -266,11 +266,12 @@ def test_manifest_engine_change_invalidates_resume():
 
 
 def test_gpu_autoinstall_needed_gates(monkeypatch):
-    """The boot-time GPU swap must fire ONLY on NVIDIA hosts with a CPU
-    sherpa-onnx: never on AMD/Intel, never when the lane is off, never when
-    the CUDA wheel is already installed, never behind the kill switch."""
+    """The boot-time GPU swap must fire ONLY on hosts with a real NVIDIA
+    compute GPU (probe, not adapter names) and a CPU sherpa-onnx: never on
+    fake adapters, never when the lane is off, never when the CUDA wheel is
+    already installed, never behind the kill switch."""
     monkeypatch.delenv(at.GPU_AUTOINSTALL_ENV, raising=False)
-    monkeypatch.setattr(at, "detect_gpu_vendor", lambda: "nvidia")
+    monkeypatch.setattr(at, "_real_gpu_info", lambda: (True, 8 * 1024 ** 3, 4 * 1024 ** 3))
     monkeypatch.delenv(at.PARAKEET_ENV, raising=False)
 
     class _FakeCuda:
@@ -298,11 +299,11 @@ def test_gpu_autoinstall_needed_gates(monkeypatch):
     assert at._gpu_autoinstall_needed() is False
 
     # non-NVIDIA GPU -> no-op
-    monkeypatch.setattr(at, "detect_gpu_vendor", lambda: "amd")
+    monkeypatch.setattr(at, "_real_gpu_info", lambda: (False, 0, 0))
     assert at._gpu_autoinstall_needed() is False
 
     # kill switch (VODRIP_PARAAKEET=0) -> no-op even on NVIDIA
-    monkeypatch.setattr(at, "detect_gpu_vendor", lambda: "nvidia")
+    monkeypatch.setattr(at, "_real_gpu_info", lambda: (True, 8 * 1024 ** 3, 4 * 1024 ** 3))
     monkeypatch.setenv(at.PARAKEET_ENV, "0")
     assert at._gpu_autoinstall_needed() is False
 
@@ -334,7 +335,7 @@ def test_gpu_autoinstall_respects_stamp_and_installs(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "frozen", False, raising=False)
     monkeypatch.setattr(at, "_gpu_autoinstall_stamp_path", lambda: tmp_path / "stamp.txt")
     monkeypatch.setattr(at, "_gpu_autoinstall_needed", lambda: True)
-    monkeypatch.setattr(at, "detect_gpu_vendor", lambda: "nvidia")
+    monkeypatch.setattr(at, "_real_gpu_info", lambda: (True, 8 * 1024 ** 3, 4 * 1024 ** 3))
     runs = []
 
     class _Proc:
