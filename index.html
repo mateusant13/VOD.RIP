@@ -14,8 +14,115 @@
     <!-- Non-render-blocking: font CSS loads async; text paints in fallback then swaps (display=swap). -->
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;700;900&family=Syne:wght@400;700;800&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
     <noscript><link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;700;900&family=Syne:wght@400;700;800&display=swap" rel="stylesheet"></noscript>
+    <!-- Pre-React loading screen: inline so it paints before the JS bundle
+         (and its index.css) loads — no white screen on cold start. React
+         removes it from main.tsx once the first frame is mounted. -->
+    <style>
+      #vodrip-loader {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483000;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background-color: #09090b;
+        background-image: radial-gradient(#27272a 1px, transparent 1px);
+        background-size: 24px 24px;
+        color: #fafafa;
+        font-family: "Syne", sans-serif;
+        transition: opacity 0.25s ease;
+      }
+      #vodrip-loader.vodrip-loader--done {
+        opacity: 0;
+        pointer-events: none;
+      }
+      .vodrip-loader-inner {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 14px;
+        text-align: center;
+        padding: 24px;
+      }
+      .vodrip-loader-brand {
+        font-size: 44px;
+        font-weight: 800;
+        letter-spacing: -0.02em;
+        line-height: 1;
+      }
+      .vodrip-loader-tag {
+        font-family: "Space Grotesk", monospace;
+        font-size: 13px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: #a1a1aa;
+      }
+      .vodrip-loader-tag .sep {
+        color: #3f3f46;
+        margin: 0 6px;
+      }
+      .vodrip-loader-rip {
+        position: relative;
+        margin-top: 8px;
+        width: 240px;
+        height: 2px;
+        background: #27272a;
+        overflow: hidden;
+        border-radius: 1px;
+      }
+      .vodrip-loader-rip-bar {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 42%;
+        height: 100%;
+        background: #53fc18;
+        border-radius: 1px;
+        box-shadow: 0 0 12px rgba(83, 252, 24, 0.45);
+        animation: vodrip-rip-sweep 1.15s ease-in-out infinite;
+      }
+      .vodrip-loader-note {
+        font-family: "Space Grotesk", monospace;
+        font-size: 11px;
+        letter-spacing: 0.04em;
+        color: #71717a;
+      }
+      /* "taking longer than usual" hint — appears only if the bundle is slow */
+      .vodrip-loader-slow {
+        opacity: 0;
+        font-family: "Space Grotesk", monospace;
+        font-size: 11px;
+        letter-spacing: 0.04em;
+        color: #52525b;
+        animation: vodrip-slow-appear 0s linear 10s forwards;
+      }
+      @keyframes vodrip-rip-sweep {
+        0% { transform: translateX(-110%); }
+        100% { transform: translateX(340%); }
+      }
+      @keyframes vodrip-slow-appear {
+        to { opacity: 0.6; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .vodrip-loader-rip-bar {
+          animation: none;
+          transform: translateX(-10%);
+        }
+      }
+    </style>
   </head>
   <body>
+    <div id="vodrip-loader" role="status" aria-live="polite">
+      <div class="vodrip-loader-inner">
+        <div class="vodrip-loader-brand">VOD.RIP</div>
+        <div class="vodrip-loader-tag">
+          <span style="color:#53fc18">Kick</span><span class="sep">//</span><span style="color:#9146FF">Twitch</span><span class="sep">//</span><span style="color:#F03030">YouTube</span>
+        </div>
+        <div class="vodrip-loader-rip" aria-hidden="true"><div class="vodrip-loader-rip-bar"></div></div>
+        <div class="vodrip-loader-note">Ripping streams into VODs&hellip;</div>
+        <div class="vodrip-loader-slow">still loading &mdash; taking longer than usual</div>
+      </div>
+    </div>
     <div id="root"></div>
     <div id="explore-portal"></div>
     <script type="module" src="/src/main.tsx"></script>
