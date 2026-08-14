@@ -1739,7 +1739,7 @@ def _shard_sample_bounds(i: int, shard_sec: float) -> tuple[int, int]:
 
 
 class _ShardedAudio:
-    """Fixed-duration float32 shards on disk plus absolute range reads.
+    """Fixed-duration int16 PCM shards on disk plus absolute range reads.
 
     Shard i covers samples [_shard_sample_bounds(i)); read() returns any
     absolute [start, end) window as one array, so VAD / the ASR engine /
@@ -1750,11 +1750,15 @@ class _ShardedAudio:
     def __init__(self, files: list, shard_sec: float) -> None:
         self.files = list(files)
         self.shard_sec = float(shard_sec)
-        self.total_samples = sum(Path(f).stat().st_size // 4 for f in self.files)
+        self.total_samples = sum(Path(f).stat().st_size // 2 for f in self.files)
         self.total_sec = self.total_samples / SAMPLE_RATE
 
     def read(self, start_sec: float, end_sec: float) -> Any:
-        """Concatenated float32 16 kHz samples for an absolute window."""
+        """Concatenated float32 16 kHz samples for an absolute window.
+
+        Shards are stored as int16 PCM (half the disk of float32, no speech
+        precision loss); reads convert to float32 in [-1, 1] for the
+        consumers (VAD / ASR / events)."""
         import numpy as np
 
         s0 = max(0, int(start_sec * SAMPLE_RATE))
@@ -1768,7 +1772,11 @@ class _ShardedAudio:
                 continue
             lo = max(s0, fs) - fs
             hi = min(e0, fe) - fs
-            parts.append(np.fromfile(fpath, dtype=np.float32, count=hi - lo, offset=lo * 4))
+            parts.append(
+                np.fromfile(fpath, dtype=np.int16, count=hi - lo, offset=lo * 2)
+                .astype(np.float32)
+                / 32768.0
+            )
         return np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
 
 
@@ -1778,10 +1786,11 @@ def _decode_to_shards(
     shard_sec: Optional[float] = None,
     out_dir: Optional[str] = None,
 ) -> Iterator[tuple[float, Any]]:
-    """Decode ONCE to fixed-duration float32 shard files; yield (start_sec, np.ndarray).
+    """Decode ONCE to fixed-duration int16 PCM shard files; yield (start_sec, np.ndarray).
 
-    One ffmpeg process pipes mono 16 kHz f32 to stdout; stdout is sliced into
-    shard-sized buffers and each spilled to ``<out_dir>/shard_%06d.f32``.
+    One ffmpeg process pipes mono 16 kHz s16 (int16 — half the disk of
+    float32, no speech precision loss) to stdout; stdout is sliced into
+    shard-sized buffers and each spilled to ``<out_dir>/shard_%06d.i16``.
     Peak RAM is a couple of shard buffers, independent of media length.
     With out_dir=None a temp dir is created and removed when the iterator is
     exhausted or closed (also on failure); callers that need the files after
@@ -1794,10 +1803,10 @@ def _decode_to_shards(
         ffmpeg_bin = _resolve_ffmpeg_exe()
     own_dir = out_dir is None
     tmpdir = Path(out_dir) if out_dir else Path(tempfile.mkdtemp(prefix="vodrip-shards-"))
-    shard_bytes = int(shard_sec * SAMPLE_RATE) * np.dtype(np.float32).itemsize
+    shard_bytes = int(shard_sec * SAMPLE_RATE) * np.dtype(np.int16).itemsize
     cmd = [
         ffmpeg_bin, "-nostdin", "-v", "error", "-i", str(path),
-        "-f", "f32le", "-ac", "1", "-ar", str(SAMPLE_RATE), "-",
+        "-f", "s16le", "-ac", "1", "-ar", str(SAMPLE_RATE), "-",
     ]
     proc: Optional[sp.Popen] = None
     try:
@@ -1807,9 +1816,11 @@ def _decode_to_shards(
             raw = proc.stdout.read(shard_bytes)
             if not raw:
                 break
-            fpath = tmpdir / f"shard_{idx:06d}.f32"
+            fpath = tmpdir / f"shard_{idx:06d}.i16"
             fpath.write_bytes(raw)
-            arr = np.frombuffer(raw, dtype=np.float32).copy()  # writable copy
+            # int16 on disk, float32 [-1, 1] to consumers (astype makes a
+            # fresh writable array — torch.from_numpy safe).
+            arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
             yield idx * shard_sec, arr
             idx += 1
         proc.wait()
@@ -2814,7 +2825,7 @@ def _transcribe_audio_source(
         shard_sec = _shard_seconds()
         for _start_sec, _arr in _decode_to_shards(path, shard_sec=shard_sec, out_dir=shard_dir):
             pass  # decode pass — PCM is spilled to disk, never held whole
-        files = sorted(shard_dir.glob("shard_*.f32"))
+        files = sorted(shard_dir.glob("shard_*.i16"))
         if not files:
             raise RuntimeError(f"ffmpeg produced no audio from {path}")
         sharded_audio = _ShardedAudio(files, shard_sec)
@@ -3777,6 +3788,33 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
             _multi_tls.active = False
 
 
+def _reap_stale_shard_dirs(max_age_s: float = 24 * 3600.0) -> None:
+    """Delete orphaned shard scratch dirs in the system temp dir.
+
+    Per-job cleanup runs in the job's own process (finally: rmtree); a
+    violently killed job (taskkill /T, crash) never reaches it and Windows
+    does not collect temp dirs, so orphans accumulate (observed a 1.2 GB
+    dir from one dead job). A live job touches its shards continuously, so
+    mtime older than max_age_s means the owner is gone. Runs once per
+    worker start; harmless when nothing is stale."""
+    import shutil
+    import tempfile
+    import time
+
+    tdir = Path(tempfile.gettempdir())
+    cutoff = time.time() - max_age_s
+    try:
+        for p in tdir.glob("vodrip-shards-*"):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    shutil.rmtree(p, ignore_errors=True)
+                    logger.info("reaped stale shard dir %s", p.name)
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
 def run_worker(
     *,
     once: bool = False,
@@ -3809,6 +3847,7 @@ def run_worker(
     the new one — a GPU that becomes free turns the worker GPU-on without a
     restart. max_workers plans are static (tests/launchers pin them).
     """
+    _reap_stale_shard_dirs()  # one cleanup pass per boot; orphaned shards only
     plan = _pool_plan(max_workers)
     budget = len(plan)
     multi = budget > 1
