@@ -232,7 +232,6 @@ a = Analysis(
         "tkinter.test",
         "tkinter.tix",
         "test",
-        "unittest",
         "django",
         "flask",
         "tornado",
