@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Kick Overlay</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      width: 260px;
+      font: 13px/1.4 system-ui, sans-serif;
+      background: #0e0e10;
+      color: #efeff1;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 12px;
+      background: #18181b;
+      border-bottom: 1px solid #2d2d33;
+      font-weight: 600;
+    }
+    header img { width: 18px; height: 18px; }
+    .body { padding: 10px 12px 12px; }
+    .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+    .row label { color: #bfbfc6; }
+    input[type="checkbox"] { width: 34px; height: 18px; accent-color: #059669; }
+    select {
+      background: #18181b;
+      border: 1px solid #2d2d33;
+      color: #efeff1;
+      border-radius: 4px;
+      padding: 4px 6px;
+      outline: none;
+    }
+    .channel { color: #a970ff; font-weight: 600; margin-bottom: 8px; }
+    .map { display: flex; gap: 6px; }
+    input[type="text"] {
+      flex: 1;
+      background: #18181b;
+      border: 1px solid #2d2d33;
+      color: #efeff1;
+      border-radius: 4px;
+      padding: 5px 7px;
+      outline: none;
+    }
+    input[type="text"]:focus { border-color: #772ce8; }
+    button {
+      background: #772ce8;
+      border: 0;
+      color: #fff;
+      border-radius: 4px;
+      padding: 5px 10px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button:hover { background: #9147ff; }
+    .status { margin-top: 10px; font-size: 12px; color: #adadb8; min-height: 16px; }
+    .status b.ok { color: #53fc18; }
+    .status b.off { color: #f87171; }
+    .hint { margin-top: 8px; font-size: 11px; color: #73737c; }
+  </style>
+</head>
+<body>
+  <header>
+    <img src="images/icon32.png" alt="" />
+    Kick Overlay
+  </header>
+  <div class="body">
+    <div class="row">
+      <label for="enabled">Overlay</label>
+      <input type="checkbox" id="enabled" />
+    </div>
+    <div class="row">
+      <label for="player">Player</label>
+      <select id="player">
+        <option value="kick">Kick</option>
+        <option value="twitch">Twitch</option>
+      </select>
+    </div>
+    <div class="channel" id="channel">—</div>
+    <div class="map">
+      <input type="text" id="kick" placeholder="Kick channel slug" />
+      <button id="save">Save</button>
+    </div>
+    <div class="status" id="status"></div>
+    <div class="hint">Pick the Kick player (no Twitch ads) or the Twitch player — switch anytime from the player itself.</div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
