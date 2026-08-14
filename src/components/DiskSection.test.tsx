@@ -15,7 +15,7 @@ const BASE_SETTINGS: AppSettings = {
 
 const USAGE = {
   archive_vods: 11 * 1024 ** 3,
-  whisper_models: 2 * 1024 ** 3,
+  ai_models: 2 * 1024 ** 3,
   db: 55 * 1024 ** 2,
   logs: 200 * 1024,
   preview_cache: 1024 ** 3,
@@ -80,7 +80,7 @@ describe("DiskSection", () => {
     await waitFor(() => expect(screen.getByText("Archive VODs")).toBeInTheDocument());
     expect(screen.getByText("11.00 GB")).toBeInTheDocument();
     expect(screen.getByLabelText("clean archive_vods")).toBeInTheDocument();
-    expect(screen.getByLabelText("clean whisper_models")).toBeInTheDocument();
+    expect(screen.getByLabelText("clean ai_models")).toBeInTheDocument();
     expect(screen.getByLabelText("clean preview_cache")).toBeInTheDocument();
     expect(screen.getByLabelText("clean update_temps")).toBeInTheDocument();
     expect(screen.queryByLabelText("clean db")).not.toBeInTheDocument();

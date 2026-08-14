@@ -14,7 +14,6 @@ const BASE: AppSettings = {
   quality: "720p",
   skip_youtube_startup_warm: false,
   archive_vod_keep_count: 5,
-  whisper_model: "large-v3-turbo",
   whisper_model_cache: null,
   yt_subtitles_first: true,
 };

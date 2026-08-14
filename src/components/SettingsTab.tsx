@@ -37,7 +37,7 @@ type Props = {
 const SETTING_KEYS = [
   'download_folder', 'download_threads', 'max_cache_mb', 'skip_youtube_startup_warm',
   'start_with_windows', 'download_layout', 'download_transcript_sidecar',
-  'archive_vod_keep_count', 'whisper_model', 'asr_engine', 'whisper_model_cache', 'yt_subtitles_first',
+  'archive_vod_keep_count', 'whisper_model_cache', 'yt_subtitles_first',
   'asr_language',
   'cache_dir', 'data_dir',
   'auto_install_extension',

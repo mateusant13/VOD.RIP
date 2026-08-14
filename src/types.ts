@@ -123,21 +123,14 @@ export interface AppSettings {
   auto_install_extension?: boolean;
   /** Post-merge field (VOD retention slice); absent on older backends -> default 5. */
   archive_vod_keep_count?: number;
-  /** Local transcription model: faster-whisper id + HF cache dir (absent on
-   * older backends -> default large-v3-turbo; weights live under the AI-models
-   * folder, see whisper_model_cache). */
-  whisper_model?: string;
-  /** ASR engine: 'parakeet' (default) | 'whisper'. Whisper stays the
-   * automatic fallback for ja/ko/zh/ar and parakeet-engine failures. */
-  asr_engine?: string;
-  /** AI-models folder — home of all model weights (whisper, parakeet, embed
-   * ONNX, PANNs + tokenizers). '' = auto -> best-value drive (free space +
+  /** AI-models folder — home of all model weights (parakeet, embed ONNX,
+   * PANNs + tokenizers). '' = auto -> best-value drive (free space +
    * speed). */
   whisper_model_cache?: string | null;
-  /** Captions-first: skip whisper for YouTube videos that already have
+  /** Captions-first: skip ASR for YouTube videos that already have
    * auto-caption rows at ingest (absent on older backends -> default true). */
   yt_subtitles_first?: boolean;
-  /** Default ASR language for whisper jobs: 'auto' or a family code ('pt','en','es'). */
+  /** Default ASR language for parakeet jobs: 'auto' or a family code ('pt','en','es'). */
   asr_language?: string;
   /** Per-channel ASR override: channel slug -> 'auto' or family code. */
   channel_asr_languages?: Record<string, string> | null;
@@ -164,7 +157,7 @@ export interface AiAskResponse {
 
 export interface DiskUsage {
   archive_vods: number;
-  whisper_models: number;
+  ai_models: number;
   db: number;
   logs: number;
   preview_cache: number;

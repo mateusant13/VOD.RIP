@@ -7,10 +7,11 @@ import { useI18n } from '../i18n';
 import type { AppSettings } from '../types';
 
 /**
- * Transcription (ASR) settings: engine (parakeet default / whisper), model
- * id, subtitles-first, captions language. The model CACHE lives in
- * DiskSection (own disk picker, same disk-choice rule as cache/data drives).
- * The inline Save persists only these fields (backend applies the rest).
+ * Transcription (ASR) settings: subtitles-first, captions language. The ASR
+ * engine is fixed (parakeet is the only engine — the faster-whisper engine
+ * selector is gone) and the model CACHE lives in DiskSection (own disk
+ * picker, same disk-choice rule as cache/data drives). The inline Save
+ * persists only these fields (backend applies the rest).
  */
 type Props = {
   settings: AppSettings;
@@ -24,18 +25,11 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
   const [msg, setMsg] = useState<string | null>(null);
   const { t } = useI18n();
 
-  const engine = (settings.asr_engine ?? '').trim() || 'parakeet';
-  // whisper_model is the faster-whisper id (large-v3-turbo default) — the
-  // engine selector, not this field, decides parakeet vs whisper.
-  const whisperModel = (settings.whisper_model ?? '').trim() || 'large-v3-turbo';
-
   const onSave = useCallback(async () => {
     setSaving(true);
     setMsg(null);
     try {
       const updated = await apiPost<AppSettings>('/api/settings', {
-        whisper_model: whisperModel,
-        asr_engine: engine,
         yt_subtitles_first: settings.yt_subtitles_first ?? true,
         asr_language: settings.asr_language ?? 'auto',
         channel_asr_languages: settings.channel_asr_languages ?? null,
@@ -48,44 +42,13 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
     } finally {
       setSaving(false);
     }
-  }, [whisperModel, engine, settings.yt_subtitles_first, settings.asr_language, settings.channel_asr_languages, setSettings, onSaved]);
+  }, [settings.yt_subtitles_first, settings.asr_language, settings.channel_asr_languages, setSettings, onSaved]);
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex flex-col gap-1.5">
-        <FieldCaption
-          noWrap
-          info={t('Parakeet is the default ASR. Whisper large-v3-turbo is downloaded and used only when Parakeet itself fails (unsupported language such as ja/ko/zh/ar, or a Parakeet engine error).')}
-        >
-          {t('ASR engine')}
-        </FieldCaption>
-        <select
-          value={engine}
-          onChange={(e) => setSettings({ ...settings, asr_engine: e.target.value })}
-          aria-label="ASR engine"
-          className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-xs focus:outline-none focus:border-white"
-        >
-          <option value="parakeet">{t('Parakeet (default)')}</option>
-          <option value="whisper">{t('Whisper large-v3-turbo')}</option>
-        </select>
-        <p className="text-[10px] font-mono text-zinc-500 leading-relaxed">
-          {t('Parakeet is default. Whisper large-v3-turbo runs only if Parakeet fails on that job (Parakeet error or language Parakeet cannot do: ja/ko/zh/ar). Other errors do not trigger Whisper.')}
-        </p>
-        {/* Parakeet's label already shows in the select above — only
-            whisper surfaces its resolved model id here, so the default
-            engine renders exactly one field. */}
-        {engine === 'whisper' ? (
-          <span
-            className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-xs"
-            aria-label="whisper model id (read-only)"
-          >
-            {whisperModel}
-          </span>
-        ) : null}
-      </div>
       <Toggle
         label={t('YouTube subtitles first')}
-        info={t('Fallback to Whisper when subtitles are unavailable')}
+        info={t('Skip ASR when subtitles are already available')}
         checked={settings.yt_subtitles_first ?? true}
         onChange={(c) => setSettings({ ...settings, yt_subtitles_first: c })}
         ariaLabel="use youtube subtitles first"
@@ -93,7 +56,7 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
       <div className="flex flex-col gap-1.5">
         <FieldCaption
           noWrap
-          info={t('Default ASR language for Whisper jobs. Per-channel languages are auto-learned from transcript evidence (backend services/channel_language.py) — override only if a channel is consistently misdetected.')}
+          info={t('Default ASR language for parakeet jobs. Per-channel languages are auto-learned from transcript evidence (backend services/channel_language.py) — override only if a channel is consistently misdetected.')}
         >
           {t('Captions Language')}
         </FieldCaption>
@@ -121,7 +84,7 @@ export default function TranscriptionSection({ settings, setSettings, onSaved }:
           {saving ? <Loader2 size={13} className="animate-spin" /> : null}
           {saving ? '...' : t('Save')}
         </button>
-        <span className="text-[11px] text-zinc-400 font-mono">{t('active: {model}', { model: engine === 'parakeet' ? 'parakeet' : whisperModel })}</span>
+        <span className="text-[11px] text-zinc-400 font-mono">{t('active engine: {model}', { model: 'parakeet' })}</span>
         {msg ? <span className="text-[11px] text-emerald-500 font-mono">{msg === 'saved' ? t('saved') : t('save failed')}</span> : null}
       </div>
     </div>

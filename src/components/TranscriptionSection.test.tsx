@@ -11,7 +11,6 @@ const BASE_SETTINGS: AppSettings = {
   ffmpeg_path: "",
   temp_folder: "",
   quality: "720p",
-  whisper_model: "large-v3-turbo",
   yt_subtitles_first: true,
   asr_language: "auto",
   channel_asr_languages: null,
@@ -36,37 +35,34 @@ beforeEach(() => {
 });
 
 describe("TranscriptionSection", () => {
-  it("shows parakeet as default engine with exactly one field (no duplicate read-only row)", () => {
+  it("has no ASR engine selector (parakeet is the only engine)", () => {
     render(
       <TranscriptionSection
         settings={BASE_SETTINGS}
         setSettings={() => {}}
       />,
     );
-    // Parakeet's label lives only in the select — no second "Parakeet (default)" row.
-    const engine = screen.getByLabelText("ASR engine");
-    expect(engine.tagName).toBe("SELECT");
+    expect(screen.queryByLabelText("ASR engine")).not.toBeInTheDocument();
     expect(screen.queryByLabelText("whisper model id (read-only)")).not.toBeInTheDocument();
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
   });
 
-  it("shows the resolved whisper model id when engine=whisper and setting blank", () => {
+  it("renders the fixed-engine caption with parakeet", () => {
     render(
       <TranscriptionSection
-        settings={{ ...BASE_SETTINGS, asr_engine: "whisper", whisper_model: "" }}
+        settings={BASE_SETTINGS}
         setSettings={() => {}}
       />,
     );
-    const model = screen.getByLabelText("whisper model id (read-only)");
-    expect(model.textContent).toBe("large-v3-turbo");
-    expect(model.tagName).toBe("SPAN");
-    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+    expect(screen.getByText(/active engine: parakeet/i)).toBeInTheDocument();
   });
 
-  it("saving still sends the resolved whisper_model to the backend", async () => {
-    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+  it("saving sends only the surviving ASR fields to the backend", async () => {
+    let sentBody = "";
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url === "/api/settings") {
+        sentBody = String(init?.body ?? "");
         return new Response(JSON.stringify(BASE_SETTINGS), {
           status: 200,
           headers: { "Content-Type": "application/json" },
@@ -77,7 +73,7 @@ describe("TranscriptionSection", () => {
     vi.stubGlobal("fetch", fetchMock);
     render(
       <TranscriptionSection
-        settings={{ ...BASE_SETTINGS, whisper_model: "small" }}
+        settings={{ ...BASE_SETTINGS, asr_language: "pt" }}
         setSettings={() => {}}
       />,
     );
@@ -86,9 +82,11 @@ describe("TranscriptionSection", () => {
       expect(fetchMock).toHaveBeenCalledWith(
         "/api/settings",
         expect.objectContaining({
-          body: expect.stringContaining('"whisper_model":"small"'),
+          body: expect.stringContaining('"asr_language":"pt"'),
         }),
       );
     });
+    expect(sentBody).not.toContain("whisper_model");
+    expect(sentBody).not.toContain("asr_engine");
   });
 });
