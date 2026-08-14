@@ -33,6 +33,7 @@ import os
 import pathlib
 import shutil
 import subprocess as sp
+import pytest
 import sys
 import tempfile
 
@@ -259,6 +260,7 @@ def _run() -> None:
     shutil.rmtree(_TMP, ignore_errors=True)
 
 
+@pytest.mark.real  # real whisper inference (~50-90s/core) — opt-in
 def test_transcribe_shards() -> None:
     if pathlib.Path(os.environ["VODRIP_ARCHIVE_DB"]) != archive_db._db_path():
         import pytest

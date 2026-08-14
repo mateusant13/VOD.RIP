@@ -16,6 +16,7 @@ TITILTEI_URLS = (
 POST_WARM_BUDGET_MS = 3000
 
 
+@pytest.mark.network
 def test_youtube_preview_session_post_warm_under_3s():
     from services.preview_service import warm_youtube_preview_resolve, _RESOLVED_STREAM_CACHE
     from services.ytdlp_hls import _EXTRACT_INFO_CACHE

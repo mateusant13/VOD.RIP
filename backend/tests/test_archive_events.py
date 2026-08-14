@@ -348,6 +348,7 @@ def _run_real() -> None:
     print(f"  wall: {wall:.1f}s | job: {job['status']} | replace-on-rerun: {len(rows2)} rows")
 
 
+@pytest.mark.real  # real PANNs SED + worker loop — opt-in
 def test_events_real_e2e() -> None:
     _db_check()
     try:
@@ -453,6 +454,7 @@ def test_process_job_wires_events_hook() -> None:
     assert stats["segments"] == 1, "transcribe result must survive a failing events stage"
 
 
+@pytest.mark.real  # 3x real PANNs SED — opt-in
 def test_worker_drains_multi_job_queue() -> None:
     """run_worker(once=True, budget=2) with 3 queued jobs must finish all 3.
 

@@ -67,6 +67,11 @@ def _maybe_spawn_worker() -> None:
         return
     if archive_db.worker_live(age_s=45):
         return
+    # Crash-loop cooldown: worker_server stamps 'worker-gave-up' after 3
+    # consecutive crashes; don't spawn a replacement every 60s tick while
+    # that marker is fresh (the 33%-CPU respawn treadmill).
+    if archive_db.worker_live(age_s=900, tag="worker-gave-up"):
+        return
     if getattr(sys, "frozen", False):
         cmd = [sys.executable, "--archive-worker-launch"]
     else:
@@ -155,10 +160,36 @@ def _run_hygiene() -> None:
         _log.debug("retention failed", exc_info=True)
 
 
+def _singleton_mutex_held() -> bool:
+    """True when another background daemon holds the machine-session mutex.
+
+    Same rationale as worker_server: the heartbeat guard is DB-scoped and
+    tests isolate on scratch DBs, so daemons pile up across trees/processes
+    (observed 30+ instances). Named mutex is session-scoped; the kernel
+    releases the handle on exit/crash."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.CreateMutexW.argtypes = [
+            wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR,
+        ]
+        kernel32.CreateMutexW(None, False, "Local\\VOD.RIP.background-server")
+        return kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+    except Exception:
+        return False
+
+
 def main() -> int:
     from services import archive_db
 
     (BACKEND_DIR / "logs").mkdir(exist_ok=True)
+    if _singleton_mutex_held():
+        return 0  # another daemon owns the machine — dedupe, don't stack
     logging.basicConfig(
         filename=str(LOG_PATH),
         level=logging.INFO,

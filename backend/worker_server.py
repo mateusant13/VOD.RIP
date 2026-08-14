@@ -56,8 +56,37 @@ def _pump(stream, logf) -> None:
     stream.close()
 
 
+def _singleton_mutex_held() -> bool:
+    """True when another worker_server holds the machine-session mutex.
+
+    The heartbeat guard is DB-scoped (VODRIP_ARCHIVE_DB) and tests run on
+    scratch DBs, so supervisors from different trees/processes all win it
+    and pile up (observed 30+ daemons burning cores). A named mutex is
+    session-scoped, survives DB isolation, and the kernel releases it on
+    exit/crash. POSIX keeps the heartbeat guard only."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.CreateMutexW.argtypes = [
+            wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR,
+        ]
+        kernel32.CreateMutexW(None, False, "Local\\VOD.RIP.worker-server")
+        return kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+    except Exception:
+        return False
+
+
 def main() -> int:
     LOG_DIR.mkdir(exist_ok=True)
+    if _singleton_mutex_held():
+        _log(open(LOG_DIR / "worker.log", "a", encoding="utf-8", errors="replace"),
+             "another worker supervisor already owns the mutex — exiting")
+        return 0
     log_path = LOG_DIR / "worker.log"
     logf = open(log_path, "a", encoding="utf-8", errors="replace", buffering=1)
     _log(logf, f"VOD.RIP archive worker supervisor starting (log {log_path})")
@@ -128,6 +157,16 @@ def main() -> int:
             _log(logf, f"worker exited rc={rc} (consecutive crash #{crashes}/{MAX_CONSECUTIVE_CRASHES})")
             if crashes >= MAX_CONSECUTIVE_CRASHES:
                 _log(logf, f"giving up after {crashes} consecutive crashes — inspect {log_path}")
+                try:
+                    from services import archive_db
+
+                    # Cooldown marker: the background daemon skips respawn
+                    # for 15 min so a crash-loop worker doesn't spawn a
+                    # replacement every minute (the 'python keeps coming
+                    # back at 33% CPU' treadmill).
+                    archive_db.worker_heartbeat("worker-gave-up")
+                except Exception:
+                    pass
                 return 1
             wait = BACKOFF_SECONDS[crashes - 1]
             _log(logf, f"restarting in {wait}s...")

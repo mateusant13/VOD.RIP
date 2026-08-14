@@ -138,6 +138,7 @@ def _prove_progressive_playback(client: TestClient, sid: str, path: str) -> None
     assert _is_mp4_head(again.content), "post-refresh stream must still be MP4"
 
 
+@pytest.mark.network
 def test_youtube_preview_playback_proof():
     """Session + stream bytes must be valid MP4/HLS — simulates <video> range requests."""
     from services.youtube_session import invalidate_anonymous_session

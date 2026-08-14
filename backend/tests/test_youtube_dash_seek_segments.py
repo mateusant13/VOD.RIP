@@ -31,6 +31,7 @@ def _fetch(c, path: str, retries: int = 240) -> tuple[int, bytes]:
     return 503, b""
 
 
+@pytest.mark.network
 def test_youtube_window_hls_mid_segments():
     from services.ytdlp_hls import _EXTRACT_INFO_CACHE
 

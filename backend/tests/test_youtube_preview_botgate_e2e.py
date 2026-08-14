@@ -12,6 +12,7 @@ if _backend_root not in sys.path:
     sys.path.insert(0, _backend_root)
 
 from fastapi.testclient import TestClient
+import pytest
 from app import app
 
 # titiltei YouTube video from the startup warm list
@@ -19,6 +20,7 @@ YT_URL = "https://www.youtube.com/watch?v=1tap3CLaqr8"
 EXPECTED_HINT = "YouTube preview is temporarily restricted. Try again in a few minutes."
 
 
+@pytest.mark.network
 def test_youtube_preview_botgate_message():
     """Post a real YouTube URL; if it 503s (bot-gate), verify the message is
     the new user-facing string, not a generic 503 or a 500 crash."""

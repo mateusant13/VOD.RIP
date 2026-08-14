@@ -97,6 +97,8 @@ def _spawn_detached_worker() -> Optional[int]:
     Returns a child pid (the launcher's), or None when the spawn failed
     (the caller falls back to the in-process worker).
     """
+    if os.environ.get("VODRIP_NO_DAEMONS") == "1":
+        return None  # tests: never leak orphaned daemons on a user's box
     backend_dir = Path(__file__).resolve().parent
     if getattr(sys, "frozen", False):
         # Packaged app: sys.executable is VOD-RIP.EXE, which cannot run
@@ -160,6 +162,8 @@ def _spawn_detached_background() -> Optional[int]:
     daemon makes a second spawn a harmless immediate exit 0.
     Returns a child pid (the launcher's), or None when the spawn failed.
     """
+    if os.environ.get("VODRIP_NO_DAEMONS") == "1":
+        return None  # tests: never leak orphaned daemons on a user's box
     backend_dir = Path(__file__).resolve().parent
     if getattr(sys, "frozen", False):
         try:

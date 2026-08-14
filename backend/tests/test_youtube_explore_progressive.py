@@ -37,6 +37,7 @@ def _create_explore_session(client: TestClient, url: str) -> dict:
     return r.json()
 
 
+@pytest.mark.network
 def test_long_explore_serves_window_hls_with_full_ladder():
     """Full-VOD explore: window-HLS session exposing the full adaptive ladder
     (1080p included) with a playable master; mid-VOD seek remuxes a bounded

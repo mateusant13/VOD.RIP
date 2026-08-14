@@ -14,6 +14,7 @@ URLS = [
 
 
 @pytest.mark.timeout(300)
+@pytest.mark.network
 def test_youtube_preview_no_500():
     from services.ytdlp_hls import _EXTRACT_INFO_CACHE
 
