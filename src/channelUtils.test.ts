@@ -33,6 +33,7 @@ import {
   syncDurationFromPreviewSession,
   videoInfoDurationSec,
   displayTitle,
+  shouldDropChannelFromLivePoll,
 } from './channelUtils';
 import type { ChannelVideo, SavedChannel, VideoInfo } from './types';
 
@@ -687,5 +688,36 @@ describe('syncDurationFromPreviewSession', () => {
   it('keeps client crop_end when session duration is higher', () => {
     const out = syncDurationFromPreviewSession(50, 0, 50);
     expect(out).toEqual({ start: 0, end: 50, duration: 50 });
+  });
+});
+
+describe('shouldDropChannelFromLivePoll', () => {
+  // Live-status poll 404 drop decision: an id that 404s while STILL present
+  // in the saved list is the add race (backend learns the channel ~2s after
+  // the debounced settings POST) and must keep polling; an id that 404s and
+  // is gone from the list is a stale id and must be dropped.
+  const saved: SavedChannel[] = [
+    {
+      id: 'ch_live',
+      displayName: 'LiveOne',
+      kickSlug: 'liveone',
+      twitchSlug: '',
+      youtubeSlug: '',
+      vodVideos: [],
+      clipVideos: [],
+      updatedAt: '',
+    },
+  ];
+
+  it('does not drop a 404d id that is still in the saved list (add race)', () => {
+    expect(shouldDropChannelFromLivePoll('ch_live', saved)).toBe(false);
+  });
+
+  it('drops a 404d id that is absent from the saved list (stale id)', () => {
+    expect(shouldDropChannelFromLivePoll('ch_gone', saved)).toBe(true);
+  });
+
+  it('drops an id when the saved list is empty', () => {
+    expect(shouldDropChannelFromLivePoll('x', [])).toBe(true);
   });
 });
