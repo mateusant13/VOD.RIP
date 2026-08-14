@@ -1,0 +1,272 @@
+// IG FollowGuard — dashboard (popup + injected panel share this).
+'use strict';
+
+const TABS = { nonFollowers: 'nonFollowers', events: 'events', mutual: 'mutual' };
+const PAGE = 60;
+const R = 60 * 1000;
+
+const $ = (id) => document.getElementById(id);
+
+const el = {
+  pill: () => $('pill'),
+  pillText: () => $('pill-text'),
+  lastSync: () => $('last-sync'),
+  refresh: () => $('refresh'),
+  cardK: () => $('card-k'),
+  cardF: () => $('card-f'),
+  cardM: () => $('card-m'),
+  tabs: () => $('tabs'),
+  search: () => $('search'),
+  list: () => $('list'),
+  error: () => $('error'),
+  errText: () => $('err-text'),
+  errBtn: () => $('err-btn'),
+  meta: () => $('meta'),
+  interval: () => $('interval'),
+  notif: () => $('notif'),
+  openIg: () => $('open-ig'),
+};
+
+let state = { status: 'idle' };
+let settings = {};
+let followers = {};
+let following = {};
+let events = [];
+let tab = TABS.nonFollowers;
+let query = '';
+let shown = 0;
+let live = [];
+
+function relTime(iso) {
+  if (!iso) return 'nunca';
+  const d = Date.now() - new Date(iso).getTime();
+  if (d < R) return 'agora';
+  const m = Math.floor(d / R);
+  if (m < 60) return `há ${m} min`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `há ${h} h`;
+  const days = Math.floor(h / 24);
+  return `há ${days} d`;
+}
+
+function avatarImg(u, size) {
+  if (u.profile_pic_url) {
+    return `<img class="avatar" src="${u.profile_pic_url}" alt="" referrerpolicy="no-referrer" onerror="this.outerHTML='${placeholder(u)}'">`;
+  }
+  return placeholder(u);
+}
+function placeholder(u) {
+  const letter = (u.username || '?')[0].toUpperCase();
+  return `<span class="avatar" style="display:inline-flex;align-items:center;justify-content:center;font-weight:700;color:#fff;background:linear-gradient(135deg,#feda75,#d62976,#962fbf,#4f5bd5)">${letter}</span>`;
+}
+
+function itemHtml(u) {
+  const tags = [];
+  if (u.is_private) tags.push('<span class="tag private">privado</span>');
+  if (u.is_verified) tags.push('<span class="tag verified">✓</span>');
+  const name = u.full_name ? ` — ${u.full_name}` : '';
+  return `
+    <div class="item" data-u="${u.username}">
+      ${avatarImg(u)}
+      <div class="who">
+        <b><a href="https://www.instagram.com/${encodeURIComponent(u.username)}/" target="_blank" rel="noopener">${u.username}</a></b>
+        <span title="${u.full_name}">${u.full_name || ''}</span>
+      </div>
+      ${tags.join('')}
+    </div>`;
+}
+
+function eventHtml(e) {
+  const tags = [];
+  if (e.stillFollowing) tags.push('<span class="tag unfollowed">você segue</span>');
+  const name = e.fullName ? ` — ${e.fullName}` : '';
+  return `
+    <div class="item" data-u="${e.username}">
+      <span class="avatar" style="display:inline-flex;align-items:center;justify-content:center;font-weight:700;color:#fff;background:linear-gradient(135deg,#feda75,#d62976,#962fbf,#4f5bd5)">${(e.username || '?')[0].toUpperCase()}</span>
+      <div class="who">
+        <b><a href="https://www.instagram.com/${encodeURIComponent(e.username)}/" target="_blank" rel="noopener">${e.username}</a></b>
+        <span title="${e.fullName}">${e.fullName || ''}</span>
+      </div>
+      ${tags.join('')}
+      <time>${relTime(new Date(e.detectedAt).toISOString())}</time>
+    </div>`;
+}
+
+function computeLists() {
+  const fKeys = new Set(Object.keys(followers));
+  const gKeys = Object.keys(following);
+  const nonFollowers = gKeys.filter((u) => !fKeys.has(u));
+  const mutual = gKeys.filter((u) => fKeys.has(u));
+  return { nonFollowers, mutual };
+}
+
+function renderHeader() {
+  const pill = el.pill();
+  pill.className = 'pill';
+  const t = el.pillText();
+  switch (state.status) {
+    case 'syncing': pill.classList.add('sync'); t.textContent = 'sincronizando…'; break;
+    case 'ok': pill.classList.add('ok'); t.textContent = 'atualizado'; break;
+    case 'error': pill.classList.add('err'); t.textContent = 'erro'; break;
+    case 'idle': t.textContent = 'aguardando'; break;
+    default: t.textContent = state.status;
+  }
+  el.lastSync().textContent = `última: ${relTime(state.lastSyncAt)}`;
+  el.refresh().disabled = state.status === 'syncing';
+  el.cardK().querySelector('.count').textContent = state.notFollowingBackCount;
+  el.cardF().querySelector('.count').textContent = state.followersCount;
+  el.cardM().querySelector('.count').textContent = state.followingCount;
+}
+
+function renderError() {
+  if (state.status === 'error' && state.error) {
+    el.error().style.display = 'block';
+    el.errText().textContent = state.error;
+    const isLogin = /sessão|login|verificação/i.test(state.error);
+    el.errBtn().textContent = isLogin ? 'Abrir Instagram' : 'Tentar de novo';
+    el.errBtn().onclick = isLogin ? openInstagram : () => sendSync();
+  } else {
+    el.error().style.display = 'none';
+  }
+}
+
+function renderTabs() {
+  const { nonFollowers, mutual } = computeLists();
+  const nEvents = events.length;
+  const tabs = [
+    { key: TABS.nonFollowers, label: `Não seguem de volta (${nonFollowers.length})` },
+    { key: TABS.events, label: `Deixaram de seguir (${nEvents})` },
+    { key: TABS.mutual, label: `Seguem de volta (${mutual.length})` },
+  ];
+  el.tabs().innerHTML = tabs
+    .map((t) => `<button class="tab ${t.key === tab ? 'active' : ''}" data-tab="${t.key}">${t.label}</button>`)
+    .join('');
+  el.tabs().querySelectorAll('.tab').forEach((b) => {
+    b.onclick = () => { tab = b.dataset.tab; shown = 0; render(); };
+  });
+}
+
+function renderList() {
+  const { nonFollowers, mutual } = computeLists();
+  const q = query.trim().toLowerCase();
+  let pool;
+  if (tab === TABS.events) {
+    pool = events.filter((e) => !q || e.username.toLowerCase().includes(q) || (e.fullName || '').toLowerCase().includes(q));
+  } else {
+    const keys = tab === TABS.nonFollowers ? nonFollowers : mutual;
+    const map = tab === TABS.nonFollowers ? following : following;
+    pool = keys
+      .map((u) => map[u])
+      .filter(Boolean)
+      .filter((u) => !q || u.username.toLowerCase().includes(q) || (u.full_name || '').toLowerCase().includes(q));
+  }
+  live = pool;
+  const slice = pool.slice(0, shown + PAGE);
+  if (slice.length === 0) {
+    el.list().innerHTML = '<div class="empty">Nada aqui' + (query ? ' para essa busca' : '') + '.</div>';
+    return;
+  }
+  el.list().innerHTML =
+    slice.map(tab === TABS.events ? eventHtml : itemHtml).join('') +
+    (pool.length > slice.length ? '<button class="more">Mostrar mais</button>' : '');
+  const more = el.list().querySelector('.more');
+  if (more) more.onclick = () => { shown += PAGE; renderList(); };
+  el.list().querySelectorAll('.item').forEach((it) => {
+    it.onclick = (ev) => {
+      if (ev.target.closest('a')) return;
+      openProfile(it.dataset.u);
+    };
+  });
+}
+
+function renderMeta() {
+  el.meta().textContent = state.ownUsername ? `@${state.ownUsername} · listas completas` : '';
+}
+
+function renderSettings() {
+  el.interval().value = String(settings.refreshMinutes || 60);
+  el.notif().checked = settings.notificationsEnabled !== false;
+}
+
+function render() {
+  renderHeader();
+  renderError();
+  renderTabs();
+  renderList();
+  renderMeta();
+  renderSettings();
+}
+
+function sendSync() {
+  chrome.runtime.sendMessage({ type: 'igf-sync', trigger: 'manual' });
+}
+
+function openInstagram() {
+  chrome.tabs.create({ url: 'https://www.instagram.com/' });
+}
+
+function openProfile(username) {
+  chrome.tabs.create({ url: `https://www.instagram.com/${encodeURIComponent(username)}/` });
+}
+
+async function load() {
+  const o = await chrome.storage.local.get([
+    'igf.state', 'igf.settings', 'igf.followers', 'igf.following', 'igf.unfollowEvents',
+  ]);
+  state = o['igf.state'] || { status: 'idle' };
+  settings = o['igf.settings'] || {};
+  followers = o['igf.followers'] || {};
+  following = o['igf.following'] || {};
+  events = o['igf.unfollowEvents'] || [];
+  render();
+  // Panel: auto-sync when data is stale (popup relies on the manual button).
+  if (document.body.classList.contains('panel')) {
+    const staleMs = (settings.refreshMinutes || 60) * 60 * 1000;
+    if (!state.lastSyncAt || Date.now() - new Date(state.lastSyncAt).getTime() > staleMs) {
+      sendSync();
+    }
+  }
+  // Announce the dashboard is live (the injected panel listens; harmless
+  // when this page runs as the toolbar popup — posting to self, no receiver).
+  try {
+    parent.postMessage({ type: 'igf-panel-ready' }, '*');
+  } catch { /* never break the UI */ }
+}
+
+// --- events ----------------------------------------------------------------
+el.refresh().onclick = sendSync;
+el.cardK().onclick = () => { tab = TABS.nonFollowers; shown = 0; render(); };
+el.cardF().onclick = () => { tab = TABS.mutual; shown = 0; render(); };
+el.cardM().onclick = () => { tab = TABS.mutual; shown = 0; render(); };
+el.search().addEventListener('input', (e) => { query = e.target.value; shown = 0; renderList(); });
+el.interval().addEventListener('change', async (e) => {
+  await chrome.runtime.sendMessage({
+    type: 'igf-settings-update',
+    settings: { refreshMinutes: Number(e.target.value) },
+  });
+});
+el.notif().addEventListener('change', async (e) => {
+  await chrome.runtime.sendMessage({
+    type: 'igf-settings-update',
+    settings: { notificationsEnabled: e.target.checked },
+  });
+});
+el.openIg().onclick = openInstagram;
+
+// Panel-only: the inline close script was removed from panel.html (extension
+// CSP blocks inline scripts -> console errors); wired here, guarded for the
+// popup which has no #close button.
+const closeBtn = $('close');
+if (closeBtn) closeBtn.addEventListener('click', () => parent.postMessage({ type: 'igf-close-panel' }, '*'));
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local') return;
+  if (changes['igf.state']) state = changes['igf.state'].newValue || { status: 'idle' };
+  if (changes['igf.settings']) settings = changes['igf.settings'].newValue || {};
+  if (changes['igf.followers']) followers = changes['igf.followers'].newValue || {};
+  if (changes['igf.following']) following = changes['igf.following'].newValue || {};
+  if (changes['igf.unfollowEvents']) events = changes['igf.unfollowEvents'].newValue || [];
+  render();
+});
+
+load();

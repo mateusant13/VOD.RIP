@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <title>IG FollowGuard</title>
+  <link rel="stylesheet" href="dashboard.css" />
+</head>
+<body class="popup">
+  <header>
+    <img src="images/icon128.png" alt="" />
+    <div class="title">IG FollowGuard<small>quem não te segue de volta</small></div>
+    <span id="pill" class="pill"><span id="pill-text">…</span></span>
+    <button id="refresh" class="btn ghost" title="Sincronizar agora">↻</button>
+  </header>
+
+  <div id="error" class="error" style="display:none">
+    <div id="err-text"></div>
+    <button id="err-btn">Tentar de novo</button>
+  </div>
+
+  <div class="summary">
+    <div class="card k" id="card-k"><b class="count">–</b><span>não seguem de volta</span></div>
+    <div class="card" id="card-f"><b class="count">–</b><span>seguidores</span></div>
+    <div class="card" id="card-m"><b class="count">–</b><span>seguindo</span></div>
+  </div>
+
+  <div id="tabs" class="tabs"></div>
+  <div class="search"><input id="search" type="text" placeholder="Buscar conta…" autocomplete="off" /></div>
+
+  <div id="list" class="list"></div>
+
+  <footer>
+    <div class="foot-row">
+      <span id="last-sync" class="meta"></span>
+      <a id="open-ig" class="profile-link" href="#">abrir instagram.com</a>
+    </div>
+    <div class="settings">
+      <label>Sincronizar a cada
+        <select id="interval">
+          <option value="30">30 min</option>
+          <option value="60">1 h</option>
+          <option value="180">3 h</option>
+          <option value="360">6 h</option>
+          <option value="720">12 h</option>
+          <option value="1440">1 dia</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="notif" /> notificações</label>
+    </div>
+    <div id="meta" class="meta"></div>
+  </footer>
+
+  <script type="module" src="dashboard.js"></script>
+</body>
+</html>
