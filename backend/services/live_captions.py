@@ -4,7 +4,7 @@ The livestream popup's CC overlay needs a rolling transcription of the live
 audio. One ``LiveCaptioner`` per (platform, channel) polls the channel's live
 HLS media playlist (audio-only rendition — a fraction of the bandwidth),
 downloads NEW segments (a seen-set skips re-downloads), decodes them to mono
-16 kHz PCM via ffmpeg, buffers a ~3s caption window, VAD-splits the window
+16 kHz PCM via ffmpeg, buffers a ~2s caption window, VAD-splits the window
 and transcribes the speech with the parakeet engine — reusing
 ``archive_transcribe``'s recognizer (``_parakeet_model`` +
 ``_transcribe_batch_parakeet``) so the model cache/download logic is shared
@@ -48,19 +48,21 @@ SUPPORTED_PLATFORMS = ("twitch", "kick")
 WINDOW_SEC_ENV = "VODRIP_CAPTION_WINDOW_SEC"
 POLL_SEC_ENV = "VODRIP_CAPTION_POLL_SEC"
 MAX_BACKLOG_SEC_ENV = "VODRIP_CAPTION_MAX_BACKLOG_SEC"
-# ~3s of speech is a usable caption block (~2-4 words per second of speech);
+# ~2s of speech is a usable caption block (~2-4 words per second of speech);
 # a 1s window would yield 2-3 words — too short to read.
 #
 # INTENTIONAL DELAY: the transcript needs the audio it describes, so a
 # caption for window [t0, t1] is emitted right after t1 plus the transcribe
 # latency — never before the window's audio is complete. Parakeet (CPU
-# int8) on a 3s window transcribes in ~0.5-1.5s, so the caption text lands
-# ~1s after the words it transcribes; the player's own ~1-2s behind-live
-# then puts it ~2-4s behind the live edge, matching closed-caption
-# expectations. That ~1s past-the-audio delay is deliberate and tuned by
-# WINDOW_SEC/POLL_SEC (a smaller window cuts the delay but makes blocks
-# too short to read).
-WINDOW_SEC = 3.0
+# int8) on a 2s window transcribes in ~0.3-1s, so the caption text lands
+# ~0.5s after the words it transcribes; the player's own sub-second
+# behind-live (liveSyncDurationCount 0) then puts it ~1-2s behind the live
+# edge. The 2s window (was 3s) makes each 2s Twitch segment flush alone —
+# the old 3s window waited for a second segment to fill, adding a full
+# segment of pipeline latency. The frontend anchors every block to the
+# VIDEO clock (frag PDT), so the visible lag is just this transcribe trail,
+# self-adaptive per machine (stalls pause the overlay automatically).
+WINDOW_SEC = 2.0
 POLL_SEC = 1.0  # media-playlist poll cadence (~1 segment ahead of the player)
 # Cap on untranscribed stale audio: after the live freezes/buffers, one poll
 # returns the whole gap; transcribing it segment-by-segment keeps captions
@@ -223,11 +225,29 @@ def _decode_audio_bytes(data: bytes) -> "Any":
 def _resolve_live_master(platform: str, channel: str) -> Optional[dict]:
     """Resolve the live master playlist — reuses the SAME resolver the
     ``/api/live/{platform}`` endpoint uses (services.live_capture), so auth /
-    token / ad-rotation logic stays in one place. Returns ``{url, headers}``
-    or None when the channel is offline / unreachable."""
-    from services.live_capture import kick_live_info, twitch_live_info
+    token / ad-rotation logic stays in one place. Twitch goes through the
+    fast GQL+usher ``probe_twitch_live_master`` first (~1-3s, per-channel 60s
+    cache) instead of the yt-dlp page extract (3-15s) — the captioner must
+    not sit on the popup's open path. Returns ``{url, headers}`` or None
+    when the channel is offline / unreachable."""
+    from services.live_capture import kick_live_info, probe_twitch_live_master
 
-    info = twitch_live_info(channel) if platform == "twitch" else kick_live_info(channel)
+    if platform == "twitch":
+        probed = probe_twitch_live_master(channel)
+        if probed and probed.get("url"):
+            return {"url": probed["url"], "headers": probed.get("headers") or {}}
+        # ponytail: the usher probe failed (GQL token / usher unreachable) —
+        # fall back to the yt-dlp page extract, which routes around it at a
+        # 3-15s cost. Upgrade path: fix the probe path, then drop yt-dlp
+        # from this resolver entirely.
+        from services.live_capture import twitch_live_info
+
+        info = twitch_live_info(channel)
+        if not info or not info.get("url"):
+            return None
+        return {"url": info["url"], "headers": info.get("headers") or {}}
+
+    info = kick_live_info(channel)
     if not info or not info.get("url"):
         return None
     return {"url": info["url"], "headers": info.get("headers") or {}}
@@ -255,6 +275,23 @@ def _transcribe_window(audio: "Any", duration: float) -> str:
             if text:
                 texts.append(text)
     return " ".join(texts)
+
+
+def _warm_asr() -> None:
+    """Pre-load the parakeet engine + Silero VAD once per worker start so the
+    FIRST flush is not a 2-6s cold model load. Runs in the captioner's worker
+    thread (never on the SSE request path). Failure is non-fatal — the first
+    flush retries the same calls through the normal path, and the flush
+    failure counter still surfaces a persistently broken engine."""
+    try:
+        from services import archive_transcribe as at
+
+        at._parakeet_model()
+        at._get_vad()
+    except Exception as exc:
+        logger.debug(
+            "live captions ASR pre-warm failed (first flush loads lazily): %s", exc
+        )
 
 
 # --- captioner registry ------------------------------------------------------
@@ -397,6 +434,7 @@ class LiveCaptioner:
 
     def _run(self) -> None:
         try:
+            _warm_asr()
             self._run_loop()
         except Exception:
             logger.exception(
@@ -610,11 +648,19 @@ class LiveCaptioner:
             self.platform, self.channel, buffer_sec, text[:80],
         )
         start = win_start_off + (self._origin or 0.0)
-        self._emit("caption", {
+        end = start + buffer_sec
+        payload = {
             "text": text,
             "start": round(start, 3),
-            "end": round(start + buffer_sec, 3),
-        })
+            "end": round(end, 3),
+        }
+        if self._origin is not None:
+            # Wall-clock pipeline latency: ms since the window's audio
+            # completed. The frontend anchors captions to the VIDEO clock,
+            # so the visible lag is just this trail. Stream-relative times
+            # (no PDT anchor) cannot measure wall latency — key omitted.
+            payload["latency_ms"] = round((time.time() - end) * 1000)
+        self._emit("caption", payload)
 
     def _emit(self, event: str, data: dict) -> None:
         def _put(q: asyncio.Queue, ev: str, payload: dict) -> None:
