@@ -5,7 +5,7 @@
 // fetches ride on the extension's host_permissions. Controls are driven
 // over postMessage by the content script; state is reported back ~1/s.
 const V = document.getElementById('v');
-const IVS = window.IVSPlayerModule;
+const HLS_MODE = new URLSearchParams(location.search).get('m') === 'hls';
 const beacon = (ev, data) => {
   try {
     chrome.runtime.sendMessage({ __koDiag: { ev, data } }, () => void chrome.runtime.lastError);
@@ -15,19 +15,6 @@ const beacon = (ev, data) => {
 };
 window.addEventListener('error', (e) => beacon('ivs_page_err', { msg: String((e && e.message) || e).slice(0, 150), src: (e && e.filename ? e.filename.slice(-40) : '') }));
 window.addEventListener('unhandledrejection', (e) => beacon('ivs_page_err', { rej: String((e && e.reason) || '').slice(0, 150) }));
-beacon('ivs_page', { mod: typeof IVS, create: typeof (IVS || {}).create });
-const create = IVS.create;
-const ET = IVS.PlayerEventType || {};
-const p = create({
-  wasmWorker: chrome.runtime.getURL('ivs/amazon-ivs-wasmworker.min.js'),
-  wasmBinary: chrome.runtime.getURL('ivs/amazon-ivs-wasmworker.min.wasm'),
-  logLevel: 'warn',
-});
-beacon('ivs_boot', { ver: p.getVersion(), worker: chrome.runtime.getURL('ivs/amazon-ivs-wasmworker.min.js').slice(-44) });
-p.attachHTMLVideoElement(V);
-p.setAutoplay(true);
-p.setMuted(true);
-
 const post = (m) => {
   try {
     parent.postMessage({ __koKick: m }, '*');
@@ -35,6 +22,108 @@ const post = (m) => {
     /* parent gone */
   }
 };
+
+if (HLS_MODE) {
+  // ---- HLS engine (YouTube layer) ------------------------------------------
+  // Same bridge protocol as IVS: {t:'load'|'play'|'pause'|'mute'|'volume'|
+  // 'seek'|'seekToLive'|'getState'} in, {t:'ready'} + ~1/s {t:'st'} + {t:'ev'}
+  // out. hls.js plays the innertube hlsManifestUrl; native controls visible.
+  const h = new Hls({ maxBufferLength: 30, liveSyncDurationCount: 3 });
+  let currentUrl = null;
+  let reloaded = false;
+  const st = () => {
+    let dur = 0;
+    try { dur = V.duration || 0; } catch { /* not ready */ }
+    if (!isFinite(dur) || dur < 0 || dur >= 1e15) dur = 0;
+    let pos = V.currentTime || 0;
+    if (!isFinite(pos) || pos < 0 || pos >= 1e15) pos = 0;
+    let lat = 0;
+    try {
+      if (V.seekable && V.seekable.length) lat = V.seekable.end(V.seekable.length - 1) - pos;
+    } catch { /* not ready */ }
+    if (!isFinite(lat) || lat < 0) lat = 0;
+    let q = null;
+    const levels = h.levels || [];
+    if (h.currentLevel >= 0 && levels[h.currentLevel]) {
+      const l = levels[h.currentLevel];
+      q = { name: l.height ? l.height + 'p' : String(l.width || ''), w: l.width, h: l.height };
+    }
+    const state = V.paused ? (V.readyState === 0 ? 'Idle' : 'Paused') : 'Playing';
+    return { state, paused: V.paused, muted: V.muted, volume: V.volume, pos, lat, dur, q, qcount: levels.length };
+  };
+  const sendSt = () => post({ t: 'st', st: st() });
+  window.addEventListener('message', (ev) => {
+    if (ev.source !== window.parent) return;
+    const m = ev.data && ev.data.__koKick;
+    if (!m) return;
+    switch (m.t) {
+      case 'load':
+        try {
+          currentUrl = m.url;
+          reloaded = false;
+          h.loadSource(m.url);
+          h.attachMedia(V);
+          V.play().catch(() => { /* autoplay policy — unlock via gesture */ });
+        } catch (e) {
+          post({ t: 'ev', e: 'error', d: String(e) });
+        }
+        break;
+      case 'play':
+        V.play().catch(() => { /* ignore */ });
+        break;
+      case 'pause':
+        V.pause();
+        break;
+      case 'mute':
+        V.muted = !!m.m;
+        break;
+      case 'volume':
+        if (Number.isFinite(m.v)) V.volume = Math.max(0, Math.min(1, m.v));
+        break;
+      case 'seek':
+        if (Number.isFinite(m.s) && m.s >= 0 && m.s < 1e15) V.currentTime = m.s;
+        break;
+      case 'seekToLive':
+        try {
+          if (V.seekable && V.seekable.length) V.currentTime = V.seekable.end(V.seekable.length - 1);
+        } catch { /* ignore */ }
+        break;
+      case 'getState':
+        sendSt();
+        break;
+    }
+  });
+  h.on(Hls.Events.ERROR, (_e, d) => {
+    beacon('hls_err', { type: d.type, details: d.details, fatal: !!d.fatal });
+    if (d.fatal) {
+      post({ t: 'ev', e: 'error', d: String(d.details || d.type) });
+      // One reload per url (stale manifest on live switches); then the
+      // content script's fallback (kick) takes over.
+      if (currentUrl && !reloaded) {
+        reloaded = true;
+        setTimeout(() => {
+          h.loadSource(currentUrl);
+          h.attachMedia(V);
+        }, 1500);
+      }
+    }
+  });
+  setInterval(sendSt, 1000);
+  post({ t: 'ready' });
+} else {
+  const IVS = window.IVSPlayerModule;
+  beacon('ivs_page', { mod: typeof IVS, create: typeof (IVS || {}).create });
+  const create = IVS.create;
+  const ET = IVS.PlayerEventType || {};
+  const p = create({
+    wasmWorker: chrome.runtime.getURL('ivs/amazon-ivs-wasmworker.min.js'),
+    wasmBinary: chrome.runtime.getURL('ivs/amazon-ivs-wasmworker.min.wasm'),
+    logLevel: 'warn',
+  });
+  beacon('ivs_boot', { ver: p.getVersion(), worker: chrome.runtime.getURL('ivs/amazon-ivs-wasmworker.min.js').slice(-44) });
+  p.attachHTMLVideoElement(V);
+  p.setAutoplay(true);
+  p.setMuted(true);
 
 // A position to apply once the next load() completes (kick-style rewind:
 // switch to the DVR url, then seek within the loaded broadcast).
@@ -163,3 +252,4 @@ try {
 }
 setInterval(sendSt, 1000);
 post({ t: 'ready' });
+} // /else (IVS engine)

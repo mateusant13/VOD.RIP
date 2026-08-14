@@ -265,25 +265,30 @@ function setBadge(text, color) {
 
 // ---- YouTube bridge ---------------------------------------------------------
 
-// YouTube layer — driven DIRECTLY against the live_stream embed via the
-// IFrame API postMessage protocol, no page-world script needed (a <script
-// src="chrome-extension://…"> injection into the Twitch page is silently
-// CSP-blocked — the old yt-bridge.js never ran, so the embed never got
-// ready). Commands go to the iframe's contentWindow; the embed answers
-// with 'infoDelivery' messages the content script receives on the top
-// window (that is how the official IFrame API works — no same-origin
-// access required). Native embed controls stay enabled.
-const YT_FN = { play: 'playVideo', pause: 'pauseVideo', mute: 'mute', unmute: 'unMute', setVolume: 'setVolume', seekToLive: 'seekTo' };
-
-function ytCmd(cmd, arg) {
+// YouTube layer — the extension's OWN HLS player (player.html?m=hls). The
+// live_stream embed cannot initialize on bot-gated/cookieless sessions: the
+// server bakes an error config ("Erro 153") into the page and the player
+// never issues an innertube request, so no pot in the URL can fix it. The
+// background mints the stream via an anonymous MWEB player API call (the
+// yt-dlp recipe) and the HLS frame speaks the same __koKick protocol as IVS.
+function ytSend(o) {
   const f = document.getElementById('ko-yt');
   if (!f || !f.contentWindow) return;
-  const fn = YT_FN[cmd];
-  if (!fn) return;
   try {
-    f.contentWindow.postMessage({ event: 'command', func: fn, args: cmd === 'seekToLive' ? [Number.MAX_SAFE_INTEGER] : [arg] }, '*');
+    f.contentWindow.postMessage({ __koKick: o }, '*');
   } catch {
     /* frame gone */
+  }
+}
+
+function ytCmd(cmd, arg) {
+  switch (cmd) {
+    case 'play': return ytSend({ t: 'play' });
+    case 'pause': return ytSend({ t: 'pause' });
+    case 'mute': return ytSend({ t: 'mute', m: true });
+    case 'unmute': return ytSend({ t: 'mute', m: false });
+    case 'setVolume': return ytSend({ t: 'volume', v: arg });
+    case 'seekToLive': return ytSend({ t: 'seekToLive' });
   }
 }
 
@@ -314,21 +319,45 @@ async function ensureYtId() {
   return !!KO.ytId;
 }
 
+// Mint the live HLS manifest through the background (MWEB player API call —
+// Chrome transport, anonymous). One-shot per probe cycle; the background
+// caches the URL for a few minutes.
+async function ensureYtHls() {
+  if (KO.ytHlsUrl || KO.ytHlsFailed) return;
+  try {
+    const r = await new Promise((res) => {
+      try {
+        chrome.runtime.sendMessage({ type: 'ko-yt-play', channelRef: KO.ytId || KO.ytRaw }, (rr) => res(rr || {}));
+      } catch {
+        res({});
+      }
+    });
+    if (r && r.url) {
+      KO.ytHlsUrl = r.url;
+      diag('yt_hls', { url: r.url.slice(0, 60) });
+    } else {
+      KO.ytHlsFailed = true;
+      diag('yt_hls', { err: (r && r.error) || 'no-url' });
+    }
+  } catch (e) {
+    KO.ytHlsFailed = true;
+    diag('yt_hls', { err: String(e).slice(0, 120) });
+  }
+}
+
 function ensureYtIframe() {
   if (document.getElementById('ko-yt')) return;
   if (!KO.wrap) mount(); // youtube-only path never mounted the wrap (kick paths did)
+  if (!KO.ytHlsUrl) return; // manifest still pending — probe retries
   const iframe = document.createElement('iframe');
   iframe.id = 'ko-yt';
-  iframe.src =
-    'https://www.youtube.com/embed/live_stream?channel=' +
-    encodeURIComponent(KO.ytId) +
-    '&autoplay=1&mute=1&controls=1&playsinline=1&enablejsapi=1&origin=' +
-    encodeURIComponent(location.origin);
+  iframe.src = chrome.runtime.getURL('player.html?m=hls');
   iframe.setAttribute('allow', 'autoplay; fullscreen; encrypted-media');
   iframe.setAttribute('allowfullscreen', '');
   KO.wrap.appendChild(iframe);
-  KO.ytEmbedAt = Date.now(); // fallback clock: yt must init within YT_EMBED_GRACE
-  diag('yt_embed', { id: KO.ytId.slice(0, 8) });
+  KO.pendingYtUrl = KO.ytHlsUrl; // handed to the frame on its 'ready'
+  KO.ytEmbedAt = Date.now(); // fallback clock: hls must init within YT_EMBED_GRACE
+  diag('yt_embed', { id: KO.ytId.slice(0, 8), hls: !!KO.ytHlsUrl });
 }
 
 function enableYtUnlock() {
@@ -347,39 +376,48 @@ function enableYtUnlock() {
 let lastYtProbe = 0;
 let ytFirstInfo = false;
 window.addEventListener('message', (ev) => {
-  const f = document.getElementById('ko-yt');
-  if (!f || ev.source !== f.contentWindow) return;
   const d = ev.data;
-  if (!d || typeof d !== 'object') return;
-  // The embed announces itself (the IFrame API handshake).
-  if (d.event === 'onReady' || d.event === 'initialDelivery') {
+  if (!d || !d.__koKick) return;
+  const f = document.getElementById('ko-yt');
+  if (!f || ev.source !== f.contentWindow) return; // the yt (hls) frame only
+  const m = d.__koKick;
+  if (m.t === 'ready') {
+    KO.ytWin = ev.source;
+    KO.ytState.ready = true;
     if (!ytFirstInfo) {
       ytFirstInfo = true;
       diag('yt_ready', {});
     }
-    KO.ytState.ready = true;
-    ytCmd('setVolume', KO.ytVol); // restore the user's last yt volume on a fresh embed
+    ytCmd('setVolume', KO.ytVol); // restore the user's last yt volume on a fresh frame
+    if (KO.pendingYtUrl) {
+      ytSend({ t: 'load', url: KO.pendingYtUrl });
+      KO.pendingYtUrl = null;
+    }
     return;
   }
-  if (d.event !== 'infoDelivery' || !d.info) return;
-  const info = d.info;
-  const st = info.playerState; // -1 unstarted, 0 ended, 1 playing, 2 paused, 3 buffering, 5 cued
-  const prevLive = KO.ytState.live;
-  // LIVE detection: a real stream is playing/buffering; the offline
-  // placeholder sits at -1 (unstarted) and never leaves it.
-  KO.ytState.playing = st === 1;
-  KO.ytState.muted = !!info.muted;
-  KO.ytState.live = st === 1 || st === 2 || st === 3; // 2=paused: the layer is up, just not playing
-  KO.ytState.dur = info.duration || 0;
-  KO.ytState.ct = info.currentTime || 0;
-  KO.ytState.vq = info.playbackQuality || '';
-  if (typeof info.volume === 'number' && info.volume >= 0 && !info.muted && KO.ytVol !== info.volume) {
-    KO.ytVol = info.volume; // remember the user's yt volume slider
-    saveState();
+  if (m.t === 'st' && m.st) {
+    const st = m.st;
+    const prevLive = KO.ytState.live;
+    // hls.js state mapping — a paused-but-loaded video is still live.
+    KO.ytState.playing = st.state === 'Playing';
+    KO.ytState.muted = !!st.muted;
+    KO.ytState.live = st.state === 'Playing' || st.state === 'Buffering' || st.state === 'Paused';
+    KO.ytState.dur = st.dur || 0;
+    KO.ytState.ct = st.pos || 0;
+    KO.ytState.vq = (st.q && st.q.name) || '';
+    if (typeof st.volume === 'number' && st.volume >= 0 && !st.muted && KO.ytVol !== st.volume) {
+      KO.ytVol = st.volume; // remember the user's yt volume slider
+      saveState();
+    }
+    if (KO.player === 'youtube') throttledYtProbe();
+    if (prevLive && !KO.ytState.live && KO.player === 'youtube') throttledYtProbe();
+    if (KO.player === 'youtube' && KO.ytState.live && KO.ytState.muted) enableYtUnlock();
+    return;
   }
-  if (KO.player === 'youtube') throttledYtProbe();
-  if (prevLive && !KO.ytState.live && KO.player === 'youtube') throttledYtProbe();
-  if (KO.player === 'youtube' && KO.ytState.live && KO.ytState.muted) enableYtUnlock();
+  if (m.t === 'ev' && m.e === 'error') {
+    console.log('[ko] yt (hls) error', m.d || '');
+    diag('yt_hls_err', { msg: String(m.d || '').slice(0, 140) });
+  }
 });
 
 function throttledYtProbe() {
@@ -422,6 +460,8 @@ function kickFrame() {
 window.addEventListener('message', (ev) => {
   const d = ev.data;
   if (!d || !d.__koKick) return;
+  const ytf = document.getElementById('ko-yt');
+  if (ytf && ev.source === ytf.contentWindow) return; // the yt (hls) frame — handled by the yt listener
   if (KO.kickWin && ev.source !== KO.kickWin) return;
   const m = d.__koKick;
   if (m.t === 'ready') {
@@ -889,9 +929,14 @@ function teardown() {
     KO.wrap.remove();
     KO.wrap = null;
   }
-  // the embed dies with the removed iframe; no ytCmd('destroy') exists
+  // the frame dies with the removed iframe; no ytCmd('destroy') exists
   KO.ytState = { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, error: 0 };
   KO.ytUnlock = false;
+  KO.ytWin = null;
+  KO.ytHlsUrl = null;
+  KO.ytHlsFailed = false;
+  KO.pendingYtUrl = null;
+  KO.ytEmbedAt = 0;
   KO.kickWin = null;
   KO.kickReady = false;
   KO.kickState = null;
@@ -1197,18 +1242,26 @@ async function probe() {
     if (KO.wrap) hideWrap();
     return;
   }
+  await ensureYtHls();
   ensureYtIframe();
   if (KO.ytState.live) {
     showYtLayer();
     setBadge('YT', '#ff0000');
     return;
   }
-  // The embed never initialized (YouTube player-config error 153 on
-  // bot-gated/cookieless sessions — nothing posts, ready stays false).
-  // When the channel also has a kick mapping, hand over to kick instead
-  // of leaving the native Twitch player (ads) visible.
-  if (KO.kickSlug && KO.ytEmbedAt && !KO.ytState.ready && Date.now() - KO.ytEmbedAt > YT_EMBED_GRACE) {
-    diag('yt_fallback', { kick: KO.kickSlug, embedMs: Date.now() - KO.ytEmbedAt });
+  // The HLS layer never initialized: the manifest mint failed (ytHlsFailed)
+  // or the frame never reached ready within YT_EMBED_GRACE. When the channel
+  // also has a kick mapping, hand over to kick instead of leaving the native
+  // Twitch player (ads) visible.
+  if (
+    KO.kickSlug &&
+    (KO.ytHlsFailed || (KO.ytEmbedAt && !KO.ytState.ready && Date.now() - KO.ytEmbedAt > YT_EMBED_GRACE))
+  ) {
+    diag('yt_fallback', {
+      kick: KO.kickSlug,
+      fail: !!KO.ytHlsFailed,
+      embedMs: KO.ytEmbedAt ? Date.now() - KO.ytEmbedAt : 0,
+    });
     setPlayer('kick');
     return;
   }

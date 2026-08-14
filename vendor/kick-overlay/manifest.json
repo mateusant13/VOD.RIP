@@ -11,12 +11,13 @@
     "activeTab",
     "declarativeNetRequest"
   ],
-  "host_permissions": [
-    "https://www.twitch.tv/*",
-    "https://live-video.net/*",
-    "https://*.live-video.net/*",
-    "https://www.youtube.com/*"
-  ],
+ "host_permissions": [
+  "https://www.twitch.tv/*",
+  "https://live-video.net/*",
+  "https://*.live-video.net/*",
+  "https://www.youtube.com/*",
+  "https://*.googlevideo.com/*"
+ ],
   "background": {
     "service_worker": "background.js"
   },

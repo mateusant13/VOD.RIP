@@ -21,6 +21,14 @@
 </script>
 <video id="v" autoplay playsinline></video>
 <script src="ivs/index.js"></script>
+<script src="hls/hls.min.js"></script>
+<script>
+  // HLS mode (player.html?m=hls): the YouTube layer plays the innertube
+  // manifest with hls.js; native controls give it the same UX the embed had.
+  if (new URLSearchParams(location.search).get('m') === 'hls') {
+    document.getElementById('v').controls = true;
+  }
+</script>
 <script src="player-bridge.js"></script>
 </body>
 </html>
