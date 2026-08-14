@@ -489,8 +489,13 @@ def _make_geometry_saver(settings_mgr: SettingsManager):
 # ---------------------------------------------------------------------------
 
 
-def _launch_pywebview(port: int, *, start_hidden: bool = False) -> bool:
+def _launch_pywebview(port: int, *, start_hidden: bool = False, url: str | None = None) -> bool:
     """Open PyWebView with system-tray minimize-on-close behavior.
+
+    ``url`` overrides the default ``http://127.0.0.1:{port}`` — used by
+    dev mode (``VODRIP_DEV_UI_URL``) to point the window at the Vite dev
+    server so frontend HMR and backend auto-reload reach the running app
+    without a PyInstaller rebuild.
 
     start_hidden (autostart boot): the window is created hidden and the
     tray is the only entry point — the user opens the UI from the tray
@@ -530,7 +535,7 @@ def _launch_pywebview(port: int, *, start_hidden: bool = False) -> bool:
 
     kwargs = dict(
         title="VOD.RIP 🪦",
-        url=f"http://127.0.0.1:{port}",
+        url=url or f"http://127.0.0.1:{port}",
         width=1280,
         height=800,
         min_size=(800, 600),
@@ -618,12 +623,13 @@ def _launch_pywebview(port: int, *, start_hidden: bool = False) -> bool:
 
 
 def _launch_browser_and_tray(
-    port: int, *, webview2_missing: bool = False, open_browser: bool = True
+    port: int, *, webview2_missing: bool = False, open_browser: bool = True, url: str | None = None
 ):
     """Fallback UI: open the default browser + system tray icon.
 
     open_browser=False (autostart boot): tray only — a boot-time browser
-    popup is hostile; the user opens the UI from the tray when ready."""
+    popup is hostile; the user opens the UI from the tray when ready.
+    ``url`` overrides the default ``http://127.0.0.1:{port}`` (dev mode)."""
     import webbrowser
 
     logger = logging.getLogger("VOD.RIP")
@@ -653,7 +659,7 @@ def _launch_browser_and_tray(
             pass
 
     if open_browser:
-        webbrowser.open(f"http://127.0.0.1:{port}")
+        webbrowser.open(url or f"http://127.0.0.1:{port}")
 
     from services.app_lifecycle import request_app_exit
     from services.tray_service import TrayService
@@ -674,12 +680,20 @@ def _launch_browser_and_tray(
 # ---------------------------------------------------------------------------
 
 
-def _shutdown(port: int = 7897):
-    """Cancel active downloads, stop uvicorn, and release the API port."""
+def _shutdown(port: int = 7897, *, stop_api: bool = True):
+    """Cancel active downloads, stop uvicorn, and release the API port.
+
+    ``stop_api=False`` (dev mode): the API on *port* is the ``npm run dev``
+    backend — owned by the dev supervisor, not this launcher — so leave it
+    running and only close the window.
+    """
+    logger = logging.getLogger("VOD.RIP")
+    if not stop_api:
+        logger.info("Dev mode — leaving dev API on :%d running", port)
+        return
     from services.server_lifecycle import stop_api_server
     from services.shutdown_util import shutdown_downloads_and_children
 
-    logger = logging.getLogger("VOD.RIP")
     logger.info("Shutting down ...")
     shutdown_downloads_and_children()
     stop_api_server(port)
@@ -747,6 +761,12 @@ def main():
 
     port = int(os.environ.get("PORT", 7897))
 
+    # Dev UI mode: point the app window at the Vite dev server and use the
+    # already-running `npm run dev` API instead of spawning the bundle's own
+    # backend. Frontend edits hot-reload (HMR), backend edits auto-restart
+    # the dev API — no PyInstaller rebuild needed while iterating.
+    dev_ui_url = os.environ.get("VODRIP_DEV_UI_URL", "").strip() or None
+
     # Autostart boot (HKCU Run key -> VOD-RIP.exe --autostart): hide the
     # window and mark the process as background so the pacing layer runs
     # quieter (fewer lanes, wider gaps — nobody is at the keyboard yet).
@@ -805,23 +825,35 @@ def main():
 
     logger.info("Starting FastAPI on 127.0.0.1:%d", port)
 
-    from services.server_lifecycle import release_api_port
+    if dev_ui_url:
+        # The `npm run dev` API (supervised by dev-all.mjs) is expected to
+        # already own the port. Never release it, spawn a competing
+        # backend, or run the health watchdog over a foreign process.
+        logger.info("Dev UI mode — window at %s, reusing dev API on :%d", dev_ui_url, port)
+    else:
+        from services.server_lifecycle import release_api_port
 
-    release_api_port(port, skip_pid=os.getpid())
+        release_api_port(port, skip_pid=os.getpid())
 
-    server_thread = threading.Thread(target=_server_supervisor, args=(port,), daemon=True)
-    server_thread.start()
-    # Anti-hang watchdog: the supervisor only restarts on crashes (uvicorn
-    # exits); a process that is alive but deadlocked (sqlite lock storm,
-    # hung executor) would otherwise sit unresponsive forever. Poll the
-    # health endpoint; after repeated misses ask uvicorn to stop — the
-    # supervisor sees the exit and restarts in 2s.
-    threading.Thread(
-        target=_server_health_watchdog, args=(port,), daemon=True, name="health-watchdog"
-    ).start()
+        server_thread = threading.Thread(target=_server_supervisor, args=(port,), daemon=True)
+        server_thread.start()
+        # Anti-hang watchdog: the supervisor only restarts on crashes (uvicorn
+        # exits); a process that is alive but deadlocked (sqlite lock storm,
+        # hung executor) would otherwise sit unresponsive forever. Poll the
+        # health endpoint; after repeated misses ask uvicorn to stop — the
+        # supervisor sees the exit and restarts in 2s.
+        threading.Thread(
+            target=_server_health_watchdog, args=(port,), daemon=True, name="health-watchdog"
+        ).start()
 
     if not _wait_for_server(port):
-        logger.critical("FastAPI server did not become ready within timeout")
+        if dev_ui_url:
+            logger.critical(
+                "Dev UI mode: no VOD.RIP API on :%d — start it first with `npm run dev`",
+                port,
+            )
+        else:
+            logger.critical("FastAPI server did not become ready within timeout")
         sys.exit(1)
 
     logger.info("Server ready — launching UI")
@@ -845,8 +877,8 @@ def main():
             logger.warning("WebView2 setup failed: %s", exc)
             webview2_ok = False
 
-    if webview2_ok and _launch_pywebview(port, start_hidden=autostart):
-        _shutdown(port)
+    if webview2_ok and _launch_pywebview(port, start_hidden=autostart, url=dev_ui_url):
+        _shutdown(port, stop_api=dev_ui_url is None)
         sys.exit(0)
 
     if os.name == "nt" and getattr(sys, "frozen", False):
@@ -854,16 +886,18 @@ def main():
             from services.webview2_setup import ensure_webview2, webview2_installed
             if not webview2_installed():
                 webview2_ok = ensure_webview2()
-            if webview2_ok and _launch_pywebview(port, start_hidden=autostart):
-                _shutdown(port)
+            if webview2_ok and _launch_pywebview(port, start_hidden=autostart, url=dev_ui_url):
+                _shutdown(port, stop_api=dev_ui_url is None)
                 sys.exit(0)
         except Exception as exc:
         # ponytail: best-effort — sys.exit(0)
             logger.warning("WebView2 retry failed: %s", exc)
             webview2_ok = False
 
-    _launch_browser_and_tray(port, webview2_missing=not webview2_ok, open_browser=not autostart)
-    _shutdown(port)
+    _launch_browser_and_tray(
+        port, webview2_missing=not webview2_ok, open_browser=not autostart, url=dev_ui_url
+    )
+    _shutdown(port, stop_api=dev_ui_url is None)
     sys.exit(0)
 
 
