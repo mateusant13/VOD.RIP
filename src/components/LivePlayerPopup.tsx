@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Captions, ExternalLink, Loader2, Maximize2, Minimize2, MessageSquare, Pause, Play, Search, Volume2, VolumeX, RefreshCw, X } from 'lucide-react';
+import { Captions, ExternalLink, Languages, Loader2, Maximize2, Minimize2, MessageSquare, Pause, Play, Search, Volume2, VolumeX, RefreshCw, X } from 'lucide-react';
 import { apiDelete, apiPost } from '../hooks/useApiClient';
 import { archiveVideoIdFromUrl } from '../archiveScope';
 import { buildVodUrl } from '../channelUtils';
@@ -1082,20 +1082,24 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       enableWorker: true,
       startLevel: 0,
       lowLatencyMode: true,
-      // Live latency target: ZERO segments behind the live edge. hls.js
-      // 1.6.2 VALIDATES count 0 fine (the only constraint is
-      // liveMaxLatencyDurationCount > liveSyncDurationCount — 6 > 0 passes)
+      // Live latency target: ONE segment behind the live edge instead of
+      // zero. count 0 gave a hair-thin forward buffer (~0.33s LL part) that
+      // ANY proxy/browser hiccup drained to zero → 'buffering' spinner →
+      // 1.5× catch-up churn. count 1 (≈0.7-1s at LL parts, ~2s at non-LL
+      // segments) is still a sub-second-to-~1s intentional delay — the user
+      // asked for less than 1s and this stays ≤1s on LL — while giving the
+      // decode/proxy pipeline a real cushion so transient jitter no longer
+      // rebuffers. hls.js VALIDATES count 0/1 fine (the only constraint is
+      // liveMaxLatencyDurationCount > liveSyncDurationCount — 6 > 1 passes)
       // and its targetLatency getter treats 0 as "no count override",
-      // falling back to the LL partHoldBack/holdBack, while liveSyncPosition
-      // clamps to at most one PART (partTarget ≈0.33s on Twitch LL) behind
-      // the edge — an intentional delay < 1s instead of the old one-segment
-      // (~2s) target. lowLatencyMode also enables LL-HLS part handling; the
-      // backend prefers Twitch LL masters and non-LL playlists play
-      // identically with it on. hls.js THROWS when count and duration sync
-      // variants are mixed, so the count knobs are the only live-sync
+      // falling back to the LL partHoldBack/holdBack; 1 is an explicit
+      // segment-count target. lowLatencyMode also enables LL-HLS part
+      // handling; the backend prefers Twitch LL masters and non-LL playlists
+      // play identically with it on. hls.js THROWS when count and duration
+      // sync variants are mixed, so the count knobs are the only live-sync
       // geometry here — computeLiveEdgeSec mirrors hls.js's targetLatency
-      // (count × level targetduration, 0 × td = 0) to keep the edge math
-      // exact. maxLiveSyncPlaybackRate 1.5 recovers from any drift by
+      // (count × level targetduration, 1 × td ≈ 1 segment) to keep the edge
+      // math exact. maxLiveSyncPlaybackRate 1.5 recovers from any drift by
       // playing up to 1.5× instead of stalling; liveMaxLatencyDurationCount
       // 6 (≈12s at 2s segments) is the force-resync ceiling for slow
       // networks. maxBufferLength 20 keeps the buffer deep so the tighter
@@ -1111,7 +1115,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       fragLoadingTimeOut: 20000,
       manifestLoadingTimeOut: 10000,
       testBandwidth: false,
-      liveSyncDurationCount: 0,
+      liveSyncDurationCount: 1,
       // hls.js REQUIRES liveMaxLatencyDurationCount > liveSyncDurationCount
       // (config validation throws otherwise) — 6 ≈ 12s at 2s segments.
       liveMaxLatencyDurationCount: 6,
@@ -1239,14 +1243,16 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
 
     hls.on(Hls.Events.ERROR, (_e, data) => {
       // Stall guard (live only): hls.js 1.6.2 reports a stall as
-      // BUFFER_STALLED_ERROR ("stall detected" — non-fatal once per stall
-      // period, fatal after nudges fail) and breaks hard as a fatal
-      // NETWORK_ERROR. Either, with another live entry available, jumps to
-      // the next entry instead of waiting out the backend stall. Replay/rail
-      // is untouched — only LIVE mode qualifies.
-      const liveStall = modeRef.current === 'live' && (
+      // BUFFER_STALLED_ERROR — NON-fatal once per stall period (hls.js
+      // nudges and retries first), then fatal if the nudges fail. A
+      // transient <1s jitter must NOT advance to the next entry (that
+      // deletes the session, kills the player, and restarts a different
+      // channel at its live edge — the 'stream keeps loading / is
+      // inconsistent after play' symptom). Only a FATAL stall (nudges
+      // exhausted = genuinely dead) or a fatal network error advances.
+      const liveStall = modeRef.current === 'live' && data?.fatal === true && (
         data?.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR ||
-        (data?.type === Hls.ErrorTypes.NETWORK_ERROR && data.fatal === true)
+        data?.type === Hls.ErrorTypes.NETWORK_ERROR
       );
       if (liveStall && tryAdvanceEntry()) return;
       if (!data?.fatal) return;
@@ -2348,10 +2354,11 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                       onClick={() => setCaptionLangMenuOpen((o) => !o)}
                       aria-haspopup="menu"
                       aria-expanded={captionLangMenuOpen}
+                      aria-label={t('Caption language')}
                       title={t('Caption language')}
-                      className={`${transportBtn} px-1 font-mono text-[10px] font-bold leading-none`}
+                      className={`${transportBtn} px-1`}
                     >
-                      {(captionLang ?? 'auto').toUpperCase()}
+                      <Languages size={15} aria-hidden />
                     </button>
                     {captionLangMenuOpen && (
                       <div className="absolute bottom-full left-0 z-30 mb-1.5 flex flex-col border-2 border-zinc-600 bg-zinc-950 shadow-lg">
