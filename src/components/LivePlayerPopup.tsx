@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom';
 import { Captions, ExternalLink, Loader2, Maximize2, Minimize2, MessageSquare, Pause, Play, Search, Volume2, VolumeX, RefreshCw, X } from 'lucide-react';
 import { apiDelete, apiPost } from '../hooks/useApiClient';
-import { openTwitchLiveClipEditorInBrowser, reportClipEvent } from '../twitchClip';
+import { archiveVideoIdFromUrl } from '../archiveScope';
 import { useI18n } from '../i18n';
 import type { PanelSize, PreviewSessionResponse, SavedChannel } from '../types';
 import ArchiveSearchPopup from './ArchiveSearchPopup';
@@ -35,10 +35,6 @@ import {
 import { platformButtonShadow, platformPreviewCtrlBtn, type PlatformStyleKey } from '../platformStyles';
 import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from '../twitchAdBlock';
 import {
-  clampClipSeconds,
-  clipCooldownRemaining,
-  FAST_CLIP_COOLDOWN_MS,
-  FAST_CLIP_DEFAULT_SEC,
   filterLiveLevels,
   liveBroadcastPositionSec,
   liveChatSlugFromUrl,
@@ -50,6 +46,7 @@ import {
 } from '../livePlayerLevels';
 import LiveChatPanel, { LIVE_CHAT_PANEL_W } from './LiveChatPanel';
 import TwitchLogoIcon from './TwitchLogoIcon';
+import TwitchClipPopup from './TwitchClipPopup';
 import { previewRetryAfterError, type PreviewRetryState } from '../previewRetry';
 import { noteUserUnpause, pauseOtherPreviews, registerPreviewPlayback } from '../previewPlaybackBus';
 import { nextLiveEntry } from '../liveEntryFallback';
@@ -117,14 +114,6 @@ const INITIAL_CHAT_OPEN = false;
  *  been measured yet (drag starts before the first paint). */
 const POPUP_HEADER_EST = 52;
 
-/** Honest fast-clip capability payload — this build has NO server-side live
- *  clip path, so `available` is always false and `reason`/`needed` document
- *  the exact backend requirement (never a fake clip id). */
-interface LiveClipCapability {
-  available: boolean;
-  reason?: string;
-  needed?: string[];
-}
 /** Re-snapshot the archive playlist while parked in REPLAY (grows while live). */
 const REPLAY_RESNAPSHOT_MS = 30_000;
 /** Live session POST stall budget — after this the popup advances to the next
@@ -238,11 +227,18 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   const [chatOpen, setChatOpen] = useState(INITIAL_CHAT_OPEN);
   const chatOpenRef = useRef(INITIAL_CHAT_OPEN);
   useEffect(() => { chatOpenRef.current = chatOpen; }, [chatOpen]);
-  // Fast CLIP: seconds input (5..60) + 5s cooldown + transient notification.
-  const [clipSeconds, setClipSeconds] = useState(FAST_CLIP_DEFAULT_SEC);
-  const lastClipAtRef = useRef(0);
-  const [clipCooldownLeft, setClipCooldownLeft] = useState(0);
-  const clipCooldownTimerRef = useRef<number | null>(null);
+  /** Twitch clip mini-preview — opened at the live playhead (120s window,
+   *  user trims there and creates the clip). Mirrors the preview clip popup
+   *  state (ChannelExplorePopup). */
+  const [clipPopup, setClipPopup] = useState<{
+    url: string;
+    broadcasterLogin: string;
+    vodId: string;
+    playheadSec: number;
+    vodDurationSec: number;
+    reuseSession?: { sessionId: string; trimTimeline: boolean } | null;
+  } | null>(null);
+  // Transient clip notice (VOD guard feedback).
   const [clipNotice, setClipNotice] = useState<string | null>(null);
   const clipNoticeTimerRef = useRef<number | null>(null);
   const [position, setPosition] = useState(() => {
@@ -829,10 +825,6 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
 
   // Cleanup player on unmount
   const cleanup = useCallback(() => {
-    if (clipCooldownTimerRef.current != null) {
-      window.clearTimeout(clipCooldownTimerRef.current);
-      clipCooldownTimerRef.current = null;
-    }
     if (clipNoticeTimerRef.current != null) {
       window.clearTimeout(clipNoticeTimerRef.current);
       clipNoticeTimerRef.current = null;
@@ -1249,63 +1241,12 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     }
   }, []);
 
-  // --- Fast CLIP (5s cooldown, seconds input, honest capability report) ---
+  // --- Twitch clip mini-preview (identical to the preview clip buttons) ---
   const showClipNotice = useCallback((msg: string) => {
     setClipNotice(msg);
     if (clipNoticeTimerRef.current != null) window.clearTimeout(clipNoticeTimerRef.current);
     clipNoticeTimerRef.current = window.setTimeout(() => setClipNotice(null), 3500);
   }, []);
-
-  const handleFastClip = useCallback(async () => {
-    const now = Date.now();
-    if (clipCooldownRemaining(lastClipAtRef.current, now) > 0) return; // 2nd click within 5s ignored
-    lastClipAtRef.current = now;
-    const platform = (activeEntry.platform || '').toLowerCase();
-    const slug = liveChatSlugFromUrl(activeEntry.url, platform) ?? channelSlug ?? '';
-    const durationSec = clampClipSeconds(clipSeconds);
-    reportClipEvent('live_clip_clicked', { platform, slug, durationSec });
-    // Countdown ticker on the button (250ms steps).
-    const tick = () => {
-      const left = clipCooldownRemaining(lastClipAtRef.current, Date.now(), FAST_CLIP_COOLDOWN_MS);
-      setClipCooldownLeft(left);
-      if (left > 0) {
-        clipCooldownTimerRef.current = window.setTimeout(tick, 250);
-      } else {
-        clipCooldownTimerRef.current = null;
-      }
-    };
-    if (clipCooldownTimerRef.current != null) window.clearTimeout(clipCooldownTimerRef.current);
-    tick();
-    if (platform === 'twitch') {
-      // Twitch live clips run in Twitch's own browser editor (player Clip
-      // button) driven by the cookie extension — no Helix/OAuth server path
-      // (audited; backend live.py has no clip mutation). Open the editor and
-      // let the extension fill + publish with the session cookie.
-      try {
-        const title = (activeEntry.title || '').trim();
-        openTwitchLiveClipEditorInBrowser(slug, durationSec, title);
-        reportClipEvent('live_clip_editor_open', { platform, slug, durationSec, title });
-        showClipNotice(t('Opening Twitch clip editor…'));
-      } catch (err) {
-        showClipNotice(`${t('Clip unavailable')}: ${err instanceof Error ? err.message : ''}`);
-      }
-      return;
-    }
-    try {
-      const res = await apiPost<LiveClipCapability>('/api/live/clip', {
-        platform,
-        slug,
-        duration_sec: durationSec,
-      });
-      // The backend never fabricates a clip: it reports what it CAN do. When
-      // a server-side path arrives, `available` flips and this shows success.
-      showClipNotice(res.available
-        ? t('Clip created')
-        : `${t('Clip unavailable')}: ${t(res.reason ?? '')}`);
-    } catch (err) {
-      showClipNotice(`${t('Clip unavailable')}: ${err instanceof Error ? err.message : ''}`);
-    }
-  }, [activeEntry.url, activeEntry.platform, activeEntry.title, channelSlug, clipSeconds, showClipNotice, t]);
 
   // --- Resize: aspect-locked (video keeps the stream's aspect; chat docks
   //     right of the video, so the video area = popup − chat panel width) ---
@@ -1429,6 +1370,40 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   // The live edge lags the playhead between playlist refreshes — never show
   // a total smaller than the current position.
   const displayTotal = Math.max(totalSec, currentSec);
+
+  /**
+   * Open the Twitch clip mini-preview at the live playhead (120s window, user
+   * trims there and creates the clip) — same flow as the preview clip buttons
+   * (App.openPreviewTwitchClip / ChannelExplorePopup.openExploreTwitchClip).
+   * Requires a DVR VOD URL (vodUrl, resolved by App.liveArchiveContext); the
+   * channel page alone has no VOD timeline to select from.
+   */
+  const handleFastClip = useCallback(() => {
+    const platform = (activeEntry.platform || '').toLowerCase();
+    const slug = liveChatSlugFromUrl(activeEntry.url, platform) ?? channelSlug ?? '';
+    if (!slug) {
+      showClipNotice(t('Channel login missing — cannot open the Twitch editor'));
+      return;
+    }
+    const url = vodUrl ?? activeEntry.url;
+    const vodId = archiveVideoIdFromUrl(url);
+    if (!vodId) {
+      showClipNotice(t('Not a Twitch VOD URL'));
+      return;
+    }
+    try { videoRef.current?.pause(); } catch { /* ignore */ }
+    pauseOtherPreviews();
+    setClipPopup({
+      url,
+      broadcasterLogin: slug,
+      vodId,
+      playheadSec: currentSec,
+      vodDurationSec: archiveDuration,
+      reuseSession: sessionIdRef.current
+        ? { sessionId: sessionIdRef.current, trimTimeline: false }
+        : null,
+    });
+  }, [activeEntry.url, activeEntry.platform, channelSlug, vodUrl, currentSec, archiveDuration, showClipNotice, t]);
 
   // Zoomed rail window — zoom=1 → the full 0..railMax (pixel-identical to
   // the unzoomed rail); otherwise the window anchored at railAnchorFrac.
@@ -1828,64 +1803,24 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                 )}
               </div>
 
-              {/* Fast CLIP — one click, no popups: seconds input (5..60) +
-                  5s cooldown; the backend reports its real capability
-                  (never fakes a clip). Sits BESIDE the volume button and
-                  shares its transportBtn class so both render the SAME
-                  height docked and fullscreen (user request). */}
-              <div className="flex items-center gap-1.5">
+              {/* Twitch clip — opens the in-app mini-preview at the live
+                  playhead (120s window, user trims 5..60s, then the Twitch
+                  editor), identical to the preview clip buttons. Kick gets
+                  no clip button (same gate as the explore player). Sits
+                  BESIDE the volume button and shares its transportBtn class
+                  so both render the SAME height docked and fullscreen. */}
+              {ctrlPlatform === 'twitch' && (
                 <button
                   type="button"
                   onClick={handleFastClip}
-                  disabled={clipCooldownLeft > 0}
-                  title={clipCooldownLeft > 0
-                    ? t('Clip cooldown {n}s', { n: Math.ceil(clipCooldownLeft / 1000) })
-                    : t('Create a clip of the live stream')}
-                  className={`${transportBtn} flex items-center gap-1.5 disabled:pointer-events-none`}
+                  title={t('Open the Twitch clip mini-preview at the playhead')}
+                  className={`${transportBtn} flex items-center gap-1.5`}
                 >
                   <TwitchLogoIcon size={15} className="shrink-0" />
                   {/* Logo already says Twitch — label stays bare "clip" (user request). */}
-                  <span className="text-[9px] font-bold uppercase tracking-wider whitespace-nowrap leading-none">
-                    {clipCooldownLeft > 0 ? `${Math.ceil(clipCooldownLeft / 1000)}s` : 'clip'}
-                  </span>
+                  <span className="text-[9px] font-bold uppercase tracking-wider whitespace-nowrap leading-none">clip</span>
                 </button>
-                <div className="relative shrink-0">
-                  <input
-                    type="text"
-                    inputMode="numeric"
-                    value={String(clipSeconds)}
-                    onChange={(e) => {
-                      const digits = e.target.value.replace(/\D/g, '');
-                      const v = digits === '' ? NaN : parseInt(digits, 10);
-                      setClipSeconds(Number.isFinite(v) ? clampClipSeconds(v) : FAST_CLIP_DEFAULT_SEC);
-                    }}
-                    onFocus={(e) => e.currentTarget.select()}
-                    onKeyDown={(e) => {
-                      // Full-selection Backspace removes ONE digit (30 → 3,
-                      // clamped to 5), not the whole value; typing still
-                      // replaces it all.
-                      const el = e.currentTarget;
-                      if (e.key === 'Backspace' && el.selectionStart === 0 && el.selectionEnd === el.value.length) {
-                        e.preventDefault();
-                        const digits = el.value.slice(0, -1).replace(/\D/g, '');
-                        const v = digits === '' ? NaN : parseInt(digits, 10);
-                        setClipSeconds(Number.isFinite(v) ? clampClipSeconds(v) : FAST_CLIP_DEFAULT_SEC);
-                        // React re-renders the new value asynchronously; drop
-                        // the caret to the end so typing appends (30→5→5X).
-                        requestAnimationFrame(() => {
-                          el.setSelectionRange(el.value.length, el.value.length);
-                        });
-                      }
-                    }}
-                    className={`w-10 bg-black border-2 border-white/60 text-white text-[9px] font-mono py-1.5 pl-1 pr-3 text-right caret-white focus:border-white focus:bg-zinc-900 focus:outline-none ${platformButtonShadow(ctrlPlatform)}`}
-                    aria-label={t('Clip duration (seconds)')}
-                    title={t('Clip duration (seconds)')}
-                  />
-                  <span className="pointer-events-none absolute right-1 top-1/2 -translate-y-1/2 text-[9px] font-mono text-zinc-500">
-                    s
-                  </span>
-                </div>
-              </div>
+              )}
 
               {/* Live captions toggle — CC overlay over the video. Only
                   rendered when the parakeet gate reports available (503 /
@@ -1972,6 +1907,27 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         />
       )}
       </div>
+      {clipPopup && (
+        <TwitchClipPopup
+          url={clipPopup.url}
+          broadcasterLogin={clipPopup.broadcasterLogin}
+          vodId={clipPopup.vodId}
+          playheadSec={clipPopup.playheadSec}
+          vodDurationSec={clipPopup.vodDurationSec}
+          reuseSession={clipPopup.reuseSession}
+          // The clip title defaults to the VOD's title (user-mandated: the
+          // clip keeps the ORIGINAL title) — sent as vodrip_title so the
+          // extension fills the editor's required field.
+          vodTitle={activeEntry.title ?? ''}
+          // Ladder-derived: the live popup's shared-ladder rank + 50 headroom
+          // (same pattern as the explore player's clip popup).
+          zIndex={(zIndex ?? LIVE_POPUP_ACTIVE_Z) + 50}
+          // Inherit the live popup's volume so opening the clip window never
+          // resets the user's level.
+          initialVolume={volume}
+          onClose={() => setClipPopup(null)}
+        />
+      )}
     </div>,
     // Mount inside #explore-portal with the explore/local-file players so all
     // popups share one DOM subtree (it is a static mount point with no stacking

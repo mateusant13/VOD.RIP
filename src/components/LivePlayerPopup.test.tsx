@@ -105,17 +105,20 @@ function mockFetch() {
     if (url.includes('/api/archive/videos')) {
       return new Response(JSON.stringify({ videos: [] }), { status: 200 });
     }
-    if (url.includes('/api/live/clip')) {
-      // Honest capability report — never a fake clip.
-      return new Response(JSON.stringify({
-        available: false,
-        reason: 'Kick has no public clip-creation API.',
-        needed: [],
-      }), { status: 200 });
-    }
     if (url.includes('/api/live/captions/available')) {
       // Parakeet gate probe — captions available for the playing entry.
       return new Response(JSON.stringify({ available: true }), { status: 200 });
+    }
+    if (url.includes('/api/preview/session')) {
+      // TwitchClipPopup mini-preview session — resolves so the popup's HLS
+      // attach runs quietly against FakeHls (a 404 would retry 1.2s/2.4s and
+      // reject with an unhandled error after the test ends).
+      return new Response(JSON.stringify({
+        session_id: 'cs1',
+        kind: 'hls',
+        master_url: '/api/preview/hls/cs1/master.m3u8',
+        playback_url: '/api/preview/hls/cs1/master.m3u8',
+      }), { status: 200 });
     }
     return new Response(JSON.stringify({}), { status: 404 });
   });
@@ -281,133 +284,83 @@ describe('LivePlayerPopup fullscreen', () => {
 });
 
 describe('LivePlayerPopup fast clip', () => {
-  it('fires ONE clip request on a double-click (5s cooldown ignores the second)', async () => {
-    const fetchMock = mockFetch();
-    renderPopup();
-    await screen.findByTitle('Fullscreen');
+  const twitchEntry = { url: 'https://www.twitch.tv/titiltei', title: 'Late night', platform: 'twitch' };
+  const twitchVodUrl = 'https://www.twitch.tv/videos/2117068816';
 
-    const btn = screen.getByTitle('Create a clip of the live stream');
-    fireEvent.click(btn);
-    fireEvent.click(btn); // within the 5s window — must be ignored
-
-    const clipCalls = fetchMock.mock.calls.filter(([u]) => String(u).includes('/api/live/clip'));
-    expect(clipCalls).toHaveLength(1);
-
-    // The button flips into countdown mode (disabled, showing seconds).
-    await waitFor(() => expect(btn).toBeDisabled());
-
-    // Honest notification: reports the capability gap, never "clip saved".
-    const notice = await screen.findByRole('status');
-    expect(notice.textContent).toContain('Clip unavailable');
-  });
-
-  it('clamps the seconds input to 5..60', async () => {
-    mockFetch();
-    renderPopup();
-    await screen.findByTitle('Fullscreen');
-
-    const input = screen.getByLabelText('Clip duration (seconds)');
-    fireEvent.change(input, { target: { value: '99' } });
-    expect((input as HTMLInputElement).value).toBe('60');
-    fireEvent.change(input, { target: { value: '0' } });
-    expect((input as HTMLInputElement).value).toBe('5');
-  });
-
-  it('shows a fixed "s" suffix next to the seconds value', async () => {
-    mockFetch();
-    renderPopup();
-    await screen.findByTitle('Fullscreen');
-
-    const input = screen.getByLabelText('Clip duration (seconds)');
-    expect((input as HTMLInputElement).value).toBe('30');
-    // The "s" is a sibling span, never part of the input value — it cannot
-    // be deleted, so it always re-appears by construction.
-    const suffix = input.parentElement!.querySelector('span');
-    expect(suffix?.textContent).toBe('s');
-  });
-
-  it('typing over a focused value replaces it (30 → 15)', async () => {
-    mockFetch();
-    renderPopup();
-    await screen.findByTitle('Fullscreen');
-
-    const input = screen.getByLabelText('Clip duration (seconds)') as HTMLInputElement;
-    fireEvent.focus(input); // select-all on focus
-    fireEvent.change(input, { target: { value: '15' } });
-    expect(input.value).toBe('15');
-  });
-
-  it('Backspace on a fully-selected value removes ONE digit, then clamps (30 → 5)', async () => {
-    mockFetch();
-    renderPopup();
-    await screen.findByTitle('Fullscreen');
-
-    const input = screen.getByLabelText('Clip duration (seconds)') as HTMLInputElement;
-    fireEvent.focus(input); // select-all on focus (selectionStart 0, end = len)
-    input.setSelectionRange(0, input.value.length);
-    fireEvent.keyDown(input, { key: 'Backspace' });
-    expect(input.value).toBe('5');
-  });
-
-  it('TWITCH live clip opens the browser editor — NO /api/live/clip call (no Helix path)', async () => {
-    const fetchMock = mockFetch();
-    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null);
-    render(
+  function renderTwitchPopup(vodUrl?: string) {
+    return render(
       <LivePlayerPopup
-        entry={{ url: 'https://www.twitch.tv/titiltei', title: 'Late night', platform: 'twitch' }}
-        entries={[{ url: 'https://www.twitch.tv/titiltei', title: 'Late night', platform: 'twitch' }]}
+        entry={twitchEntry}
+        entries={[twitchEntry]}
         channelName="titiltei"
         channelSlug="titiltei"
+        vodUrl={vodUrl}
         onClose={vi.fn()}
         onOpenHit={vi.fn()}
         savedChannels={[]}
       />,
     );
+  }
+
+  it('TWITCH: clicking clip opens the in-app mini-preview (TwitchClipPopup) — no /api/live/clip call', async () => {
+    const fetchMock = mockFetch();
+    renderTwitchPopup(twitchVodUrl);
     await screen.findByTitle('Fullscreen');
 
-    fireEvent.click(screen.getByTitle('Create a clip of the live stream'));
+    fireEvent.click(screen.getByTitle('Open the Twitch clip mini-preview at the playhead'));
 
-    await waitFor(() => expect(openSpy).toHaveBeenCalledTimes(1));
-    const url = String(openSpy.mock.calls[0][0]);
-    expect(url).toContain('https://www.twitch.tv/titiltei');
-    expect(url).toContain('vodrip_clip=1');
-    expect(url).toContain('vodrip_start=0');
-    expect(url).toContain('vodrip_end=30');
-    expect(url).toContain('vodrip_close=0');
-    expect(url).toContain('vodrip_title=');
-    // The browser editor replaces the old server capability call entirely.
+    // The mini-preview renders inside the app (channel header + popup marker),
+    // exactly like the preview clip buttons — not a browser tab.
+    await screen.findByText('Twitch clip');
+    expect(document.querySelector('[data-twitch-clip-popup]')).toBeTruthy();
+
+    // The old server capability POST is gone entirely.
     const clipCalls = fetchMock.mock.calls.filter(([u]) => String(u).includes('/api/live/clip'));
     expect(clipCalls).toHaveLength(0);
-    const notice = await screen.findByRole('status');
-    expect(notice.textContent).toContain('Opening Twitch clip editor');
+  });
+
+  it('TWITCH: mini-preview Create opens clips.twitch.tv/create with the VOD id + offsetSeconds', async () => {
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null);
+    mockFetch();
+    renderTwitchPopup(twitchVodUrl);
+    await screen.findByTitle('Fullscreen');
+
+    fireEvent.click(screen.getByTitle('Open the Twitch clip mini-preview at the playhead'));
+    await screen.findByText('Twitch clip');
+    fireEvent.click(screen.getByRole('button', { name: 'Create clip' }));
+
+    await waitFor(() => expect(openSpy).toHaveBeenCalledTimes(1));
+    const u = new URL(String(openSpy.mock.calls[0][0]));
+    expect(u.host).toBe('clips.twitch.tv');
+    expect(u.pathname).toBe('/create');
+    expect(u.searchParams.get('vodID')).toBe('2117068816');
+    expect(u.searchParams.get('broadcasterLogin')).toBe('titiltei');
+    // offsetSeconds = the trimmed selection END (VOD time of the clip).
+    expect(Number(u.searchParams.get('offsetSeconds'))).toBeGreaterThanOrEqual(0);
     openSpy.mockRestore();
   });
 
-  it('sits BESIDE the volume button with the SAME height (shared transportBtn class)', async () => {
+  it('TWITCH without a DVR VOD URL shows "Not a Twitch VOD URL" and opens nothing', async () => {
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null);
+    mockFetch();
+    renderTwitchPopup();
+    await screen.findByTitle('Fullscreen');
+
+    fireEvent.click(screen.getByTitle('Open the Twitch clip mini-preview at the playhead'));
+
+    const notice = await screen.findByRole('status');
+    expect(notice.textContent).toContain('Not a Twitch VOD URL');
+    expect(document.querySelector('[data-twitch-clip-popup]')).toBeNull();
+    expect(openSpy).not.toHaveBeenCalled();
+    openSpy.mockRestore();
+  });
+
+  it('KICK: no clip button at all (same platform gate as the explore player)', async () => {
     mockFetch();
     renderPopup();
     await screen.findByTitle('Fullscreen');
 
-    const clipBtn = screen.getByTitle('Create a clip of the live stream');
-    const volumeBtn = screen.getByTitle('Volume');
-
-    // Adjacency: the clip group is the volume wrapper's immediate sibling in
-    // the transport row (play → volume → clip → captions → live/quality/fs).
-    const volumeWrapper = volumeBtn.closest('[data-volume-menu]') as HTMLElement;
-    expect(volumeWrapper.nextElementSibling?.contains(clipBtn)).toBe(true);
-
-    // Same height: the clip button reuses the volume button's exact base
-    // class (transportBtn — same p-1.5 + border-2 docked, same glass border
-    // fullscreen), so both render identical heights in every mode.
-    expect(clipBtn.className.startsWith(volumeBtn.className)).toBe(true);
-
-    // Fullscreen flips the base to the glass variant — the clip button must
-    // flip WITH it (the old hardcoded non-fs class kept border-2 → taller).
-    const popupRoot = document.querySelector('[data-live-popup]') as Element;
-    fsElement = popupRoot;
-    document.dispatchEvent(new Event('fullscreenchange'));
-    await screen.findByTitle('Exit fullscreen');
-    expect(clipBtn.className.startsWith(volumeBtn.className)).toBe(true);
+    expect(screen.queryByTitle('Open the Twitch clip mini-preview at the playhead')).toBeNull();
   });
 
   it('mounts into the shared preview-pause bus (pauses other previews when a live opens)', async () => {

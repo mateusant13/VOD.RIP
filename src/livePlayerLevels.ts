@@ -302,29 +302,6 @@ export function livePanelSizeFromAspect(
   return { w, h };
 }
 
-// ---------------------------------------------------------------------------
-// Fast clip (livestream popup CLIP button)
-// ---------------------------------------------------------------------------
-
-/** Fast-clip cooldown: one clip per window; a second click is ignored. */
-export const FAST_CLIP_COOLDOWN_MS = 5000;
-/** Fast-clip duration bounds — the seconds input clamps to this range. */
-export const FAST_CLIP_MIN_SEC = 5;
-export const FAST_CLIP_MAX_SEC = 60;
-export const FAST_CLIP_DEFAULT_SEC = 30;
-
-/** Seconds remaining in the clip cooldown at `nowMs`, or 0 when free. */
-export function clipCooldownRemaining(lastClipAtMs: number, nowMs: number, cooldownMs = FAST_CLIP_COOLDOWN_MS): number {
-  if (lastClipAtMs <= 0) return 0;
-  return Math.max(0, lastClipAtMs + cooldownMs - nowMs);
-}
-
-/** Clamp the seconds input to the 5..60 fast-clip range. */
-export function clampClipSeconds(value: number): number {
-  if (!Number.isFinite(value)) return FAST_CLIP_DEFAULT_SEC;
-  return Math.min(FAST_CLIP_MAX_SEC, Math.max(FAST_CLIP_MIN_SEC, Math.round(value)));
-}
-
 /**
  * Live chat room slug from the entry URL (twitch.tv/<login>,
  * kick.com/<slug>, youtube.com/@handle) — falls back to the platform slug

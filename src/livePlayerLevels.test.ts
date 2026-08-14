@@ -1,11 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import {
-  clampClipSeconds,
-  clipCooldownRemaining,
-  FAST_CLIP_COOLDOWN_MS,
-  FAST_CLIP_DEFAULT_SEC,
-  FAST_CLIP_MAX_SEC,
-  FAST_CLIP_MIN_SEC,
   filterLiveLevels,
   liveArchiveContext,
   liveBroadcastPositionSec,
@@ -277,27 +271,6 @@ describe('livePanelSizeFromAspect', () => {
   });
 });
 
-describe('fast clip helpers', () => {
-  it('enforces the 5s cooldown window', () => {
-    expect(clipCooldownRemaining(0, 1000)).toBe(0); // never clicked
-    expect(clipCooldownRemaining(1000, 2000)).toBe(FAST_CLIP_COOLDOWN_MS - 1000);
-    expect(clipCooldownRemaining(1000, 1000 + FAST_CLIP_COOLDOWN_MS)).toBe(0);
-    expect(clipCooldownRemaining(1000, 9999)).toBe(0); // past the window
-  });
-
-  it('clamps seconds to 5..60 with a default for garbage', () => {
-    expect(FAST_CLIP_MIN_SEC).toBe(5);
-    expect(FAST_CLIP_MAX_SEC).toBe(60);
-    expect(FAST_CLIP_DEFAULT_SEC).toBe(30);
-    expect(clampClipSeconds(0)).toBe(5);
-    expect(clampClipSeconds(-5)).toBe(5);
-    expect(clampClipSeconds(4)).toBe(5);
-    expect(clampClipSeconds(99)).toBe(60);
-    expect(clampClipSeconds(12.6)).toBe(13); // rounds
-    expect(clampClipSeconds(Number.NaN)).toBe(FAST_CLIP_DEFAULT_SEC);
-    expect(clampClipSeconds(Number.POSITIVE_INFINITY)).toBe(FAST_CLIP_DEFAULT_SEC);
-  });
-});
 
 describe('liveChatSlugFromUrl', () => {
   it('parses the room slug per platform', () => {
