@@ -1089,6 +1089,17 @@ export function persistChannelLiveStatuses(
  }
 }
 
+/** A live-status poll 404 for a channel id only drops it from the poll list
+ * when the id is genuinely gone from the saved list. A freshly added channel
+ * 404s until the debounced settings POST (2s) teaches the backend about it —
+ * dropping it on that add-race would blacklist the id until the next visit. */
+export function shouldDropChannelFromLivePoll(
+ channelId: string,
+ savedChannels: SavedChannel[],
+): boolean {
+ return !savedChannels.some((ch) => ch.id === channelId);
+}
+
 /** Highest quality from API list, or source when none listed (Kick). */
 
 export const CLIP_MAX_DURATION_SEC = 60;

@@ -79,7 +79,7 @@ import { createFullscreenGate, type FullscreenGate } from './utils/fullscreenGat
 import { actionBtnHover, platformPreviewCtrlBtn, platformCardShadow, platformVodPanelBtn, platformWatchPreviewBtn, platformBulkDownloadBtn, type PlatformStyleKey } from './platformStyles';
 import { fmtDuration, formatClipDurationHuman, fmtDateAndAgo, fmtViews, parseVideoTs, formatBytes, basename, sourceQualityOptionLabel } from './formatters';
 import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout, PreviewSessionResponse, PanelPos } from './types';
-import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, isMembersOnlyVideo, isPublicVideo, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, effectivePlatformFlags, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, displayTitle, loadSavedChannels, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, isSyntheticArchiveId, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft, loadStoredChannelLiveStatuses, persistChannelLiveStatuses, type StoredChannelLiveStatus } from './channelUtils';
+import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, isMembersOnlyVideo, isPublicVideo, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, effectivePlatformFlags, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, displayTitle, loadSavedChannels, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, isSyntheticArchiveId, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft, loadStoredChannelLiveStatuses, persistChannelLiveStatuses, shouldDropChannelFromLivePoll, type StoredChannelLiveStatus } from './channelUtils';
 import ChannelLinkCard from './components/ChannelLinkCard';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, zoomWindowFromView, fracToSec, secToFrac, zoomTrimViewAround, resolveTimestampSeek, TRIM_ZOOM_STEP, type TrimRangeOpts, type TrimViewWindow } from './trimUtils';
@@ -1997,6 +1997,48 @@ export default function App() {
     };
   }, [tab, selectedChannelId, youtubeEnabled, visibleChannelVideos, url, channelContentFilter]);
 
+  // Shared success path for live-status fetches (poll tick + add-channel
+  // kick): writes state AND localStorage in one place so the two paths can
+  // never diverge.
+  const applyLiveStatus = useCallback((channelId: string, status: ChannelLiveStatus) => {
+    setChannelLiveStatuses((prev) => {
+      const next = { ...prev, [channelId]: status };
+      // ponytail: write last-known live status to localStorage so the next
+      // app open paints the LIVE badge immediately (before the first poll
+      // round-trip). Server-side warm already keeps the API hot, but
+      // local cache means we never paint an empty list.
+      persistChannelLiveStatuses(
+        Object.fromEntries(
+          Object.entries(next).map(([cid, s]) => [cid, { ...s, fetched_at: Date.now() }]),
+        ) as unknown as Record<string, StoredChannelLiveStatus>,
+      );
+      return next;
+    });
+  }, []);
+
+  // Kick an immediate live-status fetch for a freshly added channel. The
+  // backend doesn't know the channel until the 2s-debounced settings POST
+  // lands, so the first attempt 404s by design; retry once ~2.5s later,
+  // which lands after the POST. Covers the case where the poll effect is
+  // paused (preview open / other tab). Non-404 errors give up immediately —
+  // the poll effect (or the next add) will retry.
+  const kickChannelLiveStatus = useCallback((channelId: string) => {
+    void (async () => {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const status = await apiGet<ChannelLiveStatus>(`/api/channels/${channelId}/live`);
+          applyLiveStatus(channelId, status);
+          return;
+        } catch (err) {
+          const notFound = err instanceof Error && /not found/i.test(err.message);
+          if (!notFound || attempt === 1) return;
+          // ponytail: executor form — tsconfig lib predates ES2024 Promise.withResolvers
+          await new Promise<void>((resolve) => { window.setTimeout(resolve, 2500); });
+        }
+      }
+    })();
+  }, [applyLiveStatus]);
+
   // Poll live status for every saved channel while the Channels tab is open.
   // The first poll fires immediately (no setTimeout) so the LIVE badge paints
   // on the same render the Channels tab opens. Server-side startup warm
@@ -2021,10 +2063,13 @@ export default function App() {
     let pollCount = 0;
     const fetchedAt: Record<string, number> = {};
     const inFlight = new Set<string>();
-    // Channels that 404 (removed from backend settings, e.g. stale ids left
-    // in localStorage) are dropped from the poll list so they stop 404ing
-    // every cycle. Reset on effect re-run (tab switch / channel-list change),
-    // so a recovered channel gets one retry per visit.
+    // A 404 whose id is ALSO gone from the saved list (removed from backend
+    // settings, e.g. stale ids left in localStorage) is dropped from the poll
+    // list so it stops 404ing every cycle. A 404 for an id STILL in the list
+    // is the add race — the backend hasn't learned the channel yet (the
+    // frontend persists via a 2s-debounced settings POST) — and must NOT be
+    // dropped. Reset on effect re-run (tab switch / channel-list change), so
+    // a recovered channel gets one retry per visit.
     // ponytail: no periodic revalidation; re-adding the channel mints a new
     // id anyway, and backend settings hydrate replaces the list wholesale.
     const droppedIds = new Set<string>();
@@ -2039,25 +2084,20 @@ export default function App() {
         const status = await apiGet<ChannelLiveStatus>(`/api/channels/${ch.id}/live`);
         if (!cancelled) {
           fetchedAt[ch.id] = Date.now();
-          setChannelLiveStatuses((prev) => {
-            const next = { ...prev, [ch.id]: status };
-            // ponytail: write last-known live status to localStorage so the next
-            // app open paints the LIVE badge immediately (before the first poll
-            // round-trip). Server-side warm already keeps the API hot, but
-            // local cache means we never paint an empty list.
-            persistChannelLiveStatuses(
-              Object.fromEntries(
-                Object.entries(next).map(([cid, s]) => [cid, { ...s, fetched_at: Date.now() }]),
-              ) as unknown as Record<string, StoredChannelLiveStatus>,
-            );
-            return next;
-          });
+          applyLiveStatus(ch.id, status);
         }
       } catch (err) {
         // The live endpoint 404s with detail "Channel not found" when the
-        // channel no longer exists in backend settings — drop it from the
-        // poll list so a stale id stops polluting every tick.
-        if (err instanceof Error && /not found/i.test(err.message)) {
+        // channel no longer exists in backend settings. Only drop the id
+        // when it is truly gone from the saved list — a freshly added
+        // channel 404s until the 2s-debounced settings POST teaches the
+        // backend about it, and dropping it on that race would blacklist
+        // the id for the whole visit.
+        if (
+          err instanceof Error &&
+          /not found/i.test(err.message) &&
+          shouldDropChannelFromLivePoll(ch.id, savedChannelsRef.current)
+        ) {
           droppedIds.add(ch.id);
         }
       } finally {
@@ -5139,6 +5179,11 @@ export default function App() {
     };
     setSavedChannels((prev) => [...prev, entry]);
     setSelectedChannelId(id);
+    // The poll effect re-runs on this list change, but its first tick fires
+    // before the 2s-debounced settings POST reaches the backend (the add race)
+    // and the effect may be paused entirely (preview open / other tab). Kick
+    // a dedicated fetch that retries once after the POST lands.
+    kickChannelLiveStatus(id);
     channelRefreshInFlightRef.current.delete(`${id}:vods`);
     channelRefreshInFlightRef.current.delete(`${id}:clips`);
     channelRefreshInFlightRef.current.delete(`${id}:streams`);
@@ -5152,7 +5197,7 @@ export default function App() {
     if (channelContentFilter === 'streams' && youtube) {
       await refreshChannel(id, entry, 'streams');
     }
-  }, [savedChannels.length, refreshChannel, channelContentFilter]);
+  }, [savedChannels.length, refreshChannel, channelContentFilter, kickChannelLiveStatus]);
 
   const channelLinkDuplicate = useMemo(() => {
     if (!pendingAddChannel) return null;
