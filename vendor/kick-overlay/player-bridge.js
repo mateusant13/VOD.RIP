@@ -88,11 +88,7 @@ window.addEventListener('message', (ev) => {
       try { p.setMuted(!!m.m); } catch (e) { /* ignore */ }
       break;
     case 'volume':
-      try {
-        p.setVolume(m.v);
-        if (m.v === 0) p.setMuted(true);
-        else if (p.isMuted()) p.setMuted(false);
-      } catch (e) { /* ignore */ }
+      try { p.setVolume(m.v); } catch (e) { /* ignore */ }
       break;
     case 'seek':
       try { p.seekTo(m.s); } catch (e) { /* outside window */ }

@@ -72,7 +72,8 @@ const KO = {
   lastKickSt: 0,   // epoch ms of the last st message (frame-death watchdog)
   pendingUrl: null,// playback_url queued until the frame reports ready
   kickVol: 1,
-  kickMuted: true, // kick audio follows the shown/hidden layer (one-rendering)
+  kickMuted: false, // user's kick mute choice (persisted; hidden-mute is separate)
+  ytVol: 100,       // user's youtube volume (persisted, applied on show)
   ytState: { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, error: 0 },
   ytUnlock: false,
   bridgeInjected: false,
@@ -92,6 +93,15 @@ const KO = {
 
 // ---- storage ----------------------------------------------------------------
 
+function applyVols(vols) {
+  vols = vols || {};
+  const kv = vols.kick || {};
+  const yv = vols.yt || {};
+  if (typeof kv.v === 'number') KO.kickVol = kv.v;
+  if (typeof kv.m === 'boolean') KO.kickMuted = kv.m;
+  if (typeof yv.v === 'number') KO.ytVol = yv.v;
+}
+
 function loadState() {
   return new Promise((res) => {
     chrome.storage.local.get(KEY, (o) => {
@@ -99,6 +109,7 @@ function loadState() {
       KO.enabled = s.enabled === undefined ? true : !!s.enabled;
       KO.player = s.player === 'twitch' ? 'twitch' : s.player === 'youtube' ? 'youtube' : 'kick';
       KO.mappings = s.mappings && typeof s.mappings === 'object' ? s.mappings : {};
+      applyVols(s.vols);
       res();
     });
   });
@@ -107,7 +118,17 @@ function loadState() {
 function saveState() {
   return new Promise((res) => {
     chrome.storage.local.set(
-      { [KEY]: { enabled: KO.enabled, mappings: KO.mappings, player: KO.player } },
+      {
+        [KEY]: {
+          enabled: KO.enabled,
+          mappings: KO.mappings,
+          player: KO.player,
+          vols: {
+            kick: { v: KO.kickVol, m: KO.kickMuted },
+            yt: { v: KO.ytVol },
+          },
+        },
+      },
       res,
     );
   });
@@ -116,10 +137,16 @@ function saveState() {
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local' || !changes[KEY]) return;
   const s = changes[KEY].newValue || {};
+  const prev = changes[KEY].oldValue || {};
+  const pChanged =
+    !!s.enabled !== !!prev.enabled ||
+    (s.player || 'kick') !== (prev.player || 'kick') ||
+    JSON.stringify(s.mappings || {}) !== JSON.stringify(prev.mappings || {});
   KO.enabled = !!s.enabled;
   KO.player = s.player === 'twitch' ? 'twitch' : s.player === 'youtube' ? 'youtube' : 'kick';
   KO.mappings = s.mappings && typeof s.mappings === 'object' ? s.mappings : {};
-  apply(); // hot toggle / remap / player switch — no page reload
+  applyVols(s.vols);
+  if (pChanged) apply(); // hot toggle / remap / player switch — no page reload
 });
 
 // ---- helpers ----------------------------------------------------------------
@@ -207,9 +234,9 @@ function injectBridge() {
   (document.head || document.documentElement).appendChild(s);
 }
 
-function ytCmd(cmd) {
+function ytCmd(cmd, arg) {
   try {
-    window.postMessage({ __koYtCmd: cmd }, '*');
+    window.postMessage({ __koYtCmd: cmd, __koYtArg: arg }, '*');
   } catch {
     /* ignore */
   }
@@ -275,6 +302,7 @@ window.addEventListener('message', (ev) => {
   if (!d || !d.__koYt) return;
   if (d.t === 'ready') {
     KO.ytState.ready = true;
+    ytCmd('setVolume', KO.ytVol); // restore the user's last yt volume on a fresh embed
     throttledYtProbe();
   } else if (d.t === 'status') {
     const prevLive = KO.ytState.live;
@@ -284,6 +312,10 @@ window.addEventListener('message', (ev) => {
     KO.ytState.dur = d.dur || 0;
     KO.ytState.ct = d.ct || 0;
     KO.ytState.vq = d.vq || '';
+    if (!d.muted && typeof d.volume === 'number' && d.volume >= 0 && KO.ytVol !== d.volume) {
+      KO.ytVol = d.volume; // remember the user's yt volume slider
+      saveState();
+    }
     if (KO.player === 'youtube') throttledYtProbe();
     if (prevLive && !KO.ytState.live && KO.player === 'youtube') throttledYtProbe();
     if (KO.player === 'youtube' && KO.ytState.live && KO.ytState.muted) enableYtUnlock();
@@ -502,6 +534,7 @@ function mount() {
     kickSend({ t: 'mute', m: KO.kickMuted });
     if (!KO.kickMuted) kickSend({ t: 'volume', v: KO.kickVol });
     updateBar();
+    saveState(); // remember the user's kick mute choice
   });
   const vol = bar.querySelector('#ko-vol');
   vol.addEventListener('input', () => {
@@ -510,6 +543,9 @@ function mount() {
     kickSend({ t: 'volume', v: KO.kickVol });
     kickSend({ t: 'mute', m: KO.kickMuted });
     updateBar();
+  });
+  vol.addEventListener('change', () => {
+    saveState(); // remember the user's kick volume slider
   });
   const seek = bar.querySelector('#ko-seek');
   seek.addEventListener('input', () => {
@@ -612,6 +648,7 @@ function showYtLayer() {
     kickSend({ t: 'mute', m: true });
   }
   ytCmd('play');
+  ytCmd('setVolume', KO.ytVol); // the user's last yt volume follows the player switch
   ytCmd('unmute');
   setTimeout(() => {
     // Muted autoplay fallback: unmute on the first user gesture.

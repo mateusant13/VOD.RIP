@@ -27,6 +27,7 @@
       return {
         playing: player.getPlayerState() === 1,
         muted: player.isMuted(),
+        volume: player.getVolume(),
         live: !!d.video_id,
         dur: player.getDuration() || 0,
         ct: player.getCurrentTime() || 0,
@@ -108,6 +109,9 @@
           break;
         case 'live':
           player.seekTo(player.getDuration(), true);
+          break;
+        case 'setVolume':
+          player.setVolume(Number(d.__koYtArg) || 0);
           break;
         case 'status':
           var s = status();
