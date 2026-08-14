@@ -69,6 +69,9 @@ const NOT_CHANNEL = new Set([
   'wallet', 'moderation', 'popout', 'videos', 'clips', 'team', 'tags',
 ]);
 
+// Build marker for the diag stream — lets us tell which code a tab runs
+// (content scripts of pre-reload tabs survive extension reloads).
+const KO_VER = '0.7.6+f3';
 const KO = {
   enabled: false,
   player: 'kick', // 'kick' | 'youtube' | 'twitch' — switching never rebuilds players
@@ -1308,6 +1311,31 @@ function rectTick() {
         s.top = `${r.top}px`;
         s.width = `${r.width}px`;
         s.height = `${r.height}px`;
+        // One-shot anomaly dump: the applied rect and the rendered box
+        // disagree (the "mini player" symptom) — capture the constraint
+        // source. Rate-limited 30s; renders fresh ground truth.
+        if (Math.abs(KO.wrap.offsetHeight - Math.round(r.height)) > 2 && r.height > 40) {
+          if (!KO.rectFitAt || Date.now() - KO.rectFitAt > 30000) {
+            KO.rectFitAt = Date.now();
+            const cs = getComputedStyle(KO.wrap);
+            let chain = [];
+            let pel = KO.wrap.parentElement;
+            for (let i = 0; i < 4 && pel; i++, pel = pel.parentElement) {
+              const cr = pel.getBoundingClientRect();
+              chain.push(pel.tagName + '.' + String(pel.className || '').split(' ')[0] + ' h=' + Math.round(cr.height) + ' ' + getComputedStyle(pel).position);
+            }
+            diag('rect_fit', {
+              applied: { w: Math.round(r.width), h: Math.round(r.height) },
+              box: { w: KO.wrap.offsetWidth, h: KO.wrap.offsetHeight },
+              styleAttr: (KO.wrap.getAttribute('style') || '').slice(0, 160),
+              csHeight: cs.height,
+              csMaxH: cs.maxHeight,
+              csPos: cs.position,
+              wrapCount: document.querySelectorAll('#ko-wrap').length,
+              parentChain: chain,
+            });
+          }
+        }
         if (KO.wrap.style.display === 'none') showWrap();
         // Ground truth when the page video population is unusual (a second
         // visible video — hover preview, clips card — or a large shrink):
@@ -1573,11 +1601,12 @@ window.addEventListener('kick-overlay:status', () => {
   }
   injectStyles();
   startWatchers();
-  diag('boot', { url: location.href.slice(0, 70), slug: currentSlug(), enabled: KO.enabled, player: KO.player, kickSlug: KO.kickSlug, hidden: document.hidden });
+  diag('boot', { ver: KO_VER, url: location.href.slice(0, 70), slug: currentSlug(), enabled: KO.enabled, player: KO.player, kickSlug: KO.kickSlug, hidden: document.hidden });
   // Heartbeat: full overlay state every 8s while the page is open.
   setInterval(() => {
     const tv = twitchVideo();
     diag('hb', {
+      ver: KO_VER,
       slug: KO.slug,
       player: KO.player,
       wrapShown: !!(KO.wrap && KO.wrap.style.display !== 'none'),
