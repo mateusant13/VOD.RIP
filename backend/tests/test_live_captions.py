@@ -476,9 +476,55 @@ async def test_captioner_pdt_flush_carries_latency_ms(monkeypatch):
         assert block["text"] == "window-1"
         # window start anchors to the playlist PDT (wall epoch)
         assert block["start"] == pytest.approx(_time.time() - 30, abs=5.0)
-        # the flush happened AFTER the window's audio completed — a small,
-        # positive wall latency
-        assert 0 <= block["latency_ms"] < 60_000
+        # latency_ms measures wall ms since the window's audio completed —
+        # time.time() and the PDT-derived end must be on the SAME clock base
+        # (UTC epoch); a frontend/backend parse mismatch would drift this by
+        # the user's timezone offset, not by a few ms. Tolerance covers only
+        # the queue hop between the flush and this assertion.
+        assert block["latency_ms"] == pytest.approx(
+            (_time.time() - block["end"]) * 1000, abs=250.0
+        )
+        assert block["latency_ms"] >= 0
+    finally:
+        captioner.release()
+        th = captioner._thread
+        assert th is not None
+        th.join(timeout=3.0)
+    assert (captioner.platform, captioner.channel) not in live_captions._CAPTIONERS
+
+
+@pytest.mark.anyio
+async def test_captioner_pdt_with_zone_offset_parses_to_utc_epoch(monkeypatch):
+    """A PDT carrying a NON-UTC zone offset must parse to the SAME UTC epoch
+    as the equivalent Z value — caption start/end and time.time() (latency_ms)
+    share one base, so an offset-aware parse is mandatory (a naive/localtime
+    read on either side is the caption-drift suspect)."""
+    from datetime import datetime, timezone
+
+    # 2024-01-01T00:00:00Z, written with a +02:00 offset for the same instant.
+    playlist = (
+        "#EXTM3U\n#EXT-X-TARGETDURATION:2\n"
+        "#EXT-X-PROGRAM-DATE-TIME:2024-01-01T02:00:00.000+02:00\n"
+        "#EXTINF:1.0,\nseg1.ts\n"
+        "#EXTINF:1.0,\nseg2.ts\n"
+    )
+    pipeline = _FakePipeline([playlist], ["window-1"])
+    live_captions = _install_pipeline(monkeypatch, pipeline)
+
+    loop = asyncio.get_running_loop()
+    captioner = live_captions.LiveCaptioner(
+        "twitch", "srdogg", loop, window_sec=1.5, poll_sec=0.02,
+    )
+    captioner.acquire()
+    try:
+        ev, block = await _wait_event(captioner.events)
+        assert ev == "caption"
+        assert block["text"] == "window-1"
+        expected = datetime(2024, 1, 1, tzinfo=timezone.utc).timestamp()
+        # The +02:00 tag lands on the UTC epoch, not 2h off.
+        assert block["start"] == pytest.approx(expected, abs=0.01)
+        assert block["end"] == pytest.approx(expected + 2.0, abs=0.01)
+        assert block["latency_ms"] >= 0
     finally:
         captioner.release()
         th = captioner._thread
