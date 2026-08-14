@@ -92,6 +92,20 @@ def _bundled_bgutil_datas():
     return [(str(server_dir), "runtime/bgutil-pot/server")]
 
 
+def _silero_vad_datas():
+    """Bundle silero-vad's weights (silero_vad/data/*.onnx|*.jit).
+
+    model.py resolves them via importlib.resources.files("silero_vad.data"),
+    which modulegraph never sees — without this the frozen app dies with
+    'No module named silero_vad.data' on every VAD call (archive + live)."""
+    try:
+        from PyInstaller.utils.hooks import collect_data_files
+        return collect_data_files("silero_vad")
+    except Exception:
+        # ponytail: best-effort — a missing wheel just loses VAD weights
+        return []
+
+
 def _asr_gpu_binaries():
     """Bundle the on-device ASR runtime so packaged users transcribe with
     zero commands (the answer to "users dont need to run any commands").
@@ -230,7 +244,7 @@ a = Analysis(
     ] + ([(
         str(_ICON_ICNS), ".",
     )] if _IS_MAC and _ICON_ICNS.is_file() else [])
-      + _bundled_bgutil_datas(),
+      + _bundled_bgutil_datas() + _silero_vad_datas(),
     hiddenimports=_hidden_imports(),
     hookspath=[str(_hooks)] if _hooks.is_dir() else [],
     runtime_hooks=[],
