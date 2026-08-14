@@ -684,6 +684,16 @@ def _run_pass() -> None:
         refresh_async(channels)
     except Exception:  # noqa: BLE001 — the kick must never break a pass
         logger.debug("instant preview kick failed", exc_info=True)
+    # Instant-preview PREFETCH — first ~8s of the 5 newest VODs per
+    # (channel, platform), served by proxy_segment/proxy_playlist. Also a
+    # background worker (one at a time): fetches are bounded but must never
+    # block the pass. A channel add/edit (kick_scheduler_pass) refreshes it.
+    try:
+        from services.prefetch_cache import kick_prefetch_pass
+
+        kick_prefetch_pass(channels)
+    except Exception:  # noqa: BLE001 — the kick must never break a pass
+        logger.debug("prefetch kick failed", exc_info=True)
     _backfill_twitch_chat(channels)
     _backfill_youtube_chat()
     _backfill_original_titles(channels)
