@@ -346,7 +346,7 @@ window.addEventListener('message', (ev) => {
   // placeholder sits at -1 (unstarted) and never leaves it.
   KO.ytState.playing = st === 1;
   KO.ytState.muted = !!info.muted;
-  KO.ytState.live = st === 1 || st === 3;
+  KO.ytState.live = st === 1 || st === 2 || st === 3; // 2=paused: the layer is up, just not playing
   KO.ytState.dur = info.duration || 0;
   KO.ytState.ct = info.currentTime || 0;
   KO.ytState.vq = info.playbackQuality || '';
@@ -509,11 +509,17 @@ async function kickFetchDvr() {
 function kickSeekTo(target) {
   const st = KO.kickState || {};
   const max = Math.max(1, KO.kickDur || Math.ceil((st.pos || 0) + (st.lat || 0)));
-  if (max - target <= 30) {
+  const lat = isFinite(st.lat) && st.lat >= 0 ? st.lat : 0;
+  const edge = max - lat; // newest frame actually available
+  // kick semantics: a click within 30s of the edge means "go live"; farther
+  // back seeks the DVR url, clamped to edge-30s so a mis-click into the
+  // latency buffer can't request a future seek.
+  const t = Math.min(target, Math.max(0, edge - 30));
+  if (edge - t <= 30) {
     kickBackToLive();
     return;
   }
-  kickStartDvr(target);
+  kickStartDvr(t);
 }
 
 function kickStartDvr(target) {
@@ -648,7 +654,13 @@ function updateKickVolUI() {
   const muteBtn = KO.wrap.querySelector('#ko-mute');
   if (fillEl) fillEl.style.width = (v * 100) + '%';
   if (thumbEl) thumbEl.style.left = (v * 100) + '%';
-  if (muteBtn) muteBtn.innerHTML = v === 0 ? KO_SVG.muted : KO_SVG.sound;
+  if (muteBtn) {
+    const want = v === 0 ? 'muted' : 'sound';
+    if (muteBtn.dataset.st !== want) {
+      muteBtn.dataset.st = want;
+      muteBtn.innerHTML = want === 'muted' ? KO_SVG.muted : KO_SVG.sound;
+    }
+  }
 }
 
 function mount() {
@@ -717,17 +729,43 @@ function mount() {
     const r = volTrack.getBoundingClientRect();
     return r.width ? Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) : 0;
   };
-  volwrap.addEventListener('pointerdown', (e) => {
-    if (e.target === muteBtn || e.target.closest('#ko-mute')) return;
-    e.preventDefault();
+  let volDrag = false;
+  const setVolFrom = (e) => {
     const v = volFrac(e);
     KO.kickVol = v;
     KO.kickMuted = v === 0;
     kickSend({ t: 'volume', v: KO.kickVol });
     kickSend({ t: 'mute', m: KO.kickMuted });
     updateKickVolUI();
+  };
+  volwrap.addEventListener('pointerdown', (e) => {
+    if (e.target === muteBtn || e.target.closest('#ko-mute')) return;
+    e.preventDefault();
+    volDrag = true;
+    try {
+      volwrap.setPointerCapture(e.pointerId);
+    } catch {
+      /* capture unsupported */
+    }
+    setVolFrom(e);
   });
-  volwrap.addEventListener('pointerup', () => saveState());
+  volwrap.addEventListener('pointermove', (e) => {
+    if (!volDrag) return;
+    if (e.buttons === 0) {
+      // capture lost: release happened outside — still persist
+      volDrag = false;
+      saveState();
+      return;
+    }
+    setVolFrom(e);
+  });
+  volwrap.addEventListener('pointerup', () => {
+    volDrag = false;
+    saveState();
+  });
+  volwrap.addEventListener('pointercancel', () => {
+    volDrag = false;
+  });
   const sb = bar.querySelector('#ko-seekbar');
   const hov = bar.querySelector('#ko-hov');
   let dragging = false;
@@ -741,7 +779,7 @@ function mount() {
     const dur = KO.kickDur || 1;
     hov.textContent = KO.kickOnDvr
       ? fmtDur(pos, dur >= 3600)
-      : pos >= dur - 0.01 * dur
+      : pos >= dur - 30
         ? 'LIVE'
         : '-' + fmtDur(dur - pos, dur >= 3600);
     hov.style.left = Math.max(14, Math.min(r.width - 14, frac * r.width)) + 'px';
@@ -749,6 +787,11 @@ function mount() {
   };
   sb.addEventListener('pointermove', (e) => {
     if (dragging) {
+      if (e.buttons === 0) {
+        // capture lost: release happened outside the bar — end the drag
+        endDrag(e);
+        return;
+      }
       setKickFill(fracFromEvent(e));
       KO.seeking = true;
       return;
@@ -823,7 +866,7 @@ function teardown() {
     KO.wrap.remove();
     KO.wrap = null;
   }
-  ytCmd('destroy');
+  // the embed dies with the removed iframe; no ytCmd('destroy') exists
   KO.ytState = { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, error: 0 };
   KO.ytUnlock = false;
   KO.kickWin = null;
@@ -995,7 +1038,13 @@ function updateKickBar() {
     if (elapsed && Number.isFinite(KO.kickStreamStart)) elapsed.textContent = fmtDur((Date.now() - KO.kickStreamStart) / 1000, max >= 3600);
   }
   const playBtn = KO.wrap.querySelector('#ko-play');
-  if (playBtn) playBtn.innerHTML = st.state === 'Playing' ? KO_SVG.pause : KO_SVG.play;
+  if (playBtn) {
+    const want = st.state === 'Playing' ? 'pause' : 'play';
+    if (playBtn.dataset.st !== want) {
+      playBtn.dataset.st = want;
+      playBtn.innerHTML = want === 'pause' ? KO_SVG.pause : KO_SVG.play;
+    }
+  }
   updateKickVolUI();
 }
 
@@ -1188,10 +1237,24 @@ function startWatchers() {
 function startRectLoop() {
   stopRectLoop();
   KO.rectTimer = setInterval(() => {
-    if (!KO.wrap) {
-      stopRectLoop();
-      return;
+    try {
+      rectTick();
+    } catch (err) {
+      // A per-tick crash would leave the wrap frozen at a stale rect (the
+      // "mini player" symptom) — log it once and keep the loop alive.
+      if (!KO.rectErrShown) {
+        KO.rectErrShown = true;
+        diag('rect_err', { m: String((err && err.message) || err).slice(0, 120) });
+      }
     }
+  }, RECT_MS);
+}
+
+function rectTick() {
+  if (!KO.wrap) {
+    stopRectLoop();
+    return;
+  }
     ensureAttached(KO.wrap); // Twitch may re-render main — re-parent if dropped
     const tv = twitchVideo();
     updateTwLiveSticky(tv);
@@ -1265,7 +1328,6 @@ function startRectLoop() {
       resumeTwitchIfOurs();
       syncMute();
     }
-  }, RECT_MS);
 }
 
 function stopRectLoop() {
@@ -1354,6 +1416,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         /* already gone */
       }
     }
+    // The point of the button is SEEING the overlay without the Twitch
+    // player — if the current player is 'twitch' the overlay would stay
+    // hidden and the click would look dead. Force an overlay player on.
+    if (KO.player === 'twitch') {
+      KO.player = 'kick';
+      saveState();
+    }
+    apply();
     diag('tw_delete', {});
     sendResponse({ ok: true });
   }
@@ -1421,7 +1491,8 @@ window.addEventListener('kick-overlay:status', () => {
   const setupSlug = currentSlug(); // KO.slug is still null at init
   if (setupSlug && (qYt || qKick || qPlayer)) {
     const m = KO.mappings[setupSlug];
-    const base = m && typeof m === 'object' ? { ...m } : { kick: setupSlug };
+    // legacy mappings can be a plain string (mappings[slug] = 'foo'); keep it
+    const base = typeof m === 'string' ? { kick: m } : m && typeof m === 'object' ? { ...m } : { kick: setupSlug };
     if (qKick) base.kick = qKick.toLowerCase();
     if (qYt) {
       base.yt = qYt;
@@ -1480,6 +1551,8 @@ window.addEventListener('kick-overlay:status', () => {
             hot: KO.wrap.classList.contains('ko-hot'),
           }
         : null,
+      wr: KO.wrap ? { w: Math.round(KO.wrap.offsetWidth), h: Math.round(KO.wrap.offsetHeight) } : null,
+      vr: tv ? { w: Math.round(tv.getBoundingClientRect().width), h: Math.round(tv.getBoundingClientRect().height) } : null,
     });
   }, 8000);
   apply();
