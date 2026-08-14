@@ -368,40 +368,6 @@ export function openTwitchClipEditorInBrowser(
   return window.open(url, '_blank');
 }
 
-/**
- * Open Twitch's clip editor for a LIVE broadcast in the OS default browser.
- * The player page (twitch.tv/<channel>) carries the live player; the VOD.RIP
- * cookie extension's content script (clip_assist.mjs, player flow) clicks the
- * player's Clip button, opens the editor overlay, fills the title and clicks
- * Publish using Twitch's own session cookie — no API token or Helix scopes.
- * vodrip_start/end carry the requested duration (the player flow can't seek a
- * live stream; the editor's native selection stays, the duration is reported).
- */
-export function openTwitchLiveClipEditorInBrowser(
-  broadcasterLogin: string,
-  durationSec: number,
-  title: string,
-  targetWindow?: Window | null,
-): Window | null {
-  const login = broadcasterLogin.trim();
-  if (!login) throw new Error('Channel login is required to create a Twitch clip');
-  const dur = Math.max(5, Math.min(60, Math.round(durationSec)));
-  const p = new URLSearchParams({
-    vodrip_clip: '1',
-    vodrip_start: '0',
-    vodrip_end: String(dur),
-    vodrip_close: '0',
-    vodrip_title: title.trim() || `${login} live clip`,
-  });
-  const url = `https://www.twitch.tv/${encodeURIComponent(login)}?${p.toString()}`;
-  reportClipEvent('live_browser_open', { url, durationSec: dur, title: title.trim() });
-  if (targetWindow) {
-    targetWindow.location.href = url;
-    return targetWindow;
-  }
-  return window.open(url, '_blank');
-}
-
 export async function fetchTwitchClipHistory(): Promise<TwitchClipRecord[]> {
   return apiGet<TwitchClipRecord[]>('/api/twitch/clips/history');
 }
