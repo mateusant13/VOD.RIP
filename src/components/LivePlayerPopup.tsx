@@ -161,6 +161,13 @@ const CAPTION_LEAD_SEC = 0.25;
 const CAPTION_STALE_SKIP_SEC = 1.0;
 /** Newest (pos → pdt) frag anchors kept for the currentTime→wall map. */
 const CAPTION_MAX_PDT_ANCHORS = 16;
+/** Caption overlay font-size control — A−/A+ steps the transport row's CC
+ *  buttons between the default `text-sm` (14px) and 48px; the choice is
+ *  persisted so a preference survives popup reopen. */
+const CAPTION_FONT_MIN_PX = 14;
+const CAPTION_FONT_MAX_PX = 48;
+const CAPTION_FONT_STEP_PX = 2;
+const CAPTION_FONT_STORAGE_KEY = 'vodrip.live.captionFontSize';
 
 /** Wall epoch seconds of a frag's PROGRAM-DATE-TIME, with the backend's
  *  _parse_iso_epoch semantics: an explicit zone offset is honored, a NAIVE
@@ -458,6 +465,25 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   }, [activeEntry.url, activeEntry.platform, channel, channelSlug]);
   const [captionsAvailable, setCaptionsAvailable] = useState(false);
   const [captionsEnabled, setCaptionsEnabled] = useState(true);
+  // Overlay font size (px) — seeded from localStorage, A−/A+ steps it in the
+  // transport row; the save effect below writes every change back so the
+  // user's preference survives reopen (storage blocked → keep the default).
+  const [captionFontSize, setCaptionFontSize] = useState<number>(() => {
+    try {
+      const n = Number(localStorage.getItem(CAPTION_FONT_STORAGE_KEY));
+      if (Number.isInteger(n) && n >= CAPTION_FONT_MIN_PX && n <= CAPTION_FONT_MAX_PX) return n;
+    } catch {
+      /* storage unavailable */
+    }
+    return CAPTION_FONT_MIN_PX;
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(CAPTION_FONT_STORAGE_KEY, String(captionFontSize));
+    } catch {
+      /* storage blocked — the preference simply won't persist */
+    }
+  }, [captionFontSize]);
   const [caption, setCaption] = useState<CaptionBlock | null>(null);
   // Caption clock anchor state — refs (mutated by hls events + SSE, read by
   // the timeupdate sync; no re-render needed for the map itself):
@@ -2023,15 +2049,41 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                   rendered when the parakeet gate reports available (503 /
                   missing engine → no button, no overlay). */}
               {captionsAvailable && (
-                <button
-                  type="button"
-                  onClick={() => setCaptionsEnabled((on) => !on)}
-                  aria-pressed={captionsEnabled}
-                  title={captionsEnabled ? t('Hide captions') : t('Live captions')}
-                  className={captionsEnabled ? ccBtnLit : `${transportBtn} opacity-40`}
-                >
-                  <Captions size={15} />
-                </button>
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setCaptionsEnabled((on) => !on)}
+                    aria-pressed={captionsEnabled}
+                    title={captionsEnabled ? t('Hide captions') : t('Live captions')}
+                    className={captionsEnabled ? ccBtnLit : `${transportBtn} opacity-40`}
+                  >
+                    <Captions size={15} />
+                  </button>
+                  {/* Caption text size — A−/A+ step the overlay font between
+                      14px and 48px (2px per click, disabled at the ends).
+                      Font only: the anchored timing/position logic is
+                      untouched. */}
+                  <button
+                    type="button"
+                    onClick={() => setCaptionFontSize((s) => Math.max(CAPTION_FONT_MIN_PX, s - CAPTION_FONT_STEP_PX))}
+                    disabled={captionFontSize <= CAPTION_FONT_MIN_PX}
+                    title={t('Smaller captions')}
+                    aria-label={t('Smaller captions')}
+                    className={`${transportBtn} px-1 font-mono text-xs font-bold leading-none`}
+                  >
+                    A−
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setCaptionFontSize((s) => Math.min(CAPTION_FONT_MAX_PX, s + CAPTION_FONT_STEP_PX))}
+                    disabled={captionFontSize >= CAPTION_FONT_MAX_PX}
+                    title={t('Larger captions')}
+                    aria-label={t('Larger captions')}
+                    className={`${transportBtn} px-1 font-mono text-xs font-bold leading-none`}
+                  >
+                    A+
+                  </button>
+                </>
               )}
 
               {clipNotice && (
@@ -2088,7 +2140,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
             data-live-captions-overlay
             className="pointer-events-none absolute inset-x-0 bottom-16 z-[5] flex justify-center px-4"
           >
-            <p className="line-clamp-2 max-w-[95%] rounded bg-black/60 px-3 py-1.5 text-center text-sm font-semibold leading-snug text-zinc-100 [text-shadow:0_1px_2px_rgba(0,0,0,0.9)] backdrop-blur-[2px]">
+            <p
+              className="line-clamp-2 max-w-[95%] rounded bg-black/60 px-3 py-1.5 text-center font-semibold leading-snug text-zinc-100 [text-shadow:0_1px_2px_rgba(0,0,0,0.9)] backdrop-blur-[2px]"
+              style={{ fontSize: captionFontSize }}
+            >
               {caption.text}
             </p>
           </div>
