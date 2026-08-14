@@ -104,11 +104,13 @@ def test_background_mode_environment(monkeypatch):
 
 
 def test_background_caps_cpu_lanes(monkeypatch):
-    """Even a 64-thread box gets 2 lanes in background mode — the threads
-    belong to the user's other boot work, not extra model copies."""
+    """Even a 64-thread box gets 3 lanes in background mode — the threads
+    belong to the user's other boot work, not extra model copies. (FIX E:
+    background 2 -> 3; the RAM/contention clamps still cap the actual
+    slots.)"""
     monkeypatch.setenv("VODRIP_BACKGROUND", "1")
     monkeypatch.setattr("os.cpu_count", lambda: 64)
-    assert at._cpu_auto_workers() == 2
+    assert at._cpu_auto_workers() == 3
     monkeypatch.delenv("VODRIP_BACKGROUND")
     assert at._cpu_auto_workers() == 4  # interactive: ladder unchanged
 

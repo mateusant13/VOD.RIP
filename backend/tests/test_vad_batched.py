@@ -173,6 +173,49 @@ def test_vad_batched_regions_match_legacy() -> None:
     _run()
 
 
+def _multi_vad_in_thread(seen: list) -> None:
+    """One lane's view: mark the thread as a pool lane and load ITS VAD."""
+    at._multi_tls.active = True
+    try:
+        seen.append(id(at._get_vad()))
+    finally:
+        at._multi_tls.active = False
+
+
+def test_multi_mode_gives_each_lane_its_own_vad() -> None:
+    """FIX E: multi-copy lanes each own a Silero VAD instance — the global
+    _vad_lock no longer serializes lanes (it guards only lazy load), and
+    the lanes never share LSTM state. Off-pool callers keep the single
+    process-global instance."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    at._vad = None
+    at._thread_slots.clear()
+    try:
+        seen: list = []
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futs = [pool.submit(_multi_vad_in_thread, seen) for _ in range(2)]
+            for f in futs:
+                f.result()
+        assert len(seen) == 2 and seen[0] != seen[1], (
+            f"each lane must get its own VAD instance, got {seen}"
+        )
+        # The multi-mode loads never touched the global instance.
+        assert at._vad is None, "lane VADs must not populate the global slot"
+
+        # Off-pool callers (live captions, direct calls) share the global.
+        at._multi_tls.active = False
+        g1 = at._get_vad()
+        g2 = at._get_vad()
+        assert id(g1) == id(g2), "off-pool callers must share one global VAD"
+    finally:
+        at._vad = None
+        at._thread_slots.clear()
+        at._multi_tls.active = False
+        at._vad_lock = threading.Lock()  # fresh lock for later tests
+
+
 if __name__ == "__main__":
     import logging
 

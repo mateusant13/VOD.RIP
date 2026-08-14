@@ -90,6 +90,43 @@ def test_cpu_lane_exists_at_every_tier():
         assert ("cpu", "int8") in plan, (gb, plan)
 
 
+def test_background_cpu_default_is_three_lanes(monkeypatch):
+    """FIX E: background (autostart) CPU lanes 2 -> 3 — the default plan is
+    [cpu,int8] x 3 (~3 GB RSS at the 1.5 GB/lane estimate vs the 22.5 GB
+    free target). The env override VODRIP_TRANSCRIBE_WORKERS keeps winning
+    over the default."""
+    at._device_override = ("cpu", "int8")
+    monkeypatch.setenv("VODRIP_TRANSCRIBE_WORKERS", "")
+    monkeypatch.setattr(at, "background_mode", lambda: True)
+    monkeypatch.setattr(at, "_cpu_load_high", lambda: False)
+    try:
+        assert at._cpu_auto_workers() == 3, at._cpu_auto_workers()
+        plan = at._worker_plan()
+        assert plan == [
+            ("cpu", "int8"), ("cpu", "int8"), ("cpu", "int8"),
+        ], plan
+        # Env override still wins in background mode.
+        monkeypatch.setenv("VODRIP_TRANSCRIBE_WORKERS", "1")
+        assert at._worker_plan() == [("cpu", "int8")], at._worker_plan()
+    finally:
+        at._device_override = None
+
+
+def test_background_three_lanes_ram_clamped(monkeypatch):
+    """3-lane default is RAM-clamped on a tight box (usable free < 3x the
+    per-lane estimate) — never overshoots the machine."""
+    at._device_override = ("cpu", "int8")
+    monkeypatch.setenv("VODRIP_TRANSCRIBE_WORKERS", "")
+    monkeypatch.setattr(at, "background_mode", lambda: True)
+    monkeypatch.setattr(at, "_cpu_load_high", lambda: False)
+    monkeypatch.setattr(at, "_free_system_ram_bytes", lambda: 3 * 1024 ** 3)  # 3 GB free
+    try:
+        plan = at._worker_plan()
+        assert len(plan) <= 1, plan  # usable = 3*0.8 = 2.4 GB -> 1 lane
+    finally:
+        at._device_override = None
+
+
 def test_held_gpu_model_forces_cpu_lane():
     """nvidia-smi compute-apps shows another process -> never stack."""
     lane, copies, plan = _patched(16, held=True)

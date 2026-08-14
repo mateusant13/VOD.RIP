@@ -368,9 +368,10 @@ async def preview_invalidate(req: PreviewWarmRequest):
 
 
 # WS-1 preview-queue priority: previewing an archived video with no transcript
-# yet enqueues (or bumps) its transcribe job to priority 1 so the worker picks
-# it before any normal-queue job.
-_PREVIEW_TRANSCRIBE_PRIORITY = 1
+# yet enqueues (or bumps) its transcribe job to priority 200 so the worker
+# picks it before any normal-queue job AND before transcript-source search
+# re-enqueues (TRANSCRIBE_PRIORITY_HIGH = 100 — the focused preview wins).
+_PREVIEW_TRANSCRIBE_PRIORITY = 200
 
 
 def _preview_video_id(platform: str, url: str) -> Optional[str]:
@@ -391,13 +392,14 @@ def _preview_video_id(platform: str, url: str) -> Optional[str]:
 
 
 def _priority_transcribe_for_preview(session) -> None:
-    """Enqueue/bump a priority-1 transcribe job for a previewed archived video.
+    """Enqueue/bump a priority-200 transcribe job for a previewed archived video.
 
     Fires only when the archive DB has the video and transcription is enabled
     (archive_smart_enrich — the same toggle the search enrichment uses) and
-    no transcript rows exist yet. An existing *queued* job is bumped to
-    priority 1; running/failed/done jobs are never touched — the deterministic
-    job id (PK) keeps the dedupe, so nothing double-enqueues."""
+    no transcript rows exist yet. Twitch/Kick rows need no local archive file
+    (the worker downloads the audio at job time). An existing *queued* job
+    is bumped to priority 200; running/failed/done jobs are never touched —
+    the deterministic job id (PK) keeps the dedupe, so nothing double-enqueues."""
     platform = str(getattr(session, "platform", "") or "").strip().lower()
     if platform not in archive_db.PLATFORMS:
         return
@@ -410,10 +412,14 @@ def _priority_transcribe_for_preview(session) -> None:
     )
     if not rows:
         return  # not archived — nothing to transcribe
-    if not (rows[0]["archive_path"] or "").strip() or not Path(
-        rows[0]["archive_path"]
-    ).is_file():
+    if platform not in ("twitch", "kick") and (
+        not (rows[0]["archive_path"] or "").strip()
+        or not Path(rows[0]["archive_path"]).is_file()
+    ):
         return  # archive file evicted — whisper would fail immediately
+    # Twitch/Kick rows are enqueued even without a local file (Twitch ingest
+    # is metadata-only, and an evicted row still has the VOD online): the
+    # worker downloads the audio at job time (_transcribe_remote_twitch_kick).
     try:
         from deps import settings_mgr  # lazy: same pattern as routers.archive
 

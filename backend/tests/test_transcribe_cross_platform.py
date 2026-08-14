@@ -154,12 +154,42 @@ def test_process_job_skips_kick_when_mirror_transcribed(monkeypatch):
 def test_process_job_runs_whisper_when_no_higher_priority_mirror(monkeypatch):
     _seed_video("kick", "k7", "ck-nomirror")
     job_id = _seed_job("kick", "k7")
+    # FIX A: a kick row with no local archive file downloads the audio at
+    # transcribe time (_transcribe_remote_twitch_kick) instead of failing
+    # on the missing file.
+    with patch.object(
+        archive_transcribe, "_transcribe_remote_twitch_kick",
+        return_value={"segments": 1},
+    ) as remote:
+        stats = archive_transcribe._process_job(
+            {"id": job_id, "platform": "kick", "video_id": "k7"}
+        )
+    assert "skipped" not in stats
+    remote.assert_called_once()
+    assert _job_status(job_id) == "done"
+
+
+def test_process_job_uses_local_file_when_present(monkeypatch):
+    """A kick row WITH an archive file keeps the fast local path — the
+    remote downloader only fires for file-less rows."""
+    media = Path(tempfile.mkdtemp(prefix="tk-local-")) / "k.mp4"
+    media.write_bytes(b"fake media")
+    archive_db.upsert_video({
+        "platform": "kick", "video_id": "k9", "channel": "titiltei",
+        "title": "kick local k9", "canonical_key": "ck-local",
+        "started_at": "2026-08-03T17:24:00Z", "kind": "vod",
+        "status": "ready", "archive_path": str(media),
+    })
+    job_id = _seed_job("kick", "k9")
     with patch.object(
         archive_transcribe, "transcribe_video",
         return_value={"segments": 1},
-    ) as tv:
+    ) as tv, patch.object(
+        archive_transcribe, "_transcribe_remote_twitch_kick",
+        side_effect=AssertionError("remote download must not run with a file"),
+    ):
         stats = archive_transcribe._process_job(
-            {"id": job_id, "platform": "kick", "video_id": "k7"}
+            {"id": job_id, "platform": "kick", "video_id": "k9"}
         )
     assert "skipped" not in stats
     tv.assert_called_once()

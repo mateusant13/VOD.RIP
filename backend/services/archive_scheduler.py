@@ -24,10 +24,17 @@ kick_scheduler_pass()):
                stored offset); Twitch backfills self-cap at 2 concurrent
                inside backfill_chat (per-IP GQL 429 limiter, measured).
   5. Transcribe queue — top up ASR jobs at TRANSCRIBE_PRIORITY_LOW for
-               Twitch/Kick VODs without transcripts and for YouTube videos
-               whose captions are permanently unavailable
-               (captions_unavailable_at marker) — audio is downloaded at
-               transcribe time. A transcript-source search re-enqueues at
+               Twitch/Kick VODs without transcripts (ready rows with a local
+               file AND metadata-only rows — Twitch ingest is metadata-only,
+               so the audio is downloaded at transcribe time) and for
+               YouTube videos whose captions are permanently unavailable
+               (captions_unavailable_at marker). Stale-failed jobs (older
+               than FAILED_JOB_FRESH_S) are requeued IN PLACE first, in a
+               pass OUTSIDE the duration window, so a long VOD's job is
+               never starved past the LIMIT-50 candidate slice; ready rows
+               whose archive file was evicted are enqueued (the worker
+               downloads at job time) instead of skipped forever. A
+               transcript-source search re-enqueues at
                TRANSCRIBE_PRIORITY_HIGH (routers/archive.py) and the
                worker's ORDER BY priority DESC makes those jump the queue.
 """
@@ -39,7 +46,6 @@ import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Optional
 
 from services import archive_db
@@ -510,35 +516,114 @@ def _orig_titles_worker(channels: list) -> None:
             logger.debug("orig-title sweep failed for %s: %s", slug, exc)
 
 
+def _transcribe_video_candidate(platform: str, video_id: str) -> bool:
+    """True when the video can still accept a transcribe job.
+
+    Shared by the stale-failed requeue pass and the fresh window: the video
+    row must exist, carry no transcript rows yet, and hold no terminal
+    verdict (music / blocked — a DRM-dead or instrumental video is never
+    re-run)."""
+    rows = archive_db.query(
+        """SELECT 1 FROM videos
+           WHERE platform=? AND video_id=?
+             AND NOT EXISTS (SELECT 1 FROM transcripts t
+                             WHERE t.platform=videos.platform
+                               AND t.video_id=videos.video_id)""",
+        (platform, video_id),
+    )
+    if not rows:
+        return False
+    return (archive_db.video_transcript_kind(platform, video_id) or "") not in (
+        "music", "blocked",
+    )
+
+
+def _requeue_failed_transcribe_job(
+    job_id: str, now_iso: str
+) -> bool:
+    """Requeue one 'failed' transcribe job IN PLACE (stable job id — the
+    worker never claims 'failed' rows, so this is the only way back into
+    the queue). Returns True when the row was flipped; a raced enqueue
+    (row already queued by a search) leaves it untouched."""
+    cur = archive_db.execute(
+        "UPDATE archive_jobs SET status='queued', error=NULL, progress=0, "
+        "updated_at=?, heartbeat=? WHERE id=? AND status='failed'",
+        (now_iso, now_iso, job_id),
+    )
+    return cur.rowcount == 1
+
+
 def _enqueue_transcriptions() -> None:
+    """Top up transcribe jobs — Twitch/Kick (ready with a local file, or any
+    row whose audio can be fetched at transcribe time — see
+    archive_transcribe._transcribe_remote_twitch_kick) and YouTube
+    captionless rows (captions permanently unavailable). One per-pass budget
+    shared by two passes:
+
+      1. Stale-failed requeue — every 'failed' transcribe job older than
+         FAILED_JOB_FRESH_S is requeued IN PLACE first, OUTSIDE the
+         duration window. A long VOD's job ranks beyond the LIMIT-50 window
+         and would starve forever otherwise (FIX C).
+      2. Fresh window — duration-ASC candidates (shortest first), skipping
+         videos with queued/running/fresh-failed work.
+    """
+    now_utc = datetime.now(timezone.utc)
+    fresh_cutoff = now_utc - timedelta(seconds=FAILED_JOB_FRESH_S)
+    enqueued = 0
+    budget = _transcribe_budget()
+    now_iso = now_utc.isoformat(timespec="seconds")
+
+    # Pass 1 — stale-failed requeue (window-independent).
+    for r in archive_db.query(
+        """SELECT id, platform, video_id FROM archive_jobs
+           WHERE kind='transcribe' AND status='failed' AND updated_at < ?
+           ORDER BY updated_at ASC""",
+        (fresh_cutoff.isoformat(timespec="seconds"),),
+    ):
+        if enqueued >= budget:
+            break
+        if not _transcribe_video_candidate(r["platform"], r["video_id"]):
+            continue  # transcribed meanwhile / terminal verdict — leave failed
+        if _requeue_failed_transcribe_job(r["id"], now_iso):
+            enqueued += 1
+            logger.info(
+                "scheduler requeued stale failed transcribe job %s (%s/%s)",
+                r["id"], r["platform"], r["video_id"],
+            )
+
+    if enqueued >= budget:
+        return
+
+    # Pass 2 — fresh candidates. FIX A: twitch/kick rows are candidates
+    # WITHOUT a local archive file (the worker downloads the audio at job
+    # time), so the archive_path predicate is gone; a ready row whose file
+    # was evicted/relocated is enqueued instead of skipped forever (FIX B).
     rows = list(
         archive_db.query(
             """SELECT platform, video_id, channel, title, duration_sec, archive_path
                FROM videos
                WHERE platform IN ('youtube','twitch','kick')
-                 AND (status='ready' OR platform='youtube')
-                 AND (archive_path IS NOT NULL AND archive_path != ''
-                      OR platform='youtube')
+                 AND (status='ready' OR platform='youtube'
+                      OR archive_path IS NULL OR archive_path = '')
                  AND NOT EXISTS (SELECT 1 FROM transcripts t
                                  WHERE t.platform=videos.platform
                                    AND t.video_id=videos.video_id)
                ORDER BY duration_sec ASC LIMIT 50"""
         )
     )
-    now_utc = datetime.now(timezone.utc)
-    fresh_cutoff = now_utc - timedelta(seconds=FAILED_JOB_FRESH_S)
-    enqueued = 0
     for r in rows:
-        if enqueued >= _transcribe_budget():
+        if enqueued >= budget:
             break
         vid = r["video_id"]
         plat = r["platform"]
-        if plat != "youtube" and (
-            not (r["archive_path"] or "").strip() or not Path(r["archive_path"]).is_file()
-        ):
-            continue  # file evicted — whisper would fail immediately
         latest = archive_db.latest_job(plat, vid, kind="transcribe")
         job_id = f"transcribe-{plat}-{vid}"
+        # Terminal verdicts (music / blocked) are never re-run — for
+        # youtube (captionless-ASR verdicts) AND twitch/kick (the remote
+        # route marks deleted/sub-only VODs 'blocked').
+        kind = archive_db.video_transcript_kind(plat, vid) or ""
+        if kind in ("music", "blocked"):
+            continue
         if plat == "youtube":
             # Captions-first policy: create a transcribe job ONLY when the
             # caption question is settled AND there is nothing that already
@@ -547,12 +632,8 @@ def _enqueue_transcriptions() -> None:
             # rows (the SQL's NOT EXISTS above) and no terminal verdict.
             # Never create while captions are still pending (no marker: the
             # ingest leg is extracting/retrying — the worker requeues any
-            # kicked job with 'waiting for caption decision'), never for
-            # music/no-speech or DRM-blocked videos. The audio is
+            # kicked job with 'waiting for caption decision'). The audio is
             # downloaded at transcribe time (no local archive_path).
-            kind = archive_db.video_transcript_kind(plat, vid) or ""
-            if kind in ("music", "blocked"):
-                continue
             if latest is None and archive_db.captions_unavailable_at(plat, vid) is None:
                 continue
         if latest:
@@ -564,21 +645,12 @@ def _enqueue_transcriptions() -> None:
                         continue
                 except (TypeError, ValueError):
                     continue  # unparseable — treat as fresh failure
-                # Stale failed row (>= FAILED_JOB_FRESH_S old): the worker
-                # never claims 'failed' rows, so without this the job is
-                # stranded forever. Requeue IN PLACE first (mirrors the
-                # chat path in _enqueue_chat_job) so the stable job id
-                # never orphans a retry; only if the row vanished between
-                # the read and the update fall through to the INSERT.
-                now_iso = now_utc.isoformat(timespec="seconds")
-                cur = archive_db.execute(
-                    "UPDATE archive_jobs SET status='queued', error=NULL, progress=0, "
-                    "updated_at=?, heartbeat=? WHERE id=? AND status='failed'",
-                    (now_iso, now_iso, job_id),
-                )
-                if cur.rowcount == 1:
+                # Stale failed row inside the window (pass 1 may have spent
+                # the budget on older jobs first) — requeue IN PLACE, same
+                # stable-job-id contract as pass 1.
+                if _requeue_failed_transcribe_job(job_id, now_iso):
                     enqueued += 1
-                    continue
+                continue
         try:
             archive_db.enqueue_job(
                 job_id, "transcribe", plat, vid, priority=TRANSCRIBE_PRIORITY_LOW
