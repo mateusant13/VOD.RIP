@@ -202,8 +202,6 @@ async def update_settings(update: SettingsUpdate):
         current.auto_install_extension = bool(update.auto_install_extension)
     if update.entity_watch_enabled is not None:
         current.entity_watch_enabled = bool(update.entity_watch_enabled)
-    if update.twitch_monitor_enabled is not None:
-        current.twitch_monitor_enabled = bool(update.twitch_monitor_enabled)
     if update.archive_vod_keep_count is not None:
         current.archive_vod_keep_count = max(1, min(50, update.archive_vod_keep_count))
     if update.whisper_model is not None:

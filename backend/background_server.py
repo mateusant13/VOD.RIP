@@ -2,7 +2,7 @@
 
 When the app is CLOSED this process keeps the archive alive at low
 resource cost: scheduler ingests (Twitch/Kick/YouTube metadata, chat
-backfill, transcribe enqueue), live-chat capture, mention/entity
+backfill, transcribe enqueue), live-chat capture, entity
 scanning, and periodic disk hygiene + VOD retention all continue, paced
 by VODRIP_BACKGROUND=1 (6-min passes, budget-1 enqueues, 2.5x chat
 gaps) so the machine stays quiet no matter how long the app stays
@@ -95,12 +95,11 @@ _STARTED: set[str] = set()
 
 
 def _start_services() -> None:
-    from services import archive_scheduler, archive_watchdog, entity_watch, mention_irc
+    from services import archive_scheduler, archive_watchdog, entity_watch
 
     for name, start in (
         ("scheduler", archive_scheduler.start_archive_scheduler),
         ("watchdog", archive_watchdog.start_archive_watchdog),
-        ("mention", mention_irc.start_mention_irc),
         ("entity", entity_watch.start_entity_watcher),
     ):
         if name in _STARTED:
@@ -115,12 +114,11 @@ def _start_services() -> None:
 
 
 def _stop_services() -> None:
-    from services import archive_scheduler, archive_watchdog, entity_watch, mention_irc
+    from services import archive_scheduler, archive_watchdog, entity_watch
 
     for name, stop in (
         ("scheduler", archive_scheduler.stop_archive_scheduler),
         ("watchdog", archive_watchdog.stop_archive_watchdog),
-        ("mention", mention_irc.stop_mention_irc),
         ("entity", entity_watch.stop_entity_watcher),
     ):
         if name not in _STARTED:

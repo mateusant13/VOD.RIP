@@ -154,7 +154,7 @@ def _spawn_detached_worker() -> Optional[int]:
 def _spawn_detached_background() -> Optional[int]:
     """Spawn the detached "slow and steady" background daemon
     (background_server.py): owns scheduler ingest, live-chat capture,
-    mention/entity scanning and disk hygiene while the app is CLOSED.
+    entity scanning and disk hygiene while the app is CLOSED.
     Same orphan pattern as the worker; frozen EXEs dispatch
     --background-server-launch. First-wins heartbeat guard inside the
     daemon makes a second spawn a harmless immediate exit 0.
@@ -886,10 +886,8 @@ async def _app_lifespan(_app: FastAPI):
     # saved channels (auto mode), once at startup then every minute.
     try:
         from services.entity_watch import start_entity_watcher
-        from services.mention_irc import start_mention_irc
 
         start_entity_watcher()
-        start_mention_irc()
         logger.info("Entity watcher started")
     except Exception:
         logger.debug("Entity watcher start skipped", exc_info=True)
@@ -898,10 +896,8 @@ async def _app_lifespan(_app: FastAPI):
     _warm_shutdown.set()
     try:
         from services.entity_watch import stop_entity_watcher
-        from services.mention_irc import stop_mention_irc
 
         stop_entity_watcher(timeout=5.0)
-        stop_mention_irc(timeout=3.0)
     except Exception:
         logger.debug("Entity watcher stop failed", exc_info=True)
     try:
