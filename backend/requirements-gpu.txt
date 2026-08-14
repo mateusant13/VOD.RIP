@@ -10,9 +10,10 @@
 # onnxruntime-gpu install). It loads cublasLt64_12/cufft64_11/curand64_10/
 # cudnn64_9 from PATH (Windows) / LD_LIBRARY_PATH (POSIX) at session create
 # — nvidia-cublas-cu12 + nvidia-cuda-runtime-cu12 are already pinned in
-# requirements.txt (they replaced the faster-whisper/ctranslate2 wheels that
-# used to pull them); the wheels below add the rest, and
+# requirements.txt; the wheels below add the rest, and
 # archive_transcribe._ensure_cuda_libs exposes their bin/lib dirs.
+# (faster-whisper was removed; ctranslate2 is still a requirement — it runs
+# the NLLB live-caption translation lane — but it pulls no CUDA wheels.)
 --find-links https://k2-fsa.github.io/sherpa/onnx/cuda.html
 -r requirements.txt
 sherpa-onnx==1.13.4+cuda12.cudnn9

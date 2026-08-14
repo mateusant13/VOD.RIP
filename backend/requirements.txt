@@ -40,6 +40,11 @@ torch==2.7.0
 torchaudio==2.7.0
 nvidia-cublas-cu12
 nvidia-cuda-runtime-cu12
+# Live-caption speech translation (services/caption_translate.py) — NLLB-200
+# ct2-int8 runs through ctranslate2 (NOT faster-whisper: that wheel is gone;
+# ctranslate2 stayed for the NLLB MT lane). Missing here silently degraded
+# caption translation to raw ASR on fresh installs.
+ctranslate2>=4.0
 # Acoustic-event stage (services/archive_events.py) — PANNs Cnn14 SED over
 # AudioSet 527 classes (laugh/clap/scream/music...). Checkpoint downloads
 # itself on first use (zenodo record 3987831).
