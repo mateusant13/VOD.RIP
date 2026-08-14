@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Captions, ExternalLink, Loader2, Maximize2, Minimize2, MessageSquare, Pause, Play, Search, Volume2, VolumeX, RefreshCw, X } from 'lucide-react';
+import { Captions, ExternalLink, Languages, Loader2, Maximize2, Minimize2, MessageSquare, Pause, Play, Search, Volume2, VolumeX, RefreshCw, X } from 'lucide-react';
 import { apiDelete, apiPost } from '../hooks/useApiClient';
 import { archiveVideoIdFromUrl } from '../archiveScope';
 import { buildVodUrl } from '../channelUtils';
@@ -2348,10 +2348,11 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                       onClick={() => setCaptionLangMenuOpen((o) => !o)}
                       aria-haspopup="menu"
                       aria-expanded={captionLangMenuOpen}
+                      aria-label={t('Caption language')}
                       title={t('Caption language')}
-                      className={`${transportBtn} px-1 font-mono text-[10px] font-bold leading-none`}
+                      className={`${transportBtn} px-1`}
                     >
-                      {(captionLang ?? 'auto').toUpperCase()}
+                      <Languages size={15} aria-hidden />
                     </button>
                     {captionLangMenuOpen && (
                       <div className="absolute bottom-full left-0 z-30 mb-1.5 flex flex-col border-2 border-zinc-600 bg-zinc-950 shadow-lg">

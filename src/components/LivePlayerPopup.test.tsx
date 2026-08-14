@@ -933,7 +933,11 @@ describe('LivePlayerPopup live captions', () => {
     await screen.findByTitle('Hide captions');
     await waitFor(() => expect(FakeEventSource.instances).toHaveLength(3));
     expect(FakeEventSource.instances[2].url).toContain('lang=es');
-    expect(screen.getByTitle('Caption language').textContent).toBe('ES');
+    // Icon-only button: no text label (the old "ES"/"AUTO" text is gone),
+    // the icon carries the accessible name via title/aria-label.
+    const langBtn = screen.getByTitle('Caption language');
+    expect(langBtn.textContent?.trim() ?? '').toBe('');
+    expect(langBtn.querySelector('svg')).toBeTruthy();
   });
 
   it('shows no CC button or overlay when the parakeet gate reports unavailable', async () => {
