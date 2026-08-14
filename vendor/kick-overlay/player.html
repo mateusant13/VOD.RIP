@@ -8,6 +8,17 @@
 </style>
 </head>
 <body>
+<script>
+  // The IVS engine logs its own diagnostics to the console (gap jumps,
+  // stall warnings, JSON parse retries, polyfill "unhandled rejection"
+  // notices). Its real failures already arrive at the content script as
+  // {t:'ev', e:'error'} messages via player-bridge.js, so silence
+  // error/warn here to keep the chrome://extensions error badge clean.
+  // The last suppressed error is kept for player-bridge to inspect.
+  window.__koIvErr = '';
+  console.error = (...a) => { window.__koIvErr = String(a[0] || '').slice(0, 200); };
+  console.warn = () => {};
+</script>
 <video id="v" autoplay playsinline></video>
 <script src="ivs/index.js"></script>
 <script src="player-bridge.js"></script>

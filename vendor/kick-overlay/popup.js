@@ -5,12 +5,20 @@ const KEY = 'ko.v2';
 const $ = (id) => document.getElementById(id);
 
 async function readState() {
-  const o = await chrome.storage.local.get(KEY);
-  return o[KEY] || {};
+  try {
+    const o = await chrome.storage.local.get(KEY);
+    return o[KEY] || {};
+  } catch {
+    return {};
+  }
 }
 
 async function writeState(s) {
-  await chrome.storage.local.set({ [KEY]: s });
+  try {
+    await chrome.storage.local.set({ [KEY]: s });
+  } catch {
+    /* storage busy — popup state is best-effort */
+  }
 }
 
 function twitchSlugFromUrl(url) {

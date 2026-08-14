@@ -48,6 +48,20 @@ function diag(ev, data) {
   }
 }
 
+// Fire-and-forget async entry points (probe/apply/reconnect/init) must
+// never reject into the console or the chrome://extensions error badge.
+// Any failure becomes a diag event instead.
+function fire(fn) {
+  try {
+    const p = fn();
+    if (p && typeof p.catch === 'function') {
+      p.catch((e) => diag('guard', { err: String((e && e.message) || e).slice(0, 120) }));
+    }
+  } catch (e) {
+    diag('guard', { err: String((e && e.message) || e).slice(0, 120) });
+  }
+}
+
 // Twitch routes that look like /<slug> but are not channels.
 const NOT_CHANNEL = new Set([
   'directory', 'downloads', 'friends', 'gift', 'jobs', 'login', 'notifications',
@@ -116,6 +130,7 @@ function applyVols(vols) {
 function loadState() {
   return new Promise((res) => {
     chrome.storage.local.get(KEY, (o) => {
+      void chrome.runtime.lastError;
       const s = (o && o[KEY]) || {};
       KO.enabled = s.enabled === undefined ? true : !!s.enabled;
       KO.player = s.player === 'twitch' ? 'twitch' : s.player === 'youtube' ? 'youtube' : 'kick';
@@ -140,7 +155,10 @@ function saveState() {
           },
         },
       },
-      res,
+      () => {
+        void chrome.runtime.lastError;
+        res();
+      },
     );
   });
 }
@@ -157,7 +175,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   KO.player = s.player === 'twitch' ? 'twitch' : s.player === 'youtube' ? 'youtube' : 'kick';
   KO.mappings = s.mappings && typeof s.mappings === 'object' ? s.mappings : {};
   applyVols(s.vols);
-  if (pChanged) apply(); // hot toggle / remap / player switch — no page reload
+  if (pChanged) fire(apply); // hot toggle / remap / player switch — no page reload
 });
 
 // ---- helpers ----------------------------------------------------------------
@@ -363,7 +381,7 @@ function throttledYtProbe() {
   const now = Date.now();
   if (now - lastYtProbe < 1000) return;
   lastYtProbe = now;
-  probe();
+  fire(probe);
 }
 
 // ---- Kick frame bridge (IVS — the engine kick.com uses) ---------------------
@@ -426,13 +444,13 @@ window.addEventListener('message', (ev) => {
     if (KO.player === 'kick') updateKickBar();
   } else if (m.t === 'ev') {
     if (m.e === 'error') {
-      console.error('[ko] kick (IVS) error', m.d || '');
+      console.log('[ko] kick (IVS) error', m.d || '');
       diag('ivs_error', { msg: String(m.d || '').slice(0, 140), code: m.code || 0 });
       if (!KO.enabled || KO.player !== 'kick' || !KO.activeUrl) return;
       // DVR errors → go live once (kick-identical: replay failure returns to
       // the edge), never a reconnect storm. Live errors → budgeted reconnect.
       if (KO.kickOnDvr) kickBackToLive();
-      else reconnect();
+      else fire(reconnect);
     } else if (m.e === 'rebuffering') {
       diag('ivs_rebuffer', {});
     }
@@ -1211,11 +1229,11 @@ function startWatchers() {
   KO.spaTimer = setInterval(() => {
     if (location.pathname !== KO.lastPath) {
       KO.lastPath = location.pathname;
-      apply();
+      fire(apply);
     }
   }, SPA_MS);
   KO.pollTimer = setInterval(() => {
-    if (KO.enabled) probe();
+    if (KO.enabled) fire(probe);
   }, POLL_MS);
   // The boot probe can race the Twitch player's start — re-probe the
   // moment the player starts playing, throttled. Video events don't
@@ -1228,7 +1246,7 @@ function startWatchers() {
       const now = Date.now();
       if (now - lastPlayingProbe < 3000) return;
       lastPlayingProbe = now;
-      probe();
+      fire(probe);
     },
     true,
   );
@@ -1477,20 +1495,20 @@ window.addEventListener('kick-overlay:set', (e) => {
   const d = e.detail || {};
   if (typeof d.enabled === 'boolean') {
     KO.enabled = d.enabled;
-    saveState().then(() => apply());
+    saveState().then(() => fire(apply));
   }
   if (d.kickSlug && KO.slug) {
     const m = KO.mappings[KO.slug];
     KO.mappings[KO.slug] = typeof m === 'object' ? { ...m, kick: d.kickSlug } : { kick: d.kickSlug };
     KO.kickSlug = d.kickSlug;
-    saveState().then(() => apply());
+    saveState().then(() => fire(apply));
   }
   if (d.ytChannel && KO.slug) {
     const m = KO.mappings[KO.slug];
     KO.mappings[KO.slug] = typeof m === 'object' ? { ...m, yt: d.ytChannel } : { yt: d.ytChannel };
     KO.ytRaw = d.ytChannel;
     KO.ytId = null;
-    saveState().then(() => apply());
+    saveState().then(() => fire(apply));
   }
 });
 window.addEventListener('kick-overlay:status', () => {
@@ -1546,7 +1564,7 @@ window.addEventListener('kick-overlay:status', () => {
       KO.ytId = null;
     }
     if (qPlayer && ['kick', 'youtube', 'twitch'].includes(qPlayer)) KO.player = qPlayer;
-    saveState().then(() => apply());
+    saveState().then(() => fire(apply));
   }
   // Persist the resolved defaults (enabled: true) so the popup's toggle
   // always agrees with the content script.
@@ -1596,5 +1614,5 @@ window.addEventListener('kick-overlay:status', () => {
       vr: tv ? { w: Math.round(tv.getBoundingClientRect().width), h: Math.round(tv.getBoundingClientRect().height) } : null,
     });
   }, 8000);
-  apply();
-})();
+  fire(apply);
+})().catch((e) => diag('guard', { err: String((e && e.message) || e).slice(0, 120) }));
