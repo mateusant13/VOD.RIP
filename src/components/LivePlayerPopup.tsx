@@ -162,6 +162,25 @@ const CAPTION_STALE_SKIP_SEC = 1.0;
 /** Newest (pos → pdt) frag anchors kept for the currentTime→wall map. */
 const CAPTION_MAX_PDT_ANCHORS = 16;
 
+/** Wall epoch seconds of a frag's PROGRAM-DATE-TIME, with the backend's
+ *  _parse_iso_epoch semantics: an explicit zone offset is honored, a NAIVE
+ *  value (no offset) is UTC. hls.js's own programDateTime is
+ *  Date.parse(raw), which reads naive values as LOCAL time — on a naive-PDT
+ *  stream that would put the anchor clock hours off the backend's caption
+ *  clock (start/end/latency_ms are UTC epochs), the prime drift suspect. */
+function parsePdtEpochSec(raw: string | null | undefined, ms: number | null | undefined): number {
+  if (typeof raw === 'string' && raw.trim()) {
+    let v = raw.trim();
+    // Mirror the backend's _parse_iso_epoch: Z and explicit offsets parse
+    // as-is; a NAIVE value (no zone suffix) defaults to UTC.
+    if (/[zZ]$/.test(v)) v = v.slice(0, -1) + '+00:00';
+    else if (!/[+-]\d{2}:?\d{2}$/.test(v)) v = v + '+00:00';
+    const t = Date.parse(v);
+    if (Number.isFinite(t)) return t / 1000;
+  }
+  return typeof ms === 'number' && Number.isFinite(ms) ? ms / 1000 : Number.NaN;
+}
+
 // ---------------------------------------------------------------------------
 // Live quality policy registry (module-scope — ponytail: a plain counter +
 // subscriber Set, no store dependency; the whole policy is one number).
@@ -920,9 +939,13 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       const frag = data?.frag;
       if (!frag) return;
       const pos = frag.start;
-      const pdt = typeof frag.programDateTime === 'number'
-        ? frag.programDateTime / 1000
-        : Number.NaN;
+      // Re-parse the raw PDT tag (UTC-default, same base as the backend's
+      // caption times) instead of trusting hls.js's local-zone Date.parse
+      // — naive PDTs would drift the anchor clock by the user's UTC offset.
+      const pdt = parsePdtEpochSec(
+        frag.rawProgramDateTime,
+        typeof frag.programDateTime === 'number' ? frag.programDateTime : null,
+      );
       if (typeof pos !== 'number' || !Number.isFinite(pos) || !Number.isFinite(pdt)) return;
       const anchors = pdtAnchorsRef.current;
       const existing = anchors.findIndex((a) => a.pos === pos);

@@ -769,6 +769,123 @@ describe('LivePlayerPopup live captions', () => {
     expect(screen.getByText('sincronizada')).toBeTruthy();
     expect(document.querySelector('[data-live-captions-overlay]')).toBeTruthy();
   });
+
+  it('drops a caption whose window ended more than 1s before the video clock (late arrival)', async () => {
+    mockFetchWithLiveSrc();
+    renderPopup();
+    await waitFor(() => expect((window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls).toBeTruthy());
+    const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
+    await act(async () => { hls.trigger(FakeHls.Events.MANIFEST_PARSED); });
+    await screen.findByTitle('Hide captions');
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    const es = FakeEventSource.instances[0];
+
+    act(() => { hls.trigger('fragBuffered', { frag: { start: 0, programDateTime: 1_000_000 } }); });
+    const video = document.querySelector('video') as HTMLVideoElement;
+    const at = (t: number) => act(() => { video.currentTime = t; fireEvent(video, new Event('timeupdate')); });
+
+    // The video clock sits at epoch 1006 (the player live-synced past it) —
+    // a window ending at 1004 ended 2s earlier, beyond the 1s stale skip.
+    at(6);
+    act(() => { es.fire('caption', JSON.stringify({ text: 'atrasada', start: 1000, end: 1004, latency_ms: 2500 })); });
+    expect(screen.queryByText('atrasada')).toBeNull();
+    // Dropped at arrival — it must never surface later either.
+    at(8);
+    expect(screen.queryByText('atrasada')).toBeNull();
+    expect(document.querySelector('[data-live-captions-overlay]')).toBeNull();
+  });
+
+  it('calibrates a fallback origin from the first block on a no-PDT timeline (arrival-due, then video-gated)', async () => {
+    mockFetch();
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+    await screen.findByTitle('Hide captions');
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    const es = FakeEventSource.instances[0];
+    const video = document.querySelector('video') as HTMLVideoElement;
+
+    // No frag anchors: the first block calibrates the origin to its due
+    // point (origin = end − lead − broadcast position at arrival = 2.75) so
+    // it shows on arrival — the fallback never waits for a clock map.
+    act(() => { es.fire('caption', JSON.stringify({ text: 'primeira', start: 0, end: 3 })); });
+    expect(screen.getByText('primeira')).toBeTruthy();
+
+    // The second window [5, 8] is NOT due at the current clock (epoch 2.75 <
+    // 7.75) — queued and hidden even though it already arrived.
+    act(() => { es.fire('caption', JSON.stringify({ text: 'segunda', start: 5, end: 8 })); });
+    expect(screen.queryByText('segunda')).toBeNull();
+
+    // Video-gated: it appears only when the clock reaches end − lead — the
+    // calibration pins this at t = 5 exactly, not on arrival.
+    act(() => { video.currentTime = 4.9; fireEvent(video, new Event('timeupdate')); });
+    expect(screen.queryByText('segunda')).toBeNull();
+    act(() => { video.currentTime = 5; fireEvent(video, new Event('timeupdate')); });
+    expect(screen.getByText('segunda')).toBeTruthy();
+  });
+
+  it('queues captions while the video is stalled and catches up on resume without stale text', async () => {
+    mockFetchWithLiveSrc();
+    renderPopup();
+    await waitFor(() => expect((window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls).toBeTruthy());
+    const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
+    await act(async () => { hls.trigger(FakeHls.Events.MANIFEST_PARSED); });
+    await screen.findByTitle('Hide captions');
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    const es = FakeEventSource.instances[0];
+
+    act(() => { hls.trigger('fragBuffered', { frag: { start: 0, programDateTime: 1_000_000 } }); });
+    const video = document.querySelector('video') as HTMLVideoElement;
+    const at = (t: number) => act(() => { video.currentTime = t; fireEvent(video, new Event('timeupdate')); });
+    const fire = (text: string, end: number) => act(() => {
+      es.fire('caption', JSON.stringify({ text, start: end - 2, end, latency_ms: 400 }));
+    });
+
+    // The video is STALLED at t=0 (epoch 1000): both windows arrive but the
+    // clock never reaches their due points — the overlay stays dark.
+    fire('congelada-1', 1004);
+    fire('congelada-2', 1008);
+    expect(screen.queryByText('congelada-1')).toBeNull();
+    expect(screen.queryByText('congelada-2')).toBeNull();
+
+    // Playback resumes to t=8.5 (epoch 1008.5): block 1 is stale (dropped),
+    // block 2 is in-window and due → only the newest text appears, no flash
+    // of intermediate captions the video already played past.
+    at(8.5);
+    expect(screen.queryByText('congelada-1')).toBeNull();
+    expect(screen.getByText('congelada-2')).toBeTruthy();
+  });
+
+  it('parses a naive PDT (no zone offset) as UTC, matching the backend caption clock', async () => {
+    mockFetchWithLiveSrc();
+    renderPopup();
+    await waitFor(() => expect((window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls).toBeTruthy());
+    const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
+    await act(async () => { hls.trigger(FakeHls.Events.MANIFEST_PARSED); });
+    await screen.findByTitle('Hide captions');
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    const es = FakeEventSource.instances[0];
+
+    // hls.js computes programDateTime via Date.parse — LOCAL zone for a
+    // naive tag. The component must read the raw tag with a UTC default,
+    // the same base the backend's start/end/latency_ms live on.
+    const naive = '2024-01-01T00:00:00.000';
+    act(() => {
+      hls.trigger('fragBuffered', {
+        frag: { start: 0, rawProgramDateTime: naive, programDateTime: Date.parse(naive) },
+      });
+    });
+    const video = document.querySelector('video') as HTMLVideoElement;
+    const at = (t: number) => act(() => { video.currentTime = t; fireEvent(video, new Event('timeupdate')); });
+    const wall = Date.parse(naive + '+00:00') / 1000; // 2024-01-01T00:00:00Z epoch
+
+    // Window [wall+2, wall+4] — due when the video clock reaches wall+3.75.
+    act(() => { es.fire('caption', JSON.stringify({ text: 'utc', start: wall + 2, end: wall + 4, latency_ms: 500 })); });
+    expect(screen.queryByText('utc')).toBeNull();
+    at(3.7);
+    expect(screen.queryByText('utc')).toBeNull();
+    at(4);
+    expect(screen.getByText('utc')).toBeTruthy();
+  });
 });
 
 describe('LivePlayerPopup z-order', () => {
