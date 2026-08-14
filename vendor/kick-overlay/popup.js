@@ -87,6 +87,11 @@ async function kickStatus(slug) {
     const v = e.target.value;
     st.player = v === 'twitch' ? 'twitch' : v === 'youtube' ? 'youtube' : 'kick';
     await writeState(st);
+    if (v === 'youtube' && !$('yt').value.trim()) {
+      $('status').textContent = 'YouTube needs a channel: paste URL, @handle or UC… above.';
+    } else {
+      $('status').textContent = 'Applied — switch anytime from the player.';
+    }
   });
 
   $('save').addEventListener('click', async () => {

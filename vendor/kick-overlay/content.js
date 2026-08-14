@@ -57,6 +57,8 @@ const KO = {
   spaTimer: null,
   muted: new Set(), // twitch videos we muted (restored)
   hideTicks: 0,
+  stallTicks: 0,
+  lastTickT: 0,
   lastPath: location.pathname,
 };
 
@@ -366,6 +368,11 @@ function mount() {
     '<span style="flex:1"></span>' +
     '<button id="ko-fs" title="Fullscreen">\u26F6</button>';
   wrap.appendChild(bar);
+  const rc = document.createElement('div');
+  rc.id = 'ko-reconnecting';
+  rc.textContent = 'RECONNECTING\u2026';
+  rc.style.display = 'none';
+  wrap.appendChild(rc);
   overlayAnchor().appendChild(wrap);
   KO.wrap = wrap;
   KO.video = v;
@@ -464,6 +471,8 @@ function teardown() {
   KO.activeUrl = null;
   KO.reconnectCount = 0;
   KO.hideTicks = 0;
+  KO.stallTicks = 0;
+  KO.lastTickT = 0;
   KO.twLive = false;
   KO.twWasPlaying = false;
   unmuteAll();
@@ -491,14 +500,16 @@ function hideWrap() {
 
 function showKickLayer() {
   if (!KO.wrap) mount();
+  const wasHidden = !KO.wrap || KO.wrap.style.display === 'none';
   KO.wrap.classList.remove('ko-yt');
   KO.wrap.classList.add('ko-kick');
   showWrap();
   if (KO.ytState.ready && KO.ytState.playing) ytCmd('pause');
   ytCmd('mute');
   if (KO.video && KO.video.paused) KO.video.play().catch(() => {});
-  // Freshest edge on return (like "back to live").
-  if (KO.hls && KO.hls.liveSyncPosition) {
+  // Freshest edge ONLY when re-showing the layer after a hide — probe()
+  // re-shows every poll and a per-poll seek would stall live playback.
+  if (wasHidden && KO.hls && KO.hls.liveSyncPosition) {
     try {
       KO.video.currentTime = KO.hls.liveSyncPosition;
     } catch {
@@ -549,11 +560,33 @@ function ensurePlayer(url) {
   });
   KO.hls = hls;
   hls.on(Hls.Events.ERROR, (_e, data) => {
+    // Diagnostics: the kick black-screen (2026-08-13) is an hls fatal in
+    // the real browser; these lines show in the page console (F12) under
+    // the content-script context.
+    console.error(
+      '[ko] hls error',
+      JSON.stringify({
+        type: data.type,
+        details: data.details,
+        fatal: data.fatal,
+        reason: data.reason || (data.networkDetails && data.networkDetails.status) || '',
+        frag: data.frag ? data.frag.url.slice(0, 80) : '',
+      }),
+    );
     if (!data.fatal || !KO.enabled || KO.player !== 'kick') return;
     reconnect();
   });
   hls.on(Hls.Events.MANIFEST_PARSED, (_e, mdata) => {
     KO.reconnectCount = 0;
+    if (KO.wrap) {
+      const rc = KO.wrap.querySelector('#ko-reconnecting');
+      if (rc) rc.style.display = 'none';
+    }
+    const top = mdata && mdata.levels && mdata.levels[0];
+    console.log(
+      '[ko] kick manifest parsed',
+      (mdata.levels || []).length + ' levels' + (top && top.height ? `, top ${top.height}p` : ''),
+    );
     const badgeEl = KO.wrap && KO.wrap.querySelector('#ko-badge');
     if (badgeEl) {
       const lv = mdata && mdata.levels && mdata.levels[0];
@@ -592,6 +625,11 @@ async function reconnect() {
   }
   KO.reconnectCount++;
   setBadge('RECONNECT', '#d97706');
+  if (KO.wrap) {
+    const rc = KO.wrap.querySelector('#ko-reconnecting');
+    if (rc) rc.style.display = 'flex';
+  }
+  console.log(`[ko] kick reconnect attempt ${KO.reconnectCount}/${MAX_RECONNECT}`);
   const k = await kickPlaybackUrl(KO.kickSlug);
   if (!k.live || !k.url) {
     teardown();
@@ -677,6 +715,7 @@ async function probe() {
       updateSwitchButtons();
       return;
     }
+    console.log('[ko] kick offline or unreachable', KO.kickSlug, JSON.stringify(k));
     setBadge('KICK OFF', '#6b7280');
     if (KO.wrap) hideWrap();
     updateSwitchButtons();
@@ -788,6 +827,25 @@ function startRectLoop() {
       }
       syncMute();
       updateKickBar();
+      // Stall watchdog: kick video frozen >8s while shown and not paused —
+      // IVS tokens can go stale silently (no hls error). Force a fresh
+      // playback_url via the normal reconnect budget.
+      if (KO.player === 'kick' && KO.video && !KO.video.paused && KO.video.readyState >= 2) {
+        const t = KO.video.currentTime || 0;
+        if (Math.abs(t - KO.lastTickT) < 0.05) {
+          KO.stallTicks++;
+        } else {
+          KO.stallTicks = 0;
+          KO.lastTickT = t;
+        }
+        if (KO.stallTicks > 20) {
+          KO.stallTicks = 0;
+          if (KO.reconnectCount < MAX_RECONNECT) {
+            console.log('[ko] kick stalled (8s frozen) — reconnecting');
+            reconnect();
+          }
+        }
+      }
     } else {
       // twitch mode: overlay players stay paused; resume Twitch if ours.
       if (KO.video && !KO.video.paused) KO.video.pause();
@@ -818,6 +876,8 @@ function injectStyles() {
     'background:linear-gradient(0deg,rgba(0,0,0,.85),rgba(0,0,0,0));font:12px/1 system-ui,sans-serif;}' +
     '#ko-wrap.ko-yt #ko-bar{display:none;}' + // YT has native controls incl. LIVE chip
     '#ko-wrap.ko-hot #ko-bar{opacity:1;}' +
+    '#ko-reconnecting{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;' +
+    'background:rgba(0,0,0,.82);color:#fff;font:700 15px system-ui,sans-serif;letter-spacing:.04em;pointer-events:none;}' +
     '#ko-bar button{background:transparent;border:0;color:#fff;cursor:pointer;font:inherit;padding:3px 7px;border-radius:4px;white-space:nowrap;}' +
     '#ko-bar button:hover{background:rgba(255,255,255,.18);}' +
     '#ko-badge{font-weight:700;color:#53fc18;white-space:nowrap;}' +
@@ -859,7 +919,18 @@ function buildSwitchButtons() {
     b.id = 'ko-ytbtn';
     b.textContent = 'YOUTUBE';
     b.title = 'Show the YouTube player (no Twitch ads)';
-    b.addEventListener('click', () => setPlayer('youtube'));
+    b.addEventListener('click', () => {
+      setPlayer('youtube');
+      // Unmapped: open the popup so the user can paste the channel —
+      // the click is a user gesture, so openPopup() is allowed (127+).
+      if (!KO.ytRaw && !KO.ytId) {
+        try {
+          chrome.action.openPopup();
+        } catch {
+          /* older Chrome — badge 'YT?' is shown instead */
+        }
+      }
+    });
     anchor.appendChild(b);
   }
 }
@@ -869,7 +940,7 @@ function updateSwitchButtons() {
   const ids = [];
   if (KO.player !== 'twitch') ids.push('ko-twitchbtn');
   if (KO.player !== 'kick') ids.push('ko-kickbtn');
-  if (KO.player !== 'youtube' && (KO.ytRaw || KO.ytId)) ids.push('ko-ytbtn'); // only when mapped
+  if (KO.player !== 'youtube') ids.push('ko-ytbtn'); // always visible — unmapped click opens the popup
   const tv = twitchVideo();
   const shown = [];
   let totalW = 0;
