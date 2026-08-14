@@ -13,7 +13,11 @@ import tempfile
 from functools import lru_cache
 from typing import Dict, List, Optional
 
-from services.os_services import _NO_WINDOW, list_gpu_names
+from services.os_services import (
+    _NO_WINDOW,
+    _is_virtual_display_adapter,
+    list_gpu_names,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,10 +73,20 @@ def detect_gpu_vendor(names: Optional[List[str]] = None) -> str:
     if _is_apple_silicon():
         return "apple"
 
-    combined = " ".join(names if names is not None else list_gpu_names()).lower()
+    raw = names if names is not None else list_gpu_names()
+    # Drop software adapters even if a caller passed WMI's raw list — a
+    # Virtual Display Driver listed first must not hide an RTX / iGPU.
+    adapters = [n for n in raw if not _is_virtual_display_adapter(n)]
+    combined = " ".join(adapters).lower()
     if not combined.strip():
         return "none"
-    if "nvidia" in combined or "geforce" in combined or "quadro" in combined or "tesla" in combined:
+    if (
+        "nvidia" in combined
+        or "geforce" in combined
+        or "quadro" in combined
+        or "tesla" in combined
+        or " rtx " in f" {combined} "
+    ):
         return "nvidia"
     if "amd" in combined or "radeon" in combined or "ati " in combined:
         return "amd"

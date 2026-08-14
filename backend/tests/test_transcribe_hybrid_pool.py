@@ -158,8 +158,10 @@ def test_parakeet_model_honors_pin(monkeypatch):
         at._parakeet_model()
         assert calls == ["cpu", "cuda", "cpu"], "no CUDA wheel -> CPU provider"
     finally:
-        if hasattr(at._multi_tls, "pin"):
-            delattr(at._multi_tls, "pin")
+        # Restore to None — never delattr. threading.local + monkeypatch.setattr
+        # in a later test file requires the attribute to exist (observed:
+        # test_worker_budget_ram AttributeError after this test in a merged run).
+        at._multi_tls.pin = None
         at._multi_tls.active = False
         at._thread_slots.pop(tid, None)
 

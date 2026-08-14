@@ -110,12 +110,32 @@ _REAL_GPU_MIN_VRAM = int(1 * 1024 ** 3)  # below this it is not a compute GPU
 _REAL_GPU_PROBE_TIMEOUT_S = 5.0
 
 
+_smi_gpu_index = 0  # nvidia-smi index of the discrete compute GPU we picked
+
+
+def _parse_smi_vram_rows(stdout: str) -> list[tuple[int, int, int]]:
+    """[(index, total_bytes, free_bytes), ...] from csv noheader total,free lines."""
+    rows: list[tuple[int, int, int]] = []
+    for i, line in enumerate((stdout or "").strip().splitlines()):
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 2:
+            continue
+        try:
+            total_mib, free_mib = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        rows.append((i, total_mib * 1024 ** 2, free_mib * 1024 ** 2))
+    return rows
+
+
 def _nvidia_smi_vram() -> Optional[tuple[int, int]]:
-    """(total, free) VRAM bytes via nvidia-smi; None when absent/fails.
+    """(total, free) VRAM bytes of the largest NVIDIA GPU; None when absent.
 
     nvidia-smi exists only when the NVIDIA driver stack is real — a virtual
-    adapter has no SMI. Same probe style as _gpu_util (subprocess, short
-    timeout, _NO_WINDOW)."""
+    display adapter has no SMI. When several NVIDIA devices are listed we
+    pick the one with the most total VRAM (the discrete card), never GPU 0
+    blindly (GPU 0 can be a tiny NVIDIA virtual display on some boxes)."""
+    global _smi_gpu_index
     try:
         out = sp.run(
             ["nvidia-smi", "--query-gpu=memory.total,memory.free",
@@ -125,14 +145,12 @@ def _nvidia_smi_vram() -> Optional[tuple[int, int]]:
         )
         if out.returncode != 0:
             return None
-        lines = (out.stdout or "").strip().splitlines()
-        if not lines:
+        rows = _parse_smi_vram_rows(out.stdout or "")
+        if not rows:
             return None
-        parts = [p.strip() for p in lines[0].split(",")]
-        if len(parts) != 2:
-            return None
-        total_mib, free_mib = int(parts[0]), int(parts[1])
-        return total_mib * 1024 ** 2, free_mib * 1024 ** 2
+        idx, total, free = max(rows, key=lambda r: r[1])
+        _smi_gpu_index = idx
+        return total, free
     except (OSError, ValueError, sp.TimeoutExpired):
         return None
 
@@ -154,12 +172,17 @@ def _cuda_runtime_vram() -> Optional[tuple[int, int]]:
         count = ctypes.c_int(0)
         if nv.cudaGetDeviceCount(ctypes.byref(count)) != 0 or count.value <= 0:
             return None
-        if nv.cudaSetDevice(0) != 0:
-            return None
-        free_b, total_b = ctypes.c_size_t(0), ctypes.c_size_t(0)
-        if nv.cudaMemGetInfo(ctypes.byref(free_b), ctypes.byref(total_b)) != 0:
-            return None
-        return int(total_b.value), int(free_b.value)
+        best: Optional[tuple[int, int]] = None
+        for i in range(count.value):
+            if nv.cudaSetDevice(i) != 0:
+                continue
+            free_b, total_b = ctypes.c_size_t(0), ctypes.c_size_t(0)
+            if nv.cudaMemGetInfo(ctypes.byref(free_b), ctypes.byref(total_b)) != 0:
+                continue
+            cand = (int(total_b.value), int(free_b.value))
+            if best is None or cand[0] > best[0]:
+                best = cand
+        return best
     except (OSError, AttributeError):
         return None
 
@@ -262,38 +285,29 @@ _vram_lock = threading.Lock()
 
 
 def _gpu_free_vram_bytes() -> int:
-    """Free GPU VRAM in bytes — MEDIAN of reads spread over ~60 s (0 = unknown).
+    """Free GPU VRAM in bytes of the selected compute GPU (0 = unknown).
 
-    A single instant is a lie on a shared card: the user's other ML project
-    spikes and dips, and a spike would flap the lane decision. The first
-    call spreads _GPU_VRAM_MEDIAN_SAMPLES reads ~10 s apart and returns the
-    median; later calls (within the TTL) reuse it. Tests patch it directly
-    (mirrors _free_system_ram_bytes); probe failure (no torch / no CUDA /
-    nvidia-smi absent) -> 0 -> env cap trusted."""
+    Instant nvidia-smi read of the discrete card (cached 5 s). The old
+    60 s torch median blocked the worker at first plan (6 sleeps of 10 s)
+    and sampled CUDA device 0, which is the wrong GPU when a virtual
+    display is enumerated first. Tests patch this function directly."""
     global _vram_free_bytes, _vram_free_at
     now = time.monotonic()
     with _vram_lock:
-        if _vram_free_at and now - _vram_free_at < _GPU_VRAM_MEDIAN_GAP_S * _GPU_VRAM_MEDIAN_SAMPLES:
+        if _vram_free_at and now - _vram_free_at < 5.0:
             return _vram_free_bytes
-    samples: list[int] = []
-    for i in range(_GPU_VRAM_MEDIAN_SAMPLES):
+    free = 0
+    smi = _nvidia_smi_vram()
+    if smi is not None:
+        free = int(smi[1])
+    if free <= 0:
         try:
             import torch
 
-            if not torch.cuda.is_available():
-                break  # no CUDA — nothing to sample
-            samples.append(int(torch.cuda.mem_get_info()[0]))
+            if torch.cuda.is_available():
+                free = int(torch.cuda.mem_get_info()[0])
         except Exception:
-            break  # no torch — nothing to sample
-        if len(samples) >= _GPU_VRAM_MEDIAN_SAMPLES:
-            break
-        if i < _GPU_VRAM_MEDIAN_SAMPLES - 1:
-            time.sleep(_GPU_VRAM_MEDIAN_GAP_S)
-    if samples:
-        ordered = sorted(samples)
-        free = ordered[len(ordered) // 2]  # median (upper-middle for even counts)
-    else:
-        free = 0
+            free = 0
     with _vram_lock:
         _vram_free_bytes = free
         _vram_free_at = now
@@ -309,6 +323,27 @@ def _gpu_vram_allowance() -> int:
     return _gpu_free_vram_bytes()
 
 
+_HELD_VRAM_MIB = 256  # below this, WDDM compositors / our own probe are ignored
+
+
+def _compute_apps_hold_gpu(stdout: str, mine: set[int]) -> bool:
+    """True when a foreign process has a real CUDA allocation on this GPU."""
+    for line in (stdout or "").splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2:
+            continue
+        pid_s, mem_s = parts[0], parts[1]
+        if not pid_s.isdigit() or int(pid_s) in mine:
+            continue
+        try:
+            mem = int(mem_s.split()[0])
+        except ValueError:
+            continue  # [N/A] / Insufficient Permissions — not a CUDA tenant
+        if mem >= _HELD_VRAM_MIB:
+            return True
+    return False
+
+
 _gpu_held_cache = False
 _gpu_held_at = 0.0
 _gpu_held_lock = threading.Lock()
@@ -322,11 +357,13 @@ def _gpu_held_by_other() -> bool:
     probe fails (tasklist absent): the free-VRAM gate is still the primary
     guard. Cached 10 s; patched directly by tests.
 
-    Probe: `tasklist /m nvcuda.dll` — processes that LOADED the CUDA
-    runtime. nvidia-smi's compute-apps is NOT usable on Windows: it lists
-    every WDDM process that touches the GPU (dwm, explorer, browsers,
-    Discord...), tripping the gate even when no compute app runs. Loading
-    nvcuda.dll is the precise signal — real CUDA apps only."""
+    Probe: nvidia-smi compute-apps with a NUMERIC used-memory of at least
+    256 MiB. Windows compute-apps lists every WDDM touch (explorer, Chrome,
+    Discord, our own run.py) with memory [N/A] — those are NOT CUDA tenants.
+    `tasklist /m nvcuda.dll` was worse: the app process loads nvcuda.dll
+    just by probing CUDA, so the worker always saw "GPU held" and fell
+    back to CPU on a box whose only real card is an RTX. Own pid / parent
+    pid are ignored so our worker chain never blocks itself."""
     global _gpu_held_cache, _gpu_held_at
     now = time.monotonic()
     with _gpu_held_lock:
@@ -335,23 +372,13 @@ def _gpu_held_by_other() -> bool:
     held = False
     try:
         out = sp.run(
-            ["tasklist", "/m", "nvcuda.dll"],
+            ["nvidia-smi", "--query-compute-apps=pid,used_gpu_memory",
+             "--format=csv,noheader,nounits"],
             capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=5,
+            errors="replace", timeout=5, creationflags=_NO_WINDOW,
         )
         if out.returncode == 0:
-            mine = str(os.getpid())
-            for line in out.stdout.splitlines():
-                # "python.exe  12345 nvcuda.dll" (image name may contain spaces)
-                parts = line.split()
-                if (
-                    len(parts) >= 3
-                    and parts[-1] == "nvcuda.dll"
-                    and parts[-2].isdigit()
-                    and parts[-2] != mine
-                ):
-                    held = True
-                    break
+            held = _compute_apps_hold_gpu(out.stdout or "", {os.getpid(), os.getppid()})
     except Exception:
         held = False
     with _gpu_held_lock:
@@ -378,8 +405,9 @@ def _gpu_util() -> Optional[float]:
     util: Optional[float] = None
     try:
         out = sp.run(
-            ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5,
+            ["nvidia-smi", f"--id={_smi_gpu_index}",
+             "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5, creationflags=_NO_WINDOW,
         )
         if out.returncode == 0:
             util = float(out.stdout.strip().splitlines()[0]) / 100.0
@@ -601,8 +629,13 @@ def _gpu_copies() -> int:
         return 1
     if configured <= 0:
         configured = 1  # 0 == auto (same as absent)
+    # Cached False (probed at worker boot): no +cuda wheel or no compute GPU
+    # — never advertise CUDA slots that would fail jobs as ASR-unavailable.
+    # None (unprobed, tests) keeps the env/VRAM path so mock plans still work.
+    if _parakeet_cuda_ok is False:
+        return 0
     # Held check FIRST: when another process holds a GPU model the lane is
-    # forced off, so measuring the 60 s-median free VRAM would be pure waste.
+    # forced off, so measuring free VRAM would be pure waste.
     if _gpu_held_by_other() or caption_session_active():
         return 0  # a foreign process OR the live captioner holds the GPU — don't stack
     if _gpu_lane_plan() is None:
@@ -3848,6 +3881,7 @@ def run_worker(
     restart. max_workers plans are static (tests/launchers pin them).
     """
     _reap_stale_shard_dirs()  # one cleanup pass per boot; orphaned shards only
+    _parakeet_cuda_available()  # cache wheel+compute before the first plan
     plan = _pool_plan(max_workers)
     budget = len(plan)
     multi = budget > 1

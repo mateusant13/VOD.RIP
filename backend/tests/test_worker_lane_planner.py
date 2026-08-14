@@ -44,7 +44,7 @@ def _patched(
     finally:
         os.environ.pop("VODRIP_TRANSCRIBE_WORKERS", None)
         os.environ.pop("VODRIP_TRANSCRIBE_GPU_COPIES", None)
-        delattr(at._multi_tls, "pin")
+        at._multi_tls.pin = None
         for name, fn in saved.items():
             setattr(at, name, fn)
 
@@ -113,7 +113,7 @@ def test_background_cpu_default_is_three_lanes(monkeypatch):
         monkeypatch.setenv("VODRIP_TRANSCRIBE_WORKERS", "1")
         assert at._worker_plan() == [("cpu", "int8")], at._worker_plan()
     finally:
-        delattr(at._multi_tls, "pin")
+        at._multi_tls.pin = None
 
 
 def test_background_three_lanes_ram_clamped(monkeypatch):
@@ -128,7 +128,7 @@ def test_background_three_lanes_ram_clamped(monkeypatch):
         plan = at._worker_plan()
         assert len(plan) <= 1, plan  # usable = 3*0.8 = 2.4 GB -> 1 lane
     finally:
-        delattr(at._multi_tls, "pin")
+        at._multi_tls.pin = None
 
 
 def test_held_gpu_model_forces_cpu_lane():
@@ -186,33 +186,26 @@ def _fake_tasklist(stdout, mine="12345"):
 
 
 def test_gpu_held_ignores_wddm_processes():
-    """Windows nvidia-smi compute-apps lists every WDDM GPU touch (dwm,
-    explorer, browsers) — the gate must only count nvcuda.dll loaders."""
-    wddm_only = """Nome da imagem    Identifi M\u00f3dulos
-================= ======== ============================================
-dwm.exe              2168 [N/A]
-explorer.exe         13024 [N/A]
-chrome.exe           8168 [N/A]
-Discord.exe          20384 [N/A]
-"""
+    """Windows nvidia-smi compute-apps lists every WDDM GPU touch with
+    memory [N/A] — those are not CUDA tenants and must not trip the gate."""
+    wddm_only = (
+        "2168, [N/A]\n"
+        "13024, [N/A]\n"
+        "8168, [N/A]\n"
+        "20384, [N/A]\n"
+    )
     assert _fake_tasklist(wddm_only) is False
 
 
 def test_gpu_held_counts_cuda_loader_other_pid():
-    """A python holding nvcuda.dll (ComfyUI/BrandOps) -> held, never stack."""
-    with_cuda = """Nome da imagem    Identifi M\u00f3dulos
-================= ======== ============================================
-python.exe           27004 nvcuda.dll
-"""
+    """A python with a real CUDA allocation (ComfyUI) -> held, never stack."""
+    with_cuda = "27004, 4096\n"
     assert _fake_tasklist(with_cuda, mine="99999") is True
 
 
 def test_gpu_held_ignores_own_pid():
-    """The worker's own nvcuda.dll load must not count as 'other'."""
-    own_only = """Nome da imagem    Identifi M\u00f3dulos
-================= ======== ============================================
-python.exe           12345 nvcuda.dll
-"""
+    """The worker's own CUDA allocation must not count as 'other'."""
+    own_only = "12345, 4096\n"
     assert _fake_tasklist(own_only, mine="12345") is False
 
 

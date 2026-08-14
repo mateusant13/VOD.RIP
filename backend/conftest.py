@@ -6,6 +6,7 @@ see tests/test_impact_selfcheck.py for what it proves.
 
 pytest_plugins = ["tests.impact_plugin"]
 
+import pytest
 import os
 
 # archive_db's module-level self-check (25-40s DB-backed invariants on the

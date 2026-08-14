@@ -5,6 +5,8 @@ GPU interaction (the probes are patched)."""
 
 from __future__ import annotations
 
+import os
+
 import sys
 import time
 from pathlib import Path
@@ -299,3 +301,36 @@ def test_gpu_pinned_job_requeues_when_gate_held():
     finally:
         at._multi_tls.pin = saved_pin
         at._gpu_gate_video = saved_video
+
+
+
+def test_parse_smi_vram_rows_picks_largest_gpu():
+    """A tiny NVIDIA virtual display listed as GPU 0 must lose to the RTX."""
+    rows = at._parse_smi_vram_rows("2048, 1900\n16303, 13393\n")
+    assert len(rows) == 2
+    idx, total, free = max(rows, key=lambda r: r[1])
+    assert idx == 1
+    assert total == 16303 * 1024 ** 2
+    assert free == 13393 * 1024 ** 2
+
+
+def test_compute_apps_ignore_wdm_na_and_own_pid():
+    """Explorer/Chrome/[N/A] and our own pid must not look like a CUDA tenant."""
+    stdout = (
+        "12496, [N/A]\n"
+        "35816, [N/A]\n"
+        "111, 32\n"
+        "222, 4096\n"
+    )
+    assert at._compute_apps_hold_gpu(stdout, {os.getpid(), 35816}) is True  # 222 has 4 GiB
+    assert at._compute_apps_hold_gpu("35816, 4096\n", {35816}) is False
+    assert at._compute_apps_hold_gpu("12496, [N/A]\n", set()) is False
+    assert at._compute_apps_hold_gpu("111, 32\n", set()) is False  # below 256 MiB
+
+
+def test_detect_gpu_vendor_ignores_virtual_display():
+    from services.gpu_detect import detect_gpu_vendor
+
+    assert detect_gpu_vendor(["Virtual Display Driver"]) == "none"
+    assert detect_gpu_vendor(["Virtual Display Driver", "NVIDIA GeForce RTX 5080"]) == "nvidia"
+    assert detect_gpu_vendor(["Virtual Display Driver", "Intel(R) UHD Graphics 770"]) == "intel"

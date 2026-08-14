@@ -51,7 +51,7 @@ def _routed(language, *, device="cpu", parakeet_ok=True, cuda_ok=None, vram_free
     try:
         return at._job_engine(language)
     finally:
-        delattr(at._multi_tls, "pin")
+        at._multi_tls.pin = None
         at._vram_free_bytes, at._vram_free_at = saved_vram_free, saved_vram_at
 
 
@@ -407,7 +407,7 @@ def test_job_level_routing_failures_are_terminal_and_clean(tmp_path, monkeypatch
             stats = at._process_job(
                 {"id": "job-ja", "platform": "twitch", "video_id": "vid-ja"})
         finally:
-            delattr(at._multi_tls, "pin")
+            at._multi_tls.pin = None
         assert stats["error"].startswith("ASR unsupported"), stats
         row = archive_db.query(
             "SELECT status, error FROM archive_jobs WHERE id='job-ja'")[0]

@@ -88,6 +88,36 @@ def _run_text(cmd: list[str], timeout: float = 8.0) -> str:
         return ""
 
 
+# Software / IddCx adapters that Win32_VideoController lists first on a
+# lot of gaming PCs (Sunshine, Parsec, USB docks, "Virtual Display Driver").
+# They are not compute GPUs and must never win vendor / encoder detection
+# over a real NVIDIA/AMD/Intel card sitting later in the same list.
+_VIRTUAL_DISPLAY_MARKERS = (
+    "virtual display",
+    "microsoft basic display",
+    "microsoft hyper-v",
+    "remote display",
+    "iddcx",
+    "indirect display",
+    "parsec virtual",
+    "usb display",
+    "usb3 display",
+    "spacedesk",
+    "standard vga",
+    "generic pnp monitor",
+    "citrix",
+    "orayidd",
+)
+
+
+def _is_virtual_display_adapter(name: str) -> bool:
+    """True for software / IddCx display adapters (not a compute GPU)."""
+    n = (name or "").strip().lower()
+    if not n:
+        return True
+    return any(m in n for m in _VIRTUAL_DISPLAY_MARKERS)
+
+
 def _gpu_names_nvidia_smi() -> List[str]:
     names: list[str] = []
     if not shutil.which("nvidia-smi"):
@@ -95,7 +125,7 @@ def _gpu_names_nvidia_smi() -> List[str]:
     out = _run_text(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"])
     for line in out.splitlines():
         line = line.strip()
-        if line and line.lower() != "name":
+        if line and line.lower() != "name" and not _is_virtual_display_adapter(line):
             names.append(line)
     return names
 
@@ -111,15 +141,14 @@ def _gpu_names_windows() -> List[str]:
         line = line.strip()
         if line:
             names.append(line)
-    if names:
-        return names
-    # wmic fallback (older Windows)
-    out = _run_text(["wmic", "path", "win32_VideoController", "get", "name"])
-    for line in out.splitlines():
-        line = line.strip()
-        if line and line.lower() != "name":
-            names.append(line)
-    return names
+    if not names:
+        # wmic fallback (older Windows)
+        out = _run_text(["wmic", "path", "win32_VideoController", "get", "name"])
+        for line in out.splitlines():
+            line = line.strip()
+            if line and line.lower() != "name":
+                names.append(line)
+    return [n for n in names if not _is_virtual_display_adapter(n)]
 
 
 # ===================================================================
@@ -351,15 +380,22 @@ def _gpu_names_macos() -> List[str]:
 
 
 def list_gpu_names() -> List[str]:
+    """Adapter names for vendor/encoder detection.
+
+    Compute GPUs from nvidia-smi come FIRST (the real card). WMI names are
+    appended after filtering software virtual-display adapters so a
+    'Virtual Display Driver' listed first by Windows never shadows an RTX
+    sitting next to it.
+    """
     if is_windows():
-        names = _gpu_names_windows()
-        for name in _gpu_names_nvidia_smi():
-            if name not in names:
+        names: list[str] = []
+        for name in _gpu_names_nvidia_smi() + _gpu_names_windows():
+            if name not in names and not _is_virtual_display_adapter(name):
                 names.append(name)
         return names
     if is_macos():
-        return _gpu_names_macos()
-    return _gpu_names_linux()
+        return [n for n in _gpu_names_macos() if not _is_virtual_display_adapter(n)]
+    return [n for n in _gpu_names_linux() if not _is_virtual_display_adapter(n)]
 
 
 # ===================================================================
