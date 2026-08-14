@@ -36,6 +36,16 @@ import subprocess as sp
 import sys
 import tempfile
 
+# Scope the temp namespace: _shard_dirs() scans gettempdir() by name and the
+# transcribe subprocesses mkdtemp('vodrip-shards-') there too. The OS temp is
+# SHARED with any live archive worker (real VOD sharding) — a foreign
+# vodrip-shards-* dir made the leak-check flaky. Pointing TMP/TEMP (inherited
+# by the subprocesses) + tempfile.tempdir at a private dir makes all four
+# leak checks hermetic. (ponytail: pytest's tmp_* land here too — harmless.)
+os.environ["TMP"] = os.environ["TEMP"] = str(
+    pathlib.Path(tempfile.mkdtemp(prefix="vodrip-shardtest-scope-"))
+)
+tempfile.tempdir = os.environ["TMP"]
 _TMP = pathlib.Path(tempfile.mkdtemp(prefix="vodrip-shardtest-"))
 os.environ["VODRIP_ARCHIVE_DB"] = str(_TMP / "archive.db")
 os.environ.setdefault("VODRIP_WHISPER_MODEL", "small")
