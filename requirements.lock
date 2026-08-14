@@ -234,8 +234,7 @@ numpy==1.26.4
 oauthlib==3.3.1
 omegaconf==2.3.0
 onnx==1.18.0
-onnxruntime==1.23.2
-onnxruntime-gpu==1.22.0
+onnxruntime==1.24.4
 open3d==0.18.0
 openai==2.30.0
 openai-harmony==0.0.8
