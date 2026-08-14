@@ -885,9 +885,14 @@ describe('LivePlayerPopup replay rail (wheel zoom + arrow seek)', () => {
     await screen.findByTitle('Fullscreen');
 
     const rail = screen.getByRole('slider', { name: 'Seek back into the broadcast (replay)' }) as HTMLInputElement;
-    expect(rail.disabled).toBe(false);
+    // The DVR archive resolves lazily AFTER the transport renders — wait for
+    // the rail to enable and settle (same as the arrow-seek siblings below)
+    // so the native wheel listener (attached by a passive effect keyed on
+    // [railDisabled, railMax, railView]) is in place before the wheel fires;
+    // firing earlier races the effect flush and the zoom is a silent no-op.
+    await waitFor(() => expect(rail.disabled).toBe(false));
+    await waitFor(() => expect(rail.max).toBe('100'));
     expect(rail.min).toBe('0');
-    expect(rail.max).toBe('100');
 
     // jsdom reports a zero-size rect — give the rail real geometry so the
     // cursor fraction (pointer x within the rail) is computable.
