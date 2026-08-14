@@ -570,7 +570,7 @@ const ptBR: Record<string, string> = {
   'botGate.dismiss': 'Dispensar',
   // ── Cookie extension auto-install (cookieAuto.*) ──────────
   'cookieAuto.title': 'Instale a extensão de cookies',
-  'cookieAuto.body': 'Destrava YouTube, Twitch e Kick: a extensão compartilha os cookies da sua sessão com este app, só localmente. O Chrome será fechado e reaberto uma vez durante a instalação.',
+  'cookieAuto.body': 'Destrava YouTube, Twitch e Kick: a extensão compartilha os cookies da sua sessão com este app, só localmente.',
   'cookieAuto.installNow': 'Instalar agora',
   'cookieAuto.later': 'Depois',
   'cookieAuto.never': 'Não mostrar novamente',
@@ -649,7 +649,7 @@ const en: Record<string, string> = {
   'botGate.installNow': 'Install now',
   'botGate.dismiss': 'Dismiss',
   'cookieAuto.title': 'Install the cookie extension',
-  'cookieAuto.body': 'Unlock YouTube, Twitch and Kick: the extension shares your browser session cookies with this app, locally only. Chrome will close and reopen once during the install.',
+  'cookieAuto.body': 'Unlock YouTube, Twitch and Kick: the extension shares your browser session cookies with this app, locally only.',
   'cookieAuto.installNow': 'Install now',
   'cookieAuto.later': 'Later',
   'cookieAuto.never': "Don't show again",
@@ -1170,7 +1170,7 @@ const es: Record<string, string> = {
   'botGate.dismiss': 'Descartar',
   // ── Cookie extension auto-install (cookieAuto.*) ──────────
   'cookieAuto.title': 'Instala la extensión de cookies',
-  'cookieAuto.body': 'Desbloquea YouTube, Twitch y Kick: la extensión comparte las cookies de tu sesión con esta app, solo localmente. Chrome se cerrará y se reabrirá una vez durante la instalación.',
+  'cookieAuto.body': 'Desbloquea YouTube, Twitch y Kick: la extensión comparte las cookies de tu sesión con esta app, solo localmente.',
   'cookieAuto.installNow': 'Instalar ahora',
   'cookieAuto.later': 'Después',
   'cookieAuto.never': 'No volver a mostrar',
