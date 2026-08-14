@@ -1325,6 +1325,13 @@ def _clamp_range_header(range_header: str, total: int) -> Optional[str]:
     if end < start:
         return None
     return f"bytes={start}-{end}"
+
+
+# Twitch usher master URL shape — same pattern the live-rotation endpoint
+# matches (routers/preview.py) to pull the channel login out of a master URL.
+_TWITCH_USHER_CHANNEL_RE = re.compile(r"/api/channel/hls/([A-Za-z0-9_]+)\.m3u8")
+
+
 def _open_upstream_stream(
     session: PreviewSession,
     url: str,
@@ -1369,12 +1376,38 @@ def _open_upstream_stream(
             resp.close()
         except OSError:
             pass
-            if not _retried and session.platform == "YouTube":
-                new_url = _youtube_refresh_and_remap(session, url)
-                if new_url:
+        if not _retried and session.platform == "YouTube":
+            new_url = _youtube_refresh_and_remap(session, url)
+            if new_url:
+                return _open_upstream_stream(
+                    session,
+                    new_url,
+                    range_header,
+                    _retried=True,
+                )
+        if not _retried and (session.platform or "").lower() == "twitch" and (
+            url == session.master_url or url == session.entry_url
+        ):
+            # Twitch live token expiry on the MASTER fetch: re-probe the usher
+            # with a fresh GQL token and swap the session's upstream URL in
+            # place (same swap the ad-rotation endpoint does) so a long stream
+            # past token expiry reloads seamlessly instead of 403'ing into the
+            # hls.js fatal-error UI. Media-playlist/segment 403s are NOT
+            # retried here — they signal a per-resource issue, not an expired
+            # master token.
+            from services.live_capture import probe_twitch_live_master
+
+            match = _TWITCH_USHER_CHANNEL_RE.search(session.master_url or "")
+            if match:
+                probed = probe_twitch_live_master(match.group(1), skip_cache=True)
+                if probed:
+                    session.master_url = probed["url"]
+                    session.entry_url = probed["url"]
+                    session.allowed_hosts.update(_hosts_for_url(probed["url"]))
+                    session.twitch_player_type = probed["player_type"]
                     return _open_upstream_stream(
                         session,
-                        new_url,
+                        probed["url"],
                         range_header,
                         _retried=True,
                     )
