@@ -18,6 +18,9 @@ import subprocess
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def test_foreground_focus():
+    if os.environ.get("VODRIP_GUI_TESTS", "").strip().lower() not in ("1", "true", "yes", "on"):
+        import pytest
+        pytest.skip("spawns explorer.exe; set VODRIP_GUI_TESTS=1 to opt in")
     if os.name != "nt":
         print("SKIP: This test is Windows-only")
         return True
@@ -81,6 +84,9 @@ def test_foreground_focus():
 
 def test_nudge_explorer():
     """Test the retry-based nudge_explorer_foreground function."""
+    if os.environ.get("VODRIP_GUI_TESTS", "").strip().lower() not in ("1", "true", "yes", "on"):
+        import pytest
+        pytest.skip("touches Explorer; set VODRIP_GUI_TESTS=1 to opt in")
     if os.name != "nt":
         print("SKIP: nudge test is Windows-only")
         return True

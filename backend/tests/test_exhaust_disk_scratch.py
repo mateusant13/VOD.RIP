@@ -52,6 +52,7 @@ def test_wipe_covers_non_vodrip_leak_families(monkeypatch, tmp_path):
         "ai-ask-tests-abc", "archive-chat-group-xyz",
         "archive-enrich-v2-q", "archive-transcribe-download-z",
         "kd_test", "vodrip-search-lab", "vodrip-tests-scope-1",
+        "yt-transcribe-abc", "twitch-transcribe-abc",
     ], age_sec=2 * 3600)
     monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
     _ct._wipe_vodrip_scratch(min_age_s=0.0)
@@ -102,6 +103,20 @@ def test_hygiene_sweeps_worker_audio_dirs(tmp_path):
     stats = sweep_orphaned_temps(tmp_path, tmp_path / "appdata")
     assert stats["transcribe"] == 1
     assert not stale.exists() and fresh.exists()
+
+
+def test_hygiene_sweeps_legacy_yt_transcribe_dirs(tmp_path):
+    """Pre-fix yt-transcribe-* / twitch-transcribe-* leftovers must be swept."""
+    stale = tmp_path / "yt-transcribe-dQw4w9WgXcQ-"
+    stale.mkdir()
+    old = time.time() - 25 * 3600
+    os.utime(stale, (old, old))
+    kick = tmp_path / "kick-transcribe-xyz-"
+    kick.mkdir()
+    os.utime(kick, (old, old))
+    stats = sweep_orphaned_temps(tmp_path, tmp_path / "appdata")
+    assert stats["transcribe"] == 2
+    assert not stale.exists() and not kick.exists()
 
 
 # --- fix-on-sight: transcribe selfcheck gate ----------------------------

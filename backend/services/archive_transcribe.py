@@ -4080,13 +4080,27 @@ def maybe_ensure_gpu_sherpa() -> None:
         return
     if not _gpu_autoinstall_due():
         return
-    path = _gpu_autoinstall_stamp_path()
+    # BOOT-03: never pip-install (or stamp a 24h lockout) while a live
+    # worker holds sherpa DLLs — swapping the wheel under it is fatal,
+    # and a failed install used to stamp first so the next 24h was dead.
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(str(time.time()), encoding="utf-8")
-    except OSError as exc:
-        logger.debug("GPU auto-install stamp write failed: %s", exc)
+        if archive_db.worker_live(age_s=45):
+            logger.debug("GPU sherpa auto-install skipped (worker live)")
+            return
+    except Exception:
+        logger.debug("GPU sherpa auto-install skipped (worker_live probe failed)")
+        return
+
+    def _stamp() -> None:
+        path = _gpu_autoinstall_stamp_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(str(time.time()), encoding="utf-8")
+        except OSError as exc:
+            logger.debug("GPU auto-install stamp write failed: %s", exc)
+
     if not _gpu_autoinstall_needed():
+        _stamp()  # nothing to do — don't re-probe every boot
         return
     logger.info("NVIDIA GPU detected with CPU sherpa-onnx — auto-installing the CUDA wheel")
     try:
@@ -4101,6 +4115,7 @@ def maybe_ensure_gpu_sherpa() -> None:
             check=False,
         )
         if proc.returncode == 0:
+            _stamp()
             logger.info("sherpa-onnx CUDA wheel installed — GPU slots can run parakeet")
         else:
             logger.debug(

@@ -320,6 +320,11 @@ def test_scheduler_creates_youtube_job_only_with_marker_and_no_transcripts():
         "no marker -> captions pending -> never created"
     )
 
+    # BOOT-02: fresh candidates only top up an in-flight pipeline — the
+    # first job comes from a user-initiated path (seeded here).
+    archive_db.enqueue_job(
+        "transcribe-youtube-seed-sched", "transcribe", "youtube", "seed-sched"
+    )
     archive_db.mark_captions_unavailable("youtube", "vp-sched")
     archive_scheduler._enqueue_transcriptions()
     job = archive_db.latest_job("youtube", "vp-sched", kind="transcribe")

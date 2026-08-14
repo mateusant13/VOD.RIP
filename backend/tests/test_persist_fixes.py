@@ -321,6 +321,24 @@ def test_original_failed_marker_persists_and_expires(scratch_db):
 
 # --- 6. Stale failed transcribe jobs are requeued ---------------------------
 
+
+def _seed_inflight_transcribe() -> None:
+    """BOOT-02: pass-2 is idle-gated. Tests that expect a *fresh* enqueue
+    must already have transcribe work in flight (the user/search signal)."""
+    archive_db.upsert_video({
+        "platform": "twitch",
+        "video_id": "inflight-seed",
+        "channel": "seed",
+        "title": "seed",
+        "kind": "vod",
+        "status": "known",
+        "duration_sec": 10.0,
+    })
+    archive_db.enqueue_job(
+        "transcribe-twitch-inflight-seed", "transcribe", "twitch", "inflight-seed"
+    )
+
+
 def _seed_ready_youtube(vid: str, path: pathlib.Path) -> None:
     archive_db.upsert_video({
         "platform": "youtube",
@@ -351,6 +369,7 @@ def test_scheduler_youtube_transcribe_job_requires_marker(scratch_db, tmp_path):
 
     # Marker set -> ASR candidate -> created with the stable job id.
     archive_db.mark_captions_unavailable("youtube", _VID)
+    _seed_inflight_transcribe()
     archive_scheduler._enqueue_transcriptions()
     job = archive_db.latest_job("youtube", _VID, kind="transcribe")
     assert job is not None, "captions_unavailable_at + no transcripts -> ASR job"
@@ -360,7 +379,8 @@ def test_scheduler_youtube_transcribe_job_requires_marker(scratch_db, tmp_path):
 
 def test_scheduler_still_enqueues_twitch_transcribe_job(scratch_db, tmp_path):
     """Twitch/Kick ASR stays unchanged: a ready Twitch VOD without
-    transcripts still gets a transcribe job from the scheduler."""
+    transcripts still gets a transcribe job from the scheduler once the
+    pipeline is in flight (BOOT-02: an idle queue enqueues nothing)."""
     media = tmp_path / "tw.mp4"
     media.write_bytes(b"not really media")
     archive_db.upsert_video({
@@ -374,6 +394,7 @@ def test_scheduler_still_enqueues_twitch_transcribe_job(scratch_db, tmp_path):
         "duration_sec": 120.0,
     })
 
+    _seed_inflight_transcribe()
     archive_scheduler._enqueue_transcriptions()
 
     job = archive_db.latest_job("twitch", "tw-vid-0001", kind="transcribe")
@@ -397,6 +418,7 @@ def test_scheduler_enqueues_known_twitch_row(scratch_db):
         "duration_sec": 120.0,
     })
 
+    _seed_inflight_transcribe()
     archive_scheduler._enqueue_transcriptions()
 
     job = archive_db.latest_job("twitch", "tw-vid-0002", kind="transcribe")
@@ -420,6 +442,7 @@ def test_scheduler_requeues_ready_row_with_missing_file(scratch_db):
         "duration_sec": 120.0,
     })
 
+    _seed_inflight_transcribe()
     archive_scheduler._enqueue_transcriptions()
 
     job = archive_db.latest_job(
@@ -612,6 +635,7 @@ def test_background_pass1_never_starves_fresh(scratch_db, monkeypatch):
     archive_db.enqueue_job(job_a, "transcribe", "twitch", "bg-a", priority=0)
     _stale_failed_job(job_a, attempts=1)
     _seed_twitch("bg-b", 60.0)
+    _seed_inflight_transcribe()
 
     archive_scheduler._enqueue_transcriptions()
 

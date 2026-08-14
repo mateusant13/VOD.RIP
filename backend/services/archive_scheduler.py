@@ -636,6 +636,21 @@ def _enqueue_transcriptions() -> None:
     if enqueued >= budget:
         return
 
+    # BOOT-02: do not auto-create transcribe work on an idle queue. Pass 1
+    # still resurrects stale failures (attempt-capped). Fresh candidates
+    # only enqueue when the user/search already put transcribe work in
+    # flight — otherwise every 180s we'd start dozens of yt-dlp+ffmpeg jobs.
+    inflight = list(
+        archive_db.query(
+            """SELECT 1 FROM archive_jobs
+               WHERE kind='transcribe' AND status IN ('queued','running')
+               LIMIT 1"""
+        )
+    )
+    if not inflight:
+        logger.debug("scheduler skip transcribe pass-2 (idle queue)")
+        return
+
     # Pass 2 — fresh candidates. FIX A: twitch/kick rows are candidates
     # WITHOUT a local archive file (the worker downloads the audio at job
     # time), so the archive_path predicate is gone; a ready row whose file

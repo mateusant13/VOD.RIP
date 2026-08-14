@@ -79,7 +79,7 @@ _SCRATCH_PREFIXES = (
     "transcribe-cross-", "transcribe-cross-app-", "transcript-fix-",
     "transcript-fix-app-", "transcript-pipeline-", "transcript-pipeline-app-",
     "twitch-clip-chat-", "watchdog-test-", "window_hls_test_",
-    "ws1-arch-", "ws1-queue-", "yt-captions-test-", "yt-display-names-",
+    "ws1-arch-", "ws1-queue-", "yt-captions-test-", "yt-display-names-", "yt-transcribe-", "twitch-transcribe-", "kick-transcribe-", "bw-a4-", "bw-auth-", "bw-crash-",
     "yt-gate-", "yt-policy-test-", "ytdlp_aud_", "ytdlp_seg_",
 )
 # Bare scratch dir names (not mkdtemp-prefixed) in the temp dir.

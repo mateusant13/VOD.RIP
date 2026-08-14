@@ -21,6 +21,27 @@ from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
+import sys
+
+pytestmark = pytest.mark.real
+
+
+def _wants_real_archive_copy() -> bool:
+    """True when this process actually intends to run these tests.
+
+    Default pytest still *imports* the file during collection; the 134 MB
+    copy2 of the live archive.db must not run then.
+    """
+    name = Path(__file__).name
+    if any(Path(str(a).replace(chr(92), "/")).name == name for a in sys.argv):
+        return True
+    joined = " ".join(sys.argv)
+    if " -m real" in f" {joined}" or joined.endswith("-m real"):
+        return True
+    return os.environ.get("VODRIP_REAL_DB_TESTS", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
 
 APPDATA_VODRIP = Path(os.environ["APPDATA"]) / "VOD.RIP"
 SRC_DB = APPDATA_VODRIP / "archive.db"
@@ -30,6 +51,12 @@ if not SRC_DB.exists():
     pytest.skip(
         f"real archive.db missing: {SRC_DB} — this module needs the live "
         "archive (transcripts/chat) to exercise the panel",
+        allow_module_level=True,
+    )
+
+if not _wants_real_archive_copy():
+    pytest.skip(
+        "134MB archive.db copy is opt-in (-m real or this file)",
         allow_module_level=True,
     )
 

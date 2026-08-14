@@ -80,11 +80,17 @@ def sweep_orphaned_temps(temp_dir: Path, app_data: Path) -> dict:
     #    standalone transcribe e2e test's scratch — crashed/killed workers
     #    leave the former behind.
     removed = 0
-    for entry in temp_dir.glob("vodrip-transcribe-*"):
-        if entry.is_dir() and _stale(entry, orphan_cutoff):
-            shutil.rmtree(entry, ignore_errors=True)
-            if not entry.exists():
-                removed += 1
+    for pat in (
+        "vodrip-transcribe-*",
+        "yt-transcribe-*",
+        "twitch-transcribe-*",
+        "kick-transcribe-*",
+    ):
+        for entry in temp_dir.glob(pat):
+            if entry.is_dir() and _stale(entry, orphan_cutoff):
+                shutil.rmtree(entry, ignore_errors=True)
+                if not entry.exists():
+                    removed += 1
     stats["transcribe"] = removed
 
     # 3) vodrip_cookie_selfcheck_* .db leftovers from killed module

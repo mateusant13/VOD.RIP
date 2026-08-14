@@ -23,17 +23,31 @@ import shutil
 import sys
 import tempfile
 
+def _wants_real_archive_copy() -> bool:
+    name = pathlib.Path(__file__).name
+    if any(pathlib.Path(str(a).replace(chr(92), "/")).name == name for a in sys.argv):
+        return True
+    joined = " ".join(sys.argv)
+    if " -m real" in f" {joined}" or joined.endswith("-m real"):
+        return True
+    return os.environ.get("VODRIP_REAL_DB_TESTS", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 _TMP = pathlib.Path(tempfile.mkdtemp(prefix="vodrip-ws3-lang-"))
 _REAL_DB = pathlib.Path(os.environ.get("APPDATA", "")) / "VOD.RIP" / "archive.db"
 _DB_COPY = _TMP / "archive.db"
-if _REAL_DB.exists():
+if _REAL_DB.exists() and _wants_real_archive_copy():
     shutil.copy2(_REAL_DB, _DB_COPY)
-else:  # fallback: brand-new empty DB (CI without the real install)
+else:  # fallback: brand-new empty DB (CI / default collection)
     _DB_COPY.touch()
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import pytest  # noqa: E402
+
+pytestmark = pytest.mark.real
 
 
 @pytest.fixture(scope="module", autouse=True)
