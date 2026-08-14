@@ -322,6 +322,25 @@ function resumeTwitchIfOurs() {
   KO.twWasPlaying = false;
 }
 
+// The overlay must sit ABOVE the Twitch player but BELOW page UI that
+// overlaps the player (user profile cards, badge hovercards, menus).
+// Measured live (2026-08-13): the player lives in main.twilight-main
+// (z-index 1, stacking context) → persistent-player (z 1) → video; the
+// viewer card renders INSIDE main (right-column z 1 → chat wrapper z 10 →
+// card z 10). A body-level overlay with max z-index covers the whole main
+// context — card included — which is why profile clicks vanished under
+// the overlay. Fix: append the wrap AND the floating buttons INTO main and
+// use z-index 5 / 6 — above the player (1), below the chat/card wrapper
+// (10). ponytail: if Twitch reworks these z-indexes, re-measure the
+// wrapper values; the anchor selector is layout-agnostic ('main').
+function overlayAnchor() {
+  return document.querySelector('main.twilight-main, main') || document.body;
+}
+
+function ensureAttached(el) {
+  if (el && !el.isConnected) overlayAnchor().appendChild(el);
+}
+
 // ---- overlay lifecycle ------------------------------------------------------
 
 function mount() {
@@ -347,7 +366,7 @@ function mount() {
     '<span style="flex:1"></span>' +
     '<button id="ko-fs" title="Fullscreen">\u26F6</button>';
   wrap.appendChild(bar);
-  (document.body || document.documentElement).appendChild(wrap);
+  overlayAnchor().appendChild(wrap);
   KO.wrap = wrap;
   KO.video = v;
   KO.hideTicks = 0;
@@ -747,6 +766,7 @@ function startRectLoop() {
       stopRectLoop();
       return;
     }
+    ensureAttached(KO.wrap); // Twitch may re-render main — re-parent if dropped
     const tv = twitchVideo();
     updateTwLiveSticky(tv);
     const overlayShown = KO.player !== 'twitch' && KO.wrap.style.display !== 'none';
@@ -790,7 +810,7 @@ function injectStyles() {
   const st = document.createElement('style');
   st.id = 'ko-style';
   st.textContent =
-    '#ko-wrap{position:fixed;z-index:2147483647;pointer-events:none;background:#000;overflow:hidden;}' +
+    '#ko-wrap{position:fixed;z-index:5;pointer-events:none;background:#000;overflow:hidden;}' +
     '#ko-wrap video{width:100%;height:100%;display:block;pointer-events:none;object-fit:contain;background:#000;}' +
     '#ko-wrap.ko-yt iframe{width:100%;height:100%;border:0;display:block;pointer-events:auto;}' +
     '#ko-bar{position:absolute;left:0;right:0;bottom:0;pointer-events:auto;opacity:0;transition:opacity .18s ease;' +
@@ -806,7 +826,7 @@ function injectStyles() {
     '#ko-seek{flex:1;height:4px;accent-color:#53fc18;cursor:pointer;min-width:40px;}' +
     '#ko-live{font-weight:700;color:#000;background:#ff0000;border-radius:10px;padding:1px 9px;}' +
     '#ko-live:hover{background:#ff4d4d;}' +
-    '#ko-twitchbtn,#ko-kickbtn,#ko-ytbtn{position:fixed;z-index:2147483646;pointer-events:auto;display:none;' +
+    '#ko-twitchbtn,#ko-kickbtn,#ko-ytbtn{position:fixed;z-index:6;pointer-events:auto;display:none;' +
     'background:#9147ff;color:#fff;border:0;border-radius:14px;padding:6px 14px;' +
     'font:700 13px system-ui,sans-serif;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,.5);}' +
     '#ko-twitchbtn:hover,#ko-kickbtn:hover,#ko-ytbtn:hover{background:#a970ff;}' +
@@ -817,13 +837,14 @@ function injectStyles() {
 
 // Floating switch buttons: show the OTHER configured platforms' buttons.
 function buildSwitchButtons() {
+  const anchor = overlayAnchor();
   if (!document.getElementById('ko-twitchbtn')) {
     const b = document.createElement('button');
     b.id = 'ko-twitchbtn';
     b.textContent = 'TWITCH';
     b.title = 'Show the native Twitch player (the other player pauses)';
     b.addEventListener('click', () => setPlayer('twitch'));
-    (document.body || document.documentElement).appendChild(b);
+    anchor.appendChild(b);
   }
   if (!document.getElementById('ko-kickbtn')) {
     const b = document.createElement('button');
@@ -831,7 +852,7 @@ function buildSwitchButtons() {
     b.textContent = 'KICK';
     b.title = 'Show the Kick player (no Twitch ads)';
     b.addEventListener('click', () => setPlayer('kick'));
-    (document.body || document.documentElement).appendChild(b);
+    anchor.appendChild(b);
   }
   if (!document.getElementById('ko-ytbtn')) {
     const b = document.createElement('button');
@@ -839,7 +860,7 @@ function buildSwitchButtons() {
     b.textContent = 'YOUTUBE';
     b.title = 'Show the YouTube player (no Twitch ads)';
     b.addEventListener('click', () => setPlayer('youtube'));
-    (document.body || document.documentElement).appendChild(b);
+    anchor.appendChild(b);
   }
 }
 
@@ -855,6 +876,7 @@ function updateSwitchButtons() {
   for (const id of ids) {
     const el = document.getElementById(id);
     if (!el) continue;
+    ensureAttached(el); // survive Twitch main re-renders
     el.style.display = 'none';
     if (!tv) continue;
     el.style.display = 'block';
