@@ -45,6 +45,19 @@ CLIPS_CARDS_USER_HASH = "90c33f5e6465122fba8f9371e2a97076f9ed06c6fed3788d002ab9e
 CLIP_ACCESS_TOKEN_HASH = "993d9a5131f15a37bd16f32342c44ed1e0b1a9b968c6afdb662d2cddd595f6c5"
 VOD_PLAYBACK_TOKEN_HASH = "ed230aa1e33e07eebb8928504583da78a5173989fadfb1ac94be06a04f3cdbe9"
 
+# Deep-paging ceilings for the anonymous GQL channel lists.
+#  - Videos connection: cursor pages of 100 (sort: TIME). Bound the crawl at
+#    1000 (10 pages) so show-more terminates; a channel with more keeps
+#    has_more=true until the page request crosses the ceiling, then has_more
+#    goes false instead of looping forever.
+#  - Clips connection: documented to cap around ~1100 nodes; the crawler's
+#    max_pages already bounds it (5 pages recent, 10 era, 3 ALL_TIME).
+# ponytail: the anonymous GQL path is the fast no-auth route; if a channel
+# needs deeper lists than these ceilings, the upgrade path is the official
+# Helix API (cursor + 100/page, no documented node cap).
+TWITCH_VIDEOS_CEILING = 1000
+TWITCH_CLIPS_CEILING = 1000
+
 CHANNEL_VIDEOS_QUERY = """
 query ChannelVideos($login: String!, $first: Int!, $after: Cursor) {
   user(login: $login) {
@@ -637,25 +650,36 @@ def _gql_persisted(operation_name: str, sha256_hash: str, variables: Dict[str, A
     return body.get("data") or {}
 
 
-def list_channel_videos_sync(login: str, limit: int = 100) -> List[Dict[str, Any]]:
-    """Return recent VODs/highlights/uploads for a Twitch channel login."""
+def list_channel_videos_sync(
+    login: str, limit: int = 100, *, return_has_more: bool = False
+) -> List[Dict[str, Any]]:
+    """Return recent VODs/highlights/uploads for a Twitch channel login.
+
+    return_has_more: when True, return (items, has_more) — has_more is the
+    GQL pageInfo.hasNextPage at the stop point, i.e. whether a deeper page
+    exists (False when the connection is exhausted OR the request crossed
+    TWITCH_VIDEOS_CEILING)."""
     login = (login or "").strip().lower()
     if not login:
-        return []
+        return ([], False) if return_has_more else []
 
-    limit = max(1, min(int(limit), 100))
+    limit = max(1, min(int(limit), TWITCH_VIDEOS_CEILING))
 
     out: List[Dict[str, Any]] = []
     cursor: Optional[str] = None
+    has_more = False
 
     while len(out) < limit:
         batch = min(100, limit - len(out))
         data = _gql_request(CHANNEL_VIDEOS_QUERY, {"login": login, "first": batch, "after": cursor})
         user = data.get("user")
         if not user:
+            has_more = False
             break
 
         block = user.get("videos") or {}
+        page = block.get("pageInfo") or {}
+        has_more = bool(page.get("hasNextPage"))
         edges = block.get("edges") or []
         for edge in edges:
             node = edge.get("node") or {}
@@ -682,11 +706,16 @@ def list_channel_videos_sync(login: str, limit: int = 100) -> List[Dict[str, Any
             if len(out) >= limit:
                 break
 
-        page = block.get("pageInfo") or {}
-        if not page.get("hasNextPage") or len(out) >= limit:
+        if not has_more or len(out) >= limit:
             break
         cursor = page.get("endCursor")
 
+    if return_has_more:
+        # Boundary guard: once the request depth is clamped at the ceiling the
+        # connection may still report hasNextPage=true (a >1000-VOD channel) —
+        # has_more must go False there or show-more loops forever on empty
+        # pages at the bound.
+        return out, has_more and limit < TWITCH_VIDEOS_CEILING
     return out
 
 
@@ -720,7 +749,7 @@ def list_channel_clips_sync(
     if not login:
         return []
 
-    limit = max(1, min(int(limit), 10))
+    limit = max(1, min(int(limit), TWITCH_CLIPS_CEILING))
     fetch_n = max(limit, 100)
     older_cutoff: Optional[float] = None
     newer_cutoff: Optional[float] = None
@@ -731,7 +760,11 @@ def list_channel_clips_sync(
         newer_cutoff = _time.time() - max(0, newer_than_days) * 86400
 
     # Enough in-window clips for the UI (10 shown + show-more headroom).
+    # Deep page requests scale the target: a show-more page at offset N asks
+    # for N+limit clips, so the crawl must not stop short of the page end
+    # (probe +1 keeps has_more true while more in-window clips exist).
     _IN_WINDOW_TARGET = 100
+    _in_window_target = max(_IN_WINDOW_TARGET, fetch_n + 1)
 
     def _fetch(filter_label: str = "LAST_WEEK") -> List[Dict[str, Any]]:
         """Fetch clips from Twitch GQL with the given filter, paginating."""
@@ -802,7 +835,7 @@ def list_channel_clips_sync(
             if not pi.get("hasNextPage") or pages >= max_pages:
                 break
             if older_cutoff is not None:
-                if in_window >= _IN_WINDOW_TARGET:
+                if in_window >= _in_window_target:
                     break
                 if filter_label != "ALL_TIME" and sort != "views":
                     # Date-ordered bucket: past the older edge = full window.

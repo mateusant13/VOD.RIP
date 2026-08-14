@@ -36,15 +36,21 @@ from services.archive_db import (
 )
 from services.channel_cache import get_cached, make_channel_cache_key, set_cached
 from services.kick_api_service import (
+    KICK_VIDEOS_CEILING,
     get_channel_language_sync as kick_get_channel_language_sync,
     list_channel_clips_sync as kick_list_channel_clips_sync,
     list_channel_videos_sync as kick_list_channel_videos_sync,
 )
 from services.twitch_gql_service import (
+    TWITCH_CLIPS_CEILING,
+    TWITCH_VIDEOS_CEILING,
     list_channel_clips_sync as twitch_list_channel_clips_sync,
     list_channel_videos_sync as twitch_list_channel_videos_sync,
 )
-from services.youtube_service import list_channel_videos_sync as youtube_list_channel_videos_sync
+from services.youtube_service import (
+    YOUTUBE_PLAYLIST_CEILING,
+    list_channel_videos_sync as youtube_list_channel_videos_sync,
+)
 from services.youtube_innertube import innertube_channel_language
 from services.channel_language import aggregate_channel_language, persist_platform_clue
 from utils import (
@@ -62,6 +68,21 @@ from utils import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["channels"])
+
+# Per-platform deep-fetch ceilings (max items a show-more page may ask for).
+# At the ceiling has_more goes false instead of looping forever:
+#   - Twitch GQL videos connection: cursor pages of 100 — bound at 1000.
+#   - Twitch GQL clips connection: documented ~1100-node cap — bound at 1000.
+#   - Kick v2 API: single-shot list (no cursor). The service depth-truncates
+#     one API response, so deeper pages re-ask with a deeper depth; bound at
+#     500 — the full list is whatever the API returns.
+#   - YouTube flat playlist: yt-dlp pageToken paging, ~50 entries/page —
+#     bound the flat extract at 1000 entries (bot-wall / request ceiling).
+_PLATFORM_CEILINGS = {
+    "Kick": KICK_VIDEOS_CEILING,
+    "Twitch": TWITCH_VIDEOS_CEILING,
+    "YouTube": YOUTUBE_PLAYLIST_CEILING,
+}
 
 # Dedupe guard for background delta refreshes: one in-flight refresh per
 # (channel, platforms) key, so concurrent opens never double-fire the
@@ -164,33 +185,50 @@ async def _gather_channel_clips(
     days: int = CHANNEL_DAYS_DEFAULT,
     min_days: int = 0,
     sort: str = "date",
-) -> tuple[List[dict], Dict[str, str], int]:
-    """Fetch clips per platform using platform-specific logins."""
+    page: int = 1,
+) -> tuple[List[dict], Dict[str, str], int, bool]:
+    """Fetch clips per platform using platform-specific logins.
+
+    Page-aware: `limit` is the page size; `page` selects the slice
+    [offset, offset+limit) of the merged, window-filtered, sorted list. The
+    per-platform fetches are asked for the full requested depth (need) so a
+    show-more page never comes back short, and has_more reports whether the
+    platform crawls were saturated (deeper pages may exist)."""
     per_platform_errors: Dict[str, str] = {}
     all_clips: List[dict] = []
+    has_more_flags: Dict[str, bool] = {}
     loop = asyncio.get_running_loop()
     kick_slug = (kick_slug or "").strip().lower()
     twitch_login = (twitch_login or "").strip().lower()
     youtube_ref = (youtube_slug or "").strip()
+    page = max(1, int(page))
+    offset = (page - 1) * limit
+    need = offset + limit
 
     async def _fetch_youtube_shorts() -> None:
         if not youtube_ref:
             return
         try:
             from functools import partial
-            vids = await asyncio.wait_for(
+            fetched = await asyncio.wait_for(
                 loop.run_in_executor(
                     CHANNEL_EXECUTOR,
                     partial(
                         youtube_list_channel_videos_sync,
                         youtube_ref,
-                        limit,
+                        need,
                         playlist="shorts",
                         enrich=True,
+                        return_has_more=True,
                     ),
                 ),
                 timeout=YOUTUBE_CHANNEL_FETCH_TIMEOUT_SEC,
             )
+            if isinstance(fetched, tuple):
+                vids, has_more = fetched
+                has_more_flags["YouTube"] = bool(has_more)
+            else:
+                vids = fetched
         except asyncio.TimeoutError:
             per_platform_errors["YouTube"] = "Shorts fetch timed out — try again"
             return
@@ -221,7 +259,7 @@ async def _gather_channel_clips(
                     functools.partial(
                         twitch_list_channel_clips_sync,
                         twitch_login,
-                        limit,
+                        need,
                         range_label=gte,
                         sort=sort,
                         older_than_days=days,
@@ -237,6 +275,13 @@ async def _gather_channel_clips(
         # ponytail: best-effort — return
             per_platform_errors["Twitch"] = format_platform_error(e)
             return
+        # Saturation only counts for the non-era crawl (days<=0): it stops at
+        # exactly `need` clips or hasNextPage=false, so len>=need means more
+        # exist. Era crawls stop early past the window's older edge, where
+        # len includes out-of-window clips — the slice-vs-total rule below
+        # is the honest signal there.
+        if days <= 0 and len(vids) >= need:
+            has_more_flags["Twitch"] = True
         for v in vids:
             all_clips.append({
                 "id": v["id"],
@@ -263,7 +308,7 @@ async def _gather_channel_clips(
                     functools.partial(
                         kick_list_channel_clips_sync,
                         f"https://kick.com/{kick_slug}/clips",
-                        limit,
+                        need,
                         sort=sort,
                     ),
                 ),
@@ -276,6 +321,12 @@ async def _gather_channel_clips(
         # ponytail: best-effort — return
             per_platform_errors["Kick"] = format_platform_error(e)
             return
+        # Kick's clips API is single-shot (no cursor): the service returns
+        # the newest `need` clips, so len==need means the list continues past
+        # the fetched depth (a deeper page re-asks deeper), and len<need
+        # means the API list is exhausted (has_more goes False).
+        if len(vids) >= need:
+            has_more_flags["Kick"] = True
         for v in vids:
             all_clips.append({
                 "id": v["id"],
@@ -311,20 +362,23 @@ async def _gather_channel_clips(
         all_clips.sort(key=lambda v: int(v.get("views") or 0), reverse=True)
     else:
         all_clips.sort(key=lambda v: v.get("created_at") or "", reverse=True)
-    # Era windows can return hundreds of clips (deep Twitch paging) — cap the
-    # payload; the UI shows 10 and pages client-side.
-    all_clips = all_clips[:200]
+    # Serve the requested page slice; has_more = the window holds more rows
+    # past the page end, or a platform crawl saturated (deeper pages exist).
+    servable = len(all_clips)
+    page_slice = all_clips[offset:offset + limit]
+    has_more = servable > offset + len(page_slice) or any(has_more_flags.values())
     for k, v in list(per_platform_errors.items()):
         per_platform_errors[k] = user_visible_platform_error(normalize_err(v))
         if not per_platform_errors[k]:
             del per_platform_errors[k]
-    return all_clips, per_platform_errors, effective_days
+    return page_slice, per_platform_errors, days, has_more
 
 
 @router.get("/api/channel/videos")
 async def channel_videos(
     url: str,
     limit: int = CHANNEL_LIMIT_MAX,
+    page: int = 1,
     days: int = CHANNEL_DAYS_DEFAULT,
     min_days: int = 0,
     sort: str = "date",
@@ -335,7 +389,12 @@ async def channel_videos(
     youtube_slug: Optional[str] = None,
     force: str = "0",
 ):
-    """Fetch archive VODs for a channel."""
+    """Fetch archive VODs for a channel.
+
+    `limit` is the page size, `page` (1-based) selects the slice
+    [offset, offset+limit) of the merged list; the response carries
+    has_more + page so the frontend can keep requesting deeper pages until
+    the platform ceiling (see _PLATFORM_CEILINGS)."""
     raw = unquote(url).strip()
     try:
         default_slug = resolve_channel_slug(raw) if raw else ""
@@ -363,10 +422,13 @@ async def channel_videos(
         content_norm = (content or "").strip().lower()
         force_refresh = force == "1"
         limit_norm = max(1, min(int(limit), CHANNEL_CLIP_LIMIT if content_norm == "clips" else CHANNEL_LIMIT_MAX))
+        page_norm = max(1, int(page))
+        offset = (page_norm - 1) * limit_norm
+        need = offset + limit_norm
         days_norm = max(0, min(int(days), 365))
         min_days_norm = max(0, min(int(min_days), days_norm)) if days_norm > 0 else 0
         cache_key = make_channel_cache_key(
-            "videos", content_norm, kick_ch, twitch_ch, platforms, limit_norm, days_norm, sort,
+            "videos", content_norm, kick_ch, twitch_ch, platforms, limit_norm, page_norm, days_norm, sort,
             ",".join(sorted(wanted)), youtube_ch, min_days_norm,
         )
         if not force_refresh:
@@ -383,11 +445,13 @@ async def channel_videos(
                 "content": "clips" if is_clips else "vods",
                 "days": days,
                 "per_platform_errors": {},
+                "has_more": False,
+                "page": page_norm,
             }
             _cache_channel_payload(cache_key, payload)
             return payload
         if content_norm == "clips":
-            all_clips, per_platform_errors, days_eff = await _gather_channel_clips(
+            page_clips, per_platform_errors, days_eff, clips_more = await _gather_channel_clips(
                 wanted=wanted,
                 kick_slug=kick_ch,
                 twitch_login=twitch_ch,
@@ -396,39 +460,48 @@ async def channel_videos(
                 days=days_norm,
                 min_days=min_days_norm,
                 sort=sort,
+                page=page_norm,
             )
             payload = {
-                "clips": all_clips,
-                "videos": all_clips,
+                "clips": page_clips,
+                "videos": page_clips,
                 "channel": channel,
                 "platforms": wanted,
                 "content": "clips",
                 "days": days_eff,
                 "per_platform_errors": per_platform_errors,
+                "has_more": clips_more,
+                "page": page_norm,
             }
             _cache_channel_payload(cache_key, payload)
             return payload
         if content_norm == "streams":
             per_platform_errors: Dict[str, str] = {}
             all_videos: List[dict] = []
+            sat_streams = False
             loop = asyncio.get_running_loop()
             if "YouTube" in wanted and youtube_ch:
                 try:
                     from functools import partial
-                    vids = await asyncio.wait_for(
+                    fetched = await asyncio.wait_for(
                         loop.run_in_executor(
                             CHANNEL_EXECUTOR,
                             partial(
                                 youtube_list_channel_videos_sync,
                                 youtube_ch,
-                                limit_norm,
+                                need,
                                 playlist="streams",
                                 enrich=True,
+                                return_has_more=True,
                             ),
                         ),
                         timeout=YOUTUBE_CHANNEL_FETCH_TIMEOUT_SEC,
                     )
-                    all_videos.extend(vids)
+                    if isinstance(fetched, tuple):
+                        all_videos.extend(fetched[0])
+                        sat_streams = bool(fetched[1])
+                    else:
+                        all_videos.extend(fetched)
                 except asyncio.TimeoutError:
                     per_platform_errors["YouTube"] = "Stream VOD fetch timed out — try again"
                 except Exception as e:
@@ -440,16 +513,20 @@ async def channel_videos(
                 if not per_platform_errors[k]:
                     del per_platform_errors[k]
             all_videos, days_eff = filter_videos_recent_or_all_by_platform(all_videos, days_norm)
+            servable = len(all_videos)
+            page_slice = all_videos[offset:offset + limit_norm]
             payload = {
-                "videos": all_videos,
+                "videos": page_slice,
                 "channel": channel,
                 "platforms": wanted,
                 "content": "streams",
                 "days": days_eff,
                 "per_platform_errors": per_platform_errors,
+                "has_more": servable > offset + len(page_slice) or sat_streams,
+                "page": page_norm,
             }
             _cache_channel_payload(cache_key, payload)
-            asyncio.create_task(_warm_youtube_previews(all_videos))
+            asyncio.create_task(_warm_youtube_previews(page_slice))
             return payload
         limit = limit_norm
         per_platform_errors: Dict[str, str] = {}
@@ -468,14 +545,17 @@ async def channel_videos(
         _ARCHIVE_TO_LABEL = {p: label for label, (p, _, _) in platform_specs.items()}
 
         async def _fetch_one(label: str, fetch_limit: int, errors: dict) -> tuple:
-            """Fetch one platform's VOD list + its language clue.
+            """Fetch one platform's VOD list + its language clue + saturation.
 
-            Returns (items, clue) — clue is the WS-3 platform language
-            ('pt'/'en'/...) or None; a failed clue never fails the fetch."""
+            Returns (items, clue, has_more) — clue is the WS-3 platform
+            language ('pt'/'en'/...) or None; a failed clue never fails the
+            fetch. has_more is True when the platform crawl saturated the
+            requested depth (a deeper page likely exists), False when the
+            platform is exhausted or at its documented ceiling."""
             if label == "Kick":
                 slug = kick_ch or channel
                 if not slug:
-                    return [], None
+                    return [], None, False
                 try:
                     vids = await asyncio.wait_for(
                         loop.run_in_executor(
@@ -488,11 +568,11 @@ async def channel_videos(
                     )
                 except asyncio.TimeoutError:
                     errors["Kick"] = "VOD fetch timed out — try again"
-                    return [], None
+                    return [], None, False
                 except Exception as e:
                 # ponytail: best-effort — return []
                     errors["Kick"] = format_platform_error(e)
-                    return [], None
+                    return [], None, False
                 try:
                     clue = await asyncio.wait_for(
                         loop.run_in_executor(
@@ -504,6 +584,11 @@ async def channel_videos(
                     )
                 except Exception:
                     clue = None
+                # Kick's v2 API is single-shot (no cursor): the service
+                # returns the newest fetch_limit rows, so len==fetch_limit
+                # means the list continues past the fetched depth (has_more
+                # True — a deeper page re-asks deeper), and len<fetch_limit
+                # means the API list is exhausted (has_more False).
                 return [{
                     "id": v["id"],
                     "platform": "Kick",
@@ -516,28 +601,35 @@ async def channel_videos(
                     "url": v.get("url") or f"https://kick.com/{channel}/videos/{v['id']}",
                     "channel": channel,
                     "content_kind": "vod",
-                } for v in vids], clue
+                } for v in vids], clue, len(vids) >= fetch_limit
             if label == "Twitch":
                 login = twitch_ch or channel
                 if not login:
-                    return [], None
+                    return [], None, False
                 try:
-                    vids = await asyncio.wait_for(
+                    fetched = await asyncio.wait_for(
                         loop.run_in_executor(
                             CHANNEL_EXECUTOR,
-                            twitch_list_channel_videos_sync,
-                            login,
-                            fetch_limit,
+                            functools.partial(
+                                twitch_list_channel_videos_sync,
+                                login,
+                                fetch_limit,
+                                return_has_more=True,
+                            ),
                         ),
                         timeout=CHANNEL_VOD_FETCH_TIMEOUT_SEC,
                     )
+                    if isinstance(fetched, tuple):
+                        vids, twitch_more = fetched
+                    else:
+                        vids, twitch_more = fetched, False
                 except asyncio.TimeoutError:
                     errors["Twitch"] = "VOD fetch timed out — try again"
-                    return [], None
+                    return [], None, False
                 except Exception as e:
                 # ponytail: best-effort — return []
                     errors["Twitch"] = format_platform_error(e)
-                    return [], None
+                    return [], None, False
                 # Twitch clue: the broadcaster language at stream time,
                 # majority across the fetched VODs (first non-null wins).
                 clue = next(
@@ -555,12 +647,14 @@ async def channel_videos(
                     "url": v.get("url") or f"https://www.twitch.tv/videos/{v['id']}",
                     "channel": channel,
                     "content_kind": "vod",
-                } for v in vids], clue
+                } for v in vids], clue, bool(twitch_more)
             ref = youtube_ch or channel
             if not ref:
-                return [], None
+                return [], None, False
+            sat_videos = False
+            sat_streams = False
             try:
-                vids = await asyncio.wait_for(
+                fetched = await asyncio.wait_for(
                     loop.run_in_executor(
                         CHANNEL_EXECUTOR,
                         functools.partial(
@@ -569,23 +663,28 @@ async def channel_videos(
                             fetch_limit,
                             playlist="videos",
                             enrich=True,
+                            return_has_more=True,
                         ),
                     ),
                     timeout=YOUTUBE_CHANNEL_FETCH_TIMEOUT_SEC,
                 )
+                if isinstance(fetched, tuple):
+                    vids, sat_videos = fetched
+                else:
+                    vids = fetched
             except asyncio.TimeoutError:
                 errors["YouTube"] = "VOD fetch timed out — try again"
-                return [], None
+                return [], None, False
             except Exception as e:
                 errors["YouTube"] = format_platform_error(e)
-                return [], None
+                return [], None, False
             # The /streams tab holds the channel's recorded live broadcasts
             # (was_live); the /videos flat playlist never lists them, so
             # they were invisible in the panel. Merge both tabs — best
             # effort: a streams-tab failure degrades to the /videos list
             # alone, and the whole fetch must not fail on it.
             try:
-                streams = await asyncio.wait_for(
+                fetched_s = await asyncio.wait_for(
                     loop.run_in_executor(
                         CHANNEL_EXECUTOR,
                         functools.partial(
@@ -594,10 +693,15 @@ async def channel_videos(
                             fetch_limit,
                             playlist="streams",
                             enrich=True,
+                            return_has_more=True,
                         ),
                     ),
                     timeout=YOUTUBE_CHANNEL_FETCH_TIMEOUT_SEC,
                 )
+                if isinstance(fetched_s, tuple):
+                    streams, sat_streams = fetched_s
+                else:
+                    streams = fetched_s
             except Exception:
                 streams = []
             items = merge_youtube_playlists(vids, streams)
@@ -614,7 +718,7 @@ async def channel_videos(
                 )
             except Exception:
                 clue = None
-            return items, clue
+            return items, clue, bool(sat_videos or sat_streams)
 
         def _persist_platform(label: str, items: list, clue: Any = None) -> None:
             """Accumulate fetched items into the permanent channel index.
@@ -648,25 +752,28 @@ async def channel_videos(
                 touch_channel_snapshot(archive_platform, snap_key)
 
         async def _fetch_platforms(labels: List[str], fetch_limit: int, errors: dict) -> tuple:
-            """Parallel fetch of a subset of platforms; returns (items, clues)."""
+            """Parallel fetch of a subset of platforms; returns (items, clues, has_more)."""
             tasks = [
                 asyncio.create_task(_fetch_one(label, fetch_limit, errors))
                 for label in labels
             ]
             if not tasks:
-                return [], {}
+                return [], {}, {}
             results = await asyncio.gather(*tasks, return_exceptions=True)
             out: list[dict] = []
             clues: dict[str, Any] = {}
+            has_more: dict[str, bool] = {}
             for label, result in zip(labels, results):
                 if isinstance(result, BaseException):
                     logger.debug("Channel fetch task failed: %s", result)
                     continue
-                items, clue = result
+                items, clue, more = result
                 out.extend(items)
                 if clue:
                     clues[label] = clue
-            return out, clues
+                if more:
+                    has_more[label] = True
+            return out, clues, has_more
 
         def _index_rows_by_platform() -> dict:
             """All accumulated index rows for the wanted platforms, excluding
@@ -746,19 +853,40 @@ async def channel_videos(
             )
             fresh[label] = age is not None and age < window
 
-        # Platforms we must fetch NOW (blocking): forced refresh, or the
-        # index has never seen this channel. Platforms with a stale snapshot
-        # but an existing index are refreshed in the BACKGROUND with a small
-        # delta — the response is served instantly from the accumulated
-        # index, and the merge lands on the next request.
-        block_set = [label for label in wanted if force_refresh or not _idx(label)]
-        bg_set = [label for label in wanted if label not in block_set and not fresh[label]]
+        # --- fetch plan ---------------------------------------------------
+        # Which platforms must fetch synchronously, and how deep:
+        #  - forced refresh or index never seeded: page-1 behavior (delta
+        #    when an index exists, else the page size).
+        #  - show-more past the accumulated index depth (page > 1 and the
+        #    cache cannot serve the requested slice): fetch up to the page
+        #    end, bounded by the platform ceiling. Platforms already at
+        #    their ceiling are skipped — nothing deeper exists to fetch.
+        #  - Kick's v2 API is a single-shot list: the service truncates one
+        #    API response at the requested depth, so deeper pages re-ask
+        #    with a deeper depth and the index grows; once the index is at
+        #    the ceiling the skip rule below holds (no deeper fetch).
+        # Platforms with a stale snapshot but a deep-enough index are
+        # refreshed in the BACKGROUND with a small delta — the response is
+        # served instantly from the accumulated index.
+        fetch_plan: Dict[str, int] = {}
+        for label in wanted:
+            have = len(_idx(label))
+            if force_refresh or have == 0:
+                fetch_plan[label] = CHANNEL_DELTA_LIMIT if have else limit
+            elif page_norm > 1 and need > have and have < _PLATFORM_CEILINGS[label]:
+                fetch_plan[label] = min(need, _PLATFORM_CEILINGS[label])
+        bg_set = [label for label in wanted if label not in fetch_plan and not fresh[label]]
 
         fetched: list[dict] = []
-        for label in block_set:
-            fetch_limit = CHANNEL_DELTA_LIMIT if _idx(label) else limit
-            items, clues = await _fetch_platforms([label], fetch_limit, per_platform_errors)
+        fetched_more: Dict[str, bool] = {}
+        fetched_count: Dict[str, int] = {}
+        for label in fetch_plan:
+            fetch_limit = fetch_plan[label]
+            items, clues, more = await _fetch_platforms([label], fetch_limit, per_platform_errors)
             fetched.extend(items)
+            fetched_count[label] = len(items)
+            if more:
+                fetched_more[label] = True
             _persist_platform(label, items, clues.get(label))
 
         # Merge fetched (wins) over accumulated index rows, keyed per
@@ -783,22 +911,29 @@ async def channel_videos(
             return (ts, v.get("platform") or "")
 
         all_videos.sort(key=_sort_key)
-        # The index accumulates forever — cap the response at the requested
-        # limit (newest first) so payload size stays bounded.
-        all_videos = all_videos[:limit]
+        # Serve the requested page slice. has_more = the merged list holds
+        # rows past the page end, or a platform crawl saturated its fetch
+        # limit (a deeper page exists). At a platform ceiling the fetch is
+        # capped, len < fetch_limit, and has_more goes False instead of
+        # looping forever.
+        servable = len(all_videos)
+        page_slice = all_videos[offset:offset + limit]
+        has_more = servable > offset + len(page_slice) or bool(fetched_more)
         for k, v in list(per_platform_errors.items()):
             per_platform_errors[k] = user_visible_platform_error(normalize_err(v))
             if not per_platform_errors[k]:
                 del per_platform_errors[k]
         refreshing = bool(bg_set) and not force_refresh
         payload = {
-            "videos": all_videos,
+            "videos": page_slice,
             "channel": channel,
             "platforms": wanted,
             "content": "vods",
             "days": days_eff,
             "per_platform_errors": per_platform_errors,
             "refreshing": refreshing,
+            "has_more": has_more,
+            "page": page_norm,
             # Effective channel language (WS-3) — null when undetected.
             "channel_language": eff_language,
         }
@@ -826,7 +961,7 @@ async def channel_videos(
                     async def _bg_refresh() -> None:
                         try:
                             bg_errors: Dict[str, str] = {}
-                            items, clues = await _fetch_platforms(
+                            items, clues, _more = await _fetch_platforms(
                                 bg_set, CHANNEL_DELTA_LIMIT, bg_errors
                             )
                             for label in bg_set:
@@ -863,6 +998,7 @@ async def channel_clips(
     url: str = "",
     platforms: str = "Kick,Twitch",
     limit: int = CHANNEL_CLIP_LIMIT,
+    page: int = 1,
     days: int = CHANNEL_DAYS_DEFAULT,
     min_days: int = 0,
     sort: str = "date",
@@ -870,7 +1006,7 @@ async def channel_clips(
     twitch_login: Optional[str] = None,
     youtube_slug: Optional[str] = None,
 ):
-    """Fetch recent clips for a channel."""
+    """Fetch recent clips for a channel (limit = page size, page 1-based)."""
     try:
         default_slug = resolve_channel_slug(unquote(url).strip()) if (url or "").strip() else ""
         kick_ch = (kick_slug or default_slug).strip().lower()
@@ -893,10 +1029,11 @@ async def channel_clips(
                     logger.debug("channel priority mark skipped for %s/%s", _p, _slug, exc_info=True)
         wanted = parse_wanted_platforms(platforms)
         limit_norm = max(1, min(int(limit), CHANNEL_CLIP_LIMIT))
+        page_norm = max(1, int(page))
         days_norm = max(0, min(int(days), 365))
         min_days_norm = max(0, min(int(min_days), days_norm)) if days_norm > 0 else 0
         cache_key = make_channel_cache_key(
-            "clips", kick_ch, twitch_ch, platforms, limit_norm, days_norm, sort,
+            "clips", kick_ch, twitch_ch, platforms, limit_norm, page_norm, days_norm, sort,
             ",".join(sorted(wanted)), youtube_ch, min_days_norm,
         )
         cached = get_cached(cache_key)
@@ -909,10 +1046,12 @@ async def channel_clips(
                 "platforms": [],
                 "content": "clips",
                 "per_platform_errors": {},
+                "has_more": False,
+                "page": page_norm,
             }
             _cache_channel_payload(cache_key, payload)
             return payload
-        all_clips, per_platform_errors, days_eff = await _gather_channel_clips(
+        page_clips, per_platform_errors, days_eff, clips_more = await _gather_channel_clips(
             wanted=wanted,
             kick_slug=kick_ch,
             twitch_login=twitch_ch,
@@ -921,14 +1060,17 @@ async def channel_clips(
             days=days_norm,
             min_days=min_days_norm,
             sort=sort,
+            page=page_norm,
         )
         payload = {
-            "clips": all_clips,
+            "clips": page_clips,
             "channel": channel,
             "platforms": wanted,
             "content": "clips",
             "days": days_eff,
             "per_platform_errors": per_platform_errors,
+            "has_more": clips_more,
+            "page": page_norm,
         }
         _cache_channel_payload(cache_key, payload)
         return payload

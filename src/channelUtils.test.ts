@@ -16,6 +16,8 @@ import {
   mergeVodPlatformsFetched,
   channelPlatformVisibleSlice,
   channelPlatformCanExpand,
+  channelShowMoreNeedsFetch,
+  nextChannelPage,
   channelLinkDraftFromParsed,
   channelLinkWillAddSummary,
   parseChannelInput,
@@ -312,6 +314,50 @@ describe('channelPlatformVisibleSlice', () => {
   it('canExpand when older items exist beyond recent window', () => {
     const videos = [newVod('n1'), oldVod('o1')];
     expect(channelPlatformCanExpand(videos, 1, false, false)).toBe(true);
+  });
+
+  it('stays expandable while the backend reports deeper pages', () => {
+    // All rows visible, but has_more=true (deeper pages exist) — the show-more
+    // button must stay up so the next click fetches page N+1.
+    const videos = [newVod('n1'), newVod('n2'), newVod('n3')];
+    expect(channelPlatformCanExpand(videos, 10, true, false, true)).toBe(true);
+    expect(channelPlatformCanExpand(videos, 10, true, false, false)).toBe(false);
+  });
+});
+
+describe('nextChannelPage', () => {
+  it('returns undefined when the backend has no deeper pages', () => {
+    expect(nextChannelPage(false, 2)).toBeUndefined();
+    expect(nextChannelPage(false, undefined)).toBeUndefined();
+  });
+
+  it('advances the 1-based cursor when deeper pages exist', () => {
+    expect(nextChannelPage(true, 1)).toBe(2);
+    expect(nextChannelPage(true, 7)).toBe(8);
+    expect(nextChannelPage(true, undefined)).toBe(2);
+  });
+});
+
+describe('channelShowMoreNeedsFetch', () => {
+  const makeN = (n: number): ChannelVideo[] => Array.from({ length: n }, (_, i) => ({
+    id: `v${i}`,
+    platform: 'Twitch',
+    title: `VOD ${i}`,
+    duration: 3600,
+    views: 10,
+    thumbnail_url: null,
+    created_at: `2026-08-01T00:${String(i % 60).padStart(2, '0')}:00Z`,
+    url: `https://www.twitch.tv/videos/${i}`,
+    channel: 'x',
+  }));
+
+  it('fetches only when the reveal pierces the cached rows and hasMore is true', () => {
+    // 100 cached rows, visible 60, step 50 → reveal goes to 110 > 100 → fetch.
+    expect(channelShowMoreNeedsFetch(makeN(100), 60, true)).toBe(true);
+    // Cached rows cover the next reveal → no fetch needed.
+    expect(channelShowMoreNeedsFetch(makeN(200), 60, true)).toBe(false);
+    // Backend exhausted → no fetch even when the reveal pierces.
+    expect(channelShowMoreNeedsFetch(makeN(100), 60, false)).toBe(false);
   });
 });
 

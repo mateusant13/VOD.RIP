@@ -31,6 +31,17 @@ from services.ytdlp_service import is_clip_url
 
 logger = logging.getLogger(__name__)
 
+# Depth ceilings for the channel-list endpoints. Both v2 list endpoints are
+# single-shot (one response, no cursor): the service truncates the parsed
+# list at the REQUESTED depth, so show-more grows the index by re-asking with
+# a deeper depth. 500 is the safety bound — a channel whose full list exceeds
+# it is served up to the bound, then has_more goes false instead of looping
+# forever. ponytail: the v2 list endpoints have no documented node cap; if a
+# channel genuinely exceeds 500 rows the upgrade path is cursor paging on the
+# channel's own API.
+KICK_VIDEOS_CEILING = 500
+KICK_CLIPS_CEILING = 500
+
 _IMPERSONATE = "chrome"
 _BASE = "https://kick.com"
 
@@ -272,7 +283,10 @@ def list_channel_clips_api(slug: str, limit: int = 10, *, verify: bool = True) -
         seen.add(clip.id)
         parsed.append(clip)
     parsed.sort(key=lambda c: c.created_at or "", reverse=True)
-    return parsed[: max(1, min(int(limit), 10))]
+    # Depth-truncate at the requested depth (show-more pages ask deeper), not
+    # the old fixed 10 — the UI "shows 10 and pages client-side" cap that
+    # made kick clips unpaginatable.
+    return parsed[: max(1, min(int(limit), KICK_CLIPS_CEILING))]
 
 
 def list_channel_clips_sync(url: str, limit: int = 10, *, sort: str = "date") -> list[dict]:
@@ -304,6 +318,7 @@ def list_channel_videos_api(slug: str, limit: int = 20) -> List[KickVideo]:
     data = _get_json(f"/api/v2/channels/{slug}/videos", referer)
     if not isinstance(data, list):
         raise RuntimeError("Unexpected Kick videos API response")
+    limit = max(1, min(int(limit), KICK_VIDEOS_CEILING))
     out: List[KickVideo] = []
     seen: set[str] = set()
     for item in data:
