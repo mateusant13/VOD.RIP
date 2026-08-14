@@ -31,6 +31,7 @@
 const KEY = 'ko.v2';
 const POLL_MS = 20000;   // live-status re-check while enabled
 const RECT_MS = 400;     // geometry + pause/mute enforcement tick
+const YT_EMBED_GRACE = 8000; // yt embed must init (onReady) within this or fall back to kick
 const SPA_MS = 900;      // Twitch SPA pathname poll (no reload on channel nav)
 const HIDE_TICKS = 3;    // consecutive ticks without a Twitch player before hiding
 const MAX_RECONNECT = 3; // kick fatal retries (fresh playback_url each time)
@@ -326,6 +327,7 @@ function ensureYtIframe() {
   iframe.setAttribute('allow', 'autoplay; fullscreen; encrypted-media');
   iframe.setAttribute('allowfullscreen', '');
   KO.wrap.appendChild(iframe);
+  KO.ytEmbedAt = Date.now(); // fallback clock: yt must init within YT_EMBED_GRACE
   diag('yt_embed', { id: KO.ytId.slice(0, 8) });
 }
 
@@ -1201,6 +1203,15 @@ async function probe() {
     setBadge('YT', '#ff0000');
     return;
   }
+  // The embed never initialized (YouTube player-config error 153 on
+  // bot-gated/cookieless sessions — nothing posts, ready stays false).
+  // When the channel also has a kick mapping, hand over to kick instead
+  // of leaving the native Twitch player (ads) visible.
+  if (KO.kickSlug && KO.ytEmbedAt && !KO.ytState.ready && Date.now() - KO.ytEmbedAt > YT_EMBED_GRACE) {
+    diag('yt_fallback', { kick: KO.kickSlug, embedMs: Date.now() - KO.ytEmbedAt });
+    setPlayer('kick');
+    return;
+  }
   setBadge('YT OFF', '#6b7280');
   if (KO.wrap) hideWrap();
 }
@@ -1431,6 +1442,8 @@ function injectStyles() {
   st.textContent =
     '#ko-wrap{position:fixed;z-index:5;pointer-events:none;background:#000;overflow:hidden;}' +
     '#ko-wrap #ko-ivs{width:100%;height:100%;border:0;display:block;pointer-events:none;}' +
+    '#ko-wrap.ko-kick #ko-yt{display:none;}' + // one rendering: the inactive player is hidden, not covered
+    '#ko-wrap.ko-yt #ko-ivs{display:none;}' +
     '#ko-wrap.ko-yt iframe{width:100%;height:100%;border:0;display:block;pointer-events:auto;}' +
     '#ko-bar{position:absolute;left:0;right:0;bottom:0;pointer-events:auto;opacity:0;transition:opacity .18s ease;' +
     'display:flex;flex-direction:row;align-items:center;justify-content:space-between;padding:0 10px;color:#fff;' +
