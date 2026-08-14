@@ -181,7 +181,6 @@ def _hidden_imports():
         "services.autostart",
         "services.youtube_pot_service",
         "services.archive_transcribe",
-        "faster_whisper",
         "sherpa_onnx",
         "ctranslate2",
         "torch",

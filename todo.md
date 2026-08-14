@@ -20,8 +20,8 @@ compressed, and targeted (specific-first) instead of exhaustive.
   candidate query (chat-less twitch / transcript-less with file, scoped, relevance-ranked).
 
 ## 2. More GPU without lagging the system
-- faster-whisper 1.2.1 has NO num_workers/batch path (verified in installed source):
-  real parallel inference = N model copies (CT2 instances are per-thread).
+- (The faster-whisper engine that motivated this is gone — parakeet is one
+  int8 model; the copy-budget design below carries over unchanged.)
 - `_worker_budget()`: CUDA → min(VODRIP_TRANSCRIBE_GPU_COPIES (default 1),
   floor((mem_total − 512 MB headroom) / model_vram_estimate)); estimate from the first
   load (mem_get_info before/after) or 2 GB default for large-v3-turbo fp16.
@@ -68,7 +68,7 @@ compressed, and targeted (specific-first) instead of exhaustive.
 
 ## Verification
 - Targeted tests per worktree; full backend pytest + vitest on main after merge;
-- Live E2E: CPU worker + real archive DB (real Twitch backfill, real whisper on a short
+- Live E2E: CPU worker + real archive DB (real Twitch backfill, real parakeet on a short
   fixture video), browser check of enriching status line.
 
 ---
@@ -94,7 +94,8 @@ tests, strict body assertions, content over status codes).
   `VODRIP_APP_DATA` / `VODRIP_ARCHIVE_DB` env overrides — never touch the real profile.
 - Backend state is SQLite (archive.db) with FTS5; schema migrations follow the table
   rebuild pattern in `backend/services/archive_db.py::_ensure_jobs_kind_events`.
-- Whisper: faster-whisper large-v3-turbo on RTX 5080 (cuda/float16); PT captions exist —
+- ASR: parakeet TDT v3 int8 (sherpa-onnx) on CPU/CUDA — the ONLY engine
+  (faster-whisper removed); captions exist in
   `backend/services/archive_transcribe.py`; semantic embeddings just added in
   `backend/services/archive_embed.py`.
 
@@ -143,7 +144,7 @@ Tasks:
    high-priority transcribe job; running job untouched.
 5. Frontend: preview open path (App.tsx / ChannelExplorePopup.tsx) calls the prioritize
    endpoint fire-and-forget (no UI block); Queue tab reflects order. Acceptance: browser
-   e2e — enqueue 2 videos' transcribe, preview a third → third runs first (real whisper on
+   e2e — enqueue 2 videos' transcribe, preview a third → third runs first (real parakeet on
    a short fixture or job-pick order in worker logs).
 
 ## WS-2: Preview chat panel
@@ -152,7 +153,7 @@ or subtitles for the video, synced to playback position.
 
 Research first:
 - Data sources: `messages` table (chat rows with offset_sec, spam_count, FTS5-indexed),
-  whisper transcript rows (ts offsets, `archive_transcribe.py`), and existing read APIs in
+  transcript rows (ts offsets, `archive_transcribe.py`), and existing read APIs in
   `routers/archive.py` (search, chat_window, transcripts endpoints — reuse, don't duplicate).
 - Preview player structure: App.tsx preview state (~lines 426-492), ChannelExplorePopup.tsx,
   `hooks/usePreviewPlayer.ts`, `previewPlayerUtils.ts` — currentTime/seek plumbing to sync
@@ -190,10 +191,10 @@ Research first:
   `snippet.defaultAudioLanguage`/`defaultLanguage` + yt-dlp language info
   (`youtube_service.py`, `youtube_innertube.py`, `channel_cache.py`, `models/schemas.py`
   SavedChannel).
-- Transcript evidence: whisper rows carry detected language + probabilities
-  (`archive_transcribe.py` — PT captions exist; find the `language` column and
-  `detect_language` usage); `archive_embed.py` embeddings (multilingual? check model);
-  FTS5 vocab for aggregate stats.
+- Transcript evidence: transcript rows carry the job language (parakeet has no
+  language detection — `archive_transcribe.py` stores the explicit job/channel
+  language on each row; there is no per-word probability); `archive_embed.py`
+  embeddings (multilingual? check model); FTS5 vocab for aggregate stats.
 - Where channel language should live: videos table / channels table / SavedChannel schema
   + archive search hits — pick one owner and migrate cleanly.
 
@@ -201,12 +202,13 @@ Tasks:
 1. Backend: fetch language clues at channel fetch time per platform; persist on channel/
    videos rows (additive migration). Acceptance: real fetch of titiltei (pt), srdogg (en),
    mandiocaa/gaveta (yt) populates the field.
-2. Backend: whisper pipeline — generalize PT captions to per-channel/auto language
-   (whisper `language=None` auto-detect or channel-language hint); Spanish rows captioned.
-   Acceptance: real whisper run on a short es fixture yields es captions (large-v3-turbo
-   supports es) — assert language tag on rows.
-3. Backend: aggregation heuristic — when clues are missing/conflicting, tally whisper
-   language probabilities across many videos/sections; confidence + staleness rules;
+2. Backend: ASR language routing — per-channel/auto language via the existing
+   `asr_language`/`channel_asr_languages` settings (parakeet supports
+   `PARAKEET_LANG_CANDIDATES` + auto-detect-from-channel); Spanish rows captioned.
+   Acceptance: real parakeet run on a short es fixture yields es captions —
+   assert language tag on rows.
+3. Backend: aggregation heuristic — when clues are missing/conflicting, tally the
+   job language across many videos/sections; confidence + staleness rules;
    persistent per-channel language. Acceptance: self-check on synthetic rows; accuracy
    check on real titiltei/gaveta/srdogg transcripts (assert pt/pt/en).
 4. Backend: expose channel language in channel payloads + archive search hits.
@@ -370,10 +372,11 @@ space; users can change it in settings.
 
 Research first:
 - Where caches live today: `_get_appdata_dir` (`backend/services/settings.py`) →
-  %APPDATA%/VOD.RIP (archive.db, settings.json); whisper model cache (see
-  `backend/tests/test_whisper_model_settings.py` — Systran/faster-whisper-* cache dirs),
-  `ytdlp_cache.py`, `disk_hygiene.py`, `download_persistence.py` (download_folder setting
-  already exists), `os_services.py`.
+  %APPDATA%/VOD.RIP (archive.db, settings.json); AI-models root — the models cache that
+  `backend/tests/test_whisper_model_settings.py` covers (env → settings
+  `whisper_model_cache` → best-ROI drive → appdata; the sherpa parakeet cache is a subdir
+  of it), `ytdlp_cache.py`, `disk_hygiene.py`, `download_persistence.py` (download_folder
+  setting already exists), `os_services.py`.
 - Disk detection with NO new deps (psutil NOT in requirements.txt): enumerate drive letters
   via ctypes `GetLogicalDriveStringsA` (app runs Python 3.11; os.listdrives is 3.12+) +
   `shutil.disk_usage(letter)`; prefer fixed drives over removable; sort by free space.
@@ -386,7 +389,7 @@ Tasks:
    most free space on this machine.
 2. Backend: AppSettings new field `cache_dir` (default '' = auto → biggest free drive);
    settings apply/migration; settings.json round-trip. Acceptance: unit save/load test.
-3. Backend: route cache roots through the setting — whisper model cache, ytdlp cache,
+3. Backend: route cache roots through the setting — AI-models cache, ytdlp cache,
    preview temp, archive DB location (keep VODRIP_APP_DATA / VODRIP_ARCHIVE_DB env
    overrides for tests). Acceptance: with cache_dir set, a probe file lands there.
 4. Backend: relocation helper — move existing caches to the new drive on first run

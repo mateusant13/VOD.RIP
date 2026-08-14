@@ -37,11 +37,11 @@ Design (approved gate spec — implement exactly this):
     CONCATENATION dist <= 2 cumulative, per-token dist <= 1, whole-name
     len >= 5; longest names first, left-to-right, consumed spans excluded
     from the single-token pass. Windows are strong-path only.
-  * Weak path (confidence-gated): parakeet + whisper only (never captions,
-    never when confidence missing). Conditions: (dist == 2 AND core
-    len >= 5) OR (blocklisted word AND dist <= 1) — AND word_conf below
-    the engine threshold (parakeet 0.5, whisper 0.6; the env knob
-    VODRIP_TRANSCRIPT_FIX_CONF overrides both as a single number).
+  * Weak path (confidence-gated): parakeet only (never captions, never when
+    confidence missing). Conditions: (dist == 2 AND core len >= 5) OR
+    (blocklisted word AND dist <= 1) — AND word_conf below the engine
+    threshold (parakeet 0.5; the env knob VODRIP_TRANSCRIPT_FIX_CONF
+    overrides it as a single number).
   * Replacement: canonical ddragon casing + reattached edge punctuation;
     timestamps preserved (single token keeps its own start/end; a window
     collapses to one word spanning first.start / last.end); the segment
@@ -90,9 +90,9 @@ CACHE_TTL_S = 7 * 24 * 3600
 # Word-level confidence thresholds (weak path): the ASR was unsure, so a
 # near-miss champion name is a plausible correction. VODRIP_TRANSCRIPT_FIX_CONF
 # overrides both as a single number.
-_DEFAULT_CONF = {"parakeet": 0.5, "whisper": 0.6}
+_DEFAULT_CONF = {"parakeet": 0.5}
 # Engines eligible for the weak path (captions never are — "captions").
-_WEAK_ENGINES = frozenset({"parakeet", "whisper"})
+_WEAK_ENGINES = frozenset({"parakeet"})
 
 # Source-side token maps (exact token match, applied to window tokens; the
 # numeral map also applies to single-token cores where it is vacuous — iv/4
@@ -458,7 +458,7 @@ class ChampionFixer:
                     if stats is not None:
                         stats["strong_replaced"] = stats.get("strong_replaced", 0) + 1
                 continue
-            # Weak path: parakeet/whisper only, never without a confidence.
+            # Weak path: parakeet only, never without a confidence.
             if engine not in _WEAK_ENGINES:
                 continue
             conf = w.get("conf")
@@ -672,35 +672,35 @@ _check_names = {
 }
 _check = ChampionFixer(_check_names)
 _seg = {"text": "diana", "words": [{"word": "diana", "start": 0.0, "end": 0.5}]}
-assert _check.fix_segment(_seg, engine="whisper") is True
+assert _check.fix_segment(_seg, engine="parakeet") is True
 assert _seg["text"] == "Diana" and _seg["words"][0]["word"] == "Diana"
 _seg = {"text": "jarvan quatro", "words": [
     {"word": "jarvan", "start": 0.0, "end": 0.4}, {"word": "quatro", "start": 0.4, "end": 0.9}]}
-assert _check.fix_segment(_seg, engine="whisper") is True
+assert _check.fix_segment(_seg, engine="parakeet") is True
 assert _seg["text"] == "Jarvan IV" and _seg["words"] == [
     {"word": "Jarvan IV", "start": 0.0, "end": 0.9}], _seg["words"]
 _seg = {"text": "le blanc", "words": [
     {"word": "le", "start": 0.0, "end": 0.3}, {"word": "blanc", "start": 0.3, "end": 0.7}]}
-assert _check.fix_segment(_seg, engine="whisper") is True
+assert _check.fix_segment(_seg, engine="parakeet") is True
 assert _seg["text"] == "LeBlanc" and _seg["words"][0]["word"] == "LeBlanc"
 _seg = {"text": "nunu e willump", "words": [
     {"word": "nunu", "start": 0.0, "end": 0.3}, {"word": "e", "start": 0.3, "end": 0.4},
     {"word": "willump", "start": 0.4, "end": 0.9}]}
-assert _check.fix_segment(_seg, engine="whisper", language="pt") is True
+assert _check.fix_segment(_seg, engine="parakeet", language="pt") is True
 assert _seg["text"] == "Nunu e Willump"
 _seg = {"text": "nunu willump", "words": [
     {"word": "nunu", "start": 0.0, "end": 0.4}, {"word": "willump", "start": 0.4, "end": 0.9}]}
-assert _check.fix_segment(_seg, engine="whisper", language="en") is True
+assert _check.fix_segment(_seg, engine="parakeet", language="en") is True
 assert _seg["text"] == "Nunu & Willump", "en form must keep its own canonical"
 _seg = {"text": "Jarvan IV", "words": [
     {"word": "Jarvan", "start": 0.0, "end": 0.4}, {"word": "IV", "start": 0.4, "end": 0.9}]}
-assert _check.fix_segment(_seg, engine="whisper") is False, "dist-0 self-match must be a no-op"
+assert _check.fix_segment(_seg, engine="parakeet") is False, "dist-0 self-match must be a no-op"
 _seg = {"text": "jarvan iv", "words": [
     {"word": "jarvan", "start": 0.0, "end": 0.4}, {"word": "iv", "start": 0.4, "end": 0.9}]}
-assert _check.fix_segment(_seg, engine="whisper") is True
+assert _check.fix_segment(_seg, engine="parakeet") is True
 assert _seg["text"] == "Jarvan IV"
-assert _check.fix_segment(_seg, engine="whisper") is False, "second pass must be idempotent"
+assert _check.fix_segment(_seg, engine="parakeet") is False, "second pass must be idempotent"
 _check2 = ChampionFixer({"pt_BR": {"Senna": "Senna", "Sona": "Sona"}})
 _seg = {"text": "sena", "words": [{"word": "sena", "start": 0.0, "end": 0.5, "conf": 0.2}]}
-assert _check2.fix_segment(_seg, engine="whisper") is True and _seg["text"] == "Senna", (
+assert _check2.fix_segment(_seg, engine="parakeet") is True and _seg["text"] == "Senna", (
     "dist-1 tie must prefer the non-blocklisted real name")

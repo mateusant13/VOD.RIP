@@ -53,8 +53,6 @@ from services.archive_transcribe import (  # noqa: E402
 
 PLATFORM = "twitch"
 PT_VIDEO = "__parakeet_e2e_pt__"
-JA_VIDEO = "__parakeet_e2e_ja__"
-PT2_VIDEO = "__parakeet_e2e_pt2__"
 _AUDIO = os.environ.get("VODRIP_PARAAKEET_AUDIO", "").strip()
 
 logger = logging.getLogger("test_parakeet_e2e")
@@ -173,20 +171,6 @@ def _collector() -> _LogCollector:
     return handler
 
 
-def _slice(path: pathlib.Path, start_s: float, dur_s: float, out: pathlib.Path) -> pathlib.Path:
-    from services.os_services import _NO_WINDOW
-
-    ffmpeg = _resolve_ffmpeg_exe()
-    proc = sp.run(
-        [ffmpeg, "-y", "-v", "error", "-ss", str(start_s), "-t", str(dur_s),
-         "-i", str(path), "-ar", "16000", "-ac", "1", str(out)],
-        capture_output=True, timeout=120, creationflags=_NO_WINDOW,
-    )
-    if proc.returncode != 0 or not out.is_file():
-        raise RuntimeError(f"slice failed: {proc.stderr.decode('utf-8', 'replace')}")
-    return out
-
-
 def _wav_seconds(path: pathlib.Path) -> float:
     import wave
 
@@ -213,8 +197,8 @@ def _tts_speech(wav: pathlib.Path, text: str) -> pathlib.Path:
     return wav
 
 
-def _build_fixtures() -> tuple[pathlib.Path, pathlib.Path, pathlib.Path, float]:
-    """(pt_fixture, ja_fixture, pt_slice, pt_fixture_sec)."""
+def _build_fixtures() -> tuple[pathlib.Path, float]:
+    """(pt_fixture, pt_fixture_sec)."""
     if _AUDIO:
         pt = pathlib.Path(_AUDIO)
         if not pt.is_file():
@@ -224,9 +208,7 @@ def _build_fixtures() -> tuple[pathlib.Path, pathlib.Path, pathlib.Path, float]:
         pt = _TMP / "pt.wav"
         _tts_speech(pt, "This is the transcription fixture for the parakeet lane.")
         pt_sec = _wav_seconds(pt)
-    ja = _slice(pt, 0.0, min(15.0, max(5.0, pt_sec / 4)), _TMP / "ja.wav")
-    pt_slice = _slice(pt, 0.0, min(15.0, max(5.0, pt_sec / 4)), _TMP / "pt_slice.wav")
-    return pt, ja, pt_slice, pt_sec
+    return pt, pt_sec
 
 
 def _enqueue_and_run(job_id: str, video_id: str) -> dict:
@@ -284,78 +266,10 @@ def _run_parakeet(pt: pathlib.Path, pt_sec: float) -> None:
     print(f"  sample text: {segs[0]['text'][:100]!r}")
 
 
-def _run_whisper_ja(ja: pathlib.Path) -> None:
-    """ja job (known-other language) -> whisper int8 through the real worker."""
-    collector = _collector()
-    archive_db.upsert_video({
-        "platform": PLATFORM, "video_id": JA_VIDEO, "channel": "parakeet-e2e-ja",
-        "title": "ja fixture", "status": "ready",
-        "archive_path": str(ja), "duration_sec": _wav_seconds(ja),
-    })
-    archive_db.set_channel_language(PLATFORM, "parakeet-e2e-ja", "ja")
-    before = _machine_state()
-    mon = _RssMonitor(); mon.start()
-    t0 = time.monotonic()
-    job = _enqueue_and_run("parakeet-e2e-ja", JA_VIDEO)
-    wall = time.monotonic() - t0
-    peak_rss = mon.stop()
-    after = _machine_state()
-    assert job["status"] == "done", f"ja job not done: {job}"
-    assert any("whisper" in r.lower() for r in collector.records if "Loading" in r), (
-        "ja job must load the whisper model: " + repr(collector.records[-3:])
-    )
-    assert not any("Parakeet recognizer" in r for r in collector.records), (
-        "ja job must NOT load parakeet"
-    )
-    archive_db.transcript_for(PLATFORM, JA_VIDEO)  # contract holds (may be empty on mislabeled audio)
-    print("=== run 2: ja job -> WHISPER int8 (CPU lane) ===")
-    print(f"  job: {job}")
-    print(f"  machine before: {before} | after: {after}")
-    print(f"  wall: {wall:.2f}s | peak RSS: {peak_rss / 1e6:.0f} MB")
-
-
-def _run_kill_switch(pt_slice: pathlib.Path) -> None:
-    """VODRIP_PARAAKEET=0 -> the same pt job falls back to whisper int8."""
-    os.environ["VODRIP_PARAAKEET"] = "0"
-    try:
-        collector = _collector()
-        archive_db.upsert_video({
-            "platform": PLATFORM, "video_id": PT2_VIDEO, "channel": "parakeet-e2e-pt",
-            "title": "parakeet kill-switch fixture", "status": "ready",
-            "archive_path": str(pt_slice), "duration_sec": _wav_seconds(pt_slice),
-        })
-        archive_db.set_channel_language(PLATFORM, "parakeet-e2e-pt", "pt")
-        before = _machine_state()
-        mon = _RssMonitor(); mon.start()
-        t0 = time.monotonic()
-        job = _enqueue_and_run("parakeet-e2e-pt2", PT2_VIDEO)
-        wall = time.monotonic() - t0
-        peak_rss = mon.stop()
-        after = _machine_state()
-        assert job["status"] == "done", f"kill-switch job not done: {job}"
-        assert any("whisper" in r.lower() for r in collector.records if "Loading" in r), (
-            "kill-switch job must load the whisper model: " + repr(collector.records[-3:])
-        )
-        assert not any("Parakeet recognizer" in r for r in collector.records), (
-            "VODRIP_PARAAKEET=0 must keep parakeet unloaded"
-        )
-        segs = _assert_segment_contract(PT2_VIDEO)
-        print("=== run 3: pt job + VODRIP_PARAAKEET=0 -> WHISPER int8 (fallback) ===")
-        print(f"  job: {job}")
-        print(f"  machine before: {before} | after: {after}")
-        print(f"  wall: {wall:.2f}s | peak RSS: {peak_rss / 1e6:.0f} MB | "
-              f"segments: {len(segs)}")
-        print(f"  sample text: {segs[0]['text'][:100]!r}" if segs else "  (no segments)")
-    finally:
-        os.environ.pop("VODRIP_PARAAKEET", None)
-
-
 def _run() -> None:
-    pt, ja, pt_slice, pt_sec = _build_fixtures()
-    print(f"fixtures: pt={pt} ({pt_sec:.0f}s) ja={ja} slice={pt_slice}")
+    pt, pt_sec = _build_fixtures()
+    print(f"fixtures: pt={pt} ({pt_sec:.0f}s)")
     _run_parakeet(pt, pt_sec)
-    _run_whisper_ja(ja)
-    _run_kill_switch(pt_slice)
     print("\nE2E OK — parakeet CPU lane verified through the real worker path.")
 
 

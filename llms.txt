@@ -31,7 +31,7 @@ Important URLs:
 
 ## Project layout
 
-- `backend/` — Python/FastAPI service (routers, services, models). ASR/transcription via whisper and sherpa-onnx parakeet; downloads via yt-dlp; live chat sinks for Twitch IRC, Kick, and YouTube.
+- `backend/` — Python/FastAPI service (routers, services, models). ASR/transcription via sherpa-onnx parakeet; downloads via yt-dlp; live chat sinks for Twitch IRC, Kick, and YouTube.
 - `src/` — React/TypeScript frontend (Vite + Tailwind). Main app shell, channel explorer, live player popup, settings.
 - `vendor/cookie-extension/` — optional browser extension that bridges session cookies for authenticated flows (e.g. Twitch clip creation).
 - `scripts/` — build and tooling (`generate-icon.py`, `dev-all.mjs`, `build-install.ps1`).
