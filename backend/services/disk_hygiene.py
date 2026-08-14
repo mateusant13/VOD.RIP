@@ -202,15 +202,49 @@ def active_whisper_model_id() -> str:
     ).strip() or DEFAULT_MODEL
 
 
+# Once per process per model kind: a legacy (heavy-cache-dir) location is
+# being used until the AI-models folder is populated — log it once, not on
+# every resolution.
+_LEGACY_MODEL_WARNED: set = set()
+
+
+def _migrated_model_dir(primary: Path, legacy: Optional[Path], what: str) -> Path:
+    """Resolve a model-weight home: prefer *primary* (the AI-models folder),
+    but keep using a populated *legacy* location (the old heavy-cache-dir /
+    drive-root layout) until the models folder actually holds something —
+    re-downloading multi-GB weights during the migration would be worse than
+    a temporary split home. One clear log line when legacy is in use.
+    """
+    if legacy is not None and legacy.is_dir() and any(legacy.iterdir()):
+        has_model = primary.is_dir() and any(
+            e for e in primary.iterdir() if e.is_dir() and e.name != ".locks"
+        )
+        if not has_model:
+            if what not in _LEGACY_MODEL_WARNED:
+                _LEGACY_MODEL_WARNED.add(what)
+                logger.warning(
+                    "AI models folder %s is empty — reusing legacy %s models "
+                    "location %s until it is populated (move the files to %s "
+                    "to consolidate)",
+                    primary, what, legacy, primary,
+                )
+            return legacy
+    return primary
+
+
 def whisper_cache_dir() -> Path:
-    """Resolve the whisper model cache dir.
+    """Resolve the whisper model cache dir — the root of the AI-models folder
+    (all model weights resolve under it; see archive_embed/_parakeet_cache_dir/
+    archive_events for the siblings).
 
     Precedence: VODRIP_WHISPER_CACHE env -> settings.whisper_model_cache ->
     best-ROI fixed drive + VOD.RIP-models (auto: free space AND speed — see
-    best_model_cache_drive) -> %APPDATA%/VOD.RIP/whisper-models. Pointing
-    it at a shared HF hub dir (e.g. BrandOps' models--Systran--faster-whisper-*
-    checkpoints) lets faster-whisper reuse already-downloaded models without
-    any download.
+    best_model_cache_drive) -> %APPDATA%/VOD.RIP/whisper-models. The auto
+    branches fall back to the legacy heavy-cache location
+    <cache root>/whisper-models while it still holds models (migration, see
+    _migrated_model_dir). Pointing it at a shared HF hub dir (e.g. BrandOps'
+    models--Systran--faster-whisper-* checkpoints) lets faster-whisper reuse
+    already-downloaded models without any download.
     """
     env = os.environ.get(CACHE_ENV, "").strip()
     if env:
@@ -222,17 +256,27 @@ def whisper_cache_dir() -> Path:
     ).strip()
     if setting:
         return Path(setting)
+    from services.settings import cache_root
+
+    legacy_root = cache_root()
+    legacy = legacy_root / "whisper-models" if legacy_root is not None else None
     drive = best_model_cache_drive()
     if drive:
-        return Path(drive) / "VOD.RIP-models"
-    return _get_appdata_dir() / "whisper-models"
+        return _migrated_model_dir(
+            Path(drive) / "VOD.RIP-models", legacy, "whisper"
+        )
+    return _migrated_model_dir(
+        _get_appdata_dir() / "whisper-models", legacy, "whisper"
+    )
 
 
-# --- model-cache auto pick (Settings > Disk "AI Models Folder" Auto) -------
-# The whisper model cache follows its own disk-choice rule: score each drive
-# by free space AND speed. Whisper models are ~1.5-3 GB each and are read a
-# few times per process, so a big-but-slow HDD is a fine home; the SSD credit
-# only wins near-ties.
+# --- AI-models auto pick (Settings > Disk "AI Models Folder" Auto) ----------
+# The models folder follows its own disk-choice rule, distinct from the heavy
+# cache disk (biggest free space) and the data disk (fastest): score each
+# drive by free space AND speed. AI models (whisper/parakeet/embed/PANNs
+# weights + tokenizers) are ~0.3-1.6 GB each, are downloaded once (they
+# rarely change) and are read a few times per process, so a big-but-slow HDD
+# is a fine home; the SSD credit only wins near-ties.
 _MODEL_CACHE_MIN_FREE_BYTES = 8 * 1024**3  # room for a model + growth
 # Speed credit in GB of equivalent free space: NVMe +64 GB, SSD +32 GB. An
 # SSD with "adequate" free space (e.g. 100 GB -> 164 GB score) beats an HDD

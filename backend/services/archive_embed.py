@@ -20,8 +20,9 @@ vector service.
 
 Any failure (model missing, corrupt file, OOM) returns None and the search
 degrades to lexical BM25 — semantic search is an enhancement, never a
-blocker. Model dirs live under the data-drive cache:
-cache_root()/embed-models/{e5-small-int8,mmarco-mMiniLMv2-L12-int8}/ (each
+blocker. Model dirs live under the AI-models folder (same disk as the
+whisper/parakeet weights — the heavy cache disk is ephemeral data only):
+<AI-models>/embed-models/{e5-small-int8,mmarco-mMiniLMv2-L12-int8}/ (each
 holds model.onnx + tokenizer.json).
 
 ponytail: full cosine scan over embedded segments is fine well past the
@@ -51,17 +52,20 @@ _MAX_TOKENS = 512
 
 
 def _cache_dir() -> Path:
-    # Precedence: VODRIP_EMBED_CACHE env -> cache_root()/embed-models ->
-    # %APPDATA%/VOD.RIP/embed-models (app-data aware so tests stay isolated).
+    # Precedence: VODRIP_EMBED_CACHE env -> AI-models folder (whisper cache
+    # root) /embed-models -> legacy homes <cache root>/embed-models or
+    # %APPDATA%/VOD.RIP/embed-models (migration: reuse already-downloaded
+    # ONNX weights — no re-download, see disk_hygiene._migrated_model_dir).
+    # Model weights never resolve under the cache disk.
     env = os.environ.get("VODRIP_EMBED_CACHE", "").strip()
     if env:
         return Path(env)
+    from services.disk_hygiene import _migrated_model_dir, whisper_cache_dir
     from services.settings import _get_appdata_dir, cache_root
 
-    root = cache_root()
-    if root is not None:
-        return root / "embed-models"
-    return _get_appdata_dir() / "embed-models"
+    legacy_root = cache_root()
+    legacy = (legacy_root or _get_appdata_dir()) / "embed-models"
+    return _migrated_model_dir(whisper_cache_dir() / "embed-models", legacy, "embed")
 
 
 _lock = threading.Lock()

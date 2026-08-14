@@ -142,7 +142,8 @@ def model_name() -> str:
 
 
 def _cache_dir() -> Path:
-    # Shared resolver: VODRIP_WHISPER_CACHE env -> settings.whisper_model_cache -> appdata.
+    # Shared resolver: VODRIP_WHISPER_CACHE env -> settings.whisper_model_cache
+    # (AI-models folder) -> auto best-ROI drive + VOD.RIP-models -> appdata.
     return whisper_cache_dir()
 
 
@@ -1104,14 +1105,22 @@ def _parakeet_gpu_allowed() -> bool:
 
 
 def _parakeet_cache_dir() -> Path:
-    """Sherpa model cache: VODRIP_SHERRPA_CACHE override, else a SIBLING of
-    the whisper cache — never inside it (the disk-hygiene sweep would prune
-    a non-whisper HF-style model dir as 'inactive')."""
+    """Sherpa model cache: VODRIP_SHERRPA_CACHE override, else a subdir of
+    the AI-models folder (<whisper cache>/parakeet-models) so every model
+    weight lives under the models folder. Falls back to the legacy drive-root
+    sibling (<models parent>/parakeet-models — the pre-ownership-fix layout)
+    while it still holds the model (see _migrated_model_dir). The dir name
+    carries no '--', so the whisper prune (HF-style dirs only) leaves it
+    alone."""
     override = os.environ.get(PARAKEET_CACHE_ENV, "").strip()
     if override:
         return Path(override)
+    from services.disk_hygiene import _migrated_model_dir
+
     base = _cache_dir()
-    return base.parent / "parakeet-models"
+    return _migrated_model_dir(
+        base / "parakeet-models", base.parent / "parakeet-models", "parakeet"
+    )
 
 
 def _parakeet_resolve_dir() -> Optional[Path]:

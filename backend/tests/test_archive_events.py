@@ -8,10 +8,11 @@ Layers, cheap to expensive:
     available), asserting content (events inside speech regions, scores in
     [0, 1], replace-on-rerun).
 
-The real-E2E part needs the checkpoint at ~/panns_data (or
-VODRIP_EVENTS_CHECKPOINT) and skips cleanly when the model is unavailable —
-the pure parts always run. Under pytest the DB part skips if archive_db is
-already bound elsewhere (same guard as the transcribe E2E); run directly:
+The real-E2E part needs the checkpoint under the AI-models folder
+(<models>/panns_data — legacy ~/panns_data or VODRIP_EVENTS_CHECKPOINT are
+also accepted) and skips cleanly when the model is unavailable — the pure
+parts always run. Under pytest the DB part skips if archive_db is already
+bound elsewhere (same guard as the transcribe E2E); run directly:
 
     python tests/test_archive_events.py
 """
@@ -22,6 +23,8 @@ import pathlib
 import sys
 import tempfile
 import time
+
+import pytest
 
 _TMP = pathlib.Path(tempfile.mkdtemp(prefix="vodrip-events-"))
 os.environ["VODRIP_ARCHIVE_DB"] = str(_TMP / "archive.db")
@@ -43,6 +46,16 @@ from services.archive_events import (  # noqa: E402
 
 PLATFORM = "twitch"
 VIDEO_ID = "__events_e2e__"
+
+
+@pytest.fixture(autouse=True)
+def _no_real_disk_probe(monkeypatch):
+    """_checkpoint_path() resolves through whisper_cache_dir(), whose auto
+    pick probes real drives (PowerShell). Patching best_model_cache_drive to
+    None keeps the pytest process hermetic — the e2e still finds the real
+    checkpoint through the legacy home fallback."""
+    monkeypatch.setattr("services.disk_hygiene.best_model_cache_drive", lambda: None)
+    yield
 
 
 # --- pure run extraction --------------------------------------------------
@@ -125,6 +138,49 @@ def test_event_classes_env_and_intersection() -> None:
             os.environ.pop("VODRIP_EVENTS_CLASSES", None)
         else:
             os.environ["VODRIP_EVENTS_CLASSES"] = saved
+
+
+def test_checkpoint_path_resolves_under_models_folder(tmp_path, monkeypatch) -> None:
+    """PANNs weights live under the AI-models folder (same drive as whisper);
+    a legacy home checkpoint is reused until the models folder has one."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from services.archive_events import _checkpoint_path, _legacy_checkpoint_homes
+
+    monkeypatch.delenv("VODRIP_EVENTS_CHECKPOINT", raising=False)
+    monkeypatch.delenv("VODRIP_WHISPER_CACHE", raising=False)
+    monkeypatch.setattr("services.settings.cache_root", lambda: None)
+    monkeypatch.setattr(
+        "services.disk_hygiene.best_model_cache_drive", lambda: str(tmp_path / "drive")
+    )
+    with patch("deps.settings_mgr") as mgr:
+        mgr.get.return_value = SimpleNamespace(whisper_model_cache="")
+        name = "Cnn14_DecisionLevelMax_mAP=0.385.pth"
+        primary = tmp_path / "drive" / "VOD.RIP-models" / "panns_data" / name
+        monkeypatch.setattr("services.archive_events._legacy_checkpoint_homes", lambda: [])
+        assert _checkpoint_path() == str(primary), "no checkpoint anywhere -> models-dir default"
+
+        # legacy home holds the checkpoint -> reused (migration, no re-download)
+        legacy = tmp_path / "legacy"
+        (legacy / name).parent.mkdir(parents=True)
+        (legacy / name).write_bytes(b"ckpt")
+        monkeypatch.setattr(
+            "services.archive_events._legacy_checkpoint_homes", lambda: [legacy]
+        )
+        assert _checkpoint_path() == str(legacy / name)
+
+        # models-folder checkpoint wins over the legacy home
+        primary.parent.mkdir(parents=True)
+        primary.write_bytes(b"new")
+        assert _checkpoint_path() == str(primary)
+
+
+def test_checkpoint_env_override_wins(tmp_path, monkeypatch) -> None:
+    from services.archive_events import _checkpoint_path
+
+    monkeypatch.setenv("VODRIP_EVENTS_CHECKPOINT", str(tmp_path / "custom.pth"))
+    assert _checkpoint_path() == str(tmp_path / "custom.pth")
 
 
 def test_events_enabled_defaults_on() -> None:

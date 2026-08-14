@@ -309,6 +309,28 @@ def test_whisper_cache_dir_auto_uses_roi_drive(monkeypatch):
         assert disk_hygiene.whisper_cache_dir() == Path("H:\\VOD.RIP-models")
 
 
+def test_whisper_cache_legacy_cache_dir_reused_until_migrated(monkeypatch, tmp_path):
+    """Migration: an EMPTY models folder falls back to the legacy
+    <cache root>/whisper-models (no re-download); once the models folder has
+    a real model dir it wins."""
+    monkeypatch.delenv("VODRIP_WHISPER_CACHE", raising=False)
+    monkeypatch.setenv("VODRIP_CACHE_DIR", str(tmp_path / "cache"))
+    legacy = tmp_path / "cache" / "whisper-models"
+    (legacy / "models--Systran--faster-whisper-large-v3-turbo").mkdir(parents=True)
+    models_root = tmp_path / "drive" / "VOD.RIP-models"
+    with patch("deps.settings_mgr") as mgr:
+        mgr.get.return_value = SimpleNamespace(whisper_model_cache=None)
+        monkeypatch.setattr(
+            "services.disk_hygiene.best_model_cache_drive",
+            lambda: str(tmp_path / "drive"),
+        )
+        # the models folder is empty -> legacy cache-dir models reused
+        assert disk_hygiene.whisper_cache_dir() == legacy
+        # a real model dir in the models folder flips resolution to it
+        (models_root / "models--Systran--faster-whisper-small").mkdir(parents=True)
+        assert disk_hygiene.whisper_cache_dir() == models_root
+
+
 def test_whisper_cache_dir_explicit_beats_auto(monkeypatch):
     monkeypatch.delenv("VODRIP_WHISPER_CACHE", raising=False)
     with patch("deps.settings_mgr") as mgr:

@@ -54,7 +54,9 @@ def _archive_dir() -> Path:
 
 def _whisper_cache_dir() -> Path:
     # Shared resolver (services.disk_hygiene): VODRIP_WHISPER_CACHE env ->
-    # settings.whisper_model_cache -> %APPDATA%/VOD.RIP/whisper-models.
+    # settings.whisper_model_cache (the AI-models folder) -> best-ROI drive +
+    # VOD.RIP-models -> appdata. Legacy cache-dir models are redirected with
+    # a log until the models folder is populated.
     return whisper_cache_dir()
 
 

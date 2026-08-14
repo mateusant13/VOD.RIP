@@ -99,8 +99,8 @@ const ptBR: Record<string, string> = {
   'The Whisper model is auto-managed (default large-v3-turbo). The model id is resolved from the saved setting — typing it here had no effect on jobs.':
     'O modelo Whisper é gerenciado automaticamente (padrão large-v3-turbo). O id do modelo é resolvido da configuração salva — digitá-lo aqui não tinha efeito nos trabalhos.',
   'AI Models Folder': 'Pasta de modelos de IA',
-  'Whisper models download here. Auto picks the best-value drive — free space first, SSD/NVMe preferred; a large slow HDD wins only when it has much more space. A custom path (shared HF hub) still works.':
-    'Os modelos Whisper são baixados aqui. Automático escolhe o melhor disco — espaço livre primeiro, com preferência para SSD/NVMe; um HDD grande e lento só vence quando tem muito mais espaço. Um caminho personalizado (HF hub compartilhado) também funciona.',
+  'AI model weights download here — Whisper, Parakeet, embedding & audio-event models (+ tokenizers). Auto picks the best-value drive — free space first, SSD/NVMe preferred; a large slow HDD wins only when it has much more space (models are large but downloaded once and rarely change). A custom path (shared HF hub) still works.':
+    'Os pesos dos modelos de IA são baixados aqui — Whisper, Parakeet, modelos de embedding e de eventos de áudio (+ tokenizadores). Automático escolhe o melhor disco — espaço livre primeiro, com preferência para SSD/NVMe; um HDD grande e lento só vence quando tem muito mais espaço (modelos são grandes, mas são baixados uma vez e raramente mudam). Um caminho personalizado (HF hub compartilhado) também funciona.',
   'YouTube subtitles first': 'Legendas do YouTube primeiro',
   'Fallback to Whisper when subtitles are unavailable':
     'Recorre ao Whisper quando as legendas não estiverem disponíveis',
@@ -126,8 +126,8 @@ const ptBR: Record<string, string> = {
     'ESPAÇO EM DISCO BAIXO — {free} livres. Execute as limpezas abaixo ou libere espaço manualmente.',
   'Storage': 'Armazenamento',
   'Heavy Cache Disk': 'Disco de cache pesado',
-  'Whisper models, yt-dlp cache, preview temp & embed models — applies on Save Settings (next launch)':
-    'Modelos Whisper, cache yt-dlp, temporários de pré-visualização e modelos de embed — aplica ao salvar configurações (próxima inicialização)',
+  'yt-dlp cache, transcript-fix cache & temp files — ephemeral, re-creatable data (no AI models). Auto picks the drive with the most free space; applies on Save Settings (next launch)':
+    'Cache yt-dlp, cache de transcrição e arquivos temporários — dados efêmeros e recriáveis (sem modelos de IA). Automático escolhe o disco com mais espaço livre; aplica ao salvar configurações (próxima inicialização)',
   'Auto (biggest free space)': 'Automático (maior espaço livre)',
   'Transcripts & Chat Data Disk': 'Disco de transcrições e chat',
   'transcripts, chat data & preview cache — takes effect after restart (moves the database)':
@@ -748,7 +748,7 @@ const es: Record<string, string> = {
   'The Whisper model is auto-managed (default large-v3-turbo). The model id is resolved from the saved setting — typing it here had no effect on jobs.':
     'El modelo Whisper se gestiona automáticamente (predeterminado large-v3-turbo). El id del modelo se resuelve desde la configuración guardada — escribirlo aquí no tenía efecto en los trabajos.',
   'AI Models Folder': 'Carpeta de modelos de IA',
-  'Whisper models download here. Auto picks the best-value drive — free space first, SSD/NVMe preferred; a large slow HDD wins only when it has much more space. A custom path (shared HF hub) still works.': 'Los modelos Whisper se descargan aquí. Automático elige el mejor disco — espacio libre primero, con preferencia por SSD/NVMe; un HDD grande y lento solo gana cuando tiene mucho más espacio. Una ruta personalizada (HF hub compartido) también funciona.',
+  'AI model weights download here — Whisper, Parakeet, embedding & audio-event models (+ tokenizers). Auto picks the best-value drive — free space first, SSD/NVMe preferred; a large slow HDD wins only when it has much more space (models are large but downloaded once and rarely change). A custom path (shared HF hub) still works.': 'Los pesos de los modelos de IA se descargan aquí — Whisper, Parakeet, modelos de embeddings y de eventos de audio (+ tokenizadores). Automático elige el mejor disco — espacio libre primero, con preferencia por SSD/NVMe; un HDD grande y lento solo gana cuando tiene mucho más espacio (los modelos son grandes, pero se descargan una vez y rara vez cambian). Una ruta personalizada (HF hub compartido) también funciona.',
   'YouTube subtitles first': 'Subtítulos de YouTube primero',
   'Fallback to Whisper when subtitles are unavailable': 'Usar Whisper cuando no haya subtítulos',
   'ASR engine': 'Motor de ASR',
@@ -769,7 +769,7 @@ const es: Record<string, string> = {
   'LOW DISK SPACE — {free} free. Run cleanups below or free space manually.': 'POCO ESPACIO EN DISCO — {free} libres. Ejecuta las limpiezas de abajo o libera espacio manualmente.',
   'Storage': 'Almacenamiento',
   'Heavy Cache Disk': 'Disco de caché pesada',
-  'Whisper models, yt-dlp cache, preview temp & embed models — applies on Save Settings (next launch)': 'Modelos Whisper, caché de yt-dlp, temporales de vista previa y modelos embed — se aplica al guardar ajustes (próximo inicio)',
+  'yt-dlp cache, transcript-fix cache & temp files — ephemeral, re-creatable data (no AI models). Auto picks the drive with the most free space; applies on Save Settings (next launch)': 'Caché de yt-dlp, caché de corrección de transcripciones y archivos temporales — datos efímeros y recreables (sin modelos de IA). Automático elige el disco con más espacio libre; se aplica al guardar ajustes (próximo inicio)',
   'Auto (biggest free space)': 'Automático (más espacio libre)',
   'Transcripts & Chat Data Disk': 'Disco de transcripciones y chat',
   'transcripts, chat data & preview cache — takes effect after restart (moves the database)': 'transcripciones, datos de chat y caché de vista previa — surte efecto tras reiniciar (mueve la base de datos)',

@@ -14,8 +14,10 @@ Design notes:
     (clip-level) so events carry real boundaries — the paste's "acoustic
     event detection" needs timestamps, not flags.
   * Model + weights are the package defaults (Cnn14_DecisionLevelMax_mAP=
-    0.385.pth under ~/panns_data); panns_inference is imported lazily on
-    first use, so a worker with events disabled never pays its import cost.
+    0.385.pth under the AI-models folder /panns_data); panns_inference is
+    imported lazily on first use, so a worker with events disabled never
+    pays its import cost. A checkpoint still in a legacy home (~/panns_data
+    or <cache>/panns_data) is reused until the models folder is populated.
 
   Env knobs (all optional, VODRIP_WHISPER_* style):
   VODRIP_EVENTS_ENABLED     0|1   auto-run after each transcribe job (default 1)
@@ -25,7 +27,7 @@ Design notes:
   VODRIP_EVENTS_DEVICE           cuda|cpu (default: cuda when available)
   VODRIP_EVENTS_CLASSES          comma-separated AudioSet labels (default: interest set)
   VODRIP_EVENTS_CHECKPOINT       Cnn14_DecisionLevelMax .pth path
-                                 (default ~/panns_data/Cnn14_DecisionLevelMax_mAP=0.385.pth)
+                                 (default <AI-models folder>/panns_data/Cnn14_DecisionLevelMax_mAP=0.385.pth)
 """
 from __future__ import annotations
 
@@ -128,11 +130,44 @@ def _effective_device() -> str:
         return "cpu"
 
 
+def _legacy_checkpoint_homes() -> list[Path]:
+    """Legacy PANNs weight homes (checked in order when the models-folder
+    copy is absent): ~/panns_data (historical default) and the heavy-cache
+    root <cache>/panns_data (pre-ownership-fix layout)."""
+    roots = [Path.home() / "panns_data"]
+    try:
+        from services.settings import cache_root
+
+        root = cache_root()
+        if root is not None:
+            roots.append(root / "panns_data")
+    except Exception:
+        pass
+    return roots
+
+
 def _checkpoint_path() -> str:
     env = os.environ.get(CHECKPOINT_ENV, "").strip()
     if env:
         return env
-    return str(Path.home() / "panns_data" / "Cnn14_DecisionLevelMax_mAP=0.385.pth")
+    # Model weights live under the AI-models folder (whisper cache root);
+    # a checkpoint still in a legacy home is reused instead of re-downloaded
+    # (~300 MB) — one clear log line when that happens.
+    from services.disk_hygiene import whisper_cache_dir
+
+    name = "Cnn14_DecisionLevelMax_mAP=0.385.pth"
+    primary = whisper_cache_dir() / "panns_data" / name
+    if primary.is_file():
+        return str(primary)
+    for legacy in _legacy_checkpoint_homes():
+        if (legacy / name).is_file():
+            logger.warning(
+                "PANNs checkpoint found at legacy %s — reusing it; new "
+                "downloads land in the AI-models folder (%s)",
+                legacy, primary,
+            )
+            return str(legacy / name)
+    return str(primary)
 
 
 # --- model ---------------------------------------------------------------
@@ -166,7 +201,7 @@ def _ensure_checkpoint() -> str:
             pass
         raise FileNotFoundError(
             f"PANNs checkpoint download failed: {exc} — place "
-            "Cnn14_DecisionLevelMax_mAP=0.385.pth into ~/panns_data "
+            f"Cnn14_DecisionLevelMax_mAP=0.385.pth at {ckpt} "
             "(zenodo record 3987831)"
         )
     logger.info("PANNs checkpoint downloaded to %s", ckpt)
