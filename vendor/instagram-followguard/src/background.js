@@ -19,7 +19,8 @@ const K = {
 const EVENTS_MAX = 100;
 const SYNC_ALARM = 'igf-sync';
 const DEFAULT_SETTINGS = {
-  username: 'mateus.antonio19', // own profile (user-provided; editable)
+  // No username here: the logged-in profile is resolved at runtime from the
+  // session cookie (ds_user_id -> /api/v1/users/{pk}/info/). Never hardcode.
   refreshMinutes: 60,
   notificationsEnabled: true,
   autoSync: true,
@@ -45,7 +46,9 @@ async function getSettings() {
 }
 
 async function saveSettings(s) {
-  await chrome.storage.local.set({ [K.settings]: s });
+  const clean = { ...s };
+  delete clean.username; // legacy hardcoded field — never persist/use it
+  await chrome.storage.local.set({ [K.settings]: clean });
 }
 
 async function getState() {
@@ -84,15 +87,19 @@ async function sync(trigger) {
       return { ok: false, error: session.message };
     }
     const settings = await getSettings();
+    const st0 = await getState();
     let uid = session.uid;
-    let username = settings.username || null;
+    let username = st0.ownUsername || null; // runtime-resolved, never hardcoded
     try {
-      if (!uid) {
+      if (uid && !username) {
+        username = (await resolveOwnUser(null, session, uid)).username;
+      } else if (!uid) {
+        if (!username) {
+          throw new IgApiError('not-logged-in', 'Não encontrei seu ID de usuário. Abra instagram.com logado.');
+        }
         const info = await resolveOwnUser(username, session);
         uid = info.uid;
         username = info.username;
-      } else if (!username) {
-        username = (await resolveOwnUser(null, session, uid)).username;
       }
       if (uid) await setState({ ownUserId: String(uid) });
       if (username) await setState({ ownUsername: username });
@@ -260,6 +267,40 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (!msg || !msg.type || !msg.type.startsWith('igf-')) return false;
   if (msg.type === 'igf-sync') {
     sync(msg.trigger || 'manual').then(sendResponse);
+    return true;
+  }
+  if (msg.type === 'igf-get-own') {
+    // Logged-in profile, resolved from the session at runtime (never hardcoded).
+    (async () => {
+      const st = await getState();
+      if (st.ownUsername) {
+        sendResponse({ ok: true, username: st.ownUsername, uid: st.ownUserId ? String(st.ownUserId) : null });
+        return;
+      }
+      const session = await readSession().catch((err) => err);
+      if (session instanceof IgApiError) {
+        sendResponse({ ok: false, error: session.message });
+        return;
+      }
+      let uid = session.uid;
+      let username = null;
+      try {
+        if (uid) {
+          username = (await resolveOwnUser(null, session, uid)).username;
+        } else {
+          throw new IgApiError('not-logged-in', 'Não encontrei seu ID de usuário. Abra instagram.com logado.');
+        }
+      } catch (err) {
+        sendResponse({
+          ok: false,
+          error: err instanceof IgApiError ? err.message : String(err && err.message || err),
+        });
+        return;
+      }
+      if (uid) await setState({ ownUserId: String(uid) });
+      if (username) await setState({ ownUsername: username });
+      sendResponse({ ok: !!(uid && username), username: username || null, uid: uid ? String(uid) : null });
+    })();
     return true;
   }
   if (msg.type === 'igf-settings-update') {

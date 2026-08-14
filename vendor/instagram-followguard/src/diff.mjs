@@ -19,14 +19,17 @@ export function diffAndRecord(prev, next, following, history, now) {
   for (const [u, meta] of Object.entries(prev)) {
     if (!next.has(u)) {
       const stillFollowing = following.has(u);
+      const cur = stillFollowing ? following.get(u) : null;
       const h = newHistory[u] || {};
       const pk = String(meta.pk || h.pk || '');
       const fullName = meta.full_name || h.fullName || '';
-      events.push({ username: u, pk, fullName, detectedAt: now, stillFollowing });
+      const profilePicUrl = (cur && cur.profile_pic_url) || meta.profile_pic_url || h.profilePicUrl || '';
+      events.push({ username: u, pk, fullName, profilePicUrl, detectedAt: now, stillFollowing });
       newHistory[u] = {
         ...h,
         pk,
         fullName,
+        profilePicUrl,
         firstFollowedAt: h.firstFollowedAt || null,
         lastFollowedAt: h.lastFollowedAt || null,
         unfollowedAt: now,
@@ -40,6 +43,7 @@ export function diffAndRecord(prev, next, following, history, now) {
       ...h,
       pk: String(meta.pk || h.pk || ''),
       fullName: meta.full_name || h.fullName || '',
+      profilePicUrl: meta.profile_pic_url || h.profilePicUrl || '',
       firstFollowedAt: h.firstFollowedAt || now,
       lastFollowedAt: now,
       unfollowedAt: null,

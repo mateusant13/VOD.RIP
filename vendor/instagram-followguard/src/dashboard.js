@@ -49,9 +49,9 @@ function relTime(iso) {
   return `há ${days} d`;
 }
 
-function avatarImg(u, size) {
+function avatarImg(u) {
   if (u.profile_pic_url) {
-    return `<img class="avatar" src="${u.profile_pic_url}" alt="" referrerpolicy="no-referrer" onerror="this.outerHTML='${placeholder(u)}'">`;
+    return `<img class="avatar" src="${u.profile_pic_url}" alt="" referrerpolicy="no-referrer">`;
   }
   return placeholder(u);
 }
@@ -82,7 +82,7 @@ function eventHtml(e) {
   const name = e.fullName ? ` — ${e.fullName}` : '';
   return `
     <div class="item" data-u="${e.username}">
-      <span class="avatar" style="display:inline-flex;align-items:center;justify-content:center;font-weight:700;color:#fff;background:linear-gradient(135deg,#feda75,#d62976,#962fbf,#4f5bd5)">${(e.username || '?')[0].toUpperCase()}</span>
+      ${avatarImg({ username: e.username, profile_pic_url: e.profilePicUrl })}
       <div class="who">
         <b><a href="https://www.instagram.com/${encodeURIComponent(e.username)}/" target="_blank" rel="noopener">${e.username}</a></b>
         <span title="${e.fullName}">${e.fullName || ''}</span>
@@ -201,6 +201,19 @@ function sendSync() {
   chrome.runtime.sendMessage({ type: 'igf-sync', trigger: 'manual' });
 }
 
+// Events stored before profilePicUrl existed: backfill the pic from the
+// current follow lists (the user is in at least one of them while relevant).
+function enrichEvents(list) {
+  return list.map((e) => {
+    if (e.profilePicUrl) return e;
+    const pic =
+      (following[e.username] && following[e.username].profile_pic_url) ||
+      (followers[e.username] && followers[e.username].profile_pic_url) ||
+      '';
+    return pic ? { ...e, profilePicUrl: pic } : e;
+  });
+}
+
 function openInstagram() {
   chrome.tabs.create({ url: 'https://www.instagram.com/' });
 }
@@ -217,7 +230,7 @@ async function load() {
   settings = o['igf.settings'] || {};
   followers = o['igf.followers'] || {};
   following = o['igf.following'] || {};
-  events = o['igf.unfollowEvents'] || [];
+  events = enrichEvents(o['igf.unfollowEvents'] || []);
   render();
   // Panel: auto-sync when data is stale (popup relies on the manual button).
   if (document.body.classList.contains('panel')) {
@@ -253,6 +266,15 @@ el.notif().addEventListener('change', async (e) => {
 });
 el.openIg().onclick = openInstagram;
 
+// CSP-safe avatar fallback: a failed <img> becomes the letter placeholder.
+// (Inline onerror= handlers are blocked by the extension CSP.)
+document.addEventListener('error', (ev) => {
+  const t = ev.target;
+  if (!t || t.tagName !== 'IMG' || !t.classList || !t.classList.contains('avatar')) return;
+  const item = t.closest && t.closest('.item');
+  t.outerHTML = placeholder(item && item.dataset ? { username: item.dataset.u } : {});
+}, true);
+
 // Panel-only: the inline close script was removed from panel.html (extension
 // CSP blocks inline scripts -> console errors); wired here, guarded for the
 // popup which has no #close button.
@@ -265,7 +287,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (changes['igf.settings']) settings = changes['igf.settings'].newValue || {};
   if (changes['igf.followers']) followers = changes['igf.followers'].newValue || {};
   if (changes['igf.following']) following = changes['igf.following'].newValue || {};
-  if (changes['igf.unfollowEvents']) events = changes['igf.unfollowEvents'].newValue || [];
+  if (changes['igf.unfollowEvents']) events = enrichEvents(changes['igf.unfollowEvents'].newValue || []);
   render();
 });
 

@@ -50,7 +50,6 @@
       "resources": [
         "panel.html",
         "panel.css",
-        "panel.js",
         "dashboard.css",
         "dashboard.js",
         "images/*"
