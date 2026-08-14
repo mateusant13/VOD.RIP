@@ -131,9 +131,9 @@ class AppSettings(BaseModel):
     # pointing at a shared HF hub dir reuses already-downloaded checkpoints.
     # NOTE: whisper_model is the faster-whisper model id (NOT an engine) —
     # 'parakeet' here would break WhisperModel() loads. Engine selection is
-    # asr_engine ('parakeet' default; whisper large-v3-turbo only when
+    # asr_engine ('parakeet' default; whisper small only when
     # parakeet itself fails or the language is ja/ko/zh/ar).
-    whisper_model: str = "large-v3-turbo"
+    whisper_model: str = "small"
     # ASR engine: 'parakeet' (default) or 'whisper'. The job router keeps
     # whisper as the fallback for ja/ko/zh/ar and parakeet-engine failures
     # regardless; this setting forces the engine for every job.

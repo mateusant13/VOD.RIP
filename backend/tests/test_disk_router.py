@@ -162,14 +162,14 @@ async def test_cleanup_unknown_category_400(scratch_env, client):
 async def test_cleanup_whisper_models_prunes_unused_keeps_active(scratch_env, client):
     cache = scratch_env.appdata / "whisper-models"
     _write(cache / "models--Systran--faster-whisper-small" / "model.bin", 2048)
-    _write(cache / "models--Systran--faster-whisper-large-v3-turbo" / "model.bin", 8192)
+    _write(cache / "models--Systran--faster-whisper-medium" / "model.bin", 8192)
     _write(cache / "not-a-model-dir" / "user-file.txt", 10)  # unknown dir — untouched
 
     resp = await client.post("/api/disk/cleanup", json={"category": "whisper_models"})
     assert resp.status_code == 200
-    assert resp.json() == {"freed_bytes": 2048}
-    assert (cache / "models--Systran--faster-whisper-small").exists() is False
-    assert (cache / "models--Systran--faster-whisper-large-v3-turbo").exists() is True
+    assert resp.json() == {"freed_bytes": 8192}
+    assert (cache / "models--Systran--faster-whisper-small").exists() is True
+    assert (cache / "models--Systran--faster-whisper-medium").exists() is False
     assert (cache / "not-a-model-dir").exists() is True
 
 

@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # Whisper model settings — same knobs as services.archive_transcribe. The
 # env vars stay per-process overrides (tests/benchmarks pin env-first); the
 # persisted settings fields are the user's choice whenever env is unset.
-DEFAULT_MODEL = "large-v3-turbo"
+DEFAULT_MODEL = "small"
 MODEL_ENV = "VODRIP_WHISPER_MODEL"
 CACHE_ENV = "VODRIP_WHISPER_CACHE"
 # Transcripts/chat data root — env override for the settings.data_dir knob.
@@ -353,7 +353,7 @@ def prune_inactive_whisper_models(cache_dir: Path, active_id: str) -> int:
     """Delete HF-style model dirs that aren't the active model.
 
     faster-whisper cache dirs are named models--<org>--<model> (e.g.
-    models--Systran--faster-whisper-large-v3-turbo). A dir is kept when the
+    models--Systran--faster-whisper-small). A dir is kept when the
     active model id (slashes -> '--') is contained in its name; non-HF-style
     dirs are left alone. Returns bytes freed.
 

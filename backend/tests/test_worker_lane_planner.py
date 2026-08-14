@@ -159,7 +159,7 @@ def test_vram_estimate_by_model_name():
     at._worker_lane_model = None
     for name, gb in (
         ("large-v3-turbo", 6.0), ("large-v3", 10.0), ("medium", 5.0),
-        ("small", 2.0), ("base", 1.0), ("tiny", 0.6), ("weird-name", 6.0),
+        ("small", 2.0), ("base", 1.0), ("tiny", 0.6), ("weird-name", 2.0),
     ):
         try:
             at.model_name = lambda _n=name: _n

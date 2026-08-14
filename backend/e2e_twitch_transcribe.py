@@ -13,7 +13,7 @@ from pathlib import Path
 LAB = Path(os.environ.get("TEMP", ".")) / "vodrip-search-lab"
 os.environ.setdefault("VODRIP_ARCHIVE_DB", str(LAB / "playground.db"))
 os.environ.setdefault("VODRIP_WHISPER_DEVICE", "cuda")
-os.environ.setdefault("VODRIP_WHISPER_MODEL", "large-v3-turbo")
+os.environ.setdefault("VODRIP_WHISPER_MODEL", "small")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from services import archive_db, archive_transcribe  # noqa: E402

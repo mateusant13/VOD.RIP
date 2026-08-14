@@ -31,7 +31,8 @@ Design decisions:
     not 0), slots transcribe jobs whose language is in Parakeet TDT v3's 25
     European languages with sherpa-onnx (2.5-5.2 RTFx on CPU int8 vs
     whisper-large-v3-turbo cpu/int8 at 0.26-0.6, ~0.7 GB less RSS, no
-    silence hallucination — A/B 2026-08-07). Known-other (ja, ...) and
+    silence hallucination — A/B 2026-08-07; the whisper default is now the
+    much smaller 'small', so the gap is even wider). Known-other (ja, ...) and
     unknown languages stay whisper. CUDA-enabled sherpa-onnx wheels
     (>=1.13.x, see requirements.txt) let GPU slots run parakeet with
     provider='cuda', gated on the measured free-VRAM allowance; without a
@@ -41,8 +42,10 @@ Design decisions:
   * Device: detect_gpu_vendor() — 'nvidia' -> cuda/float16, everything else
     cpu/int8. This machine has an NVIDIA RTX 5080 (CUDA works via torch),
     so real runs are cuda/float16; the CPU path exists for GPU-less hosts.
-  * Default model 'large-v3-turbo'; override with env VODRIP_WHISPER_MODEL
-    (e.g. 'freds0/distil-whisper-large-v3-ptbr' or 'small').
+  * Whisper fallback model 'small' (parakeet is the primary engine for its
+    26 languages; whisper covers everything else + the parakeet-failure
+    retry). Override with env VODRIP_WHISPER_MODEL
+    (e.g. 'freds0/distil-whisper-large-v3-ptbr').
 
 Opt-in by design: app.py does NOT import this module. Start the worker with
 ``python -m services.archive_transcribe`` or ``start_worker()`` from a launcher.
@@ -79,7 +82,7 @@ from services.ytdlp_ffmpeg import _resolve_ffmpeg_exe, _resolve_ffprobe_exe
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "large-v3-turbo"
+DEFAULT_MODEL = "small"
 SAMPLE_RATE = 16000
 
 # Env knobs (all optional).
@@ -162,11 +165,11 @@ _GPU_VRAM_MEDIAN_GAP_S = 10.0
 def _gpu_model_vram_est() -> int:
     """fp16 VRAM estimate (bytes) for the ACTIVE whisper model (name-prefixed).
 
-    large-v3-turbo is the default (~6 GiB); large/distil-large ~10; medium/
-    distil-medium ~5; small ~2; base ~1; tiny ~0.6. Unknown names fall back
-    to 6 GiB (the default model) — conservative for the common case."""
+    small is the default (~2 GiB); large-v3-turbo/large ~6-10; medium/
+    distil-medium ~5; base ~1; tiny ~0.6. Unknown names fall back to the
+    default (2 GiB) — conservative for the common case."""
     name = (model_name() or "").lower()
-    gb = 6.0  # default: large-v3-turbo
+    gb = 2.0  # default: small
     if name.startswith("large-v3-turbo") or name.startswith("distil-large-v3"):
         gb = 6.0
     elif name.startswith("large"):
@@ -995,8 +998,8 @@ def _current_model() -> Any:
 
 
 # --- Parakeet lane (sherpa-onnx) ------------------------------------------
-# A/B verdict (2026-08-07, 60 s pt-BR segments, i5-13600K): parakeet TDT v3
-# int8 on CPU runs 2.5-5.2 RTFx vs whisper large-v3-turbo cpu/int8 at
+    # A/B verdict (2026-08-07, 60 s pt-BR segments, i5-13600K): parakeet TDT v3
+# int8 on CPU runs 2.5-5.2 RTFx vs whisper-large-v3-turbo cpu/int8 at
 # 0.26-0.6 (7-15x), ~0.7 GB less peak RSS, and outputs nothing on silence
 # (no hallucination). GPU: CUDA-enabled sherpa-onnx wheels exist since
 # 1.13.x (sherpa-onnx==X+cuda12.cudnn9 — see requirements.txt); when one is
@@ -1234,7 +1237,7 @@ def _job_engine(language: Optional[str]) -> str:
     """Engine for THIS job on the calling lane.
 
     TASK9: parakeet is the DEFAULT engine — every language the lane can run
-    through sherpa, including UNKNOWN (None) — and whisper large-v3-turbo is
+    through sherpa, including UNKNOWN (None) — and whisper small is
     the fallback, used ONLY when (a) the current thread's job override says
     whisper (user forced asr_engine='whisper', or a parakeet run failed and
     _process_job is retrying it), (b) the language is one parakeet cannot do
@@ -3614,7 +3617,7 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
                     "requeued": "youtube-gate",
                 }
             except Exception as exc:
-                # TASK9: whisper large-v3-turbo is the fallback when parakeet
+                # TASK9: whisper (small default) is the fallback when parakeet
                 # itself fails (decode error, recognizer crash) — retry the SAME
                 # job once with whisper before giving up. Terminal failures
                 # (missing archive file, yt-dlp download error) are NOT retried:

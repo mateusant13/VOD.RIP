@@ -323,7 +323,7 @@ def test_midrun_twin_win_aborts_before_insert(tmp_path):
         patch.object(at, "_append_manifest_entry", return_value=None),
         patch.object(at, "_manifest_path", return_value=manifest),
         patch.object(at, "_effective_device", return_value=("cpu", "int8")),
-        patch.object(at, "_asr_model_name", return_value="large-v3-turbo"),
+        patch.object(at, "_asr_model_name", return_value="small"),
         patch.object(archive_db, "transcribed_on_higher_priority_platform", return_value=True),
         patch.object(archive_db, "insert_transcript", side_effect=lambda *a, **k: inserted.append(a) or 0),
         patch.object(archive_db, "delete_transcripts", side_effect=lambda p, v: deleted.append((p, v)) or 1),

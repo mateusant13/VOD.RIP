@@ -207,7 +207,7 @@ async def update_settings(update: SettingsUpdate):
     if update.whisper_model is not None:
         # Non-empty model id; empty/whitespace falls back to the default.
         val = update.whisper_model.strip()
-        current.whisper_model = val or "large-v3-turbo"
+        current.whisper_model = val or "small"
     if update.asr_engine is not None:
         # 'parakeet' (default) or 'whisper' — anything else falls back to
         # the default; the job router still auto-falls back to whisper for

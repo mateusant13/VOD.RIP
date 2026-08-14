@@ -69,7 +69,7 @@ async def test_whisper_settings_roundtrip(client):
 async def test_whisper_settings_blank_model_falls_back_to_default(client):
     resp = await client.post("/api/settings", json={"whisper_model": "   "})
     assert resp.status_code == 200
-    assert resp.json()["whisper_model"] == "large-v3-turbo"
+    assert resp.json()["whisper_model"] == "small"
 
 
 @pytest.mark.asyncio
@@ -114,7 +114,7 @@ def test_transcribe_resolution_defaults(monkeypatch):
     monkeypatch.delenv("VODRIP_WHISPER_CACHE", raising=False)
     with patch("deps.settings_mgr") as mgr:
         mgr.get.return_value = SimpleNamespace(whisper_model="", whisper_model_cache="")
-        assert archive_transcribe.model_name() == "large-v3-turbo"
+        assert archive_transcribe.model_name() == "small"
 
 
 def test_transcribe_env_override_beats_settings(monkeypatch):
