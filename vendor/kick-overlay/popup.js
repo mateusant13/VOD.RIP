@@ -1,4 +1,4 @@
-// Kick Overlay popup — toggle + per-channel Twitch→Kick mapping + live status.
+// Kick Overlay popup — toggle + per-channel Kick/YouTube mapping + live status.
 'use strict';
 
 const KEY = 'ko.v2';
@@ -21,31 +21,24 @@ function twitchSlugFromUrl(url) {
 
 async function kickStatus(slug) {
   // Same v2→v1 fallback as the content script; both endpoints are
-  // anonymous and reflect any Origin.
+  // anonymous and reflect any Origin. v2 exposes playback_url TOP-LEVEL.
   const enc = encodeURIComponent(slug);
-  for (const [url, v2] of [
-    [`https://kick.com/api/v2/channels/${enc}`, true],
-    [`https://kick.com/api/v1/channels/${enc}`, false],
+  for (const url of [
+    `https://kick.com/api/v2/channels/${enc}`,
+    `https://kick.com/api/v1/channels/${enc}`,
   ]) {
     try {
       const r = await fetch(url, { credentials: 'omit' });
       if (!r.ok) continue;
       const d = await r.json();
-      if (v2) {
-        const ls = d && d.livestream;
-        if (ls && ls.playback_url) {
-          return {
-            live: true,
-            viewers: ls.viewer_count ?? null,
-            title: ls.session_title ?? '',
-          };
-        }
-        if (!ls) return { live: false };
-      } else if (d && d.playback_url) {
-        return { live: true, viewers: d.viewer_count ?? null, title: (d.livestream && d.livestream.session_title) || '' };
-      } else {
-        return { live: false };
+      if (d && d.playback_url) {
+        return {
+          live: true,
+          viewers: d.viewer_count ?? null,
+          title: (d.livestream && d.livestream.session_title) || '',
+        };
       }
+      if (d && d.livestream) return { live: false };
     } catch {
       /* try next */
     }
@@ -60,14 +53,17 @@ async function kickStatus(slug) {
 
   $('channel').textContent = slug ? `twitch.tv/${slug}` : 'Not on a Twitch channel';
   $('enabled').checked = st.enabled === undefined ? true : !!st.enabled;
-  $('player').value = st.player === 'twitch' ? 'twitch' : 'kick';
-  if (slug) {
-    $('kick').value = (st.mappings && st.mappings[slug]) || '';
-  }
+  $('player').value = st.player === 'twitch' ? 'twitch' : st.player === 'youtube' ? 'youtube' : 'kick';
+  const m = slug ? (st.mappings && st.mappings[slug]) : undefined;
+  const kickSlug = typeof m === 'string' ? m : m ? m.kick || '' : '';
+  const ytVal = m && typeof m === 'object' ? m.yt || '' : '';
+  if (slug) $('kick').value = kickSlug;
+  $('yt').value = ytVal;
   $('kick').disabled = !slug;
+  $('yt').disabled = !slug;
 
-  if (slug && st.mappings && st.mappings[slug]) {
-    const s = await kickStatus(st.mappings[slug]);
+  if (slug && kickSlug) {
+    const s = await kickStatus(kickSlug);
     if (s.live === true) {
       $('status').innerHTML =
         `<b class="ok">Kick: LIVE</b>${s.viewers ? ` · ${s.viewers} viewers` : ''}${s.title ? ` · ${s.title}` : ''}`;
@@ -76,6 +72,8 @@ async function kickStatus(slug) {
     } else {
       $('status').textContent = 'Kick: unreachable';
     }
+  } else if (slug && ytVal) {
+    $('status').textContent = 'YouTube: mapped (status shown on the page)';
   }
 
   // Storage writes hot-apply in the content script via storage.onChanged —
@@ -86,16 +84,34 @@ async function kickStatus(slug) {
   });
 
   $('player').addEventListener('change', async (e) => {
-    st.player = e.target.value === 'twitch' ? 'twitch' : 'kick';
+    const v = e.target.value;
+    st.player = v === 'twitch' ? 'twitch' : v === 'youtube' ? 'youtube' : 'kick';
     await writeState(st);
   });
 
   $('save').addEventListener('click', async () => {
-    const kickSlug = $('kick').value.trim().toLowerCase();
     if (!slug) return;
+    const kick = $('kick').value.trim().toLowerCase();
+    const yt = $('yt').value.trim();
     if (!st.mappings) st.mappings = {};
-    if (kickSlug) {
-      st.mappings[slug] = kickSlug;
+    const prev = st.mappings[slug];
+    const base = prev && typeof prev === 'object' ? prev : {};
+    if (kick || yt) {
+      const next = { ...base, kick: kick || base.kick || slug, yt: yt || base.yt || '' };
+      // Resolve the YouTube handle/URL to its UC... id now, so the content
+      // script never has to wait for a fetch when switching to YouTube.
+      if (next.yt) {
+        try {
+          const r = await chrome.runtime.sendMessage({ type: 'ko-resolve-yt', value: next.yt });
+          if (r && r.id) next.ytId = r.id;
+          else delete next.ytId;
+        } catch {
+          delete next.ytId;
+        }
+      } else {
+        delete next.ytId;
+      }
+      st.mappings[slug] = next;
     } else {
       delete st.mappings[slug];
     }

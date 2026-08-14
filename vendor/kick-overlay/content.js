@@ -1,25 +1,27 @@
 // Kick Overlay — content script (runs on https://www.twitch.tv/*).
 //
-// While enabled and the streamer is live on BOTH platforms, plays the
-// streamer's REAL Kick stream (the same playback_url the VOD.RIP downloader
-// uses — full HD, all IVS renditions) in an overlay pinned exactly over the
-// Twitch player. Twitch keeps playing underneath, muted — Twitch ads are
-// invisible and inaudible without touching Twitch's own requests. The
-// player is a thin hls.js shell with a minimal control bar; the STREAM is
-// Kick's own (the embed player.kick.com is deliberately capped by Kick at
-// low res + "Visit Kick for HD", so it is not used).
+// While enabled and the streamer is live on BOTH platforms, overlays the
+// streamer's REAL Kick or YouTube stream over the Twitch player so Twitch
+// ads become invisible and inaudible (Twitch keeps playing underneath,
+// muted + PAUSED — never rendering while covered).
 //
-// Seamless player switch (user mandate 2026-08-13): the Kick player mounts
-// ONCE per channel and is NEVER destroyed when switching kick<->twitch —
-// the switch only toggles wrap visibility + mute state, so the live keeps
-// playing without a single frame of rebuffer or blink. hls fatal errors
-// reconnect IN PLACE (the wrap keeps covering Twitch the whole time) — no
-// teardown flash, no Twitch peek-through.
+// Sources: Kick = the same playback_url the VOD.RIP downloader uses (full
+// HD, all IVS renditions). YouTube = the official live_stream embed
+// (youtube.com/embed/live_stream?channel=<UC...>, real YT player, native
+// controls incl. seek-back + LIVE chip — the "back to live" option). The
+// channel handle is resolved to its UC... id by the service worker.
+//
+// ONE player rendering at all times (user mandate 2026-08-13): the hidden
+// players are PAUSED (not just covered) — kick video, yt iframe, and the
+// native Twitch player all pause while another layer is shown; switching
+// resumes instantly (buffers are kept; kick/yt seek back to the live edge
+// on return). The Kick player also offers seek-back within the live window
+// + a LIVE button (Kick supports it via the hls sliding window).
 'use strict';
 
 const KEY = 'ko.v2';
-const POLL_MS = 20000;   // Kick live-status re-check while enabled
-const RECT_MS = 400;     // overlay geometry + mute enforcement tick
+const POLL_MS = 20000;   // live-status re-check while enabled
+const RECT_MS = 400;     // geometry + pause/mute enforcement tick
 const SPA_MS = 900;      // Twitch SPA pathname poll (no reload on channel nav)
 const HIDE_TICKS = 3;    // consecutive ticks without a Twitch player before hiding
 const MAX_RECONNECT = 3; // hls fatal retries (fresh playback_url each time)
@@ -33,21 +35,27 @@ const NOT_CHANNEL = new Set([
 
 const KO = {
   enabled: false,
-  player: 'kick', // 'kick' (overlay) | 'twitch' (native) — switching never rebuilds the player
-  mappings: {},   // twitchSlug -> kickSlug
+  player: 'kick', // 'kick' | 'youtube' | 'twitch' — switching never rebuilds players
+  mappings: {},   // twitchSlug -> kickSlug (string) | {kick, yt, ytId}
   slug: null,
   kickSlug: null,
-  activeUrl: null, // playback_url currently attached
+  ytRaw: '',
+  ytId: null,
+  activeUrl: null, // kick playback_url currently attached
   hls: null,
   video: null,    // our overlay <video> (Kick stream)
-  wrap: null,     // overlay container (video + control bar) — persists across switches
-  twitchBtn: null, // floating TWITCH switch (kick mode)
-  kickBtn: null,   // floating KICK switch (twitch mode)
+  wrap: null,     // overlay container — persists across switches
+  ytState: { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, error: 0 },
+  ytUnlock: false,
+  bridgeInjected: false,
+  twLive: false,       // sticky: Twitch channel confirmed live on this page
+  twWasPlaying: false, // Twitch was playing when we paused it → resume on switch back
+  seeking: false,
   reconnectCount: 0,
   pollTimer: null,
   rectTimer: null,
   spaTimer: null,
-  muted: new Set(), // twitch videos we muted (restored on teardown/switch)
+  muted: new Set(), // twitch videos we muted (restored)
   hideTicks: 0,
   lastPath: location.pathname,
 };
@@ -58,9 +66,8 @@ function loadState() {
   return new Promise((res) => {
     chrome.storage.local.get(KEY, (o) => {
       const s = (o && o[KEY]) || {};
-      // Default ON (user mandate 2026-08-13). Explicit OFF respected.
       KO.enabled = s.enabled === undefined ? true : !!s.enabled;
-      KO.player = s.player === 'twitch' ? 'twitch' : 'kick';
+      KO.player = s.player === 'twitch' ? 'twitch' : s.player === 'youtube' ? 'youtube' : 'kick';
       KO.mappings = s.mappings && typeof s.mappings === 'object' ? s.mappings : {};
       res();
     });
@@ -69,7 +76,10 @@ function loadState() {
 
 function saveState() {
   return new Promise((res) => {
-    chrome.storage.local.set({ [KEY]: { enabled: KO.enabled, mappings: KO.mappings, player: KO.player } }, res);
+    chrome.storage.local.set(
+      { [KEY]: { enabled: KO.enabled, mappings: KO.mappings, player: KO.player } },
+      res,
+    );
   });
 }
 
@@ -77,7 +87,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local' || !changes[KEY]) return;
   const s = changes[KEY].newValue || {};
   KO.enabled = !!s.enabled;
-  KO.player = s.player === 'twitch' ? 'twitch' : 'kick';
+  KO.player = s.player === 'twitch' ? 'twitch' : s.player === 'youtube' ? 'youtube' : 'kick';
   KO.mappings = s.mappings && typeof s.mappings === 'object' ? s.mappings : {};
   apply(); // hot toggle / remap / player switch — no page reload
 });
@@ -114,27 +124,34 @@ function twitchIsLive(v) {
   return !!(v && !v.paused && v.readyState >= 2 && v.currentTime > 0);
 }
 
-// Kick stream source — THE full-HD playback_url (the same endpoint the
-// VOD.RIP downloader uses; all IVS renditions incl. 1080p+). v2 exposes it
-// TOP-LEVEL (d.playback_url); v1 is the fallback for the few channels that
-// only expose it there. Anonymous, reflects any Origin (verified).
+// Sticky "Twitch is live" — survives OUR pause (overlay shown pauses the
+// native player; a paused live must not be treated as offline).
+function updateTwLiveSticky(v) {
+  if (twitchIsLive(v)) {
+    KO.twLive = true;
+  } else if (!v || v.readyState < 1) {
+    if (!v) KO.twLive = false;
+  }
+  // else: video exists but paused by us → keep sticky value
+}
+
+// Kick stream source — THE full-HD playback_url (same endpoint the VOD.RIP
+// downloader uses; all IVS renditions incl. 1080p+; v2 exposes it TOP-LEVEL).
 async function kickPlaybackUrl(slug) {
   const enc = encodeURIComponent(slug);
   const probes = [
-    { url: `https://kick.com/api/v2/channels/${enc}`, top: true },
-    { url: `https://kick.com/api/v1/channels/${enc}`, top: false },
+    `https://kick.com/api/v2/channels/${enc}`,
+    `https://kick.com/api/v1/channels/${enc}`,
   ];
-  for (const p of probes) {
+  for (const url of probes) {
     try {
-      const r = await fetch(p.url, { credentials: 'omit' });
+      const r = await fetch(url, { credentials: 'omit' });
       if (!r.ok) continue;
       const d = await r.json();
       const ls = d && d.livestream;
-      const pu = p.top ? d.playback_url : d.playback_url;
-      if (pu) return { live: true, url: pu };
+      if (d && d.playback_url) return { live: true, url: d.playback_url };
       if (ls && ls.playback_url) return { live: true, url: ls.playback_url };
-      if (p.top && !ls) return { live: false }; // v2 explicitly offline
-      if (d && !d.playback_url && !ls) return { live: false };
+      if (!d || (!d.playback_url && !ls)) return { live: false }; // explicitly offline
     } catch {
       // transient — try next endpoint / next poll tick
     }
@@ -151,24 +168,129 @@ function setBadge(text, color) {
   }
 }
 
-// ---- mute model -------------------------------------------------------------
-// kick mode: every Twitch video muted (ads inaudible), our Kick video loud.
-// twitch mode: Twitch unmuted, our Kick video muted (keeps playing hidden).
-// We only track videos WE muted, so a user-set Twitch mute survives teardown.
+// ---- YouTube bridge ---------------------------------------------------------
+
+function injectBridge() {
+  if (KO.bridgeInjected) return;
+  KO.bridgeInjected = true;
+  const s = document.createElement('script');
+  s.src = chrome.runtime.getURL('yt-bridge.js');
+  (document.head || document.documentElement).appendChild(s);
+}
+
+function ytCmd(cmd) {
+  try {
+    window.postMessage({ __koYtCmd: cmd }, '*');
+  } catch {
+    /* ignore */
+  }
+}
+
+function resolveYtChannel(raw) {
+  return new Promise((res) => {
+    try {
+      chrome.runtime.sendMessage({ type: 'ko-resolve-yt', value: raw }, (r) => {
+        res((r && r.id) || null);
+      });
+    } catch {
+      res(null);
+    }
+  });
+}
+
+async function ensureYtId() {
+  if (KO.ytId) return true;
+  if (!KO.ytRaw) return false;
+  KO.ytId = await resolveYtChannel(KO.ytRaw);
+  if (KO.ytId) {
+    const m = KO.mappings[KO.slug];
+    if (m && typeof m === 'object') {
+      m.ytId = KO.ytId;
+      saveState();
+    }
+  }
+  return !!KO.ytId;
+}
+
+function ensureYtIframe() {
+  injectBridge();
+  if (document.getElementById('ko-yt')) return;
+  const iframe = document.createElement('iframe');
+  iframe.id = 'ko-yt';
+  iframe.src =
+    'https://www.youtube.com/embed/live_stream?channel=' +
+    encodeURIComponent(KO.ytId) +
+    '&autoplay=1&mute=1&controls=1&playsinline=1&enablejsapi=1&origin=' +
+    encodeURIComponent(location.origin);
+  iframe.setAttribute('allow', 'autoplay; fullscreen; encrypted-media');
+  iframe.setAttribute('allowfullscreen', '');
+  KO.wrap.appendChild(iframe);
+}
+
+function enableYtUnlock() {
+  if (KO.ytUnlock) return;
+  KO.ytUnlock = true;
+  const unlock = () => {
+    KO.ytUnlock = false;
+    document.removeEventListener('pointerdown', unlock, true);
+    if (KO.player !== 'youtube' || !KO.wrap || KO.wrap.style.display === 'none') return;
+    ytCmd('unmute');
+    ytCmd('play');
+  };
+  document.addEventListener('pointerdown', unlock, true);
+}
+
+let lastYtProbe = 0;
+window.addEventListener('message', (ev) => {
+  const d = ev.data;
+  if (!d || !d.__koYt) return;
+  if (d.t === 'ready') {
+    KO.ytState.ready = true;
+    throttledYtProbe();
+  } else if (d.t === 'status') {
+    const prevLive = KO.ytState.live;
+    KO.ytState.playing = !!d.playing;
+    KO.ytState.muted = !!d.muted;
+    KO.ytState.live = !!d.live;
+    KO.ytState.dur = d.dur || 0;
+    KO.ytState.ct = d.ct || 0;
+    KO.ytState.vq = d.vq || '';
+    if (KO.player === 'youtube') throttledYtProbe();
+    if (prevLive && !KO.ytState.live && KO.player === 'youtube') throttledYtProbe();
+    if (KO.player === 'youtube' && KO.ytState.live && KO.ytState.muted) enableYtUnlock();
+  } else if (d.t === 'error') {
+    KO.ytState.error = d.c || 0;
+    if (KO.player === 'youtube') throttledYtProbe();
+  }
+});
+
+function throttledYtProbe() {
+  const now = Date.now();
+  if (now - lastYtProbe < 1000) return;
+  lastYtProbe = now;
+  probe();
+}
+
+// ---- mute/pause model -------------------------------------------------------
+// One player renders at a time: with an overlay shown, every Twitch video is
+// muted AND paused (no decode, no composite); the hidden overlay player is
+// paused too. In twitch mode the overlay players are paused and Twitch
+// resumes (only if WE paused it — a user-set pause survives).
 
 function syncMute() {
-  const kickShown = KO.player === 'kick' && !!KO.wrap && KO.wrap.style.display !== 'none';
+  const overlayShown = KO.player !== 'twitch' && !!KO.wrap && KO.wrap.style.display !== 'none';
+  const kickShown = overlayShown && KO.player === 'kick';
   for (const v of document.querySelectorAll('video')) {
     if (v === KO.video) continue;
-    if (kickShown && !v.muted) {
+    if (overlayShown && !v.muted) {
       v.muted = true;
       KO.muted.add(v);
-    } else if (!kickShown && KO.muted.has(v) && v.muted) {
+    } else if (!overlayShown && KO.muted.has(v) && v.muted) {
       v.muted = false;
       KO.muted.delete(v);
     }
   }
-  if (KO.video) KO.video.muted = !kickShown;
+  if (KO.video) KO.video.muted = !kickShown; // Kick audible only in kick mode
 }
 
 function unmuteAll() {
@@ -183,6 +305,23 @@ function unmuteAll() {
   if (KO.video) KO.video.muted = false;
 }
 
+function pauseTwitchForOverlay() {
+  const v = twitchVideo();
+  if (!v) return;
+  if (!v.paused) {
+    KO.twWasPlaying = true;
+    v.pause();
+  }
+}
+
+function resumeTwitchIfOurs() {
+  const v = twitchVideo();
+  if (v && KO.twWasPlaying && v.paused) {
+    v.play().catch(() => {});
+  }
+  KO.twWasPlaying = false;
+}
+
 // ---- overlay lifecycle ------------------------------------------------------
 
 function mount() {
@@ -190,6 +329,7 @@ function mount() {
   const wrap = document.createElement('div');
   wrap.id = 'ko-wrap';
   wrap.style.display = 'none';
+  wrap.classList.add('ko-kick');
   const v = document.createElement('video');
   v.setAttribute('playsinline', '');
   v.setAttribute('autoplay', '');
@@ -201,9 +341,10 @@ function mount() {
     '<button id="ko-play" title="Play/Pause">\u275A\u275A</button>' +
     '<button id="ko-mute" title="Mute">Mute</button>' +
     '<input id="ko-vol" type="range" min="0" max="100" value="100" title="Volume" />' +
+    '<input id="ko-seek" type="range" min="0" max="1" value="0" title="Seek (live window)" />' +
+    '<button id="ko-live" title="Back to the live edge" style="display:none">LIVE</button>' +
     '<span id="ko-time">LIVE</span>' +
     '<span style="flex:1"></span>' +
-    '<button id="ko-switch">TWITCH</button>' +
     '<button id="ko-fs" title="Fullscreen">\u26F6</button>';
   wrap.appendChild(bar);
   (document.body || document.documentElement).appendChild(wrap);
@@ -243,11 +384,32 @@ function mount() {
     v.muted = vol.value === '0';
     updateBar();
   });
+  const seek = bar.querySelector('#ko-seek');
+  seek.addEventListener('input', () => {
+    KO.seeking = true;
+    try {
+      v.currentTime = Number(seek.value);
+    } catch {
+      /* seek outside window — ignored */
+    }
+  });
+  seek.addEventListener('change', () => {
+    KO.seeking = false;
+  });
+  const live = bar.querySelector('#ko-live');
+  live.addEventListener('click', () => {
+    if (KO.hls && KO.hls.liveSyncPosition) {
+      try {
+        v.currentTime = KO.hls.liveSyncPosition;
+      } catch {
+        /* ignore */
+      }
+    }
+  });
   bar.querySelector('#ko-fs').addEventListener('click', () => {
     if (document.fullscreenElement === KO.wrap) document.exitFullscreen().catch(() => {});
     else if (KO.wrap) KO.wrap.requestFullscreen().catch(() => {});
   });
-  bar.querySelector('#ko-switch').addEventListener('click', () => setPlayer('twitch'));
   v.addEventListener('play', updateBar);
   v.addEventListener('pause', updateBar);
   v.addEventListener('volumechange', updateBar);
@@ -257,6 +419,7 @@ function mount() {
     const mm = String(Math.floor((t % 3600) / 60)).padStart(2, '0');
     const ss = String(t % 60).padStart(2, '0');
     bar.querySelector('#ko-time').textContent = `LIVE \u00B7 ${hh}:${mm}:${ss}`;
+    updateKickBar();
   });
   startRectLoop();
 }
@@ -276,12 +439,19 @@ function teardown() {
     KO.wrap = null;
     KO.video = null;
   }
+  ytCmd('destroy');
+  KO.ytState = { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, error: 0 };
+  KO.ytUnlock = false;
   KO.activeUrl = null;
   KO.reconnectCount = 0;
   KO.hideTicks = 0;
+  KO.twLive = false;
+  KO.twWasPlaying = false;
   unmuteAll();
-  if (KO.twitchBtn) KO.twitchBtn.style.display = 'none';
-  if (KO.kickBtn) KO.kickBtn.style.display = 'none';
+  for (const b of ['ko-twitchbtn', 'ko-kickbtn', 'ko-ytbtn']) {
+    const el = document.getElementById(b);
+    if (el) el.style.display = 'none';
+  }
 }
 
 function showWrap() {
@@ -294,11 +464,48 @@ function showWrap() {
 function hideWrap() {
   if (!KO.wrap) return;
   KO.wrap.style.display = 'none';
+  if (KO.video && !KO.video.paused) KO.video.pause();
+  if (KO.ytState.ready && KO.ytState.playing) ytCmd('pause');
+  ytCmd('mute');
   syncMute();
 }
 
-// Attach the current playback_url to hls. If the SAME url is already
-// attached, this is a no-op — switching players never re-attaches.
+function showKickLayer() {
+  if (!KO.wrap) mount();
+  KO.wrap.classList.remove('ko-yt');
+  KO.wrap.classList.add('ko-kick');
+  showWrap();
+  if (KO.ytState.ready && KO.ytState.playing) ytCmd('pause');
+  ytCmd('mute');
+  if (KO.video && KO.video.paused) KO.video.play().catch(() => {});
+  // Freshest edge on return (like "back to live").
+  if (KO.hls && KO.hls.liveSyncPosition) {
+    try {
+      KO.video.currentTime = KO.hls.liveSyncPosition;
+    } catch {
+      /* ignore */
+    }
+  }
+  syncMute();
+}
+
+function showYtLayer() {
+  if (!KO.wrap) mount();
+  KO.wrap.classList.remove('ko-kick');
+  KO.wrap.classList.add('ko-yt');
+  showWrap();
+  if (KO.video && !KO.video.paused) KO.video.pause();
+  ytCmd('play');
+  ytCmd('unmute');
+  setTimeout(() => {
+    // Muted autoplay fallback: unmute on the first user gesture.
+    if (KO.player === 'youtube' && KO.ytState.muted) enableYtUnlock();
+  }, 500);
+  syncMute();
+}
+
+// Kick player (hls). If the SAME url is already attached this is a no-op —
+// switching players never re-attaches.
 function ensurePlayer(url) {
   if (!KO.wrap) mount();
   if (KO.activeUrl === url && KO.hls && KO.video) {
@@ -355,15 +562,13 @@ function ensurePlayer(url) {
   hls.attachMedia(KO.video);
 }
 
-// hls fatal — reconnect IN PLACE: the wrap keeps covering Twitch (muted)
-// the whole time, so the user never sees the underlying player or an ad.
-// Each attempt fetches a FRESH playback_url (IVS tokens rotate). If Kick
-// reports offline, the stream ended — tear down and let the poll take over.
+// hls fatal — reconnect IN PLACE: the wrap keeps covering Twitch (muted +
+// paused) the whole time, so the user never sees the underlying player or
+// an ad. Each attempt fetches a FRESH playback_url (IVS tokens rotate).
 async function reconnect() {
   if (KO.reconnectCount >= MAX_RECONNECT) {
     teardown();
     setBadge('KICK OFF', '#6b7280');
-    if (KO.kickBtn) KO.kickBtn.style.display = 'none';
     return;
   }
   KO.reconnectCount++;
@@ -379,10 +584,29 @@ async function reconnect() {
   ensurePlayer(k.url);
 }
 
+// Kick bar: seek slider within the live window + LIVE button when behind.
+function updateKickBar() {
+  if (!KO.wrap || KO.player !== 'kick') return;
+  const hls = KO.hls;
+  const v = KO.video;
+  if (!hls || !v) return;
+  const livePos = hls.liveSyncPosition && isFinite(hls.liveSyncPosition) ? hls.liveSyncPosition : null;
+  const ct = v.currentTime || 0;
+  const max = Math.max(1, Math.ceil(livePos || ct));
+  const seek = KO.wrap.querySelector('#ko-seek');
+  const live = KO.wrap.querySelector('#ko-live');
+  if (seek) {
+    if (!KO.seeking) seek.value = String(Math.min(max, Math.max(0, Math.floor(ct))));
+    seek.max = String(max);
+  }
+  const behind = livePos !== null && ct < livePos - 8;
+  if (live) live.style.display = behind ? 'block' : 'none';
+}
+
 function setPlayer(p) {
   if (p === KO.player) return;
   KO.player = p;
-  saveState().then(() => apply()); // apply() only toggles visibility/mute
+  saveState().then(() => apply()); // apply() only toggles layers/pause/mute
 }
 
 // ---- decision loop ----------------------------------------------------------
@@ -390,15 +614,16 @@ function setPlayer(p) {
 async function probe() {
   const slug = currentSlug();
   if (!slug) {
-    setBadge('', null);
+    setBadge('');
     teardown();
     return;
   }
   if (slug !== KO.slug) {
     KO.slug = slug;
-    // Same-handle fallback (2026-08-13): unmapped channels use the same
-    // slug on Kick (rodil -> kick.com/rodil); popup mapping overrides.
-    KO.kickSlug = KO.mappings[slug] || slug;
+    const m = KO.mappings[slug];
+    KO.kickSlug = typeof m === 'string' ? m : (m && m.kick) || slug; // same-handle fallback
+    KO.ytRaw = m && typeof m === 'object' ? m.yt || '' : '';
+    KO.ytId = m && typeof m === 'object' ? m.ytId || null : null;
     teardown();
   }
   if (!KO.enabled) {
@@ -406,36 +631,63 @@ async function probe() {
     teardown();
     return;
   }
-  const liveTw = twitchIsLive(twitchVideo());
-  const k = await kickPlaybackUrl(KO.kickSlug);
+  const tv = twitchVideo();
+  updateTwLiveSticky(tv);
+  if (!KO.twLive) {
+    setBadge('TW', '#6b7280');
+    teardown(); // nothing to mirror; 'playing' listener re-probes on start
+    return;
+  }
 
   if (KO.player === 'twitch') {
-    // Native player visible; the Kick player (if mounted) keeps playing
-    // hidden — switching back is instant. When kick is live, pre-attach
-    // it even on first entry so the first switch never re-buffers.
-    setBadge(k.live ? 'KICK' : 'KICK OFF', k.live ? '#059669' : '#6b7280');
-    if (k.live && k.url) ensurePlayer(k.url);
+    // Native player; overlay players paused (rect loop keeps them so).
     if (KO.wrap) hideWrap();
-    if (KO.kickBtn) KO.kickBtn.style.display = k.live ? 'block' : 'none';
-    syncMute();
+    const kl = await kickPlaybackUrl(KO.kickSlug);
+    const yl = KO.ytState.live;
+    setBadge(kl.live ? 'KICK' : yl ? 'YT' : 'TW', kl.live ? '#059669' : yl ? '#ff0000' : '#6b7280');
+    updateSwitchButtons();
     return;
   }
 
-  if (!liveTw) {
-    setBadge('TW', '#6b7280'); // Twitch offline — nothing to cover
-    teardown();
-    return;
-  }
-  if (!k.live || !k.url) {
-    // Kick offline: nothing to overlay — watch Twitch native (unmuted).
+  if (KO.player === 'kick') {
+    const k = await kickPlaybackUrl(KO.kickSlug);
+    if (k.live && k.url) {
+      ensurePlayer(k.url);
+      showKickLayer();
+      setBadge('KICK', '#059669');
+      updateSwitchButtons();
+      return;
+    }
     setBadge('KICK OFF', '#6b7280');
-    teardown();
+    if (KO.wrap) hideWrap();
+    updateSwitchButtons();
     return;
   }
-  ensurePlayer(k.url);
-  showWrap();
-  if (KO.twitchBtn) KO.twitchBtn.style.display = 'block';
-  syncMute();
+
+  // youtube mode
+  if (!KO.ytRaw) {
+    setBadge('YT?', '#6b7280'); // no mapping — map the channel in the popup
+    if (KO.wrap) hideWrap();
+    updateSwitchButtons();
+    return;
+  }
+  await ensureYtId();
+  if (!KO.ytId) {
+    setBadge('YT?', '#6b7280'); // could not resolve handle → check the popup value
+    if (KO.wrap) hideWrap();
+    updateSwitchButtons();
+    return;
+  }
+  ensureYtIframe();
+  if (KO.ytState.live) {
+    showYtLayer();
+    setBadge('YT', '#ff0000');
+    updateSwitchButtons();
+    return;
+  }
+  setBadge('YT OFF', '#6b7280');
+  if (KO.wrap) hideWrap();
+  updateSwitchButtons();
 }
 
 async function apply() {
@@ -446,13 +698,16 @@ async function apply() {
   }
   const slug = currentSlug();
   if (!slug) {
-    setBadge('', null);
+    setBadge('');
     teardown();
     return;
   }
   if (slug !== KO.slug) {
     KO.slug = slug;
-    KO.kickSlug = KO.mappings[slug] || slug;
+    const m = KO.mappings[slug];
+    KO.kickSlug = typeof m === 'string' ? m : (m && m.kick) || slug;
+    KO.ytRaw = m && typeof m === 'object' ? m.yt || '' : '';
+    KO.ytId = m && typeof m === 'object' ? m.ytId || null : null;
     teardown();
   }
   await probe();
@@ -468,10 +723,9 @@ function startWatchers() {
   KO.pollTimer = setInterval(() => {
     if (KO.enabled) probe();
   }, POLL_MS);
-  // The boot probe can race the Twitch player's start (10s+ delay before
-  // readyState>=2/currentTime>0 — seen live). Re-probe the moment the
-  // player starts playing, throttled. Video events don't bubble; capture
-  // catches them.
+  // The boot probe can race the Twitch player's start — re-probe the
+  // moment the player starts playing, throttled. Video events don't
+  // bubble; capture catches them.
   let lastPlayingProbe = 0;
   document.addEventListener(
     'playing',
@@ -493,9 +747,10 @@ function startRectLoop() {
       stopRectLoop();
       return;
     }
-    const kickShown = KO.player === 'kick';
-    if (kickShown) {
-      const tv = twitchVideo();
+    const tv = twitchVideo();
+    updateTwLiveSticky(tv);
+    const overlayShown = KO.player !== 'twitch' && KO.wrap.style.display !== 'none';
+    if (overlayShown) {
       if (tv) {
         const r = tv.getBoundingClientRect();
         const s = KO.wrap.style;
@@ -504,14 +759,20 @@ function startRectLoop() {
         s.width = `${r.width}px`;
         s.height = `${r.height}px`;
         if (KO.wrap.style.display === 'none') showWrap();
-        syncMute();
+        pauseTwitchForOverlay(); // one rendering: Twitch pauses under the overlay
       } else {
         // Debounce the hide: ad transitions / player re-layouts can briefly
         // drop the video from the tree — hiding on a single frame would blink.
         KO.hideTicks++;
         if (KO.hideTicks >= HIDE_TICKS) hideWrap();
       }
+      syncMute();
+      updateKickBar();
     } else {
+      // twitch mode: overlay players stay paused; resume Twitch if ours.
+      if (KO.video && !KO.video.paused) KO.video.pause();
+      if (KO.ytState.ready && KO.ytState.playing) ytCmd('pause');
+      resumeTwitchIfOurs();
       syncMute();
     }
   }, RECT_MS);
@@ -531,60 +792,82 @@ function injectStyles() {
   st.textContent =
     '#ko-wrap{position:fixed;z-index:2147483647;pointer-events:none;background:#000;overflow:hidden;}' +
     '#ko-wrap video{width:100%;height:100%;display:block;pointer-events:none;object-fit:contain;background:#000;}' +
+    '#ko-wrap.ko-yt iframe{width:100%;height:100%;border:0;display:block;pointer-events:auto;}' +
     '#ko-bar{position:absolute;left:0;right:0;bottom:0;pointer-events:auto;opacity:0;transition:opacity .18s ease;' +
-    'display:flex;align-items:center;gap:10px;padding:9px 12px;color:#fff;' +
+    'display:flex;align-items:center;gap:8px;padding:9px 12px;color:#fff;' +
     'background:linear-gradient(0deg,rgba(0,0,0,.85),rgba(0,0,0,0));font:12px/1 system-ui,sans-serif;}' +
+    '#ko-wrap.ko-yt #ko-bar{display:none;}' + // YT has native controls incl. LIVE chip
     '#ko-wrap.ko-hot #ko-bar{opacity:1;}' +
     '#ko-bar button{background:transparent;border:0;color:#fff;cursor:pointer;font:inherit;padding:3px 7px;border-radius:4px;white-space:nowrap;}' +
     '#ko-bar button:hover{background:rgba(255,255,255,.18);}' +
     '#ko-badge{font-weight:700;color:#53fc18;white-space:nowrap;}' +
     '#ko-time{color:#cfcfcf;white-space:nowrap;}' +
-    '#ko-vol{width:70px;height:4px;accent-color:#9147ff;cursor:pointer;}' +
-    '#ko-switch{font-weight:700;color:#a970ff;border:1px solid #a970ff !important;border-radius:12px !important;padding:2px 10px !important;}' +
-    '#ko-twitchbtn,#ko-kickbtn{position:fixed;z-index:2147483646;pointer-events:auto;display:none;' +
+    '#ko-vol{width:60px;height:4px;accent-color:#9147ff;cursor:pointer;}' +
+    '#ko-seek{flex:1;height:4px;accent-color:#53fc18;cursor:pointer;min-width:40px;}' +
+    '#ko-live{font-weight:700;color:#000;background:#ff0000;border-radius:10px;padding:1px 9px;}' +
+    '#ko-live:hover{background:#ff4d4d;}' +
+    '#ko-twitchbtn,#ko-kickbtn,#ko-ytbtn{position:fixed;z-index:2147483646;pointer-events:auto;display:none;' +
     'background:#9147ff;color:#fff;border:0;border-radius:14px;padding:6px 14px;' +
     'font:700 13px system-ui,sans-serif;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,.5);}' +
-    '#ko-twitchbtn:hover,#ko-kickbtn:hover{background:#a970ff;}' +
-    '#ko-kickbtn{background:#53fc18;color:#000;}';
+    '#ko-twitchbtn:hover,#ko-kickbtn:hover,#ko-ytbtn:hover{background:#a970ff;}' +
+    '#ko-kickbtn{background:#53fc18;color:#000;}' +
+    '#ko-ytbtn{background:#ff0000;color:#fff;}';
   (document.head || document.documentElement).appendChild(st);
 }
 
-// Floating switch buttons: TWITCH shown in kick mode, KICK in twitch mode.
+// Floating switch buttons: show the OTHER configured platforms' buttons.
 function buildSwitchButtons() {
-  if (!KO.twitchBtn) {
+  if (!document.getElementById('ko-twitchbtn')) {
     const b = document.createElement('button');
     b.id = 'ko-twitchbtn';
     b.textContent = 'TWITCH';
-    b.title = 'Show the native Twitch player (Kick keeps playing hidden)';
+    b.title = 'Show the native Twitch player (the other player pauses)';
     b.addEventListener('click', () => setPlayer('twitch'));
     (document.body || document.documentElement).appendChild(b);
-    KO.twitchBtn = b;
   }
-  if (!KO.kickBtn) {
+  if (!document.getElementById('ko-kickbtn')) {
     const b = document.createElement('button');
     b.id = 'ko-kickbtn';
     b.textContent = 'KICK';
     b.title = 'Show the Kick player (no Twitch ads)';
     b.addEventListener('click', () => setPlayer('kick'));
     (document.body || document.documentElement).appendChild(b);
-    KO.kickBtn = b;
+  }
+  if (!document.getElementById('ko-ytbtn')) {
+    const b = document.createElement('button');
+    b.id = 'ko-ytbtn';
+    b.textContent = 'YOUTUBE';
+    b.title = 'Show the YouTube player (no Twitch ads)';
+    b.addEventListener('click', () => setPlayer('youtube'));
+    (document.body || document.documentElement).appendChild(b);
   }
 }
 
-// Pin the active switch button to the Twitch player (bottom-right).
-function pinSwitchButton() {
-  const btn = KO.player === 'kick' ? KO.twitchBtn : KO.kickBtn;
-  const other = KO.player === 'kick' ? KO.kickBtn : KO.twitchBtn;
-  if (other) other.style.display = 'none';
-  if (!btn) return;
+// Pin the active switch buttons to the Twitch player (bottom-right row).
+function updateSwitchButtons() {
+  const ids = [];
+  if (KO.player !== 'twitch') ids.push('ko-twitchbtn');
+  if (KO.player !== 'kick') ids.push('ko-kickbtn');
+  if (KO.player !== 'youtube' && (KO.ytRaw || KO.ytId)) ids.push('ko-ytbtn'); // only when mapped
   const tv = twitchVideo();
-  if (tv) {
-    const r = tv.getBoundingClientRect();
-    btn.style.display = 'block';
-    btn.style.left = `${Math.max(8, r.right - btn.offsetWidth - 12)}px`;
-    btn.style.top = `${Math.max(8, r.bottom - btn.offsetHeight - 12)}px`;
-  } else {
-    btn.style.display = 'none';
+  const shown = [];
+  let totalW = 0;
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    el.style.display = 'none';
+    if (!tv) continue;
+    el.style.display = 'block';
+    totalW += el.offsetWidth + 8;
+    shown.push(el);
+  }
+  if (!tv || !shown.length) return;
+  const r = tv.getBoundingClientRect();
+  let x = r.right - totalW - 12;
+  for (const el of shown) {
+    el.style.left = `${Math.max(8, x)}px`;
+    el.style.top = `${Math.max(8, r.bottom - el.offsetHeight - 12)}px`;
+    x += el.offsetWidth + 8;
   }
 }
 
@@ -598,7 +881,16 @@ window.addEventListener('kick-overlay:set', (e) => {
     saveState().then(() => apply());
   }
   if (d.kickSlug && KO.slug) {
-    KO.mappings[KO.slug] = d.kickSlug;
+    const m = KO.mappings[KO.slug];
+    KO.mappings[KO.slug] = typeof m === 'object' ? { ...m, kick: d.kickSlug } : { kick: d.kickSlug };
+    KO.kickSlug = d.kickSlug;
+    saveState().then(() => apply());
+  }
+  if (d.ytChannel && KO.slug) {
+    const m = KO.mappings[KO.slug];
+    KO.mappings[KO.slug] = typeof m === 'object' ? { ...m, yt: d.ytChannel } : { yt: d.ytChannel };
+    KO.ytRaw = d.ytChannel;
+    KO.ytId = null;
     saveState().then(() => apply());
   }
 });
@@ -611,11 +903,16 @@ window.addEventListener('kick-overlay:status', () => {
         player: KO.player,
         slug: KO.slug,
         kickSlug: KO.kickSlug,
+        ytRaw: KO.ytRaw,
+        ytId: KO.ytId,
         mounted: !!KO.wrap,
         wrapShown: !!(KO.wrap && KO.wrap.style.display !== 'none'),
-        videoPlaying: !!(KO.video && !KO.video.paused && KO.video.currentTime > 0),
-        videoMuted: !!(KO.video && KO.video.muted),
-        twitchLive: twitchIsLive(v),
+        kickPlaying: !!(KO.video && !KO.video.paused && KO.video.currentTime > 0),
+        kickMuted: !!(KO.video && KO.video.muted),
+        yt: { ...KO.ytState },
+        twitchLive: KO.twLive,
+        twitchPlaying: twitchIsLive(v),
+        twitchPausedByUs: KO.twWasPlaying,
         twitchMuted: [...document.querySelectorAll('video')]
           .filter((x) => x !== KO.video)
           .every((x) => x.muted),
@@ -636,6 +933,6 @@ window.addEventListener('kick-overlay:status', () => {
   injectStyles();
   buildSwitchButtons();
   startWatchers();
-  setInterval(pinSwitchButton, RECT_MS); // cheap: position the active switch button
+  setInterval(updateSwitchButtons, RECT_MS);
   apply();
 })();
