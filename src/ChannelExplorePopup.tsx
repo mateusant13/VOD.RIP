@@ -2147,10 +2147,6 @@ export default function ChannelExplorePopup({
               // (seekVideo clamps to the effective duration and no-ops
               // until ready).
               onSeek={seekVideo}
-              // Gates only the URL-only live-captions fetch (video-first);
-              // the archive payload starts at session-create so the Twitch
-              // chat backfill kicks off before canplay.
-              started={ready}
               onLayoutChange={setChatInfo}
               onMarkersChange={handleChatMarkersChange}
             />

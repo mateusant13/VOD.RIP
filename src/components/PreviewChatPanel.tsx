@@ -155,15 +155,6 @@ interface PreviewChatPanelProps {
   onSeek?: (offsetSec: number) => void;
   /** True hides the panel (fullscreen) while keeping its state mounted. */
   hidden?: boolean;
-  /** Live-captions gate: while false the panel does NOT fetch the video's
-   *  own YouTube subtitles (URL-only previews only), so the preview's first
-   *  bytes go to video playback instead of racing that network work. The
-   *  host flips it on the player's canplay signal; defaults to true for
-   *  callers without a player (tests, non-preview hosts). The ARCHIVE
-   *  payload (chat/transcript) deliberately ignores this gate — it starts
-   *  at session-create so a Twitch backfill kicks off as early as possible;
-   *  the video-first PLAYBACK gate lives in the hosts and is untouched. */
-  started?: boolean;
   /** Initial open state. The explore popup opens collapsed (small strip)
    *  so the mini preview stays player-sized by default; the main preview
    *  keeps the panel open. */
@@ -384,7 +375,6 @@ export function PreviewChatPanel({
   channel,
   onSeek,
   hidden = false,
-  started = true,
   defaultOpen = true,
   maxWidth: maxWidthProp,
   onLayoutChange,
@@ -596,12 +586,11 @@ export function PreviewChatPanel({
       setSubsFetchState('done');
       return;
     }
-    // Video-first gate (same as the panel fetch above): URL-only previews
-    // fetch YouTube captions over the network — wait for canplay.
-    if (!started) {
-      setSubsFetchState('idle');
-      return;
-    }
+    // Fetch the live captions as soon as the URL-only state is known
+    // (session-create, in parallel with video loading) — no wait for
+    // canplay, so subtitles are ready by the time playback starts. The
+    // cache dedupes by videoId, so later re-runs of this effect never
+    // re-fetch.
     let cancelled = false;
     setSubsFetchState('loading');
     const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
@@ -618,7 +607,7 @@ export function PreviewChatPanel({
     return () => {
       cancelled = true;
     };
-  }, [subtitlesOnly, videoId, retryTick, started]);
+  }, [subtitlesOnly, videoId, retryTick]);
 
   // Subtitles are a YouTube feature: the caption display is only offered for
   // YouTube videos (URL-only previews fetch live captions; archived ones show
@@ -1051,13 +1040,6 @@ export function PreviewChatPanel({
                   : undefined
               }
             />
-          )}
-          {!started && subsFetchState === 'idle' && subtitlesOnly && (
-            <div className="flex-1 min-h-0 flex items-center justify-center gap-2 text-zinc-600 px-4">
-              <span className="text-[10px] font-mono text-center">
-                Video plays first — subtitles load once playback starts.
-              </span>
-            </div>
           )}
           {fetchState === 'loading' && (
             <div className="flex-1 min-h-0 flex items-center justify-center gap-2 text-zinc-500">

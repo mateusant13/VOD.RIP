@@ -51,6 +51,7 @@ function mockPanelFetch(
   status = 200,
   failFor: (url: string) => boolean = () => false,
   subtitlesPayload: object | null = SUBTITLES_PAYLOAD,
+  subtitlesDelayMs = 0,
 ) {
   const fn = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
@@ -63,6 +64,9 @@ function mockPanelFetch(
     }
     if (url.includes('/api/subtitles')) {
       if (failFor(url)) return new Response(JSON.stringify({ detail: 'boom' }), { status: 500 });
+      // ponytail: executor form — tsconfig lib predates ES2024 Promise.withResolvers
+      if (subtitlesDelayMs > 0)
+        await new Promise<void>((resolve) => { setTimeout(resolve, subtitlesDelayMs); });
       return new Response(JSON.stringify(subtitlesPayload), {
         status,
         headers: { 'Content-Type': 'application/json' },
@@ -117,35 +121,38 @@ describe('PreviewChatPanel', () => {
     expect(screen.queryByText('×1')).toBeNull();
   });
 
-  it('fetches the panel payload at session-create, before the video starts (video-first playback gate untouched)', async () => {
+  it('fetches the panel payload at session-create, before the video starts', async () => {
     const fetchMock = mockPanelFetch(PAYLOAD);
-    const { rerender } = render(
-      <PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} started={false} />,
-    );
-    // Session created → the archive payload fetches immediately; the panel
-    // does NOT wait for canplay (the host's playback gate is separate, and
-    // the Twitch chat backfill must kick off before playback starts).
+    render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+    // Session created → the archive payload fetches immediately; nothing the
+    // panel fetches waits for canplay (the Twitch chat backfill must kick
+    // off before playback starts).
     expect(fetchMock).toHaveBeenCalled();
     expect(String(fetchMock.mock.calls[0][0])).toContain('/api/preview/panel/twitch/v1?limit=');
     await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
-    // The started flip (canplay) must not re-trigger the payload fetch.
-    const calls = fetchMock.mock.calls.length;
-    rerender(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} started />);
-    expect(fetchMock.mock.calls.length).toBe(calls);
   });
 
-  it('defers the YouTube subtitles fetch until the video started (archive payload still loads)', async () => {
+  it('fetches YouTube subtitles at preview open, in parallel with video loading (no play gate)', async () => {
     const fetchMock = mockPanelFetch(EMPTY_PAYLOAD);
     const { rerender } = render(
-      <PreviewChatPanel platform="youtube" videoId="yt1" currentTime={1.5} started={false} />,
+      <PreviewChatPanel platform="youtube" videoId="yt1" currentTime={1.5} />,
     );
-    // The archive payload loads at session-create; the live captions wait
-    // for canplay so the video's first bytes stay unraced.
-    await waitFor(() => expect(screen.getByText(/Video plays first/)).toBeTruthy());
+    // The live captions fetch starts as soon as the URL-only state is known
+    // (session-create), NOT on canplay — subtitles load alongside the video.
     const urls = () => fetchMock.mock.calls.map((c) => String(c[0]));
+    await waitFor(() => expect(urls().some((u) => u.includes('/api/subtitles'))).toBe(true));
     expect(urls().some((u) => u.includes('/api/preview/panel/'))).toBe(true);
-    expect(urls().some((u) => u.includes('/api/subtitles'))).toBe(false);
-    rerender(<PreviewChatPanel platform="youtube" videoId="yt1" currentTime={1.5} started />);
+    await waitFor(() => expect(screen.getByText('primeira legenda')).toBeTruthy());
+    // Playback advancing must not re-trigger the fetch (deduped by videoId).
+    rerender(<PreviewChatPanel platform="youtube" videoId="yt1" currentTime={12} />);
+    expect(urls().filter((u) => u.includes('/api/subtitles')).length).toBe(1);
+  });
+
+  it('renders subtitles that arrive late, after the panel opened', async () => {
+    mockPanelFetch(EMPTY_PAYLOAD, 200, () => false, SUBTITLES_PAYLOAD, 60);
+    render(<PreviewChatPanel platform="youtube" videoId="yt1" currentTime={1.5} />);
+    // The fetch is already in flight from preview open; the caption appears
+    // the moment the response lands — no playback signal involved.
     await waitFor(() => expect(screen.getByText('primeira legenda')).toBeTruthy());
   });
 
@@ -530,7 +537,7 @@ describe('PreviewChatPanel', () => {
       });
       vi.stubGlobal('fetch', fn);
       render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
-      // Initial fetch fires at session-create (no started gate).
+      // Initial fetch fires at session-create (no playback gate).
       await act(async () => {
         await vi.advanceTimersByTimeAsync(0);
       });

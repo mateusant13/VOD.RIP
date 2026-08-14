@@ -6847,10 +6847,6 @@ export default function App() {
                     // helper owns the dispatch).
                     onSeek={handlePreviewChatSeek}
                     hidden={previewFullscreen}
-                    // Gates only the URL-only live-captions fetch (video-first);
-                    // the archive payload starts at session-create so the Twitch
-                    // chat backfill kicks off before canplay.
-                    started={previewVideoReady}
                     // Clamp the overlay to the player container's width so a
                     // narrow preview never overflows it. Container = card minus
                     // p-4(16) and border-2(2) per side = 36. The panel's own
