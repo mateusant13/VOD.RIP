@@ -156,9 +156,14 @@ function mount() {
   (document.body || document.documentElement).appendChild(wrap);
   wrap.appendChild(f);
   KO.wrap = wrap;
+  // The rect loop does the pinning (left/top/width/height over the Twitch
+  // player) + mute enforcement. Without it the wrap sits at the top-left
+  // of the viewport at content size (seen live 2026-08-13).
+  startRectLoop();
 }
 
 function teardown() {
+  stopRectLoop();
   if (KO.wrap) {
     KO.wrap.remove();
     KO.wrap = null;
@@ -340,6 +345,22 @@ function startWatchers() {
   KO.pollTimer = setInterval(() => {
     if (KO.enabled && KO.player === 'kick') probe();
   }, POLL_MS);
+  // The boot probe can race the Twitch player's start (10s+ delay before
+  // readyState>=2/currentTime>0 — seen live). Re-probe the moment the
+  // player actually starts playing, throttled so a poll tick can't
+  // double-fire. Video events don't bubble; capture catches them.
+  let lastPlayingProbe = 0;
+  document.addEventListener(
+    'playing',
+    () => {
+      if (!KO.enabled || KO.player !== 'kick') return;
+      const now = Date.now();
+      if (now - lastPlayingProbe < 3000) return;
+      lastPlayingProbe = now;
+      probe();
+    },
+    true,
+  );
 }
 
 // ---- test / automation hook -------------------------------------------------
