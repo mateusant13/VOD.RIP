@@ -260,25 +260,18 @@ def _inv(letter, free, rank):
     }
 
 
-def test_model_cache_score_prefers_ssd_near_ties():
-    # SSD with adequate free beats an HDD with a bit more (100+32 > 120).
-    assert disk_hygiene._model_cache_score(100 * 1024**3, 2) > disk_hygiene._model_cache_score(120 * 1024**3, 3)
-    # A large slow HDD beats a nearly-full SSD (400 > 300+64).
-    assert disk_hygiene._model_cache_score(400 * 1024**3, 3) > disk_hygiene._model_cache_score(300 * 1024**3, 1)
-    # NVMe credit > SSD credit at equal free space.
-    assert disk_hygiene._model_cache_score(50 * 1024**3, 1) > disk_hygiene._model_cache_score(50 * 1024**3, 2)
-
-
-def test_best_model_cache_drive_roi(monkeypatch):
+def test_best_model_cache_drive_fastest_tier_wins(monkeypatch):
+    # NVMe below the 8 GB floor drops out; the SSD (rank 2) beats the big
+    # HDD (rank 3) — models are small + hot, so speed beats headroom.
     monkeypatch.setattr(
         "services.disk_detect.disk_inventory",
         lambda: [
             _inv("C", 5 * 1024**3, 1),    # NVMe but below the 8 GB floor
             _inv("F", 100 * 1024**3, 2),  # SSD
-            _inv("I", 400 * 1024**3, 3),  # HDD with lots of space -> wins
+            _inv("I", 400 * 1024**3, 3),  # HDD with lots of space -> loses
         ],
     )
-    assert disk_hygiene.best_model_cache_drive() == "I:\\"
+    assert disk_hygiene.best_model_cache_drive() == "F:\\"
 
 
 def test_best_model_cache_drive_ssd_wins_near_tie(monkeypatch):
@@ -286,10 +279,23 @@ def test_best_model_cache_drive_ssd_wins_near_tie(monkeypatch):
         "services.disk_detect.disk_inventory",
         lambda: [
             _inv("D", 120 * 1024**3, 3),  # HDD, 120 GB
-            _inv("H", 100 * 1024**3, 1),  # NVMe, 100 GB -> 164 GB score
+            _inv("H", 100 * 1024**3, 1),  # NVMe, 100 GB — faster tier wins
         ],
     )
     assert disk_hygiene.best_model_cache_drive() == "H:\\"
+
+
+def test_best_model_cache_drive_hdd_fallback(monkeypatch):
+    """No fast tier has room -> the HDD is the last resort, not a competitor."""
+    monkeypatch.setattr(
+        "services.disk_detect.disk_inventory",
+        lambda: [
+            _inv("C", 3 * 1024**3, 1),  # NVMe below the floor
+            _inv("F", 2 * 1024**3, 2),  # SSD below the floor
+            _inv("I", 40 * 1024**3, 3),  # only the HDD qualifies
+        ],
+    )
+    assert disk_hygiene.best_model_cache_drive() == "I:\\"
 
 
 def test_best_model_cache_drive_empty(monkeypatch):

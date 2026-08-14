@@ -238,7 +238,7 @@ def whisper_cache_dir() -> Path:
     archive_events for the siblings).
 
     Precedence: VODRIP_WHISPER_CACHE env -> settings.whisper_model_cache ->
-    best-ROI fixed drive + VOD.RIP-models (auto: free space AND speed — see
+    best drive + VOD.RIP-models (auto: speed-first, see
     best_model_cache_drive) -> %APPDATA%/VOD.RIP/whisper-models. The auto
     branches fall back to the legacy heavy-cache location
     <cache root>/whisper-models while it still holds models (migration, see
@@ -272,11 +272,11 @@ def whisper_cache_dir() -> Path:
 
 # --- AI-models auto pick (Settings > Disk "AI Models Folder" Auto) ----------
 # The models folder follows its own disk-choice rule, distinct from the heavy
-# cache disk (biggest free space) and the data disk (fastest): score each
-# drive by free space AND speed. AI models (whisper/parakeet/embed/PANNs
-# weights + tokenizers) are ~0.3-1.6 GB each, are downloaded once (they
-# rarely change) and are read a few times per process, so a big-but-slow HDD
-# is a fine home; the SSD credit only wins near-ties.
+# cache disk (biggest free space) and the data disk (fastest): the FASTEST
+# tier with room wins. AI models (whisper/parakeet/embed/PANNs weights +
+# tokenizers) are small (~0.1-0.7 GB each) but loaded at every worker start
+# and warmed at live-caption open, so a slow HDD is the worst home — speed
+# beats headroom; ties within a tier break by most free space.
 _MODEL_CACHE_MIN_FREE_BYTES = 8 * 1024**3  # room for a model + growth
 # Speed credit in GB of equivalent free space: NVMe +64 GB, SSD +32 GB. An
 # SSD with "adequate" free space (e.g. 100 GB -> 164 GB score) beats an HDD
@@ -285,33 +285,25 @@ _MODEL_CACHE_MIN_FREE_BYTES = 8 * 1024**3  # room for a model + growth
 # tradeoff. ponytail: bus-classified credit (disk_detect._speed_rank) is a
 # heuristic; upgrade path is a measured rank (CrystalDiskMark-style small
 # benchmark, cached like _storage_layout) if bus classification ever misleads.
-_MODEL_CACHE_SSD_CREDIT = {
-    1: 64 * 1024**3,  # NVMe
-    2: 32 * 1024**3,  # SSD
-    # 3 (HDD) / 4 (Unknown): no credit
-}
-
-
-def _model_cache_score(free_bytes: int, speed_rank: int) -> int:
-    """ROI score = free bytes + speed credit (see _MODEL_CACHE_SSD_CREDIT)."""
-    return int(free_bytes) + _MODEL_CACHE_SSD_CREDIT.get(speed_rank, 0)
-
-
 def best_model_cache_drive() -> Optional[str]:
-    """Drive root (e.g. 'H:\\') of the best model-cache ROI pick: highest
-    free+speed score among drives with >= 8 GB free, ties broken by most
-    free space (the credit makes exact ties rare). None when no usable
-    drive exists (non-Windows host, probe failures)."""
+    """Drive root (e.g. 'H:\\') of the best model-cache pick.
+
+    Speed-first: the models are small (<= ~2 GB) but loaded at every worker
+    start and warmed at live-caption open — the FASTEST tier with >= 8 GB
+    free wins (NVMe over SSD over HDD), ties broken by most free space.
+    A slow disk is only chosen when no faster drive has room. None when no
+    usable drive exists (non-Windows host, probe failures)."""
     from services.disk_detect import disk_inventory  # lazy: keeps import light
 
     best: Optional[str] = None
-    best_score = -1
+    best_rank = 99  # 1 (NVMe) < 2 (SSD) < 3 (HDD) — lowest rank wins
+    best_free = -1
     for item in disk_inventory():
         if item["free_bytes"] < _MODEL_CACHE_MIN_FREE_BYTES:
             continue
-        score = _model_cache_score(item["free_bytes"], item["speed_rank"])
-        if score > best_score:
-            best, best_score = item["drive"], score
+        rank, free = item["speed_rank"], item["free_bytes"]
+        if rank < best_rank or (rank == best_rank and free > best_free):
+            best, best_rank, best_free = item["drive"], rank, free
     return best
 
 

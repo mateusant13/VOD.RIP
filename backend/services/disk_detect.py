@@ -110,9 +110,9 @@ def biggest_fixed_drive() -> Optional[str]:
     biggest free space maximizes how much archive-scale churn the cache can
     absorb before the low-disk warning trips, and the files are re-creatable,
     so losing them costs nothing but re-download time. Distinct from the
-    AI-models pick (best_model_cache_drive: free space AND speed — large
-    weights, downloaded once) and the data pick (fastest_disk: DB + preview
-    media need quick storage).
+    AI-models pick (best_model_cache_drive: speed-first — weights are small
+    but loaded at every worker start, so the fastest tier wins) and the data
+    pick (fastest_disk: DB + preview media need quick storage).
     """
     best: Optional[str] = None
     best_free = -1
