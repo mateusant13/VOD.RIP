@@ -36,6 +36,10 @@ const post = (m) => {
   }
 };
 
+// A position to apply once the next load() completes (kick-style rewind:
+// switch to the DVR url, then seek within the loaded broadcast).
+let pendingSeek = null;
+
 function sendSt() {
   let q = null;
   try {
@@ -50,6 +54,24 @@ function sendSt() {
   } catch {
     /* not ready */
   }
+  let dur = 0;
+  try {
+    dur = p.getDuration() || 0;
+  } catch {
+    /* not ready */
+  }
+  // Retry a pending rewind seek every poll until it lands. IVS drops a
+  // seekTo issued before the loaded media is seekable (first Playing can
+  // fire with an empty seekable range), so one-shot-on-Playing is not enough.
+  if (pendingSeek !== null) {
+    try {
+      const pos = p.getPosition();
+      if (pos >= pendingSeek - 1) pendingSeek = null;
+      else p.seekTo(pendingSeek);
+    } catch {
+      pendingSeek = null; // outside the timeline — give up quietly
+    }
+  }
   post({
     t: 'st',
     st: {
@@ -59,6 +81,7 @@ function sendSt() {
       volume: p.getVolume(),
       pos: p.getPosition(),
       lat: p.getLiveLatency(),
+      dur,
       q,
       qcount,
     },
@@ -72,7 +95,9 @@ window.addEventListener('message', (ev) => {
   switch (m.t) {
     case 'load':
       try {
+        pendingSeek = null;
         p.load(m.url);
+        if (m.seekTo !== undefined) pendingSeek = m.seekTo;
         p.play();
       } catch (e) {
         post({ t: 'ev', e: 'error', d: String(e) });

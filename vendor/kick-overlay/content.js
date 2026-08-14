@@ -74,6 +74,14 @@ const KO = {
   kickVol: 1,
   kickMuted: false, // user's kick mute choice (persisted; hidden-mute is separate)
   kickUrlT: 0,      // epoch ms of the current playback_url load (dead-url watchdog)
+  kickEverPlayed: false, // current url reached Playing at least once (re-buffers ≠ dead url)
+  kickDvrUrl: null, // replay source (sources.dvr) from the playback bootstrap
+  kickOnDvr: false, // frame is playing the DVR url (replay mode)
+  kickDur: 0,       // broadcast duration (IVS getDuration) — seek-bar range
+  kickStreamStart: null, // v1/video created_at (ISO-Z, absolute) — bar max base
+  kickDvrFetchedAt: 0, // when kickStreamStart was captured (elapsed grows)
+  kickStreamId: null, // live stream id (v2 livestream.id) — DVR entry match
+  dvrFetchedFor: null, // playback_url the DVR source was fetched for (once per url)
   ytVol: 100,       // user's youtube volume (persisted, applied on show)
   ytState: { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, error: 0 },
   ytUnlock: false,
@@ -211,8 +219,8 @@ async function kickPlaybackUrl(slug) {
       const d = await r.json();
       const ls = d && d.livestream;
       if (ls) {
-        if (ls.playback_url) return { live: true, url: ls.playback_url };
-        if (d && d.playback_url) return { live: true, url: d.playback_url };
+        if (ls.playback_url) return { live: true, url: ls.playback_url, streamId: ls.id || null };
+        if (d && d.playback_url) return { live: true, url: d.playback_url, streamId: ls.id || null };
       }
       return { live: false }; // livestream null (or url-less) → channel offline
     } catch {
@@ -385,6 +393,8 @@ window.addEventListener('message', (ev) => {
   } else if (m.t === 'st') {
     KO.kickState = m.st;
     KO.lastKickSt = Date.now();
+    if (m.st && m.st.state === 'Playing') KO.kickEverPlayed = true;
+    if (KO.kickOnDvr && m.st && m.st.state === 'Ended') kickBackToLive(); // kick: replay ended → go live
     if (KO.player === 'kick') updateKickBar();
   } else if (m.t === 'ev') {
     if (m.e === 'error') {
@@ -408,13 +418,90 @@ function ensureKick(url) {
   }
   KO.activeUrl = url;
   KO.kickUrlT = Date.now();
+  KO.kickEverPlayed = false;
+  KO.kickOnDvr = false;
+  KO.kickDur = 0;
   KO.reconnectCount = 0;
   kickFrame();
+  kickFetchDvr(); // replay source (best-effort, once per url)
   KO.pendingUrl = url;
   if (KO.kickReady) {
     kickSend({ t: 'load', url });
     KO.pendingUrl = null;
   }
+}
+
+// DVR/replay source — the same path VOD.RIP's downloader uses: the channel's
+// newest VOD entry (id == the live stream's id while live) → its video uuid →
+// GET /api/v1/video/<uuid> → `source` (the broadcast's HLS master, served
+// from stream.kick.com with Access-Control-Allow-Origin: *). The IVS player
+// loads it like any other HLS master; rewinds seek within its timeline.
+// Fetched once per playback_url. (The POST /api/v1/stream/<uuid>/playback
+// bootstrap needs the page's playbackVideoId, which the overlay — running on
+// the Twitch page — cannot see.)
+async function kickFetchDvr() {
+  if (!KO.activeUrl || KO.dvrFetchedFor === KO.activeUrl) return;
+  KO.dvrFetchedFor = KO.activeUrl;
+  try {
+    const vids = await (await fetch(`https://kick.com/api/v2/channels/${encodeURIComponent(KO.kickSlug)}/videos`, { credentials: 'omit' })).json();
+    const list = Array.isArray(vids) ? vids : [];
+    const cur = KO.kickStreamId ? list.find((v) => v && v.id === KO.kickStreamId) : null;
+    const item = cur || list[0];
+    if (!item || !item.video || !item.video.uuid) {
+      diag('dvr_fetch', { err: 'no vod entry', slug: KO.kickSlug, streamId: KO.kickStreamId });
+      return;
+    }
+    const v1 = await (await fetch(`https://kick.com/api/v1/video/${item.video.uuid}`, { credentials: 'omit' })).json();
+    const src = v1 && v1.source;
+    if (typeof src === 'string' && src) {
+      KO.kickDvrUrl = src;
+      // created_at is ISO-8601 UTC ("...Z") — an ABSOLUTE timestamp, so the
+      // full-broadcast elapsed (bar max) is wall-clock-safe on any TZ (the
+      // naive "YYYY-MM-DD HH:MM:SS" on the v2 channel endpoint is not).
+      KO.kickStreamStart = Date.parse(v1.created_at) || null;
+      KO.kickDvrFetchedAt = Date.now();
+      diag('dvr_fetch', { ok: true, uuid: item.video.uuid.slice(0, 8), host: (src.split('/')[2] || '').slice(0, 40) });
+    } else {
+      diag('dvr_fetch', { err: 'no source in v1/video', uuid: item.video.uuid.slice(0, 8) });
+    }
+  } catch (e) {
+    diag('dvr_fetch', { err: String(e).slice(0, 120) });
+  }
+}
+
+// ---- kick.com-identical seek UX ---------------------------------------------
+// Kick's player: any back-seek ≤30s from the edge just goes live; farther
+// back switches to the DVR (VOD) url of the same broadcast (sources.dvr),
+// seeked to the target. "Go Live" switches back to the live url. We mirror
+// that exactly — the live url is never back-sought.
+function kickSeekTo(target) {
+  const st = KO.kickState || {};
+  const max = Math.max(1, KO.kickDur || Math.ceil((st.pos || 0) + (st.lat || 0)));
+  if (max - target <= 30) {
+    kickBackToLive();
+    return;
+  }
+  kickStartDvr(target);
+}
+
+function kickStartDvr(target) {
+  if (!KO.kickDvrUrl) {
+    diag('dvr_rewind', { skip: 'no vod url' }); // bootstrap failed → nothing to rewind into
+    return;
+  }
+  KO.kickOnDvr = true;
+  kickSend({ t: 'load', url: KO.kickDvrUrl, seekTo: target });
+  updateKickBar();
+}
+
+function kickBackToLive() {
+  if (KO.kickOnDvr && KO.activeUrl) {
+    KO.kickOnDvr = false;
+    kickSend({ t: 'load', url: KO.activeUrl, seekTo: Number.MAX_SAFE_INTEGER });
+  } else {
+    kickSend({ t: 'seekToLive' });
+  }
+  updateKickBar();
 }
 
 // ---- mute/pause model -------------------------------------------------------
@@ -499,8 +586,8 @@ function mount() {
     '<button id="ko-play" title="Play/Pause">\u275A\u275A</button>' +
     '<button id="ko-mute" title="Mute">Mute</button>' +
     '<input id="ko-vol" type="range" min="0" max="100" value="100" title="Volume" />' +
-    '<input id="ko-seek" type="range" min="0" max="1" value="0" title="Seek (live window)" />' +
-    '<button id="ko-live" title="Back to the live edge" style="display:none">LIVE</button>' +
+    '<input id="ko-seek" type="range" min="0" max="1" value="0" title="Seek (replay)" />' +
+    '<button id="ko-live" title="Back to the live edge" style="display:none">VOLTAR AO VIVO</button>' +
     '<span id="ko-time">LIVE</span>' +
     '<span style="flex:1"></span>' +
     '<button id="ko-fs" title="Fullscreen">\u26F6</button>';
@@ -557,14 +644,14 @@ function mount() {
   });
   const seek = bar.querySelector('#ko-seek');
   seek.addEventListener('input', () => {
-    KO.seeking = true;
-    kickSend({ t: 'seek', s: Number(seek.value) });
+    KO.seeking = true; // drag preview — actual seek happens on release
   });
   seek.addEventListener('change', () => {
     KO.seeking = false;
+    kickSeekTo(Number(seek.value));
   });
   const live = bar.querySelector('#ko-live');
-  live.addEventListener('click', () => kickSend({ t: 'seekToLive' }));
+  live.addEventListener('click', () => kickBackToLive());
   bar.querySelector('#ko-fs').addEventListener('click', () => {
     if (document.fullscreenElement === KO.wrap) document.exitFullscreen().catch(() => {});
     else if (KO.wrap) KO.wrap.requestFullscreen().catch(() => {});
@@ -594,6 +681,9 @@ function teardown() {
   KO.kickState = null;
   KO.pendingUrl = null;
   KO.activeUrl = null;
+  KO.kickEverPlayed = false;
+  KO.kickOnDvr = false;
+  KO.kickDur = 0;
   KO.reconnectCount = 0;
   KO.hideTicks = 0;
   KO.stallTicks = 0;
@@ -641,7 +731,7 @@ function showKickLayer() {
     kickSend({ t: 'play' });
     // Freshest edge ONLY when re-showing the layer after a hide — probe()
     // re-shows every poll and a per-poll seek would stall live playback.
-    if (wasHidden) kickSend({ t: 'seekToLive' });
+    if (wasHidden) { KO.kickOnDvr = false; kickSend({ t: 'seekToLive' }); }
   }
   syncMute();
 }
@@ -697,8 +787,9 @@ async function reconnect() {
   }
 }
 
-// Kick bar: seek slider within the live window + LIVE button when behind.
-// Position/latency come from the IVS frame's ~1s state messages.
+// Kick bar: full-broadcast seek slider (kick-style DVR: rewinds switch to
+// the replay url, ≤30s from the edge goes live) + VOLTAR AO VIVO pill when
+// behind. Position/latency/duration come from the IVS frame's ~1s messages.
 function updateKickBar() {
   if (!KO.wrap || KO.player !== 'kick') return;
   const st = KO.kickState;
@@ -706,25 +797,37 @@ function updateKickBar() {
   const pos = st.pos || 0;
   const lat = st.lat;
   const liveEdge = isFinite(lat) && lat >= 0 ? pos + lat : null;
-  const max = Math.max(1, Math.ceil(liveEdge || pos));
+  const dur = st.dur > 0 ? st.dur : null;
+  // Full-broadcast range when the stream start is known (kick.com's bar is
+  // the whole broadcast, playhead riding the edge); window fallback before
+  // the first DVR fetch. The max GROWS as the stream runs (wall-clock).
+  let max = dur || 0;
+  if (KO.kickStreamStart && KO.kickDvrFetchedAt) {
+    const elapsed = (Date.now() - KO.kickStreamStart) / 1000;
+    if (elapsed > max) max = elapsed;
+  }
+  if (!(max > 0)) max = Math.ceil(liveEdge || pos || 1);
+  KO.kickDur = max;
+  const head = KO.kickOnDvr ? pos : Math.max(0, max - (isFinite(lat) && lat >= 0 ? lat : 0));
   const seek = KO.wrap.querySelector('#ko-seek');
   const live = KO.wrap.querySelector('#ko-live');
   if (seek) {
-    if (!KO.seeking) seek.value = String(Math.min(max, Math.max(0, Math.floor(pos))));
+    if (!KO.seeking) seek.value = String(Math.min(max, Math.max(0, Math.floor(head))));
     seek.max = String(max);
   }
-  const behind = liveEdge !== null && lat > 8;
+  const behind = KO.kickOnDvr || (liveEdge !== null && lat > 3);
   if (live) live.style.display = behind ? 'block' : 'none';
-  const t = Math.floor(pos);
+  const t = Math.floor(head);
   const hh = String(Math.floor(t / 3600)).padStart(2, '0');
   const mm = String(Math.floor((t % 3600) / 60)).padStart(2, '0');
   const ss = String(t % 60).padStart(2, '0');
   const time = KO.wrap.querySelector('#ko-time');
-  if (time) time.textContent = `LIVE \u00B7 ${hh}:${mm}:${ss}`;
+  if (time) time.textContent = (KO.kickOnDvr ? 'REPLAY \u00B7 ' : 'LIVE \u00B7 ') + `${hh}:${mm}:${ss}`;
   const badgeEl = KO.wrap.querySelector('#ko-badge');
   if (badgeEl) {
     const qn = st.q && st.q.name;
-    badgeEl.textContent = qn ? `KICK \u00B7 LIVE \u00B7 ${qn}` : 'KICK \u00B7 LIVE';
+    const mode = KO.kickOnDvr ? 'REPLAY' : 'LIVE';
+    badgeEl.textContent = qn ? `KICK \u00B7 ${mode} \u00B7 ${qn}` : `KICK \u00B7 ${mode}`;
   }
 }
 
@@ -782,6 +885,7 @@ async function probe() {
     // job (reconnect with a FRESH url) — this one covers never-played.
     if (
       KO.activeUrl &&
+      !KO.kickEverPlayed &&
       KO.kickState &&
       KO.kickState.state !== 'Playing' &&
       KO.kickUrlT &&
@@ -809,6 +913,7 @@ async function probe() {
     const k = await kickPlaybackUrl(KO.kickSlug);
     diag('kick_probe', { slug: KO.kickSlug, live: k.live, url: k.url ? 'yes' : 'no' });
     if (k.live && k.url) {
+      KO.kickStreamId = k.streamId || null;
       ensureKick(k.url);
       showKickLayer();
       setBadge('KICK', '#059669');
@@ -1004,7 +1109,8 @@ function injectStyles() {
     '#ko-time{color:#cfcfcf;white-space:nowrap;}' +
     '#ko-vol{width:60px;height:4px;accent-color:#9147ff;cursor:pointer;}' +
     '#ko-seek{flex:1;height:4px;accent-color:#53fc18;cursor:pointer;min-width:40px;}' +
-    '#ko-live{font-weight:700;color:#000;background:#ff0000;border-radius:10px;padding:1px 9px;}' +
+    '#ko-live{position:absolute;right:16px;bottom:58px;font-weight:700;color:#fff;background:#ff0000;' +
+    'border-radius:999px;padding:8px 16px;box-shadow:0 2px 10px rgba(0,0,0,.55);}' +
     '#ko-live:hover{background:#ff4d4d;}' +
     '#ko-twitchbtn,#ko-kickbtn,#ko-ytbtn{position:fixed;z-index:6;pointer-events:auto;display:none;' +
     'background:#9147ff;color:#fff;border:0;border-radius:14px;padding:6px 14px;' +
