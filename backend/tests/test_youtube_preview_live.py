@@ -15,6 +15,7 @@ WATCH = "https://www.youtube.com/watch?v=4kyvGbRpV7M"
 
 
 @pytest.mark.asyncio
+@pytest.mark.network
 @pytest.mark.parametrize("url", [*SHORTS, WATCH])
 async def test_youtube_preview_session_and_stream(url: str):
     transport = ASGITransport(app=app)
