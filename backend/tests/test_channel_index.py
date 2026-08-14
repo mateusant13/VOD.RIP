@@ -51,7 +51,7 @@ def _fake_platform_services(monkeypatch):
             "thumbnail": f"https://kick-thumb/{i}",
         } for i in range(1, 3)]
 
-    def fake_twitch(login, limit):
+    def fake_twitch(login, limit, return_has_more=False):
         calls.append("Twitch")
         return [{
             "id": f"t{i}",
@@ -61,11 +61,11 @@ def _fake_platform_services(monkeypatch):
             "created_at": "2026-08-02T00:00:00Z",
             "views": 10,
             "thumbnail_url": "https://twitch-thumb/t",
-        } for i in range(1, 2)]
+        } for i in range(1, 2)], False
 
-    def fake_youtube(ref, limit, playlist="videos", enrich=True):
+    def fake_youtube(ref, limit, playlist="videos", enrich=True, return_has_more=False):
         calls.append("YouTube")
-        return [{
+        items = [{
             "id": f"y{i}",
             "platform": "YouTube",
             "title": f"YT {i}",
@@ -78,6 +78,9 @@ def _fake_platform_services(monkeypatch):
             "channel": ref,
             "content_kind": "vod",
         } for i in range(1, 4)]
+        if return_has_more:
+            return items, False
+        return items
 
     async def no_warm(videos):
         return None
@@ -252,9 +255,9 @@ async def test_vods_fetch_merges_streams_tab_and_persists_stream_kind(
     """The /videos fetch must also pull the /streams tab so recorded
     broadcasts show in the channel panel, and persist them with kind
     'stream' (not flattened to 'vod')."""
-    def playlist_aware(ref, limit, playlist="videos", enrich=True):
+    def playlist_aware(ref, limit, playlist="videos", enrich=True, return_has_more=False):
         if playlist == "streams":
-            return [{
+            items = [{
                 "id": "s1", "platform": "YouTube", "title": "Stream 1",
                 "duration": 14814, "duration_string": "4:06:54",
                 "created_at": "2026-07-01T00:00:00Z", "views": 744,
@@ -262,14 +265,18 @@ async def test_vods_fetch_merges_streams_tab_and_persists_stream_kind(
                 "url": "https://www.youtube.com/watch?v=s1", "channel": ref,
                 "content_kind": "stream",
             }]
-        return [{
-            "id": "u1", "platform": "YouTube", "title": "Upload 1",
-            "duration": 300, "duration_string": "0:05:00",
-            "created_at": "2026-08-01T00:00:00Z", "views": 20,
-            "thumbnail_url": "https://yt-thumb/u1",
-            "url": "https://www.youtube.com/watch?v=u1", "channel": ref,
-            "content_kind": "vod",
-        }]
+        else:
+            items = [{
+                "id": "u1", "platform": "YouTube", "title": "Upload 1",
+                "duration": 300, "duration_string": "0:05:00",
+                "created_at": "2026-08-01T00:00:00Z", "views": 20,
+                "thumbnail_url": "https://yt-thumb/u1",
+                "url": "https://www.youtube.com/watch?v=u1", "channel": ref,
+                "content_kind": "vod",
+            }]
+        if return_has_more:
+            return items, False
+        return items
 
     monkeypatch.setattr(channels, "youtube_list_channel_videos_sync", playlist_aware)
 

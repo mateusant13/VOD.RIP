@@ -256,14 +256,36 @@ export function channelPlatformCanExpand(
   visibleLimit: number,
   beyondRecent: boolean,
   clips: boolean,
+  hasMore = false,
 ): boolean {
   const sorted = sortChannelVideosByMode(videos, clips);
   if (visibleLimit < sorted.length) return true;
+  // Backend reported deeper pages past the cached list — the button must
+  // stay up so show-more can keep fetching.
+  if (hasMore) return true;
   if (!beyondRecent) {
     const recent = recentChannelVideos(sorted);
     if (recent.length > 0 && recent.length < sorted.length) return true;
   }
   return false;
+}
+
+/** Next page cursor for a channel list, or undefined when no deeper pages
+ * exist (backend has_more=false). */
+export function nextChannelPage(hasMore: boolean, current: number | undefined): number | undefined {
+  if (!hasMore) return undefined;
+  return (current ?? 1) + 1;
+}
+
+/** True when revealing the next expand step pierces past the cached rows AND
+ * the backend still has deeper pages — i.e. show-more must fetch page N+1. */
+export function channelShowMoreNeedsFetch(
+  videos: ChannelVideo[],
+  visibleLimit: number,
+  hasMore: boolean,
+  step: number = CHANNEL_EXPAND_STEP,
+): boolean {
+  return hasMore && visibleLimit + step > videos.length;
 }
 
 /** Effective platform filter flags for a channel. A channel with exactly one
@@ -1008,6 +1030,8 @@ export const CHANNEL_FETCH_LIMIT = 100;
 /** Cheap head fetch on page load — merge only ids not already cached. */
 
 export const CHANNEL_INCREMENTAL_LIMIT = 25;
+/** Clips page size (backend caps at CHANNEL_CLIP_LIMIT=25). */
+export const CHANNEL_CLIP_FETCH_LIMIT = 25;
 
 export const CHANNELS_STORAGE_KEY = 'vodrip_saved_channels';
 

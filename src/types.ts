@@ -229,6 +229,19 @@ export interface SavedChannel {
   vodPlatformsFetched?: Partial<Record<'Kick' | 'Twitch' | 'YouTube', boolean>>;
   /** Per-platform clips/shorts fetch completed (empty list counts). */
   clipPlatformsFetched?: Partial<Record<'Kick' | 'Twitch' | 'YouTube', boolean>>;
+  /** 1-based page cursor of the last full-size (CHANNEL_FETCH_LIMIT) VOD fetch.
+   * Show-more fetches page+1 when the reveal pierces the cached rows. */
+  vodPages?: number;
+  /** Backend reported deeper VOD pages exist past the cached list. */
+  vodHasMore?: boolean;
+  /** 1-based page cursor of the last full-size clips/shorts fetch. */
+  clipPage?: number;
+  /** Backend reported deeper clips pages exist. */
+  clipHasMore?: boolean;
+  /** 1-based page cursor of the last full-size YouTube streams fetch. */
+  streamPage?: number;
+  /** Backend reported deeper streams pages exist. */
+  streamHasMore?: boolean;
   /** Legacy — migrated to vodVideos / clipVideos on load */
   videos?: ChannelVideo[];
 }

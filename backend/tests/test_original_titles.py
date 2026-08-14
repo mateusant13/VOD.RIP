@@ -232,9 +232,9 @@ def _fake_platform_services(monkeypatch):
     """Offline fakes for the three platform fetchers + preview warmer."""
     calls: list[str] = []
 
-    def fake_youtube(ref, limit, playlist="videos", enrich=True):
+    def fake_youtube(ref, limit, playlist="videos", enrich=True, return_has_more=False):
         calls.append("YouTube")
-        return [{
+        items = [{
             "id": f"y{i}",
             "platform": "YouTube",
             "title": f"YT {i}",
@@ -247,6 +247,9 @@ def _fake_platform_services(monkeypatch):
             "channel": ref,
             "content_kind": "vod",
         } for i in range(1, 4)]
+        if return_has_more:
+            return items, False
+        return items
 
     async def no_warm(videos):
         return None

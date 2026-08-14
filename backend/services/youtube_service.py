@@ -11,6 +11,17 @@ logger = logging.getLogger(__name__)
 
 PlaylistKind = Literal["videos", "shorts", "streams"]
 
+# Flat-extract ceiling for channel tab lists. yt-dlp pages the tab internally
+# (~50 entries/page via pageToken); the flat /videos list also mixes streams
+# and member-only entries, so the caller's requested count needs headroom
+# (playlistend = limit * 3). 1000 flat entries ≈ 20 pages of token paging —
+# the bot-wall / request-volume ceiling; deeper requests keep has_more=false
+# at this bound instead of looping forever. ponytail: the filter ratio inside
+# the flat list is a heuristic (a stream-heavy channel yields fewer "video"
+# rows per entry); the upgrade path is a pageToken-aware extractor or the
+# Data API with real pagination.
+YOUTUBE_PLAYLIST_CEILING = 1000
+
 
 def channel_playlist_url(channel_ref: str, kind: PlaylistKind = "videos") -> str:
     """Build channel tab URL from handle, @handle, channel id, or full URL."""
@@ -453,7 +464,14 @@ def list_channel_videos_sync(
     *,
     playlist: PlaylistKind = "videos",
     enrich: bool = True,
+    return_has_more: bool = False,
 ) -> list[dict[str, Any]]:
+    """Channel tab listing (flat extract, sorted newest-first, <=limit rows).
+
+    return_has_more: when True, return (rows, has_more) — has_more is True
+    when the flat extract hit its playlistend bound (the tab likely has more
+    entries beyond it), False when the tab was exhausted before the bound.
+    """
     import yt_dlp
 
     from services.ytdlp_guard import guarded_youtube_dl_channel
@@ -472,8 +490,9 @@ def list_channel_videos_sync(
         auto_auth = True
     ext_args = ytdlp_extractor_args(session, auto_auth=auto_auth)
 
+    playlistend = max(1, min(int(limit) * 3, YOUTUBE_PLAYLIST_CEILING))
     base_opts: dict[str, Any] = {
-        "playlistend": max(1, min(int(limit) * 3, 300)),
+        "playlistend": playlistend,
         "extract_flat": "in_playlist",
         "quiet": True,
         "no_warnings": True,
@@ -589,6 +608,16 @@ def list_channel_videos_sync(
     if enrich and channel_id:
         _enrich_with_rss_dates(filtered, channel_id)
 
+    if return_has_more:
+        # Saturation = the flat tab crawl hit its playlistend bound (deeper
+        # entries exist). list_order counts unique non-empty entries before
+        # kind filtering, so a stream-heavy tab still reports more correctly.
+        # The `limit < CEILING` guard keeps the signal honest at the bot-wall
+        # bound: once the requested depth reaches the ceiling a deeper ask is
+        # clamped to the same crawl and can never serve new rows, so has_more
+        # must go False there or show-more loops forever on empty pages.
+        has_more = list_order >= playlistend and int(limit) < YOUTUBE_PLAYLIST_CEILING
+        return filtered, has_more
     return filtered
 
 

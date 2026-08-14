@@ -79,7 +79,7 @@ import { createFullscreenGate, type FullscreenGate } from './utils/fullscreenGat
 import { actionBtnHover, platformPreviewCtrlBtn, platformCardShadow, platformVodPanelBtn, platformWatchPreviewBtn, platformBulkDownloadBtn, type PlatformStyleKey } from './platformStyles';
 import { fmtDuration, formatClipDurationHuman, fmtDateAndAgo, fmtViews, parseVideoTs, formatBytes, basename, sourceQualityOptionLabel } from './formatters';
 import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout, PreviewSessionResponse, PanelPos } from './types';
-import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, isMembersOnlyVideo, isPublicVideo, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, effectivePlatformFlags, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, displayTitle, loadSavedChannels, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, isSyntheticArchiveId, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_UI_STORAGE_KEY, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft, loadStoredChannelLiveStatuses, persistChannelLiveStatuses, shouldDropChannelFromLivePoll, type StoredChannelLiveStatus } from './channelUtils';
+import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, isMembersOnlyVideo, isPublicVideo, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, effectivePlatformFlags, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, displayTitle, loadSavedChannels, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, isSyntheticArchiveId, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_CLIP_FETCH_LIMIT, CHANNEL_UI_STORAGE_KEY, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, channelShowMoreNeedsFetch, nextChannelPage, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft, loadStoredChannelLiveStatuses, persistChannelLiveStatuses, shouldDropChannelFromLivePoll, type StoredChannelLiveStatus } from './channelUtils';
 import ChannelLinkCard from './components/ChannelLinkCard';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, zoomWindowFromView, fracToSec, secToFrac, zoomTrimViewAround, resolveTimestampSeek, TRIM_ZOOM_STEP, type TrimRangeOpts, type TrimViewWindow } from './trimUtils';
@@ -1162,14 +1162,24 @@ export default function App() {
   }, [bulkDownloadPlatforms]);
 
   const clipsMode = channelContentFilter === 'clips';
+  const streamsMode = channelContentFilter === 'streams';
+  // Per-platform "backend has deeper pages" signal for the current mode.
+  const platformHasMore = (p: 'Kick' | 'Twitch' | 'YouTube'): boolean => {
+    if (clipsMode) return selectedChannel?.clipHasMore ?? false;
+    if (streamsMode) return p === 'YouTube' ? (selectedChannel?.streamHasMore ?? false) : false;
+    return selectedChannel?.vodHasMore ?? false;
+  };
   const canExpandKick = effectiveKickEnabled && channelHasKick && channelPlatformCanExpand(
     kickChannelVideos, kickVisibleLimit, channelBeyondRecent.Kick ?? false, clipsMode,
+    platformHasMore('Kick'),
   );
   const canExpandTwitch = effectiveTwitchEnabled && channelHasTwitch && channelPlatformCanExpand(
     twitchChannelVideos, twitchVisibleLimit, channelBeyondRecent.Twitch ?? false, clipsMode,
+    platformHasMore('Twitch'),
   );
   const canExpandYoutube = effectiveYoutubeEnabled && channelHasYoutube && channelPlatformCanExpand(
     youtubeChannelVideos, youtubeVisibleLimit, channelBeyondRecent.YouTube ?? false, clipsMode,
+    platformHasMore('YouTube'),
   );
   const canExpandChannelList = canExpandKick || canExpandTwitch || canExpandYoutube;
 
@@ -4604,6 +4614,10 @@ export default function App() {
     days: number;
     per_platform_errors?: Record<string, string>;
     refreshing?: boolean;
+    /** True when deeper pages exist — show-more keeps fetching. */
+    has_more?: boolean;
+    /** 1-based page served (echo of the request). */
+    page?: number;
   };
 
   type ChannelClipsResponse = {
@@ -4612,6 +4626,8 @@ export default function App() {
     platforms: string[];
     content?: 'clips';
     per_platform_errors?: Record<string, string>;
+    has_more?: boolean;
+    page?: number;
   };
 
   useEffect(() => {
@@ -4705,12 +4721,17 @@ export default function App() {
     channelId: string,
     channelOverride?: SavedChannel,
     contentMode?: 'vods' | 'clips' | 'streams',
-    opts?: { incremental?: boolean; silent?: boolean; force?: boolean },
+    opts?: { incremental?: boolean; silent?: boolean; force?: boolean; page?: number },
   ) => {
     const ch = channelOverride ?? savedChannelsRef.current.find((c) => c.id === channelId);
     if (!ch) return;
     const mode = contentMode ?? channelContentFilter;
     const incremental = opts?.incremental ?? false;
+    // Show-more fetch: page N>1 of the current mode. Unlike a full refresh it
+    // must not reset visible limits, prune cached rows, or show the spinner.
+    const requestedPage = opts?.page ?? 1;
+    const pageFetch = requestedPage > 1;
+    const pageNum = pageFetch ? requestedPage : 1;
     const silent = opts?.silent ?? false;
     // Only bust the cache on explicit forced refresh — non-forced refreshes
     // must hit the backend's 90s in-memory channel cache.
@@ -4721,21 +4742,24 @@ export default function App() {
       clearChannelRefreshFlight(channelId, mode);
     }
 
-    if (!incremental) {
+    if (!incremental && !pageFetch) {
       const pending = channelRefreshPromisesRef.current.get(flightKey);
       if (pending) return pending;
     }
 
     const task = (async () => {
-    if (!incremental) channelRefreshInFlightRef.current.add(flightKey);
+    if (!incremental && !pageFetch) channelRefreshInFlightRef.current.add(flightKey);
 
-    if (!incremental && !silent) {
+    if (!incremental && !pageFetch && !silent) {
       updateChannel(channelId, { loading: true });
       resetChannelListPaging();
     }
     const errs: Record<string, string> = {};
     const incoming: ChannelVideo[] = [];
     const attempted: Partial<Record<'Kick' | 'Twitch' | 'YouTube', boolean>> = {};
+    // Per-platform backend has_more for this fetch (vods/streams only; the
+    // clips request returns one merged answer).
+    const pageHasMore: Partial<Record<'Kick' | 'Twitch' | 'YouTube', boolean>> = {};
 
     // Always fetch both platforms; Kick/Twitch toggles only filter the display.
     const wantKick = true;
@@ -4749,7 +4773,8 @@ export default function App() {
         if (ch.youtubeSlug?.trim()) clipPlatforms.push('YouTube');
         const params = new URLSearchParams({
           platforms: clipPlatforms.join(','),
-          limit: '10',
+          limit: String(CHANNEL_CLIP_FETCH_LIMIT),
+          page: String(pageNum),
           days: String(clipRangeDays),
           min_days: String(clipRangeMinDays),
           sort: clipSort,
@@ -4758,6 +4783,8 @@ export default function App() {
           youtube_slug: ch.youtubeSlug,
         });
         if (slug) params.set('url', slug);
+        let clipsMore = false;
+        let clipsPage = pageNum;
         try {
           let data: ChannelClipsResponse;
           try {
@@ -4780,6 +4807,8 @@ export default function App() {
             for (const [platform, pe] of Object.entries(data.per_platform_errors ?? {})) {
               if (pe && !isHiddenChannelPlatformError(pe)) errs[platform] = pe;
             }
+            clipsMore = Boolean(data.has_more);
+            if (typeof data.page === 'number' && data.page > 0) clipsPage = data.page;
           }
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : 'Failed to fetch clips';
@@ -4799,6 +4828,14 @@ export default function App() {
             clipVideos,
             updatedAt: new Date().toISOString(),
           });
+        } else if (pageFetch) {
+          updateChannel(channelId, {
+            clipVideos,
+            clipErrors: { ...(latest.clipErrors ?? {}), ...errs },
+            clipPage: clipsPage,
+            clipHasMore: clipsMore,
+            updatedAt: new Date().toISOString(),
+          });
         } else {
           const prevClipErrors = latest.clipErrors ?? {};
           const clipPlatformsFetched = mergeClipPlatformsFetched(
@@ -4813,6 +4850,8 @@ export default function App() {
             clipErrors: { ...prevClipErrors, ...errs },
             clipsFetched: Object.values(clipPlatformsFetched).some(Boolean),
             clipPlatformsFetched,
+            clipPage: clipsPage,
+            clipHasMore: clipsMore,
             loading: false,
             updatedAt: new Date().toISOString(),
           });
@@ -4826,6 +4865,7 @@ export default function App() {
             youtube_slug: ch.youtubeSlug,
             url: ch.youtubeSlug,
             limit: String(limit),
+            page: String(pageNum),
             days: '0',
             kick_slug: ch.kickSlug,
             twitch_login: ch.twitchSlug,
@@ -4835,6 +4875,7 @@ export default function App() {
             attempted.YouTube = true;
             incoming.push(...(data.videos ?? []).map(mapApiChannelItem));
             delete errs.YouTube;
+            pageHasMore.YouTube = Boolean(data.has_more);
             const pe = data.per_platform_errors?.YouTube;
             if (pe && !isHiddenChannelPlatformError(pe)) errs.YouTube = pe;
           } catch (err: unknown) {
@@ -4849,9 +4890,18 @@ export default function App() {
         // /videos + /streams), so replacing it with streams-only would drop
         // regular uploads from state on every VODs-tab visit.
         const vodVideos = mergeVodLists(latest.vodVideos ?? [], incoming);
+        const anyMore = Boolean(pageHasMore.YouTube);
         if (incremental) {
           updateChannel(channelId, {
             vodVideos,
+            updatedAt: new Date().toISOString(),
+          });
+        } else if (pageFetch) {
+          updateChannel(channelId, {
+            vodVideos,
+            vodErrors: { ...(latest.vodErrors ?? {}), ...errs },
+            streamPage: pageNum,
+            streamHasMore: anyMore,
             updatedAt: new Date().toISOString(),
           });
         } else {
@@ -4861,6 +4911,8 @@ export default function App() {
             streamsFetched: !ch.youtubeSlug?.trim()
               || incoming.some((v) => v.content_kind === 'stream')
               || Boolean(errs.YouTube),
+            streamPage: pageNum,
+            streamHasMore: anyMore,
             loading: false,
             updatedAt: new Date().toISOString(),
           });
@@ -4872,6 +4924,7 @@ export default function App() {
           const params = new URLSearchParams({
             url: slug,
             limit: String(limit),
+            page: String(pageNum),
             days: '0',
             platforms: platform,
             content: 'vods',
@@ -4885,6 +4938,7 @@ export default function App() {
             attempted[platform] = true;
             incoming.push(...(data.videos ?? []).map(mapApiChannelItem));
             delete errs[platform];
+            pageHasMore[platform] = Boolean(data.has_more);
             if (data.refreshing) anyRefreshing = true;
             const pe = data.per_platform_errors?.[platform];
             if (pe && !isHiddenChannelPlatformError(pe)) errs[platform] = pe;
@@ -4904,16 +4958,26 @@ export default function App() {
         await Promise.all(vodTasks);
         const latest = savedChannelsRef.current.find((c) => c.id === channelId) ?? ch;
         const prunePlatforms: string[] = [];
-        if (!incremental) {
+        if (!incremental && !pageFetch) {
           for (const p of ['Kick', 'Twitch', 'YouTube'] as const) {
             if (attempted[p] && !errs[p] && incoming.some((v) => v.platform === p)) prunePlatforms.push(p);
           }
         }
         const vodVideos = mergeVodLists(latest.vodVideos ?? [], incoming,
           prunePlatforms.length ? { prunePlatforms } : undefined);
+        const anyMore = Object.values(pageHasMore).some(Boolean);
         if (incremental) {
           updateChannel(channelId, {
             vodVideos,
+            updatedAt: new Date().toISOString(),
+          });
+        } else if (pageFetch) {
+          // Show-more page: append-only (no prune), advance the cursor.
+          updateChannel(channelId, {
+            vodVideos,
+            vodErrors: { ...(latest.vodErrors ?? {}), ...errs },
+            vodPages: pageNum,
+            vodHasMore: anyMore,
             updatedAt: new Date().toISOString(),
           });
         } else {
@@ -4935,6 +4999,8 @@ export default function App() {
             streamsFetched: !ch.youtubeSlug?.trim()
               || incoming.some((v) => v.content_kind === 'stream')
               || Boolean(errs.YouTube),
+            vodPages: pageNum,
+            vodHasMore: anyMore,
             loading: false,
             updatedAt: new Date().toISOString(),
           });
@@ -4955,7 +5021,7 @@ export default function App() {
       }
 
     } finally {
-      if (!incremental) {
+      if (!incremental && !pageFetch) {
         channelRefreshInFlightRef.current.delete(flightKey);
         channelRefreshPromisesRef.current.delete(flightKey);
         if (!silent) {
@@ -4965,7 +5031,7 @@ export default function App() {
     }
     })();
 
-    if (!incremental) {
+    if (!incremental && !pageFetch) {
       channelRefreshPromisesRef.current.set(flightKey, task);
     }
     return task;
@@ -5357,6 +5423,7 @@ export default function App() {
   }, [editingSlug, editingSlugValue, savedChannels, updateChannel, refreshChannel]);
 
   const handleExpandChannelList = useCallback(() => {
+    const ch = selectedChannel;
     const markBeyond = (videos: ChannelVideo[], nextLimit: number, platform: 'Kick' | 'Twitch' | 'YouTube') => {
       const sorted = sortChannelVideosByMode(videos, clipsMode);
       const cutoff = Date.now() - CHANNEL_RECENT_DAYS * 86_400_000;
@@ -5369,12 +5436,19 @@ export default function App() {
         setChannelBeyondRecent((prev) => ({ ...prev, [platform]: true }));
       }
     };
+    // Show-more must keep fetching when the reveal pierces the cached rows
+    // AND the backend has deeper pages (has_more). Streams mode only has a
+    // YouTube list; kick/twitch never fetch there.
+    let needsFetch = false;
     if (effectiveKickEnabled && channelHasKick) {
       setKickVisibleLimit((n) => {
         const next = n + CHANNEL_EXPAND_STEP;
         markBeyond(kickChannelVideos, next, 'Kick');
         return next;
       });
+      if (!streamsMode && channelShowMoreNeedsFetch(
+        kickChannelVideos, kickVisibleLimit, platformHasMore('Kick'),
+      )) needsFetch = true;
     }
     if (effectiveTwitchEnabled && channelHasTwitch) {
       setTwitchVisibleLimit((n) => {
@@ -5382,6 +5456,9 @@ export default function App() {
         markBeyond(twitchChannelVideos, next, 'Twitch');
         return next;
       });
+      if (!streamsMode && channelShowMoreNeedsFetch(
+        twitchChannelVideos, twitchVisibleLimit, platformHasMore('Twitch'),
+      )) needsFetch = true;
     }
     if (effectiveYoutubeEnabled && channelHasYoutube) {
       setYoutubeVisibleLimit((n) => {
@@ -5389,9 +5466,25 @@ export default function App() {
         markBeyond(youtubeChannelVideos, next, 'YouTube');
         return next;
       });
+      if (channelShowMoreNeedsFetch(
+        youtubeChannelVideos, youtubeVisibleLimit, platformHasMore('YouTube'),
+      )) needsFetch = true;
+    }
+    if (needsFetch && ch) {
+      const current = clipsMode ? (ch.clipPage ?? 1)
+        : streamsMode ? (ch.streamPage ?? 1)
+        : (ch.vodPages ?? 1);
+      const page = nextChannelPage(true, current) ?? 1;
+      // One page fetch per click — the backend slices the merged list and
+      // the per-platform merges append + dedupe by id.
+      void refreshChannel(ch.id, undefined, undefined, {
+        page,
+        silent: true,
+      });
     }
   }, [
     clipsMode,
+    streamsMode,
     effectiveKickEnabled,
     effectiveTwitchEnabled,
     effectiveYoutubeEnabled,
@@ -5401,6 +5494,13 @@ export default function App() {
     kickChannelVideos,
     twitchChannelVideos,
     youtubeChannelVideos,
+    kickVisibleLimit,
+    twitchVisibleLimit,
+    youtubeVisibleLimit,
+    platformHasMore,
+    selectedChannel,
+    selectedChannelId,
+    refreshChannel,
   ]);
   const removeChannel = useCallback((channelId: string) => {
     setSavedChannels((prev) => {
