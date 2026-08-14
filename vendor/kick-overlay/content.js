@@ -73,6 +73,7 @@ const KO = {
   pendingUrl: null,// playback_url queued until the frame reports ready
   kickVol: 1,
   kickMuted: false, // user's kick mute choice (persisted; hidden-mute is separate)
+  kickUrlT: 0,      // epoch ms of the current playback_url load (dead-url watchdog)
   ytVol: 100,       // user's youtube volume (persisted, applied on show)
   ytState: { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, error: 0 },
   ytUnlock: false,
@@ -193,6 +194,10 @@ function updateTwLiveSticky(v) {
 
 // Kick stream source — THE full-HD playback_url (same endpoint the VOD.RIP
 // downloader uses; all IVS renditions incl. 1080p+; v2 exposes it TOP-LEVEL).
+// Live iff the `livestream` object exists: kick's v2 channel endpoint ALSO
+// returns a stale top-level playback_url for OFFLINE channels (proven with
+// nyro — livestream:null + playback_url present → the url does not stream),
+// which used to put a dead black player over Twitch.
 async function kickPlaybackUrl(slug) {
   const enc = encodeURIComponent(slug);
   const probes = [
@@ -205,9 +210,11 @@ async function kickPlaybackUrl(slug) {
       if (!r.ok) continue;
       const d = await r.json();
       const ls = d && d.livestream;
-      if (d && d.playback_url) return { live: true, url: d.playback_url };
-      if (ls && ls.playback_url) return { live: true, url: ls.playback_url };
-      if (!d || (!d.playback_url && !ls)) return { live: false }; // explicitly offline
+      if (ls) {
+        if (ls.playback_url) return { live: true, url: ls.playback_url };
+        if (d && d.playback_url) return { live: true, url: d.playback_url };
+      }
+      return { live: false }; // livestream null (or url-less) → channel offline
     } catch {
       // transient — try next endpoint / next poll tick
     }
@@ -400,6 +407,7 @@ function ensureKick(url) {
     return;
   }
   KO.activeUrl = url;
+  KO.kickUrlT = Date.now();
   KO.reconnectCount = 0;
   kickFrame();
   KO.pendingUrl = url;
@@ -767,6 +775,26 @@ async function probe() {
   }
 
   if (KO.player === 'kick') {
+    // Dead-url watchdog: the frame loaded a url but never reached Playing
+    // within 15s. Kick's v2 API hands out a stale top-level playback_url for
+    // offline channels; without this the layer would sit black over Twitch
+    // (the user's nyro report). Playing-then-frozen is the stall watchdog's
+    // job (reconnect with a FRESH url) — this one covers never-played.
+    if (
+      KO.activeUrl &&
+      KO.kickState &&
+      KO.kickState.state !== 'Playing' &&
+      KO.kickUrlT &&
+      Date.now() - KO.kickUrlT > 15000
+    ) {
+      console.log('[ko] kick url never played — teardown', KO.kickSlug, KO.kickState.state);
+      diag('kick_stall', { slug: KO.kickSlug, state: KO.kickState.state, ct: KO.kickState.ct });
+      teardown();
+      if (KO.wrap) hideWrap();
+      setBadge('KICK OFF', '#6b7280');
+      updateSwitchButtons();
+      return;
+    }
     // Already playing on a live url? Keep it — IVS playback_urls rotate on
     // every API call and a re-attach would reset the stream to the live edge.
     // The stall watchdog reconnects with a FRESH url when the current one
