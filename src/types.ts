@@ -119,7 +119,6 @@ export interface AppSettings {
   /** One-click extension auto-install: ON offers the install on first run;
    * OFF = manual drag-and-drop only. Absent on older backends -> ON. */
   auto_install_extension?: boolean;
-  twitch_monitor_enabled?: boolean;
   /** Post-merge field (VOD retention slice); absent on older backends -> default 5. */
   archive_vod_keep_count?: number;
   /** Local transcription model: faster-whisper id + HF cache dir (absent on

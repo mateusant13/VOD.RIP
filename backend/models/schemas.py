@@ -122,9 +122,6 @@ class AppSettings(BaseModel):
     # manual drag-and-drop only. Absent on older backends -> ON (getattr).
     auto_install_extension: bool = True
     entity_watch_enabled: bool = True
-    # 24/7 Twitch IRC mention logger: stays joined to saved channels and
-    # persists chat lines that mention them (searchable even without a VOD).
-    twitch_monitor_enabled: bool = True
     # Archived VOD retention: keep only the newest N video FILES per platform;
     # older files are deleted but DB rows/transcripts/chat stay forever.
     archive_vod_keep_count: int = Field(default=5, ge=1, le=50)
@@ -207,7 +204,6 @@ class SettingsUpdate(BaseModel):
     cookie_bridge_enabled: Optional[bool] = None
     auto_install_extension: Optional[bool] = None
     entity_watch_enabled: Optional[bool] = None
-    twitch_monitor_enabled: Optional[bool] = None
     archive_vod_keep_count: Optional[int] = None
     whisper_model: Optional[str] = None
     asr_engine: Optional[str] = None
