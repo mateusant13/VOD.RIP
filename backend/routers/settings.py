@@ -160,6 +160,19 @@ async def update_settings(update: SettingsUpdate):
             kick_scheduler_pass()
         except Exception:
             logger.debug("archive scheduler kick skipped", exc_info=True)
+        # New channel: warm its recent YouTube previews right away so the
+        # first open is instant — the next periodic prewarm would take up to
+        # 15 min to reach it. Selection is capped + dead-vid filtered inside;
+        # submit is non-blocking (deduped on WARM_EXECUTOR).
+        try:
+            from services.preview.warm import warm_youtube_recent_channels
+
+            warm_youtube_recent_channels(
+                [c for c in (update.saved_channels or []) if str(c.get("id") or "") not in old_ids],
+                per_channel=5,
+            )
+        except Exception:
+            logger.debug("channel-add preview warm skipped", exc_info=True)
     if update.channel_kick_enabled is not None:
         current.channel_kick_enabled = bool(update.channel_kick_enabled)
     if update.channel_twitch_enabled is not None:
