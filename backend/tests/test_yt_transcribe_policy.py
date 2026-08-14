@@ -101,8 +101,11 @@ def _job_rows(vid: str) -> list[dict]:
     ))
 
 
-def _fake_download(video_id: str, outdir):
-    """download_bestaudio stand-in: write a fake audio file, return its path."""
+def _fake_download(video_id: str, outdir, **kwargs):
+    """download_bestaudio stand-in: write a fake audio file, return its path.
+
+    **kwargs absorbs the review-fix additions (progress_hook, timeout_s) so
+    the mock matches download_bestaudio's new signature."""
     f = Path(outdir) / f"{video_id}.webm"
     f.write_bytes(b"fake audio")
     return f

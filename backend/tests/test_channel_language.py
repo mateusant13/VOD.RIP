@@ -30,10 +30,27 @@ if _REAL_DB.exists():
     shutil.copy2(_REAL_DB, _DB_COPY)
 else:  # fallback: brand-new empty DB (CI without the real install)
     _DB_COPY.touch()
-os.environ["VODRIP_ARCHIVE_DB"] = str(_DB_COPY)
-os.environ["VODRIP_APP_DATA"] = str(_TMP)
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _point_env_at_copy() -> None:
+    """Env must be set at TEST time, not collection: pytest imports every
+    module before running any test, and later-collected modules overwrite
+    module-level env writes — the copy would be lost and tests would bind a
+    foreign scratch DB (order-dependent failure in the full suite)."""
+    prev = {k: os.environ.get(k) for k in ("VODRIP_ARCHIVE_DB", "VODRIP_APP_DATA")}
+    os.environ["VODRIP_ARCHIVE_DB"] = str(_DB_COPY)
+    os.environ["VODRIP_APP_DATA"] = str(_TMP)
+    yield
+    for k, v in prev.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
 
 from services import archive_db  # noqa: E402
 from services.channel_language import (  # noqa: E402
@@ -186,6 +203,8 @@ def test_search_hits_carry_channel_language() -> None:
 
 
 def main() -> None:
+    os.environ["VODRIP_ARCHIVE_DB"] = str(_DB_COPY)
+    os.environ["VODRIP_APP_DATA"] = str(_TMP)
     for fn in (
         test_normalize_language,
         test_migration_on_existing_and_fresh,

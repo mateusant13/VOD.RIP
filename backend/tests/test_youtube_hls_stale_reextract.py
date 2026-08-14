@@ -133,6 +133,11 @@ def test_mux_stale_url_cleans_partials_and_skips_ffmpeg(tmp_path, monkeypatch):
     remote = {"entered": False}
 
     def fake_remote_mux(*a, **k):
+        # Only count the URL(s) under test: a background mux thread from the
+        # in-process app (preview_panel runs the real lifespan) may still be
+        # muxing OTHER googlevideo URLs through this global patch.
+        if "cdn.invalid" not in " ".join(str(x) for x in a[1] if isinstance(x, str)):
+            return
         remote["entered"] = True
         raise AssertionError("remote fallback entered")
 
@@ -161,6 +166,8 @@ def test_mux_truncated_body_keeps_remote_fallback(tmp_path, monkeypatch):
         )
 
     def fake_remote_mux(*a, **k):
+        if "cdn.invalid" not in " ".join(str(x) for x in a[1] if isinstance(x, str)):
+            return  # background thread muxing a real URL — not under test
         raise RuntimeError("remote fallback entered")
 
     monkeypatch.setattr(ytdlp_hls, "_fetch_googlevideo_window_local", fake_fetch)
