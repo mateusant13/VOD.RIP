@@ -30,7 +30,7 @@ router = APIRouter(tags=["archive"])
 # 211 GQL pages across 6 VODs, zero 429s). Re-runs are incremental and
 # idempotent (seed = MAX(messages.offset_sec)), so a big cap only ever
 # fetches what is still missing.
-_BACKFILL_MAX_MESSAGES = 100_000
+_BACKFILL_MAX_MESSAGES = 100_000  # ponytail: platform ceiling — see BACKFILL_MAX_MESSAGES
 
 _backfill_inflight: set[str] = set()  # video_ids currently backfilling
 _backfill_lock = threading.Lock()     # guards the set + throttle clock
@@ -208,12 +208,16 @@ def preview_backfill_status(platform: str, video_id: str) -> tuple[str, float]:
     """('idle' | 'running' | 'done', progress 0..1) for the preview-panel
     envelope.
 
-    'running' also covers "kick owed": the video has no chat, no run in
-    flight and no recent failed attempt, so the next panel poll will start
-    the run (the shared 15 s global throttle only delays it). 'idle' =
-    nothing will come (unknown/synthetic video, recent failed attempt) —
-    the panel stops polling. 'done' = the archive already has chat (a
-    completed or previously-archived run); the panel fetches once more."""
+    'running' also covers "kick owed": the archive could still grow — no
+    rows yet, or stored rows that do NOT reach the video's end (a partial
+    capture: a backfill that died mid-sweep, ran while the broadcast was
+    still live, or a watchdog capture of only the watched window) — so the
+    next panel poll will kick an incremental resume (the shared 15 s
+    throttle + per-video 600 s cooldown bound the kick rate). 'idle' =
+    nothing will come (unknown/synthetic video, or the terminal no-chat
+    marker: a done job proved the API has nothing — comments disabled /
+    purged) — the panel stops polling. 'done' = stored chat covers the
+    whole video; the panel fetches once more."""
     if (platform or "").strip().lower() != "twitch":
         return "idle", 0.0
     if not video_id or not re.fullmatch(r"[0-9]+", video_id):
@@ -221,12 +225,12 @@ def preview_backfill_status(platform: str, video_id: str) -> tuple[str, float]:
     with _backfill_lock:
         if video_id in _backfill_inflight:
             return "running", _backfill_progress.get(video_id, 0.0)
-    if archive_db.has_chat("twitch", video_id):
+    if archive_db.chat_covered("twitch", video_id):
         return "done", 1.0
     latest = archive_db.latest_job("twitch", video_id, kind="chat")
     if latest and latest["status"] in ("queued", "running"):
         return "running", 0.0  # a worker owns the fetch — panel stays bounded
-    if latest and latest["status"] == "done":
+    if latest and latest["status"] == "done" and not archive_db.has_chat("twitch", video_id):
         # Terminal no-chat marker: the backfill already proved the API has
         # nothing (comments disabled / purged) — 'idle' so the panel stops
         # polling and serves the full (empty) timeline, never re-kicking.
@@ -237,10 +241,11 @@ def preview_backfill_status(platform: str, video_id: str) -> tuple[str, float]:
     )
     if not row or not (row[0]["channel"] or "").strip():
         return "idle", 0.0
-    now = time.monotonic()
-    with _backfill_lock:
-        if now - _backfill_attempted_at.get(video_id, 0.0) < _BACKFILL_COOLDOWN_S:
-            return "idle", 0.0
+    # Kick owed: no rows yet, or rows short of the video's end. Unlike the
+    # pre-coverage build, a recent failed attempt is NOT terminal 'idle' —
+    # it keeps the panel polling and the kick's own throttle + cooldown
+    # clocks bound the retry rate, so a partial capture self-heals once the
+    # API recovers instead of freezing on the head window forever.
     return "running", 0.0
 
 

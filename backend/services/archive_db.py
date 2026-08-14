@@ -1659,6 +1659,42 @@ def has_chat(platform: str, video_id: str) -> bool:
     )
 
 
+# A VOD's stored chat "covers" the stream when the newest row sits within
+# this margin of the VOD's known duration. Chat that stops earlier is an
+# INCOMPLETE capture — a backfill that died mid-sweep (429/transient on the
+# fail-fast interactive lane), a run that happened while the broadcast was
+# still live, or a watchdog capture of only the watched window — and must be
+# resumed, not served as the full history.
+CHAT_COVERAGE_MARGIN_SEC = 120.0
+
+
+def chat_covered(
+    platform: str, video_id: str, margin_sec: float = CHAT_COVERAGE_MARGIN_SEC
+) -> bool:
+    """True when stored chat plausibly covers the whole video.
+
+    False when no rows exist (or the video row is unknown). With rows: True
+    when the video's duration is unknown (watchdog synthetic captures have
+    no duration to measure against), else True only when
+    MAX(messages.offset_sec) >= duration_sec - *margin_sec*. A short head
+    (e.g. rows 0..16 min of a 5 h VOD) reports False, so the resume paths
+    re-kick an incremental backfill that re-fetches only the missing tail
+    instead of treating the partial capture as complete. """
+    row = query(
+        """SELECT (SELECT MAX(offset_sec) FROM messages
+                  WHERE platform = ? AND video_id = ?) AS m,
+                  duration_sec
+           FROM videos WHERE platform = ? AND video_id = ?""",
+        (platform, video_id, platform, video_id),
+    )
+    if not row or row[0]["m"] is None:
+        return False
+    dur = row[0]["duration_sec"]
+    if not dur or float(dur) <= 0:
+        return True
+    return float(row[0]["m"]) >= float(dur) - float(margin_sec)
+
+
 # YouTube auto-caption tracks emit the same cue text twice (same words at
 # ~+10 ms and again ~+3.3 s — overlapping ASR cues) and the pre-fix ingest
 # stored them row-for-row; the display reads collapse such repeats. A legit

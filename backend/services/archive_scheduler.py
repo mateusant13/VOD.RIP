@@ -52,6 +52,11 @@ KICK_INGEST_LIMIT = 50
 YOUTUBE_INGEST_PER_PASS = 3          # yt-dlp extracts are slow + bot-gated
 TRANSCRIBE_QUEUE_PER_PASS = 2
 BACKFILL_MAX_MESSAGES = 100_000      # chat-backfill ceiling (worker + search kick)
+# ponytail: 100k rows is the platform ceiling for one sweep (a 12 h dense
+# VOD ~= 60-100k rows). The sweep is incremental (seeds from MAX(offset_sec)),
+# so a capped run self-heals on the next resume instead of losing chat;
+# upgrade path: persist a per-video cursor (offset_sec) with the job row if
+# a single VOD ever exceeds the cap.
 TRANSCRIBE_PRIORITY_LOW = 0
 TRANSCRIBE_PRIORITY_HIGH = 100       # transcript-source search jump-the-queue
 YOUTUBE_RETRY_BACKOFF_S = 3600.0     # bot-wall retry delay per video
@@ -329,19 +334,30 @@ def _chat_job_guard(platform: str, video_id: str, *, retry_fresh_failed: bool = 
     producer-side dedupe predicate (search auto-kick, preview kick, ingest
     kick and the scheduler all consult it).
 
-    Covered means: chat rows exist, a 'chat' job is queued/running/done, or
-    — unless *retry_fresh_failed* (the interactive lanes, where the user
-    asked NOW and the per-video cooldowns already bound the hammering) — a
-    job failed within FAILED_JOB_FRESH_S. A 'done' job on a chat-less video
-    is the terminal no-chat marker (comments disabled / purged): the
-    backfill already proved the API has nothing to return, so the video
-    stops being a kick candidate instead of being re-kicked every cooldown
-    forever."""
-    if archive_db.has_chat(platform, video_id):
+    Covered means: stored chat reaches the video's end (chat_covered — full
+    capture, or a duration-less capture there is nothing to measure), a
+    'chat' job is queued/running, or — unless *retry_fresh_failed* (the
+    interactive lanes, where the user asked NOW and the per-video cooldowns
+    already bound the hammering) — a job failed within FAILED_JOB_FRESH_S.
+    A 'done' job on a chat-less video is the terminal no-chat marker
+    (comments disabled / purged), and a 'done' job on a PARTIAL capture
+    (rows exist but the newest sits far below the video's end) is terminal
+    for the scheduler — but NOT for the user-facing lanes
+    (retry_fresh_failed=True): opening the chat / searching is the user
+    asking for the full history NOW, and the resume run is incremental
+    (seeds from MAX(offset_sec)), so it only re-fetches the missing tail
+    and self-heals a mid-sweep failure or a pre-publication empty run."""
+    if archive_db.chat_covered(platform, video_id):
         return True
     latest = archive_db.latest_job(platform, video_id, kind="chat")
-    if latest and latest["status"] in ("queued", "running", "done"):
+    if latest and latest["status"] in ("queued", "running"):
         return True
+    if latest and latest["status"] == "done":
+        # Terminal markers: no-chat (done job, no rows) is permanent; a
+        # partial capture with a done job stays covered unless the user
+        # asks now (retry_fresh_failed=True) — the one bounded resume path.
+        if not archive_db.has_chat(platform, video_id) or not retry_fresh_failed:
+            return True
     if latest and latest["status"] == "failed" and not retry_fresh_failed:
         try:
             fresh = datetime.fromisoformat(latest["updated_at"]) > (
@@ -375,16 +391,20 @@ def _enqueue_chat_job(
         archive_db.enqueue_job(job_id, "chat", platform, video_id, priority=0)
         return True
     except sqlite3.IntegrityError:
-        # The row already exists (a producer race, or the stale failed job
-        # the guard passed). Re-queue a failed row IN PLACE so the stable
-        # job id never orphans a retry; queued/running/done rows are
-        # already covered by the guard above.
+        # The row already exists (a producer race, or a stale row the guard
+        # passed). Re-queue it IN PLACE so the stable job id never orphans a
+        # retry. With retry_fresh_failed=True a 'done' row can only be a
+        # PARTIAL capture the user asked to resume (the guard proved the
+        # stored chat is short of the video's end, so the no-chat marker is
+        # excluded by construction) — requeue it like a failed row.
+        allowed = ("failed", "done") if retry_fresh_failed else ("failed",)
+        marks = ",".join("?" * len(allowed))
+        now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
         cur = archive_db.execute(
             "UPDATE archive_jobs SET status='queued', error=NULL, progress=0, "
             "attempts=0, next_retry_at=NULL, updated_at=?, heartbeat=? "
-            "WHERE id=? AND status='failed'",
-            (datetime.now(timezone.utc).isoformat(timespec="seconds"),
-             datetime.now(timezone.utc).isoformat(timespec="seconds"), job_id),
+            f"WHERE id=? AND status IN ({marks})",
+            (now_iso, now_iso, job_id, *allowed),
         )
         return cur.rowcount == 1
 
