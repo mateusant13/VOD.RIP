@@ -1,9 +1,11 @@
 """Drive detection + cache relocation — stdlib only (ctypes + shutil).
 
-WS-8: large on-disk caches (whisper models, yt-dlp cache, preview temp,
-embed models) default to the drive with the most free space instead of the
-system drive. Drive enumeration uses the Win32 API via ctypes because
-``os.listdrives`` only exists on Python 3.12+ and this app ships 3.11.
+WS-8: large ephemeral on-disk caches (yt-dlp cache, temp files) default to
+the fixed drive with the most free space instead of the system drive. AI
+model weights are NOT part of this — they follow the AI-models pick
+(disk_hygiene.best_model_cache_drive: free space AND speed). Drive
+enumeration uses the Win32 API via ctypes because ``os.listdrives`` only
+exists on Python 3.12+ and this app ships 3.11.
 
 Relocation moves a cache tree across volumes with a verify step before the
 source is removed; same-volume moves are skipped (a rename/copy within one
@@ -101,7 +103,17 @@ def fixed_drives() -> List[str]:
 
 def biggest_fixed_drive() -> Optional[str]:
     """Drive root (e.g. 'D:\\') of the fixed drive with the most free space,
-    or None when no fixed drive exists (non-Windows hosts, RAM-only boxes)."""
+    or None when no fixed drive exists (non-Windows hosts, RAM-only boxes).
+
+    The heavy-cache auto pick: ephemeral data (yt-dlp http cache, temp
+    files) is written once and read once, so raw headroom beats speed — the
+    biggest free space maximizes how much archive-scale churn the cache can
+    absorb before the low-disk warning trips, and the files are re-creatable,
+    so losing them costs nothing but re-download time. Distinct from the
+    AI-models pick (best_model_cache_drive: free space AND speed — large
+    weights, downloaded once) and the data pick (fastest_disk: DB + preview
+    media need quick storage).
+    """
     best: Optional[str] = None
     best_free = -1
     for drive in fixed_drives():
@@ -193,10 +205,12 @@ def relocate_cache(src_dir, dst_dir) -> dict:
 
 # --- per-drive inventory + media classification (disk tiering) -------------
 # WS/disk-tiering: Settings > Storage picks a "heavy cache disk" (biggest
-# free space) and a "transcripts & chat data disk" (fastest). Space comes
-# from ctypes/shutil; media/bus classification comes from one cached
-# PowerShell call (Get-PhysicalDisk/Get-Partition). Every probe fails soft —
-# an unreadable drive or missing PowerShell just yields Unknown ranking.
+# free space — throwaway data), a "transcripts & chat data disk" (fastest —
+# DB + preview media), and an "AI models folder" (best value: free space +
+# speed credit — large weights, downloaded once). Space comes from
+# ctypes/shutil; media/bus classification comes from one cached PowerShell
+# call (Get-PhysicalDisk/Get-Partition). Every probe fails soft — an
+# unreadable drive or missing PowerShell just yields Unknown ranking.
 
 _LAYOUT_TTL_SEC = 60  # PowerShell classification cache TTL
 _layout_cache: dict = {}  # {"ts": float, "data": dict}

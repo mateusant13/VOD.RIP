@@ -87,7 +87,9 @@ export interface AppSettings {
   throttle_kib: number;
   ffmpeg_path: string;
   temp_folder: string;
-  /** Cache root for large on-disk caches ('' = auto -> biggest fixed drive). */
+  /** Cache root for large EPHEMERAL on-disk caches — yt-dlp cache, temp
+   * files ('' = auto -> biggest fixed drive). AI model weights live under
+   * whisper_model_cache, NOT here. */
   cache_dir?: string;
   /** Transcripts/chat data root — archive DB lives here ('' = auto ->
    * fastest usable drive; an explicit path wins). Takes effect after
@@ -123,11 +125,15 @@ export interface AppSettings {
   /** Post-merge field (VOD retention slice); absent on older backends -> default 5. */
   archive_vod_keep_count?: number;
   /** Local transcription model: faster-whisper id + HF cache dir (absent on
-   * older backends -> default large-v3-turbo + %APPDATA%/VOD.RIP/whisper-models). */
+   * older backends -> default large-v3-turbo; weights live under the AI-models
+   * folder, see whisper_model_cache). */
   whisper_model?: string;
   /** ASR engine: 'parakeet' (default) | 'whisper'. Whisper stays the
    * automatic fallback for ja/ko/zh/ar and parakeet-engine failures. */
   asr_engine?: string;
+  /** AI-models folder — home of all model weights (whisper, parakeet, embed
+   * ONNX, PANNs + tokenizers). '' = auto -> best-value drive (free space +
+   * speed). */
   whisper_model_cache?: string | null;
   /** Captions-first: skip whisper for YouTube videos that already have
    * auto-caption rows at ingest (absent on older backends -> default true). */

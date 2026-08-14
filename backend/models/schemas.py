@@ -83,9 +83,10 @@ class AppSettings(BaseModel):
     throttle_kib: int = -1
     ffmpeg_path: str = ""
     temp_folder: str = ""
-    # Cache root for large on-disk caches (whisper models, yt-dlp cache,
-    # preview temp, embed models). '' = auto -> the fixed drive with the most
-    # free space; an explicit path wins. VODRIP_CACHE_DIR env overrides both.
+    # Cache root for large ephemeral on-disk caches (yt-dlp cache,
+    # transcript-fix cache, temp files — no AI models). '' = auto -> the
+    # fixed drive with the most free space; an explicit path wins.
+    # VODRIP_CACHE_DIR env overrides both.
     cache_dir: str = ""
     # Data root for transcripts/chat (archive DB + WAL/SHM). '' = auto ->
     # the fastest usable drive (<fastest>\VOD.RIP-data); an explicit path
@@ -140,6 +141,11 @@ class AppSettings(BaseModel):
     # whisper as the fallback for ja/ko/zh/ar and parakeet-engine failures
     # regardless; this setting forces the engine for every job.
     asr_engine: str = "parakeet"
+    # AI-models folder: home of every model weight — faster-whisper
+    # checkpoints, sherpa-onnx parakeet, ONNX embedders, PANNs + tokenizers
+    # (parakeet/embed/PANNs resolve as siblings under it). None/'' = auto ->
+    # best-value drive (free space AND speed, see best_model_cache_drive);
+    # a custom path pointing at a shared HF hub dir reuses existing weights.
     whisper_model_cache: Optional[str] = None
     # Captions-first: when a YouTube video already has auto-caption rows at
     # ingest, whisper transcription skips it (default on; toggle in Disk UI).

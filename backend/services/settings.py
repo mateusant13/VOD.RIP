@@ -30,13 +30,15 @@ def _get_appdata_dir() -> Path:
 
 
 def cache_root() -> Optional[Path]:
-    """Effective root for the large on-disk caches (whisper models, yt-dlp
-    cache, preview temp, embed models).
+    """Effective root for the large ephemeral on-disk caches (yt-dlp cache,
+    transcript-fix cache, temp files). AI model weights do NOT live here —
+    they resolve under the AI-models folder (whisper_model_cache).
 
     Precedence: VODRIP_CACHE_DIR env (test/portable override) ->
     settings.cache_dir (explicit path) -> biggest fixed drive + VOD.RIP-cache
-    (auto) -> None (each cache keeps its historical default — e.g. non-Windows
-    hosts with no fixed drive to pick). Per-cache env knobs
+    (auto: most free space — throwaway data grows with the archive, so
+    headroom beats speed) -> None (each cache keeps its historical default —
+    e.g. non-Windows hosts with no fixed drive to pick). Per-cache env knobs
     (VODRIP_WHISPER_CACHE, VODRIP_EMBED_CACHE) are checked by each cache's own
     resolver BEFORE this — env always wins over the setting.
     """

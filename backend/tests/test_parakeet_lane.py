@@ -157,12 +157,21 @@ def test_langs_empty_when_lane_unavailable():
     assert at._parakeet_langs() == frozenset()
 
 
-def test_cache_dir_override_and_default_sibling(tmp_path, monkeypatch):
+def test_cache_dir_override_and_models_folder_subdir(tmp_path, monkeypatch):
     monkeypatch.setenv("VODRIP_SHERRPA_CACHE", str(tmp_path / "s"))
     assert at._parakeet_cache_dir() == tmp_path / "s"
     monkeypatch.delenv("VODRIP_SHERRPA_CACHE")
-    monkeypatch.setattr(at, "_cache_dir", lambda: tmp_path / "whisper-models")
-    assert at._parakeet_cache_dir() == tmp_path / "parakeet-models"
+    monkeypatch.setattr(at, "_cache_dir", lambda: tmp_path / "VOD.RIP-models")
+    # parakeet weights live UNDER the AI-models folder...
+    assert at._parakeet_cache_dir() == tmp_path / "VOD.RIP-models" / "parakeet-models"
+    # ...unless the legacy drive-root sibling still holds the model (migration:
+    # empty models-folder copy -> legacy reused, no re-download).
+    legacy = tmp_path / "parakeet-models"
+    (legacy / "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8").mkdir(parents=True)
+    assert at._parakeet_cache_dir() == legacy
+    # a populated models-folder copy wins over the legacy sibling.
+    (tmp_path / "VOD.RIP-models" / "parakeet-models" / "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8").mkdir(parents=True)
+    assert at._parakeet_cache_dir() == tmp_path / "VOD.RIP-models" / "parakeet-models"
 
 
 def test_word_assembly():
