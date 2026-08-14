@@ -383,6 +383,11 @@ const DEFAULT_SETTINGS: AppSettings = {
   ai_api_key_set: false,
 };
 
+/** Main-preview chat default: CLOSED. Only the header Chat toggle opens it
+ *  (no preview click does). Exported so the host contract is testable.
+ *  resetPreview() restores this on close, so the next preview starts closed. */
+export const PREVIEW_CHAT_DEFAULT_OPEN = false;
+
 export default function App() {
   const viewportTier = useViewportTier();
   const { t } = useI18n();
@@ -473,11 +478,11 @@ export default function App() {
     reuseSession?: { sessionId: string; trimTimeline: boolean } | null;
   } | null>(null);
   const clipOpenNoticeTimerRef = useRef<number | null>(null);
-  /** Main-preview chat open state (header toggle). Mirrors the panel's own
-   *  defaultOpen=true; reset on close so the next preview opens with chat.
-   *  The chat FLOATS over the video (see data-preview-chat-overlay), so no
-   *  layout footprint is tracked anymore. */
-  const [previewChatOpen, setPreviewChatOpen] = useState(true);
+  /** Main-preview chat open state (header toggle). The chat FLOATS over the
+   *  video (see data-preview-chat-overlay), so no layout footprint is
+   *  tracked. Starts closed; reset on close so the next preview also starts
+   *  closed. */
+  const [previewChatOpen, setPreviewChatOpen] = useState(PREVIEW_CHAT_DEFAULT_OPEN);
   /** Load start of the current preview session — any user unpause at/after
    *  this timestamp suppresses the load-complete auto-pause. */
   const previewLoadSinceRef = useRef(0);
@@ -1326,7 +1331,7 @@ export default function App() {
     setPreviewTimeUi(0);
     setPreviewPlaying(false);
     setPreviewFullscreen(false);
-    setPreviewChatOpen(true);
+    setPreviewChatOpen(false);
     setTrimPanelHeight(0);
     setPreviewLevels([]);
     setPreviewQualityLevel(0);

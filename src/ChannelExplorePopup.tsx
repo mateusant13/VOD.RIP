@@ -206,8 +206,8 @@ export default function ChannelExplorePopup({
   /** Chat-history column alongside the video; the panel reports its footprint.
    *  The container grows to panelWidth + footprint so the video never shrinks
    *  when the chat opens. The explore popup starts collapsed (strip only) so
-   *  the mini preview is player-sized by default; the main preview keeps the
-   *  chat open. */
+   *  the mini preview is player-sized by default; the main preview starts
+   *  closed too — only its header Chat toggle opens it. */
   const [chatInfo, setChatInfo] = useState<{ open: boolean; width: number }>(() => ({
     open: false,
     width: readPreviewChatPanelWidth(),

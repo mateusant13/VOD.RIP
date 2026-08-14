@@ -7,11 +7,14 @@
  * survives. Rendering the whole App is not feasible in jsdom (preview only
  * opens through the real URL→session flow), so this host mirrors the exact
  * structure App.tsx renders: preview row → player container → absolute
- * right-anchored overlay → controlled PreviewChatPanel.
+ * right-anchored overlay → controlled PreviewChatPanel. The one host state
+ * observable without a session — the chat default — is pinned directly via
+ * App's exported PREVIEW_CHAT_DEFAULT_OPEN (App.tsx imports cleanly in jsdom).
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { useState } from 'react';
+import { PREVIEW_CHAT_DEFAULT_OPEN } from './App';
 import PreviewChatPanel, { type PreviewPanelPayload } from './components/PreviewChatPanel';
 
 const PAYLOAD: PreviewPanelPayload = {
@@ -100,6 +103,13 @@ afterEach(() => {
 });
 
 describe('main preview chat overlay host', () => {
+  it('starts with the chat CLOSED — no preview click opens it; only the header toggle does', () => {
+    // Host contract: the main preview's chat must NOT auto-open. App's state
+    // is initialized from this exported constant (and reset to it on close),
+    // so flipping the default back to open breaks this test.
+    expect(PREVIEW_CHAT_DEFAULT_OPEN).toBe(false);
+  });
+
   it('renders as an absolute overlay inside the player container, not a row sibling', async () => {
     mockPanelFetch(PAYLOAD);
     render(<ChatOverlayHost open />);
