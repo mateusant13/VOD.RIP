@@ -54,6 +54,23 @@ async function kickStatus(slug) {
   $('channel').textContent = slug ? `twitch.tv/${slug}` : 'Not on a Twitch channel';
   $('enabled').checked = st.enabled === undefined ? true : !!st.enabled;
   $('player').value = st.player === 'twitch' ? 'twitch' : st.player === 'youtube' ? 'youtube' : 'kick';
+  // Popup is INERT off Twitch: no state writes, no player switches, no delete.
+  const offTwitch = !slug;
+  $('enabled').disabled = offTwitch;
+  $('player').disabled = offTwitch;
+  if (offTwitch) $('status').textContent = 'Abra uma página da Twitch para controlar o overlay.';
+  const del = $('del');
+  if (slug && tab && tab.id) {
+    del.style.display = 'block';
+    del.addEventListener('click', async () => {
+      try {
+        await chrome.tabs.sendMessage(tab.id, { type: 'ko-delete-twitch' });
+        $('status').textContent = 'Player da Twitch removido — recarregue a página para restaurar.';
+      } catch {
+        $('status').textContent = 'Recarregue a página da Twitch primeiro (extensão não injetada).';
+      }
+    });
+  }
   const m = slug ? (st.mappings && st.mappings[slug]) : undefined;
   const kickSlug = typeof m === 'string' ? m : m ? m.kick || '' : '';
   const ytVal = m && typeof m === 'object' ? m.yt || '' : '';

@@ -57,6 +57,14 @@
       font-weight: 600;
     }
     button:hover { background: #9147ff; }
+    button.danger {
+      background: transparent;
+      border: 1px solid #f87171;
+      color: #f87171;
+      margin-top: 10px;
+      width: 100%;
+    }
+    button.danger:hover { background: rgba(248, 113, 113, 0.12); }
     .status { margin-top: 10px; font-size: 12px; color: #adadb8; min-height: 16px; }
     .status b.ok { color: #53fc18; }
     .status b.off { color: #f87171; }
@@ -90,7 +98,8 @@
       <input type="text" id="yt" placeholder="YouTube channel (URL, @handle or UC…)" />
     </div>
     <div class="status" id="status"></div>
-    <div class="hint">Overlay the Kick or YouTube player (no Twitch ads) — switch anytime from the player itself; only one player renders at a time.</div>
+    <button id="del" class="danger" style="display:none">Deletar player Twitch</button>
+    <div class="hint">Player alternado SÓ pelo popup. O player da Twitch continua rodando (mudo) embaixo do overlay — ads passam em silêncio e voltar pra Twitch cai ao vivo. "Deletar player Twitch" remove o player nativo pra conferir que o vídeo visível é o overlay; recarregue a página pra restaurar.</div>
   </div>
   <script src="popup.js"></script>
 </body>

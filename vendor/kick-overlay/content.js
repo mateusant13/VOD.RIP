@@ -81,6 +81,8 @@ const KO = {
   kickStreamStart: null, // v1/video created_at (ISO-Z, absolute) — bar max base
   kickDvrFetchedAt: 0, // when kickStreamStart was captured (elapsed grows)
   kickStreamId: null, // live stream id (v2 livestream.id) — DVR entry match
+  twDeleted: false, // user deleted the Twitch player (popup) — restored on reload
+  lastRect: null,   // last Twitch player rect (keeps the overlay pinned when deleted)
   dvrFetchedFor: null, // playback_url the DVR source was fetched for (once per url)
   ytVol: 100,       // user's youtube volume (persisted, applied on show)
   ytState: { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, error: 0 },
@@ -90,6 +92,7 @@ const KO = {
   twWasPlaying: false, // Twitch was playing when we paused it → resume on switch back
   seeking: false,
   reconnectCount: 0,
+  stableSince: null, // epoch ms of the current uninterrupted Playing run (budget reset)
   pollTimer: null,
   rectTimer: null,
   spaTimer: null,
@@ -394,13 +397,26 @@ window.addEventListener('message', (ev) => {
     KO.kickState = m.st;
     KO.lastKickSt = Date.now();
     if (m.st && m.st.state === 'Playing') KO.kickEverPlayed = true;
+    // Reconnect budget replenishes only after a stable Playing stretch —
+    // a fresh url that plays 2s then errors must NOT reset the budget
+    // (that was the endless reconnect loop: ensureKick reset it per try).
+    if (m.st && m.st.state === 'Playing') {
+      if (!KO.stableSince) KO.stableSince = Date.now();
+      else if (Date.now() - KO.stableSince > 15000) KO.reconnectCount = 0;
+    } else {
+      KO.stableSince = null;
+    }
     if (KO.kickOnDvr && m.st && m.st.state === 'Ended') kickBackToLive(); // kick: replay ended → go live
     if (KO.player === 'kick') updateKickBar();
   } else if (m.t === 'ev') {
     if (m.e === 'error') {
       console.error('[ko] kick (IVS) error', m.d || '');
       diag('ivs_error', { msg: String(m.d || '').slice(0, 140), code: m.code || 0 });
-      if (KO.enabled && KO.player === 'kick' && KO.activeUrl) reconnect();
+      if (!KO.enabled || KO.player !== 'kick' || !KO.activeUrl) return;
+      // DVR errors → go live once (kick-identical: replay failure returns to
+      // the edge), never a reconnect storm. Live errors → budgeted reconnect.
+      if (KO.kickOnDvr) kickBackToLive();
+      else reconnect();
     } else if (m.e === 'rebuffering') {
       diag('ivs_rebuffer', {});
     }
@@ -421,7 +437,7 @@ function ensureKick(url) {
   KO.kickEverPlayed = false;
   KO.kickOnDvr = false;
   KO.kickDur = 0;
-  KO.reconnectCount = 0;
+  KO.stableSince = null;
   kickFrame();
   kickFetchDvr(); // replay source (best-effort, once per url)
   KO.pendingUrl = url;
@@ -497,7 +513,11 @@ function kickStartDvr(target) {
 function kickBackToLive() {
   if (KO.kickOnDvr && KO.activeUrl) {
     KO.kickOnDvr = false;
-    kickSend({ t: 'load', url: KO.activeUrl, seekTo: Number.MAX_SAFE_INTEGER });
+    // A fresh load of the live url starts AT the live edge (kick.com's
+    // goBackToLive does exactly this: switch to the live url, no seek).
+    // Reset the url timer so the transition grace covers this reload.
+    KO.kickUrlT = Date.now();
+    kickSend({ t: 'load', url: KO.activeUrl });
   } else {
     kickSend({ t: 'seekToLive' });
   }
@@ -505,11 +525,11 @@ function kickBackToLive() {
 }
 
 // ---- mute/pause model -------------------------------------------------------
-// One player renders at a time: with an overlay shown, every Twitch video is
-// muted AND paused (no decode, no composite); the hidden overlay players
-// (kick frame + yt iframe) are paused too. In twitch mode the overlay
-// players are paused and Twitch resumes (only if WE paused it — a user-set
-// pause survives).
+// One player renders at a time: the OVERLAY players (kick frame + yt iframe)
+// pause when hidden. The native Twitch player is different (user mandate
+// 2026-08-14): it KEEPS RUNNING, muted, while covered — so a Twitch ad plays
+// out inaudibly and switching back lands on live content, not on a paused ad.
+// syncMute() is what keeps it inaudible; nothing pauses it for the overlay.
 
 function syncMute() {
   const overlayShown = KO.player !== 'twitch' && !!KO.wrap && KO.wrap.style.display !== 'none';
@@ -535,21 +555,14 @@ function unmuteAll() {
   KO.muted.clear();
 }
 
+// The Twitch player runs through the overlay (muted) so ads play out in the
+// background; nothing to do here — syncMute() handles the audio.
 function pauseTwitchForOverlay() {
-  const v = twitchVideo();
-  if (!v) return;
-  if (!v.paused) {
-    KO.twWasPlaying = true;
-    v.pause();
-  }
+  /* no-op: Twitch keeps playing, muted, under the overlay (ad-through) */
 }
 
 function resumeTwitchIfOurs() {
-  const v = twitchVideo();
-  if (v && KO.twWasPlaying && v.paused) {
-    v.play().catch(() => {});
-  }
-  KO.twWasPlaying = false;
+  /* no-op: the native player was never paused; syncMute() unmutes on switch */
 }
 
 // The overlay must sit ABOVE the Twitch player but BELOW page UI that
@@ -801,12 +814,15 @@ function updateKickBar() {
   // Full-broadcast range when the stream start is known (kick.com's bar is
   // the whole broadcast, playhead riding the edge); window fallback before
   // the first DVR fetch. The max GROWS as the stream runs (wall-clock).
+  // Cap at 48h and require finite values — poisoned/NaN player readings
+  // (a bad seek, getLiveLatency() quirks) must never reach the input.
   let max = dur || 0;
-  if (KO.kickStreamStart && KO.kickDvrFetchedAt) {
+  if (Number.isFinite(KO.kickStreamStart) && KO.kickDvrFetchedAt) {
     const elapsed = (Date.now() - KO.kickStreamStart) / 1000;
     if (elapsed > max) max = elapsed;
   }
   if (!(max > 0)) max = Math.ceil(liveEdge || pos || 1);
+  if (!isFinite(max) || max > 172800) max = 172800; // 48h ceiling
   KO.kickDur = max;
   const head = KO.kickOnDvr ? pos : Math.max(0, max - (isFinite(lat) && lat >= 0 ? lat : 0));
   const seek = KO.wrap.querySelector('#ko-seek');
@@ -817,7 +833,8 @@ function updateKickBar() {
   }
   const behind = KO.kickOnDvr || (liveEdge !== null && lat > 3);
   if (live) live.style.display = behind ? 'block' : 'none';
-  const t = Math.floor(head);
+  let t = Math.floor(head);
+  if (!isFinite(t) || t < 0) t = 0;
   const hh = String(Math.floor(t / 3600)).padStart(2, '0');
   const mm = String(Math.floor((t % 3600) / 60)).padStart(2, '0');
   const ss = String(t % 60).padStart(2, '0');
@@ -873,7 +890,6 @@ async function probe() {
     const kl = await kickPlaybackUrl(KO.kickSlug);
     const yl = KO.ytState.live;
     setBadge(kl.live ? 'KICK' : yl ? 'YT' : 'TW', kl.live ? '#059669' : yl ? '#ff0000' : '#6b7280');
-    updateSwitchButtons();
     return;
   }
 
@@ -896,7 +912,6 @@ async function probe() {
       teardown();
       if (KO.wrap) hideWrap();
       setBadge('KICK OFF', '#6b7280');
-      updateSwitchButtons();
       return;
     }
     // Already playing on a live url? Keep it — IVS playback_urls rotate on
@@ -907,7 +922,28 @@ async function probe() {
     if (KO.activeUrl && KO.kickState && KO.kickState.state === 'Playing') {
       showKickLayer();
       setBadge('KICK', '#059669');
-      updateSwitchButtons();
+      return;
+    }
+    // Transition grace: a url younger than 25s is still loading (fresh live
+    // loads after a DVR replay take ~10s to first frames; the DVR→live
+    // switch must NOT be interrupted by a mid-load url rotation — that was
+    // the "reconnecting" loop: every 20s poll fetched a NEW playback_url
+    // and restarted the load). Failure recovery is the watchdogs' job:
+    // never-played (>15s) tears down, stuck-not-playing (>25s, below)
+    // reconnects on budget, frozen-while-playing (>8s) reconnects on budget.
+    if (KO.activeUrl && KO.kickUrlT && Date.now() - KO.kickUrlT < 25000) {
+      showKickLayer();
+      setBadge('KICK', '#059669');
+      return;
+    }
+    // Stuck not-playing watchdog: the url loaded but the player never left
+    // Idle/Ready/Buffering (e.g. a live reload after the replay that IVS
+    // won't start). Budgeted like any reconnect — a stable Playing resets
+    // the budget, so real transient failures self-heal without looping.
+    if (KO.activeUrl && KO.kickState && KO.kickState.state !== 'Playing' && KO.reconnectCount < MAX_RECONNECT) {
+      console.log('[ko] kick not-playing for 25s — reconnecting', KO.kickState.state);
+      diag('kick_stuck', { state: KO.kickState.state, ct: KO.kickState.ct });
+      reconnect();
       return;
     }
     const k = await kickPlaybackUrl(KO.kickSlug);
@@ -917,14 +953,12 @@ async function probe() {
       ensureKick(k.url);
       showKickLayer();
       setBadge('KICK', '#059669');
-      updateSwitchButtons();
       return;
     }
     console.log('[ko] kick offline or unreachable', KO.kickSlug, JSON.stringify(k));
     diag('kick_offline', { slug: KO.kickSlug, live: k.live, url: k.url ? 'yes' : 'no' });
     setBadge('KICK OFF', '#6b7280');
     if (KO.wrap) hideWrap();
-    updateSwitchButtons();
     return;
   }
 
@@ -932,26 +966,22 @@ async function probe() {
   if (!KO.ytRaw) {
     setBadge('YT?', '#6b7280'); // no mapping — map the channel in the popup
     if (KO.wrap) hideWrap();
-    updateSwitchButtons();
     return;
   }
   await ensureYtId();
   if (!KO.ytId) {
     setBadge('YT?', '#6b7280'); // could not resolve handle → check the popup value
     if (KO.wrap) hideWrap();
-    updateSwitchButtons();
     return;
   }
   ensureYtIframe();
   if (KO.ytState.live) {
     showYtLayer();
     setBadge('YT', '#ff0000');
-    updateSwitchButtons();
     return;
   }
   setBadge('YT OFF', '#6b7280');
   if (KO.wrap) hideWrap();
-  updateSwitchButtons();
 }
 
 async function apply() {
@@ -1017,14 +1047,20 @@ function startRectLoop() {
     const overlayShown = KO.player !== 'twitch' && KO.wrap.style.display !== 'none';
     if (overlayShown) {
       if (tv) {
-        const r = tv.getBoundingClientRect();
+        KO.lastRect = tv.getBoundingClientRect();
+        const r = KO.lastRect;
         const s = KO.wrap.style;
         s.left = `${r.left}px`;
         s.top = `${r.top}px`;
         s.width = `${r.width}px`;
         s.height = `${r.height}px`;
         if (KO.wrap.style.display === 'none') showWrap();
-        pauseTwitchForOverlay(); // one rendering: Twitch pauses under the overlay
+      } else if (KO.twDeleted) {
+        // User deleted the Twitch player from the popup: keep the overlay
+        // pinned at its last rect (the whole point is seeing the overlay
+        // WITHOUT the Twitch player underneath).
+        KO.hideTicks = 0;
+        if (KO.wrap.style.display === 'none') showWrap();
       } else {
         // Debounce the hide: ad transitions / player re-layouts can briefly
         // drop the video from the tree — hiding on a single frame would blink.
@@ -1112,83 +1148,34 @@ function injectStyles() {
     '#ko-live{position:absolute;right:16px;bottom:58px;font-weight:700;color:#fff;background:#ff0000;' +
     'border-radius:999px;padding:8px 16px;box-shadow:0 2px 10px rgba(0,0,0,.55);}' +
     '#ko-live:hover{background:#ff4d4d;}' +
-    '#ko-twitchbtn,#ko-kickbtn,#ko-ytbtn{position:fixed;z-index:6;pointer-events:auto;display:none;' +
-    'background:#9147ff;color:#fff;border:0;border-radius:14px;padding:6px 14px;' +
-    'font:700 13px system-ui,sans-serif;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,.5);}' +
-    '#ko-twitchbtn:hover,#ko-kickbtn:hover,#ko-ytbtn:hover{background:#a970ff;}' +
-    '#ko-kickbtn{background:#53fc18;color:#000;}' +
-    '#ko-ytbtn{background:#ff0000;color:#fff;}';
-  (document.head || document.documentElement).appendChild(st);
+  '  (document.head || document.documentElement).appendChild(st);'
 }
 
-// Floating switch buttons: show the OTHER configured platforms' buttons.
-function buildSwitchButtons() {
-  const anchor = overlayAnchor();
-  if (!document.getElementById('ko-twitchbtn')) {
-    const b = document.createElement('button');
-    b.id = 'ko-twitchbtn';
-    b.textContent = 'TWITCH';
-    b.title = 'Show the native Twitch player (the other player pauses)';
-    b.addEventListener('click', () => setPlayer('twitch'));
-    anchor.appendChild(b);
-  }
-  if (!document.getElementById('ko-kickbtn')) {
-    const b = document.createElement('button');
-    b.id = 'ko-kickbtn';
-    b.textContent = 'KICK';
-    b.title = 'Show the Kick player (no Twitch ads)';
-    b.addEventListener('click', () => setPlayer('kick'));
-    anchor.appendChild(b);
-  }
-  if (!document.getElementById('ko-ytbtn')) {
-    const b = document.createElement('button');
-    b.id = 'ko-ytbtn';
-    b.textContent = 'YOUTUBE';
-    b.title = 'Show the YouTube player (no Twitch ads)';
-    b.addEventListener('click', () => {
-      setPlayer('youtube');
-      // Unmapped: open the popup so the user can paste the channel —
-      // the click is a user gesture, so openPopup() is allowed (127+).
-      if (!KO.ytRaw && !KO.ytId) {
-        try {
-          chrome.action.openPopup();
-        } catch {
-          /* older Chrome — badge 'YT?' is shown instead */
-        }
+// ---- popup actions ----------------------------------------------------------
+// ko-delete-twitch: remove the native Twitch player element so the user can
+// SEE that the visible video is the overlay's, not Twitch's. Restored on
+// page reload (Twitch rebuilds its player). The overlay stays pinned at the
+// last player rect.
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg && msg.type === 'ko-delete-twitch') {
+    KO.twDeleted = true;
+    const v = twitchVideo();
+    if (v) {
+      try {
+        v.pause();
+      } catch {
+        /* already gone */
       }
-    });
-    anchor.appendChild(b);
+      try {
+        v.remove();
+      } catch {
+        /* already gone */
+      }
+    }
+    diag('tw_delete', {});
+    sendResponse({ ok: true });
   }
-}
-
-// Pin the active switch buttons to the Twitch player (bottom-right row).
-function updateSwitchButtons() {
-  const ids = [];
-  if (KO.player !== 'twitch') ids.push('ko-twitchbtn');
-  if (KO.player !== 'kick') ids.push('ko-kickbtn');
-  if (KO.player !== 'youtube') ids.push('ko-ytbtn'); // always visible — unmapped click opens the popup
-  const tv = twitchVideo();
-  const shown = [];
-  let totalW = 0;
-  for (const id of ids) {
-    const el = document.getElementById(id);
-    if (!el) continue;
-    ensureAttached(el); // survive Twitch main re-renders
-    el.style.display = 'none';
-    if (!tv) continue;
-    el.style.display = 'block';
-    totalW += el.offsetWidth + 8;
-    shown.push(el);
-  }
-  if (!tv || !shown.length) return;
-  const r = tv.getBoundingClientRect();
-  let x = r.right - totalW - 12;
-  for (const el of shown) {
-    el.style.left = `${Math.max(8, x)}px`;
-    el.style.top = `${Math.max(8, r.bottom - el.offsetHeight - 12)}px`;
-    x += el.offsetWidth + 8;
-  }
-}
+});
 
 // ---- test / automation hook -------------------------------------------------
 // The page world can dispatch CustomEvent('kick-overlay:set', {detail:{...}})
@@ -1248,9 +1235,7 @@ window.addEventListener('kick-overlay:status', () => {
     await saveState();
   }
   injectStyles();
-  buildSwitchButtons();
   startWatchers();
-  setInterval(updateSwitchButtons, RECT_MS);
   diag('boot', { url: location.href.slice(0, 70), slug: currentSlug(), enabled: KO.enabled, player: KO.player, kickSlug: KO.kickSlug, hidden: document.hidden });
   // Heartbeat: full overlay state every 8s while the page is open.
   setInterval(() => {

@@ -39,6 +39,7 @@ const post = (m) => {
 // A position to apply once the next load() completes (kick-style rewind:
 // switch to the DVR url, then seek within the loaded broadcast).
 let pendingSeek = null;
+let pendingTries = 0; // seek retry budget (1/s) — give up instead of looping
 
 function sendSt() {
   let q = null;
@@ -60,31 +61,47 @@ function sendSt() {
   } catch {
     /* not ready */
   }
-  // Retry a pending rewind seek every poll until it lands. IVS drops a
-  // seekTo issued before the loaded media is seekable (first Playing can
-  // fire with an empty seekable range), so one-shot-on-Playing is not enough.
-  if (pendingSeek !== null) {
-    try {
-      const pos = p.getPosition();
-      if (pos >= pendingSeek - 1) pendingSeek = null;
-      else p.seekTo(pendingSeek);
-    } catch {
-      pendingSeek = null; // outside the timeline — give up quietly
+  // Sanitize everything that reaches the bar: a poisoned seek (or IVS
+  // quirks) can report MAX_SAFE_INTEGER / NaN positions — the content
+  // script must never format Infinity or set an insane input range.
+  let pos = 0;
+  try {
+    pos = p.getPosition();
+  } catch {
+    /* not ready */
+  }
+  if (!isFinite(pos) || pos < 0 || pos >= 1e15) pos = 0;
+  let lat = 0;
+  try {
+    lat = p.getLiveLatency();
+  } catch {
+    /* not ready */
+  }
+  if (!isFinite(lat)) lat = 0;
+  if (!isFinite(dur) || dur < 0 || dur >= 1e15) dur = 0;
+  // Retry a pending rewind seek every poll until it lands, capped — IVS
+  // drops a seekTo issued before the loaded media is seekable (first
+  // Playing can fire with an empty seekable range), but a target that
+  // never becomes reachable must give up instead of seeking forever
+  // (that "video replays every second" bug — each seek restarts playback).
+  if (pendingSeek !== null && pendingSeek < 1e15) {
+    if (pendingTries-- > 0) {
+      if (pos < pendingSeek - 1) {
+        try {
+          p.seekTo(pendingSeek);
+        } catch {
+          pendingSeek = null; // outside the timeline — give up quietly
+        }
+      } else {
+        pendingSeek = null; // landed
+      }
+    } else {
+      pendingSeek = null; // capped — stop hammering
     }
   }
   post({
     t: 'st',
-    st: {
-      state: p.getState(),
-      paused: p.isPaused(),
-      muted: p.isMuted(),
-      volume: p.getVolume(),
-      pos: p.getPosition(),
-      lat: p.getLiveLatency(),
-      dur,
-      q,
-      qcount,
-    },
+    st: { state: p.getState(), paused: p.isPaused(), muted: p.isMuted(), volume: p.getVolume(), pos, lat, dur, q, qcount },
   });
 }
 
@@ -97,7 +114,10 @@ window.addEventListener('message', (ev) => {
       try {
         pendingSeek = null;
         p.load(m.url);
-        if (m.seekTo !== undefined) pendingSeek = m.seekTo;
+        if (Number.isFinite(m.seekTo) && m.seekTo > 0 && m.seekTo < 1e15) {
+          pendingSeek = m.seekTo;
+          pendingTries = 30;
+        }
         p.play();
       } catch (e) {
         post({ t: 'ev', e: 'error', d: String(e) });
@@ -122,7 +142,7 @@ window.addEventListener('message', (ev) => {
       try {
         const lat = p.getLiveLatency();
         if (isFinite(lat) && lat > 0) p.seekTo(p.getPosition() + lat);
-        else p.seekTo(Number.MAX_SAFE_INTEGER);
+        else p.play(); // already at the edge — no MAX-hack (that poisoned pos)
       } catch (e) { /* ignore */ }
       break;
     case 'getState':
