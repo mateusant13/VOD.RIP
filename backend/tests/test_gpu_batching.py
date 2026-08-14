@@ -159,12 +159,19 @@ def test_batch_size_cpu_provider_sequential(monkeypatch):
     assert at._parakeet_batch_size() == 1
 
 
-def test_caption_seam_defaults_to_zero(monkeypatch):
-    """Absent caption hooks (not merged) read as 0 reservation / inactive."""
-    monkeypatch.delattr(at, "caption_reserved_vram_bytes", raising=False)
-    monkeypatch.delattr(at, "caption_session_active", raising=False)
+def test_caption_seams_resolve_to_real_reservation(monkeypatch):
+    """Post-merge the seams wire to the caption-priority reservation: idle ->
+    0 bytes / inactive; an active session reports its VRAM footprint."""
+    assert at._caption_session_held() is False
     assert at._caption_reserved_vram_bytes() == 0
-    assert at._caption_session_active() is False
+    try:
+        at.set_caption_session_active(True)
+        assert at._caption_session_held() is True
+        assert at._caption_reserved_vram_bytes() == (
+            at._PARAKEET_GPU_VRAM_EST + at._GPU_VRAM_HEADROOM
+        )
+    finally:
+        at.set_caption_session_active(False)
 
 
 # --- part 2: decode_streams batching (order preserved) ---------------------

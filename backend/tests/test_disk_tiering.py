@@ -106,6 +106,7 @@ def test_inventory_powershell_failure_is_unknown(monkeypatch):
     """A failed PS probe (missing powershell) degrades to Unknown ranks."""
     monkeypatch.setattr(disk_detect, "_list_drives", lambda: ["C:\\"])
     monkeypatch.setattr(disk_detect, "_run_powershell", lambda _s: None)
+    monkeypatch.setattr(disk_detect, "_layout_cache", {})  # hermetic: an earlier real probe (60 s TTL) would bypass the patched probe
     monkeypatch.setattr(
         disk_detect, "_drive_usage", lambda d: (100 * 1024**3, 50 * 1024**3)
     )

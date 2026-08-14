@@ -441,7 +441,7 @@ def _gpu_gate_try_acquire(platform: str, video_id: str) -> bool:
     is active on the GPU or a live-caption session holds it."""
     global _gpu_gate_video
     with _gpu_gate_lock:
-        if _caption_session_active():
+        if _caption_session_held():
             return False
         if _gpu_gate_video is not None and _gpu_gate_video != (platform, video_id):
             return False
@@ -1349,13 +1349,15 @@ _PARAAKEET_WINDOW_VRAM_EST = int(64 * 1024 ** 2)  # per 30 s window: features + 
 _PARAAKEET_BATCH_VRAM_SAFETY = int(512 * 1024 ** 2)  # free VRAM never committed to the batch
 
 
-def _caption_session_active() -> bool:
+def _caption_session_held() -> bool:
     """True when a live-caption session is active.
 
     Seam to the caption-priority work (WorkerCaptionPriority2): their
     ``caption_session_active()`` lands in this module; while it returns True
     the GPU sequential gate refuses new GPU dispatch. Absent (their changes
-    not merged) -> False."""
+    not merged) -> False. Named _caption_session_held (NOT _caption_session_active)
+    because that name is the reservation flag itself (bool, set by
+    set_caption_session_active) — a def here would shadow it."""
     try:
         return bool(globals().get("caption_session_active", lambda: False)())
     except Exception:
