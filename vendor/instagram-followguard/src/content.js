@@ -71,13 +71,15 @@
   };
 
   // Anchor the FAB to the right of the settings gear (12px gap).
+  const FAB_SIZE = 40;
   const positionNearSettings = () => {
     if (!host) return false;
     const gearDiv = findGearDiv();
     if (gearDiv) {
       const r = gearDiv.getBoundingClientRect();
-      const right = Math.max(8, Math.round(innerWidth - r.right + 12));
-      const top = Math.max(8, Math.round(r.top + (r.height - 52) / 2));
+      // FAB's left edge = gear's right edge + 12px.
+      const right = Math.max(8, Math.round(innerWidth - r.right - 12 - FAB_SIZE));
+      const top = Math.max(8, Math.round(r.top + (r.height - FAB_SIZE) / 2));
       host.style.right = right + 'px';
       host.style.top = top + 'px';
       return true;
@@ -96,14 +98,14 @@
     fab.title = 'IG FollowGuard — quem não te segue de volta';
     fab.setAttribute('aria-label', fab.title);
     fab.style.cssText =
-      'all:initial;display:block;width:52px;height:52px;padding:0;border:0;border-radius:50%;' +
+      'all:initial;display:block;width:40px;height:40px;padding:0;border:0;border-radius:50%;' +
       'cursor:pointer;background:linear-gradient(135deg,#feda75,#d62976,#962fbf,#4f5bd5);' +
-      'box-shadow:0 4px 16px rgba(0,0,0,.45);';
+      'box-shadow:0 3px 12px rgba(0,0,0,.45);';
 
     const icon = document.createElement('img');
     icon.src = chrome.runtime.getURL('images/icon128.png');
     icon.alt = '';
-    icon.style.cssText = 'all:initial;display:block;width:52px;height:52px;border-radius:50%;';
+    icon.style.cssText = 'all:initial;display:block;width:36px;height:36px;border-radius:50%;margin:2px;';
     fab.appendChild(icon);
 
     const togglePanel = () => {
@@ -117,7 +119,7 @@
           'z-index:2147483647;';
         // Open below the FAB, sharing its right edge.
         const top = host.style.top ? parseInt(host.style.top, 10) : 150;
-        panel.style.top = (top + 62) + 'px';
+        panel.style.top = (top + FAB_SIZE + 12) + 'px';
         panel.style.right = (host.style.right ? parseInt(host.style.right, 10) : 24) + 'px';
         shadow.appendChild(panel);
       } else {

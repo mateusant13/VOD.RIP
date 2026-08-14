@@ -51,13 +51,46 @@ function relTime(iso) {
 
 function avatarImg(u) {
   if (u.profile_pic_url) {
-    return `<img class="avatar" src="${u.profile_pic_url}" alt="" referrerpolicy="no-referrer">`;
+    // No direct src: fbcdn serves `Cross-Origin-Resource-Policy: same-origin`
+    // for no-referrer/cross-site requests, which the browser enforces on <img>
+    // (net::ERR_BLOCKED_BY_RESPONSE.NotSameOrigin — the old placeholder bug).
+    // hydrateAvatars() fetches the pic with an instagram.com referrer (CDN
+    // then answers `cross-origin`) and swaps in a same-origin blob URL.
+    const esc = String(u.profile_pic_url).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+    return `<img class="avatar" data-pic="${esc}" alt="">`;
   }
   return placeholder(u);
 }
 function placeholder(u) {
   const letter = (u.username || '?')[0].toUpperCase();
   return `<span class="avatar" style="display:inline-flex;align-items:center;justify-content:center;font-weight:700;color:#fff;background:linear-gradient(135deg,#feda75,#d62976,#962fbf,#4f5bd5)">${letter}</span>`;
+}
+
+// Resolve profile pics as same-origin blob URLs (deduped per page instance).
+const picCache = new Map(); // url -> Promise<blobUrl>
+function hydrateAvatars(root) {
+  for (const img of root.querySelectorAll('img.avatar[data-pic]')) {
+    const url = img.dataset.pic;
+    img.removeAttribute('data-pic');
+    let p = picCache.get(url);
+    if (!p) {
+      p = fetch(url, { referrer: 'https://www.instagram.com/', credentials: 'omit' })
+        .then((r) => {
+          if (!r.ok) throw new Error('http ' + r.status);
+          return r.blob();
+        })
+        .then((b) => URL.createObjectURL(b))
+        .catch((err) => { picCache.delete(url); throw err; });
+      picCache.set(url, p);
+    }
+    p.then((blobUrl) => { if (img.isConnected) img.src = blobUrl; })
+      .catch(() => {
+        if (img.isConnected) {
+          const item = img.closest('.item');
+          img.outerHTML = placeholder(item && item.dataset ? { username: item.dataset.u } : {});
+        }
+      });
+  }
 }
 
 function itemHtml(u) {
@@ -177,6 +210,7 @@ function renderList() {
       openProfile(it.dataset.u);
     };
   });
+  hydrateAvatars(el.list());
 }
 
 function renderMeta() {
