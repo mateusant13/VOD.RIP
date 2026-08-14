@@ -42,6 +42,7 @@ from services.archive_events import (  # noqa: E402
     event_classes,
     events_enabled,
     detect_events_video,
+    _checkpoint_path,
 )
 
 PLATFORM = "twitch"
