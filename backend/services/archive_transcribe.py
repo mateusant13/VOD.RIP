@@ -438,6 +438,50 @@ def _gpu_lane_plan() -> Optional[tuple[Optional[str], str]]:
     return None  # < 2 GiB — CPU lane only
 
 
+# --- live-caption session reservation ---------------------------------------
+# The real-time captioner (services.live_captions) is the MAX-priority tenant
+# while a livestream is watched: its parakeet ASR must never wait behind
+# archive whisper/parakeet GPU copies (VRAM) or CPU lanes (decode threads).
+# The captioner toggles this on first subscriber acquire / last release; the
+# planner reads it at every re-plan (run_worker start + the 30 s plan-watch),
+# so a caption session pauses the pool's GPU lane within ~_PLAN_RECHECK_S and
+# caps its CPU lanes to one quiet thread. The GPU-dispatch code paths read
+# caption_reserved_vram_bytes() for their free-VRAM budget.
+_caption_session_lock = threading.Lock()
+_caption_session_active = False
+
+
+def set_caption_session_active(active: bool) -> None:
+    """Declare (True) or clear (False) an active live-caption session.
+
+    Called by services.live_captions from the SSE request path on the first
+    subscriber acquire / last release. Idempotent and thread-safe."""
+    global _caption_session_active
+    with _caption_session_lock:
+        _caption_session_active = bool(active)
+
+
+def caption_session_active() -> bool:
+    """True while a livestream caption session is live — the archive planner
+    must yield the GPU to the captioner and keep only a quiet CPU lane."""
+    with _caption_session_lock:
+        return _caption_session_active
+
+
+def caption_reserved_vram_bytes() -> int:
+    """VRAM bytes the live captioner owns while a session is active, else 0.
+
+    The captioner's CUDA parakeet footprint on the shared card: model
+    weights (~0.7 GiB) + the CUDA EP arena, plus the standard tenant
+    headroom — _PARAKEET_GPU_VRAM_EST + _GPU_VRAM_HEADROOM, evaluated at
+    call time (both constants live in this module). The archive worker's
+    VRAM-derived decisions (batch size, sequential GPU dispatch) subtract
+    this from the measured free-VRAM allowance."""
+    if not caption_session_active():
+        return 0
+    return _PARAKEET_GPU_VRAM_EST + _GPU_VRAM_HEADROOM
+
+
 def _gpu_copies() -> int:
     """GPU model copies: VODRIP_TRANSCRIBE_GPU_COPIES (default 1) is a CEILING.
 
@@ -446,7 +490,9 @@ def _gpu_copies() -> int:
     medium int8 -> CPU); below the 2 GiB floor -> 0 copies, the CPU side of
     the hybrid plan covers the queue. A GPU model held by another process
     (live backend / the user's other ML project) also forces 0 — never
-    stack. A second copy only when the GPU is idle-ish (<70% util) AND the
+    stack; the in-process live captioner's session does the same (it owns
+    the card for real-time ASR while a livestream is watched). A second
+    copy only when the GPU is idle-ish (<70% util) AND the
     allowance fits ~2x. Probe failure (no torch / no CUDA / nvidia-smi
     absent) degrades to trusting the env cap. 0/absent -> auto (1 copy)."""
     try:
@@ -457,7 +503,8 @@ def _gpu_copies() -> int:
         configured = 1  # 0 == auto (same as absent)
     # Held check FIRST: when another process holds a GPU model the lane is
     # forced off, so measuring the 60 s-median free VRAM would be pure waste.
-    if _gpu_held_by_other():
+    if _gpu_held_by_other() or caption_session_active():
+        return 0  # a foreign process OR the live captioner holds the GPU — don't stack
         return 0  # another process holds a GPU model — don't stack
     if _gpu_lane_plan() is None:
         return 0  # measured median free VRAM < 2 GiB — CPU lane only
@@ -600,12 +647,12 @@ def _worker_plan() -> list[tuple[str, str]]:
     if device == "cpu":
         workers = _cpu_worker_ceiling() or _cpu_auto_workers()  # 0 == auto on CPU-only hosts
         slots = _ram_worker_clamp(workers, _CPU_WORKER_RSS_EST)
-        if _cpu_load_high():
-            slots = min(slots, 1)  # box contended — at most one CPU thread
+        if _cpu_load_high() or caption_session_active():
+            slots = min(slots, 1)  # contended box / live captions — at most one quiet thread
         return [("cpu", "int8")] * slots
     gpu_slots = _gpu_copies()
     cpu_slots = _ram_worker_clamp(_cpu_worker_ceiling(), _CPU_WORKER_RSS_EST)
-    if _cpu_load_high():
+    if _cpu_load_high() or caption_session_active():
         cpu_slots = min(cpu_slots, 1)
     plan: list[tuple[str, str]] = [("cpu", "int8")] * cpu_slots
     if gpu_slots:
@@ -1074,6 +1121,54 @@ def _parakeet_cuda_available() -> bool:
     return _parakeet_cuda_ok
 
 
+def _real_cuda_works() -> bool:
+    """True when torch says CUDA is actually usable (driver + compute device).
+
+    A Virtual Display Driver / broken driver has no CUDA compute, so
+    torch.cuda.is_available() is False even when the +cuda wheel is
+    installed — this is the discriminator that keeps onnxruntime's CUDA EP
+    (and its crash-prone in-process CPU fallback) away from such boxes."""
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+_offpool_cuda_ok: Optional[bool] = None  # real-CUDA probe for off-pool callers (None = unprobed)
+
+
+def _offpool_cuda_available() -> bool:
+    """True when OFF-POOL callers (the live captioner) may load the CUDA EP.
+
+    The +cuda wheel tag (_parakeet_cuda_available) is not enough: on a box
+    whose "GPU" is a Virtual Display Driver / broken driver, onnxruntime's
+    CUDA EP append raises at session-create AND the in-process CPU fallback
+    access-violates the whole process (reproduced: the captioner's CUDA
+    attempt crashed the API listener). A REAL NVIDIA GPU with a working CUDA
+    runtime is the gate — torch CUDA up AND the vendor probe. VODRIP_CAPTION_CUDA=0
+    is a hard kill switch. Probed once per process and cached; failure ->
+    CPU, the legacy safe captioner path. Runs in the captioner's WORKER
+    thread (never the API request path). Tests patch the cached flag or the
+    helper probes directly so they never import torch."""
+    if os.environ.get("VODRIP_CAPTION_CUDA", "1").strip() == "0":
+        return False
+    global _offpool_cuda_ok
+    if _offpool_cuda_ok is None:
+        ok = False
+        try:
+            ok = bool(
+                _parakeet_cuda_available()
+                and _real_cuda_works()
+                and detect_gpu_vendor() == "nvidia"
+            )
+        except Exception:
+            ok = False
+        _offpool_cuda_ok = ok
+    return _offpool_cuda_ok
+
+
 # Parakeet int8 on GPU: ~0.7 GB of weights + the CUDA EP's arena. GPU slots
 # route parakeet only when the measured free-VRAM allowance (fresh cache
 # read — never re-triggers the ~60 s median probe) leaves this much free.
@@ -1275,16 +1370,18 @@ def _parakeet_provider() -> str:
     """'cuda' on a CUDA-pinned pool slot with CUDA sherpa present, else 'cpu'.
 
     Mirrors the whisper thread's device pin. Off-pool callers (the live
-    captions worker, tests, any direct call) ALWAYS get the plain CPU int8
-    recognizer — never the CUDA EP: on a box where CUDA cannot actually
-    load (no real GPU — e.g. a Virtual Display Driver), the EP append
-    raises AND the in-process CPU fallback access-violates the process
-    (reproduced: the captioner's CUDA attempt crashed the whole API
-    listener). The real-time captioner must never touch CUDA; pool threads
-    keep their pinned slot device."""
+    captions worker, tests, any direct call) get the CUDA EP ONLY on a
+    verified real NVIDIA GPU (_offpool_cuda_available — torch CUDA up AND
+    vendor nvidia): on a box where CUDA cannot actually load (no real GPU —
+    e.g. a Virtual Display Driver), the EP append raises AND the in-process
+    CPU fallback access-violates the process (reproduced: the captioner's
+    CUDA attempt crashed the whole API listener). The probe keeps the
+    real-time captioner on CPU on such boxes while letting it use the card
+    on a real GPU (the RTX 5080 class the pool already targets). Pool
+    threads keep their pinned slot device."""
     pin = _thread_pin()
     if pin is None:
-        return "cpu"
+        return "cuda" if _offpool_cuda_available() else "cpu"
     device, _ = pin
     if device == "cuda" and _parakeet_cuda_available():
         return "cuda"

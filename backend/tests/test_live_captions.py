@@ -338,6 +338,114 @@ async def test_captioner_refcount_starts_and_stops_worker(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_release_stops_worker_mid_ingest_without_transcribing(monkeypatch):
+    """Stream-switch teardown: a release while the worker is blocked fetching
+    a segment must NOT decode/transcribe it afterwards — the old session
+    stops promptly (no zombie ASR on the old stream), the window never rolls
+    post-release, and the registry entry is removed."""
+    import threading as _threading
+
+    fetch_entered = _threading.Event()
+    released = _threading.Event()
+
+    class _BlockingPipeline(_FakePipeline):
+        def __init__(self):
+            super().__init__(
+                [PLAYLIST_2, PLAYLIST_3, PLAYLIST_4], ["window-1", "window-2"]
+            )
+            self.transcribe_calls = 0
+
+        def fetch(self, url, headers):
+            if url.endswith("seg2.ts"):
+                fetch_entered.set()
+                released.wait(timeout=5.0)  # hold the ingest until release()
+            return super().fetch(url, headers)
+
+        def decode(self, data):
+            return np.zeros(16000, dtype=np.float32)  # 1s of audio
+
+        def transcribe_window(self, audio, duration):
+            self.transcribe_calls += 1
+            return "window-1"
+
+    pipeline = _BlockingPipeline()
+    live_captions = _install_pipeline(monkeypatch, pipeline)
+
+    loop = asyncio.get_running_loop()
+    captioner = live_captions.LiveCaptioner(
+        "twitch", "srdogg", loop, window_sec=1.5, poll_sec=0.02,
+    )
+    captioner.acquire()
+    try:
+        # The worker ingested seg1 (1s buffered, one short of the 1.5s
+        # window) and is now blocked mid-ingest on seg2's fetch.
+        assert fetch_entered.wait(timeout=5.0)
+        assert pipeline.segment_fetches == ["https://edge/seg1.ts"]
+        captioner.release()  # stream switched / popup closed
+        released.set()
+        th = captioner._thread
+        assert th is not None
+        th.join(timeout=3.0)
+        assert not th.is_alive()
+        # The in-flight segment was fetched but dropped: no ASR pass on the
+        # old stream, no caption emitted after the release.
+        assert "https://edge/seg2.ts" in pipeline.segment_fetches
+        assert pipeline.transcribe_calls == 0
+        assert captioner.events.empty()
+    finally:
+        released.set()
+        captioner.release()
+        th = captioner._thread
+        if th is not None:
+            th.join(timeout=3.0)
+    assert (captioner.platform, captioner.channel) not in live_captions._CAPTIONERS
+
+
+@pytest.mark.anyio
+async def test_caption_session_reservation_toggles_with_refcount(monkeypatch):
+    """The archive GPU reservation follows the caption session across ALL
+    captioners: first acquire declares it, last release clears it, and a
+    concurrent second session keeps it active until the last one leaves
+    (idempotent releases never clear a live session)."""
+    from services import archive_transcribe as at
+
+    live_captions = _install_pipeline(monkeypatch, _FakePipeline([], []))
+    # The resolver reports offline so the workers park without network or
+    # model loads — only the reservation toggle is under test.
+    live_captions._resolve_live_master = lambda platform, channel: None
+
+    loop = asyncio.get_running_loop()
+    c1 = live_captions.LiveCaptioner("twitch", "ch1", loop, poll_sec=0.02)
+    c2 = live_captions.LiveCaptioner("twitch", "ch2", loop, poll_sec=0.02)
+    assert at.caption_session_active() is False
+    try:
+        c1.acquire()
+        assert at.caption_session_active() is True
+        c2.acquire()
+        assert at.caption_session_active() is True
+        c1.release()
+        assert at.caption_session_active() is True  # c2 still live
+        c2.release()
+        assert at.caption_session_active() is False
+        # idempotent release must not clear a live session
+        c1.acquire()
+        c2.acquire()
+        c1.release()
+        c1.release()  # double release — c2 keeps the session live
+        assert at.caption_session_active() is True
+        c2.release()
+        assert at.caption_session_active() is False
+    finally:
+        c1.release()
+        c2.release()
+        for c in (c1, c2):
+            if c._thread is not None:
+                c._thread.join(timeout=3.0)
+    assert (c1.platform, c1.channel) not in live_captions._CAPTIONERS
+    assert (c2.platform, c2.channel) not in live_captions._CAPTIONERS
+
+
+@pytest.mark.anyio
 async def test_captioner_recovers_from_transient_fetch_failures(monkeypatch):
     """A playlist fetch that fails once must not kill the loop — the next poll
     succeeds and captions keep flowing."""

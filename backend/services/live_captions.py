@@ -372,6 +372,41 @@ def _maybe_translate(
 _CAPTIONERS: dict[tuple[str, str], "LiveCaptioner"] = {}
 _REGISTRY_LOCK = threading.Lock()
 
+# Live-caption session count across ALL captioners. While >= 1 the archive
+# worker's GPU lane is paused (services.archive_transcribe holds the flag;
+# the counter makes set/unset correct when several channels are captioned
+# concurrently — the last release clears the reservation).
+_session_count = 0
+_session_lock = threading.Lock()
+
+
+def _session_begin() -> None:
+    """Declare a live-caption session (first subscriber across all captioners)."""
+    global _session_count
+    with _session_lock:
+        _session_count += 1
+        if _session_count == 1:
+            try:
+                from services import archive_transcribe as at
+
+                at.set_caption_session_active(True)
+            except Exception:
+                pass  # best-effort reservation — never break the SSE path
+
+
+def _session_end() -> None:
+    """Clear the live-caption session when the last subscriber leaves."""
+    global _session_count
+    with _session_lock:
+        _session_count = max(0, _session_count - 1)
+        if _session_count == 0:
+            try:
+                from services import archive_transcribe as at
+
+                at.set_caption_session_active(False)
+            except Exception:
+                pass
+
 
 def get_captioner(
     platform: str, channel: str, loop: asyncio.AbstractEventLoop
@@ -474,6 +509,9 @@ class LiveCaptioner:
         with self._life_lock:
             self._refcount += 1
             if self._refcount == 1:
+                # First subscriber anywhere: the archive worker must yield the
+                # GPU/CPU to the real-time captioner for the session's life.
+                _session_begin()
                 th = self._thread
                 if th is not None and th.is_alive():
                     # The last release set _stop; wait for the old thread so a
@@ -504,11 +542,16 @@ class LiveCaptioner:
 
     def release(self) -> None:
         """Refcount-- — stops the worker thread when the last subscriber
-        leaves. Idempotent-safe (refcount never goes negative)."""
+        leaves. Idempotent-safe: a second release on an already-released
+        captioner is a no-op (refcount never goes negative, the archive
+        session reservation is only cleared on the real 1->0 transition)."""
         with self._life_lock:
-            self._refcount = max(0, self._refcount - 1)
+            if self._refcount == 0:
+                return  # already released — nothing to stop or un-reserve
+            self._refcount -= 1
             if self._refcount == 0:
                 self._stop.set()
+                _session_end()
 
     # --- worker ----------------------------------------------------------
 
@@ -665,14 +708,21 @@ class LiveCaptioner:
 
     def _ingest(self, seg: dict) -> None:
         """Download, decode and buffer one segment; flush a caption when the
-        window fills."""
+        window fills. Checks _stop between the blocking steps so a release
+        (stream switch / popup close) ends the session promptly: a segment
+        already being fetched is dropped after the fetch, never decoded or
+        transcribed, and the shared window state is left untouched."""
         import numpy as np
 
         master = self._master
         data = _fetch(seg["uri"], master["headers"])
+        if self._stop.is_set():
+            return  # session ended mid-fetch — discard the segment
         samples = _decode_audio_bytes(data)
         if samples is None or len(samples) == 0:
             return
+        if self._stop.is_set():
+            return  # session ended mid-decode — don't roll the window after release
         dur = seg.get("dur") or (len(samples) / 16000.0)
         if self._origin is None and seg.get("pdt") is not None:
             # pdt is the segment's wall-clock start; stream time 0 = pdt
@@ -693,7 +743,12 @@ class LiveCaptioner:
         The window rolls either way: dead air / no speech emits nothing (a
         silent stretch must not accumulate forever), speech emits one block
         with the window's absolute stream time (PDT-anchored when the
-        playlist carries PROGRAM-DATE-TIME, else stream-relative seconds)."""
+        playlist carries PROGRAM-DATE-TIME, else stream-relative seconds).
+        A release (stream switch / popup close) mid-window skips the ASR
+        pass entirely — the old session never transcribes audio after the
+        subscriber left, and the shared buffer is left for the restart."""
+        if self._stop.is_set():
+            return  # session ended — never roll/transcribe a stale window
         audio = self._buffer
         buffer_sec = self._buffer_sec
         win_start_off = self._stream_sec - buffer_sec
