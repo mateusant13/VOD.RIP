@@ -47,6 +47,7 @@ SUPPORTED_PLATFORMS = ("twitch", "kick")
 # --- env knobs (all optional) ------------------------------------------------
 WINDOW_SEC_ENV = "VODRIP_CAPTION_WINDOW_SEC"
 POLL_SEC_ENV = "VODRIP_CAPTION_POLL_SEC"
+MAX_BACKLOG_SEC_ENV = "VODRIP_CAPTION_MAX_BACKLOG_SEC"
 # ~3s of speech is a usable caption block (~2-4 words per second of speech);
 # a 1s window would yield 2-3 words — too short to read.
 #
@@ -61,6 +62,13 @@ POLL_SEC_ENV = "VODRIP_CAPTION_POLL_SEC"
 # too short to read).
 WINDOW_SEC = 3.0
 POLL_SEC = 1.0  # media-playlist poll cadence (~1 segment ahead of the player)
+# Cap on untranscribed stale audio: after the live freezes/buffers, one poll
+# returns the whole gap; transcribing it segment-by-segment keeps captions
+# stuck on audio the player already live-synced past. Dropping the stale
+# head (see LiveCaptioner._trim_stale_head) bounds the transcript's lag —
+# the realtime-transcript contract. ~10s covers a normal hiccup and still
+# feels live; the player's own live-sync seek skips the same audio.
+_MAX_BACKLOG_SEC = 10.0
 _FLUSH_FAIL_LIMIT = 3  # consecutive ASR flush failures -> offline (never a silent dead stream)
 _MASTER_TTL_SEC = 300.0  # re-resolve the live master (fresh usher tokens)
 _MASTER_403_TTL_SEC = 60.0  # ...or sooner after a 403 (expired token)
@@ -313,6 +321,7 @@ class LiveCaptioner:
         *,
         window_sec: Optional[float] = None,
         poll_sec: Optional[float] = None,
+        max_backlog_sec: Optional[float] = None,
     ):
         self.platform = platform
         self.channel = channel
@@ -322,6 +331,11 @@ class LiveCaptioner:
         self.events: asyncio.Queue = asyncio.Queue(maxsize=_QUEUE_MAX)
         self.window_sec = window_sec if window_sec is not None else _env_float(WINDOW_SEC_ENV, WINDOW_SEC)
         self.poll_sec = poll_sec if poll_sec is not None else _env_float(POLL_SEC_ENV, POLL_SEC)
+        self.max_backlog_sec = (
+            max_backlog_sec
+            if max_backlog_sec is not None
+            else _env_float(MAX_BACKLOG_SEC_ENV, _MAX_BACKLOG_SEC)
+        )
         self._life_lock = threading.Lock()
         self._refcount = 0
         self._stop = threading.Event()
@@ -423,6 +437,7 @@ class LiveCaptioner:
                 continue
             backoff = _BACKOFF_INITIAL_SEC
             self._offline_strikes = 0
+            segments = self._trim_stale_head(segments)
             for seg in segments:
                 if self._stop.is_set():
                     return
@@ -483,6 +498,50 @@ class LiveCaptioner:
             raise _Offline("channel offline")
         logger.info("live captions %s/%s master resolved", self.platform, self.channel)
         return master
+
+    def _trim_stale_head(self, segments: list[dict]) -> list[dict]:
+        """Backlog cap — the realtime-transcript guard against falling behind.
+
+        After the live freezes/buffers/loads, one poll returns the whole gap
+        (e.g. 60s) PLUS the live edge. Transcribing it segment-by-segment
+        would keep captions stuck on audio the player has already live-synced
+        past (hls.js maxLiveSyncPlaybackRate + live-sync seek), so the
+        transcript stays behind indefinitely. Drop the stale head (including
+        any buffered pre-gap window) and keep only the newest
+        ``max_backlog_sec`` of audio; ``_stream_sec`` still
+        advances across the dropped audio so PDT-anchored caption times stay
+        exact (stream time is a timeline, not a transcription log).
+        Segment-quantized (whole segments dropped; a tail up to one segment
+        over the cap is fine and avoids splitting decoded samples).
+        """
+        cap = self.max_backlog_sec
+        if not cap or len(segments) <= 1:
+            return segments
+        durs = [s.get("dur") for s in segments]
+        if any(d is None for d in durs):
+            return segments  # unknown durations — keep every segment
+        total = sum(durs)  # type: ignore[arg-type]
+        if total <= cap:
+            return segments
+        drop_sec = total - cap
+        dropped = 0.0
+        while len(segments) > 1 and dropped + (segments[0].get("dur") or 0.0) <= drop_sec:
+            dropped += segments.pop(0)["dur"]  # type: ignore[typeddict-item]
+        if dropped > 0:
+            self._stream_sec += dropped
+            # The buffered window predates the dropped head — it is part of
+            # the stale backlog (the player live-synced past it too). Clear it
+            # so the first post-stall caption starts at the live edge; keeping
+            # it would flush a window mixing pre-gap audio with the live edge
+            # and anchor it mid-gap.
+            self._buffer = None
+            self._buffer_sec = 0.0
+            logger.info(
+                "live captions %s/%s dropped %.1fs of stale backlog (cap %.1fs) "
+                "— resyncing to live edge",
+                self.platform, self.channel, dropped, cap,
+            )
+        return segments
 
     def _ingest(self, seg: dict) -> None:
         """Download, decode and buffer one segment; flush a caption when the

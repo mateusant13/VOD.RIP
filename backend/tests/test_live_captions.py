@@ -353,6 +353,50 @@ async def test_captioner_recovers_from_transient_fetch_failures(monkeypatch):
         captioner._thread.join(timeout=3.0)
 
 
+@pytest.mark.anyio
+async def test_captioner_drops_stale_backlog_and_resyncs_to_live_edge(monkeypatch):
+    """After a freeze/buffer the poll returns the whole gap; transcribing it
+    segment-by-segment would keep captions behind the live edge. With
+    max_backlog_sec=5 and a 15x1s gap, only the newest 5s may reach the
+    transcriber, the timeline advances across the dropped head, and the
+    first caption anchors AFTER the gap (resynced to live edge)."""
+    gap = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n" + "".join(
+        f"#EXTINF:1.0,\nseg{i}.ts\n" for i in range(1, 16)
+    )
+    pipeline = _FakePipeline([gap], ["tail-window-1", "tail-window-2"])
+    live_captions = _install_pipeline(monkeypatch, pipeline)
+
+    loop = asyncio.get_running_loop()
+    captioner = live_captions.LiveCaptioner(
+        "twitch", "srdogg", loop, window_sec=1.5, poll_sec=0.02,
+        max_backlog_sec=5.0,
+    )
+    captioner.acquire()
+    try:
+        ev1, block1 = await _wait_event(captioner.events)
+        ev2, block2 = await _wait_event(captioner.events)
+        assert ev1 == "caption" and ev2 == "caption"
+        # The events are queued by the flush; the worker still ingests the
+        # remaining tail segments after the last flush (and a segment's fetch
+        # lands before its stream_sec increment) — settle on the timeline.
+        deadline = loop.time() + 5.0
+        while captioner._stream_sec < 15.0 and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+        # Only the newest 5 of the 15 seconds may be fetched/transcribed.
+        assert sorted(pipeline.segment_fetches) == [
+            f"https://edge/seg{i}.ts" for i in range(11, 16)
+        ]
+        # First caption starts after the dropped gap — at the live edge.
+        assert block1["start"] == pytest.approx(10.0)
+        assert block2["start"] == pytest.approx(12.0)
+        # Timeline accounts for the dropped audio (10s dropped + 5s ingested).
+        assert captioner._stream_sec == pytest.approx(15.0)
+    finally:
+        captioner.release()
+        captioner._thread.join(timeout=3.0)
+    assert (captioner.platform, captioner.channel) not in live_captions._CAPTIONERS
+
+
 # ---------------------------------------------------------------------------
 # Parakeet wiring (ASR functions stubbed)
 # ---------------------------------------------------------------------------
