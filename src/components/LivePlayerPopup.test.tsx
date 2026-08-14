@@ -886,6 +886,83 @@ describe('LivePlayerPopup live captions', () => {
     at(4);
     expect(screen.getByText('utc')).toBeTruthy();
   });
+
+  it('A+ / A− resize the caption overlay text, clamped at the 14px floor', async () => {
+    localStorage.removeItem('vodrip.live.captionFontSize');
+    mockFetch();
+    renderPopup();
+    await screen.findByTitle('Hide captions');
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    const es = FakeEventSource.instances[0];
+    act(() => { es.fire('caption', JSON.stringify({ text: 'redimensionável', start: 0, end: 3 })); });
+
+    const overlayText = () => document.querySelector('[data-live-captions-overlay] p') as HTMLElement;
+    // Default matches the previous fixed `text-sm` (14px).
+    expect(overlayText().style.fontSize).toBe('14px');
+
+    // A− at the floor is disabled and a no-op.
+    expect((screen.getByTitle('Smaller captions') as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByTitle('Smaller captions'));
+    expect(overlayText().style.fontSize).toBe('14px');
+
+    // A+ grows in 2px steps…
+    fireEvent.click(screen.getByTitle('Larger captions'));
+    expect(overlayText().style.fontSize).toBe('16px');
+    fireEvent.click(screen.getByTitle('Larger captions'));
+    expect(overlayText().style.fontSize).toBe('18px');
+
+    // …A− shrinks back…
+    fireEvent.click(screen.getByTitle('Smaller captions'));
+    expect(overlayText().style.fontSize).toBe('16px');
+    fireEvent.click(screen.getByTitle('Smaller captions'));
+    expect(overlayText().style.fontSize).toBe('14px');
+
+    // …and clamps: another A− stays at the floor.
+    fireEvent.click(screen.getByTitle('Smaller captions'));
+    expect(overlayText().style.fontSize).toBe('14px');
+  });
+
+  it('A+ clamps at the 48px ceiling and persists the choice', async () => {
+    localStorage.removeItem('vodrip.live.captionFontSize');
+    mockFetch();
+    renderPopup();
+    await screen.findByTitle('Hide captions');
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    const es = FakeEventSource.instances[0];
+    act(() => { es.fire('caption', JSON.stringify({ text: 'gigante', start: 0, end: 3 })); });
+
+    const overlayText = () => document.querySelector('[data-live-captions-overlay] p') as HTMLElement;
+    // 17 × A+ from 14 reaches exactly 48px (14 + 17·2).
+    for (let i = 0; i < 17; i++) fireEvent.click(screen.getByTitle('Larger captions'));
+    expect(overlayText().style.fontSize).toBe('48px');
+
+    // At the ceiling the button is disabled and a further click is a no-op.
+    expect((screen.getByTitle('Larger captions') as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByTitle('Larger captions'));
+    expect(overlayText().style.fontSize).toBe('48px');
+
+    // Persisted to localStorage.
+    expect(localStorage.getItem('vodrip.live.captionFontSize')).toBe('48');
+  });
+
+  it('restores a persisted caption font size on remount', async () => {
+    localStorage.setItem('vodrip.live.captionFontSize', '30');
+    mockFetch();
+    const view = renderPopup();
+    await screen.findByTitle('Hide captions');
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    const es = FakeEventSource.instances[0];
+    act(() => { es.fire('caption', JSON.stringify({ text: 'persistida', start: 0, end: 3 })); });
+    expect((document.querySelector('[data-live-captions-overlay] p') as HTMLElement).style.fontSize).toBe('30px');
+
+    // Remount — the preference survives the popup reopen.
+    view.unmount();
+    renderPopup();
+    await screen.findByTitle('Hide captions');
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(2));
+    act(() => { FakeEventSource.instances[1].fire('caption', JSON.stringify({ text: 'persistida de novo', start: 0, end: 3 })); });
+    expect((document.querySelector('[data-live-captions-overlay] p') as HTMLElement).style.fontSize).toBe('30px');
+  });
 });
 
 describe('LivePlayerPopup z-order', () => {
