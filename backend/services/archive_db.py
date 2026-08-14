@@ -2598,19 +2598,29 @@ def worker_heartbeat(tag: str, pid: Optional[int] = None) -> None:
     replacement daemon can detect take-over; other callers leave it None
     and the existing pid (if any) is preserved."""
     global _HB_PID_COL
-    if not _HB_PID_COL:
-        try:
-            execute("ALTER TABLE worker_heartbeats ADD COLUMN pid INTEGER")
-        except sqlite3.OperationalError as e:
-            if "duplicate column" not in str(e):
-                raise
-        _HB_PID_COL = True
-    execute(
+    sql = (
         "INSERT INTO worker_heartbeats (tag, at, pid) VALUES (?, ?, ?) "
         "ON CONFLICT(tag) DO UPDATE SET "
-        "at = excluded.at, pid = COALESCE(excluded.pid, worker_heartbeats.pid)",
-        (tag, _now_iso(), pid),
+        "at = excluded.at, pid = COALESCE(excluded.pid, worker_heartbeats.pid)"
     )
+    # _HB_PID_COL is a per-process cache, but the connection can be rebound
+    # (tests point VODRIP_ARCHIVE_DB at fresh scratch DBs; a fresh DB has no
+    # pid column). The flag alone would skip the migration on a rebound DB,
+    # so a column error self-heals: ALTER + retry once.
+    if _HB_PID_COL:
+        try:
+            execute(sql, (tag, _now_iso(), pid))
+            return
+        except sqlite3.OperationalError as e:
+            if "no column named pid" not in str(e):
+                raise
+    try:
+        execute("ALTER TABLE worker_heartbeats ADD COLUMN pid INTEGER")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e):
+            raise
+    execute(sql, (tag, _now_iso(), pid))
+    _HB_PID_COL = True
 
 
 def worker_heartbeat_owner(tag: str, age_s: int = 30) -> Optional[int]:

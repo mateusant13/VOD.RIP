@@ -400,6 +400,18 @@ def test_process_job_wires_events_hook() -> None:
     _db_check()
     seen: dict = {}
 
+    # FIX A routing: a Twitch row with NO archive file goes down the remote
+    # downloader (_transcribe_remote_twitch_kick) instead of transcribe_video.
+    # Give vid-hook a real local file so the job takes the local route and the
+    # hook wiring on transcribe_video (the patched function) is exercised.
+    _hook_media = pathlib.Path(tempfile.mkdtemp(prefix="hook-job-media-")) / "audio.wav"
+    _hook_media.write_bytes(b"RIFF" + b"\x00" * 256)
+    archive_db.upsert_video({
+        "platform": PLATFORM, "video_id": "vid-hook", "channel": "selftest",
+        "title": "hook", "status": "ready",
+        "archive_path": str(_hook_media), "duration_sec": 60.0,
+    })
+
     def fake_transcribe(platform: str, video_id: str, **kw):
         # Mirrors the real transcribe_video contract: the hook may raise but
         # must never fail the transcription; its result merges under 'events'.

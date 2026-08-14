@@ -125,6 +125,7 @@ def test_embed_models_follow_models_folder_not_cache_dir(monkeypatch, tmp_path):
     NOT the heavy cache_dir — model weights never resolve under the cache
     disk (storage-ownership fix)."""
     monkeypatch.delenv("VODRIP_EMBED_CACHE", raising=False)
+    monkeypatch.delenv("VODRIP_WHISPER_CACHE", raising=False)  # parakeet e2e sets it at collection
     monkeypatch.setenv("VODRIP_CACHE_DIR", str(tmp_path / "cache"))
     with patch("deps.settings_mgr") as mgr:
         mgr.get.return_value = SimpleNamespace(
@@ -137,6 +138,7 @@ def test_embed_models_auto_under_models_drive(monkeypatch, tmp_path):
     """Auto (no models setting): embed models resolve under the auto-picked
     models drive, never under cache_dir."""
     monkeypatch.delenv("VODRIP_EMBED_CACHE", raising=False)
+    monkeypatch.delenv("VODRIP_WHISPER_CACHE", raising=False)
     monkeypatch.setenv("VODRIP_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setattr("services.disk_hygiene.best_model_cache_drive", lambda: "H:\\")
     with patch("deps.settings_mgr") as mgr:
@@ -149,6 +151,7 @@ def test_embed_models_legacy_cache_dir_reused_until_migrated(monkeypatch, tmp_pa
     legacy <cache root>/embed-models (no re-download); a populated models
     folder wins over the legacy location."""
     monkeypatch.delenv("VODRIP_EMBED_CACHE", raising=False)
+    monkeypatch.delenv("VODRIP_WHISPER_CACHE", raising=False)
     monkeypatch.setenv("VODRIP_CACHE_DIR", str(tmp_path / "cache"))
     legacy = tmp_path / "cache" / "embed-models"
     (legacy / "e5-small-int8").mkdir(parents=True)

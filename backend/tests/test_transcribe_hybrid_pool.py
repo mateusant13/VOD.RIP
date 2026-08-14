@@ -92,6 +92,7 @@ def test_plan_env_forced_cpu_matches_cpu_host(monkeypatch):
     monkeypatch.setenv("VODRIP_WHISPER_DEVICE", "cpu")
     monkeypatch.setattr(at, "_device_override", None)
     monkeypatch.setattr(at, "_free_system_ram_bytes", lambda: 64 * GIB)
+    monkeypatch.setattr(at, "_cpu_load_high", lambda: False)  # deterministic under suite load
     at._detect_device.cache_clear()
     try:
         assert at._worker_plan() == [("cpu", "int8")] * at._cpu_auto_workers()

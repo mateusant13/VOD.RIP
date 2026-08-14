@@ -51,6 +51,7 @@ os.environ["VODRIP_ARCHIVE_DB"] = str(_DB)
 
 # Import AFTER env is set (archive_db binds its connection on import).
 from services import archive_db  # noqa: E402
+from services.archive_db import _PANEL_CHAT_SLICE_ROWS  # noqa: E402
 from routers.preview import (  # noqa: E402
     _PANEL_LIMIT_DEFAULT,
     _preview_archive_capabilities,
@@ -128,7 +129,7 @@ async def test_panel_transcript_video_strict_shape_and_order():
 
 async def test_panel_chat_only_video():
     p, vid = CHAT_ONLY_VIDEO
-    payload = await preview_panel(p, vid, limit=_PANEL_LIMIT_DEFAULT)
+    payload = await preview_panel(p, vid, limit=_PANEL_LIMIT_DEFAULT, offset_sec=None)
     assert payload["has_transcript"] is False
     assert payload["has_chat"] is True
     assert payload["transcript"] == []
@@ -138,11 +139,20 @@ async def test_panel_chat_only_video():
 
 async def test_panel_limit_and_unknown_platform():
     p, vid = CHAT_ONLY_VIDEO
-    small = await preview_panel(p, vid, limit=10)
-    assert len(small["chat"]) == 10
-    assert len(small["transcript"]) == 0
+    small = await preview_panel(p, vid, limit=10, offset_sec=None)
+    # While a Twitch chat backfill is owed the panel returns the bounded
+    # playhead window (polling contract), not the limit cap.
+    if small["backfill"] == "running":
+        assert len(small["chat"]) <= _PANEL_CHAT_SLICE_ROWS
+        assert small["chat_truncated"] is True
+    else:
+        assert len(small["chat"]) == 10
+        assert small["chat_truncated"] is False
+    # limit still caps when no backfill is owed (YouTube has no replay backfill).
+    done = await preview_panel("youtube", TRANSCRIPT_VIDEO[1], limit=10, offset_sec=None)
+    assert len(done["chat"]) == 10
     with pytest.raises(HTTPException) as exc:
-        await preview_panel("vimeo", vid)
+        await preview_panel("vimeo", vid, offset_sec=None)
     assert exc.value.status_code == 400
 
 
@@ -156,7 +166,7 @@ async def test_panel_events_mapping_and_order():
         {"start_sec": 42.0, "end_sec": 42.3, "event": "Shout", "score": 0.88},
     ])
     try:
-        payload = await preview_panel(p, vid, limit=_PANEL_LIMIT_DEFAULT)
+        payload = await preview_panel(p, vid, limit=_PANEL_LIMIT_DEFAULT, offset_sec=None)
         events = payload["events"]
         assert [e["event"] for e in events] == ["Clapping", "Laughter", "Shout"], (
             "events must come back in start_sec order"
@@ -201,7 +211,14 @@ async def test_panel_http_surface():
             "backfill", "backfill_progress", "total_rows", "chat_truncated",
         }
         assert body["has_chat"] is True and body["has_transcript"] is False
-        assert len(body["chat"]) == 5
+        # While a Twitch chat backfill is owed the panel returns the bounded
+        # playhead window (polling contract); otherwise the limit caps.
+        if body["backfill"] == "running":
+            assert len(body["chat"]) <= _PANEL_CHAT_SLICE_ROWS
+            assert body["chat_truncated"] is True
+        else:
+            assert len(body["chat"]) == 5
+            assert body["chat_truncated"] is False
         # Default limit (no ?limit=) resolves through FastAPI — must not 422.
         resp2 = await client.get("/api/preview/panel/youtube/aexkXGl9Gr4")
         assert resp2.status_code == 200
