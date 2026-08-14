@@ -376,6 +376,23 @@ def proxy_playlist(session_id: str, upstream_url: str) -> Tuple[bytes, str, dict
             200,
         )
 
+    # Instant-preview prefetch: media playlists of COMPLETED VODs are stored
+    # verbatim (a multi-hour VOD playlist is 0.5-2MB — the dominant first-play
+    # cost once the segments are cached); serve the per-session rewrite, no
+    # upstream fetch. Growing/incomplete VODs are never stored, so a hit is
+    # immutable and safe. (services/prefetch_cache.py)
+    from services.prefetch_cache import lookup_prefetched_playlist
+
+    prefetched_pl = lookup_prefetched_playlist(session, upstream_url)
+    if prefetched_pl is not None:
+        cache[upstream_url] = (prefetched_pl, now)
+        return (
+            prefetched_pl,
+            "application/vnd.apple.mpegurl",
+            {"Cache-Control": "no-cache"},
+            200,
+        )
+
     if _is_playlist_url(upstream_url):
         data, status = _fetch_and_rewrite_playlist_streaming(session, upstream_url)
         if not data.lstrip().startswith(b"#EXTM3U"):
@@ -402,6 +419,17 @@ def proxy_segment(
     session = get_session(session_id)
     if not session:
         raise ValueError("Preview session not found or expired")
+
+    # Instant-preview prefetch: the first ~8s segments of the 5 newest VODs
+    # per (channel, platform) are served from the cross-session prefix cache
+    # (raw bytes, byte-identical to upstream — see services/prefetch_cache.py).
+    # Everything past the prefix falls through to the normal path below.
+    from services.prefetch_cache import lookup_prefetched_segment
+
+    prefetched = lookup_prefetched_segment(session, upstream_url)
+    if prefetched is not None:
+        body, hdrs, status = _bytes_response_for_range(prefetched, range_header)
+        return body, _guess_content_type(upstream_url), hdrs, status
 
     cached = _read_cache(session, upstream_url)
     if cached is not None:
