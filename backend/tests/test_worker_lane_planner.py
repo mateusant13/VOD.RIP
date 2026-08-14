@@ -1,22 +1,18 @@
-"""GPU capability ladder unit tests — simulated free-VRAM tiers.
+"""GPU lane plan unit tests — parakeet-only, 2 GiB floor.
 
 The lane planner (services.archive_transcribe._gpu_lane_plan / _gpu_copies /
 _worker_plan) is a PURE function of the measured 60 s-median free-VRAM
 allowance + the nvidia-smi compute-apps/util readouts. No real hardware, no
-network, no model load: every probe is patched, so the whole ladder (6 ->
+network, no model load: every probe is patched, so the whole ladder (1.5 ->
 32 GiB cards + the sub-2 GiB floor) is pinned without a GPU.
 
-Tiers (user requirement):
-  >= 6.5 GiB -> active model fp16 (turbo fp16 on defaults); 2nd copy only
-                when util < 70% AND the allowance fits ~2x
-  >= 3.5 GiB -> active model int8 (the 6-8 GiB card sweet spot)
-  >= 2.0 GiB -> medium int8 (entry cards)
-  <  2.0 GiB -> CPU lane only (1-2 int8 copies by cores/RAM)
-The CPU lane exists at EVERY tier. int8 is the default precision; fp16 only
-when VRAM clearly allows.
+The old whisper model/precision ladder is GONE with the engine: parakeet is
+ONE int8 model on every tier. The only ladder left is the VRAM floor —
+  >= 2 GiB free allowance -> the GPU lane runs parakeet int8
+  <  2 GiB -> CPU lane only (1-2 int8 copies by cores/RAM)
+Unknown allowance (probe failure) trusts the env cap like everywhere else.
 """
 import os
-from importlib import reload
 
 from services import archive_transcribe as at
 
@@ -24,15 +20,20 @@ from services import archive_transcribe as at
 def _patched(
     free_vram_gb, *, held=False, util=None, workers="2", gpu_copies="1"
 ):
-    """Patch the planner's probes and return (lane, copies, plan)."""
+    """Patch the planner's probes and return (lane, copies, plan).
+
+    Every patched probe is RESTORED (the module-level _gpu_held_by_other
+    must stay the real tasklist probe — the held-process tests call it)."""
+    saved = {name: getattr(at, name) for name in (
+        "_gpu_free_vram_bytes", "_gpu_held_by_other", "_gpu_util",
+        "_cpu_load_high", "_free_system_ram_bytes",
+    )}
     at._gpu_free_vram_bytes = lambda: int(free_vram_gb * 1024 ** 3)
     at._gpu_held_by_other = lambda: held
     at._gpu_util = lambda: util
     at._cpu_load_high = lambda: False
     at._free_system_ram_bytes = lambda: 64 * 1024 ** 3  # RAM never binds
-    at._device_override = ("cuda", "float16")
-    at._worker_lane_model = None
-    at.model_name = lambda: "large-v3-turbo"  # pin est=6 GiB -> per-copy 8 GiB
+    at._multi_tls.pin = ("cuda", "int8")
     os.environ["VODRIP_TRANSCRIBE_WORKERS"] = workers
     os.environ["VODRIP_TRANSCRIBE_GPU_COPIES"] = gpu_copies
     try:
@@ -43,37 +44,40 @@ def _patched(
     finally:
         os.environ.pop("VODRIP_TRANSCRIBE_WORKERS", None)
         os.environ.pop("VODRIP_TRANSCRIBE_GPU_COPIES", None)
-        at._device_override = None
+        delattr(at._multi_tls, "pin")
+        for name, fn in saved.items():
+            setattr(at, name, fn)
 
 
-def test_ladder_32gb_fp16():
+def test_ladder_32gb_int8():
     lane, copies, plan = _patched(32)
-    assert lane == (None, "float16"), lane
+    assert lane == (None, "int8"), lane
     assert copies == 1, copies
-    assert plan == [("cuda", "float16"), ("cpu", "int8"), ("cpu", "int8")], plan
+    assert plan == [("cuda", "int8"), ("cpu", "int8"), ("cpu", "int8")], plan
 
 
-def test_ladder_16gb_fp16():
+def test_ladder_16gb_int8():
     lane, copies, plan = _patched(16)
-    assert lane == (None, "float16"), lane
-    assert plan[0] == ("cuda", "float16"), plan
+    assert lane == (None, "int8"), lane
+    assert plan[0] == ("cuda", "int8"), plan
 
 
-def test_ladder_8gb_fp16():
+def test_ladder_8gb_int8():
     lane, copies, plan = _patched(8)
-    assert lane == (None, "float16"), lane
-    assert plan[0] == ("cuda", "float16"), plan
+    assert lane == (None, "int8"), lane
+    assert plan[0] == ("cuda", "int8"), plan
 
 
-def test_ladder_6gb_int8_sweet_spot():
+def test_ladder_6gb_int8():
     lane, copies, plan = _patched(6)
     assert lane == (None, "int8"), lane
     assert plan[0] == ("cuda", "int8"), plan
 
 
-def test_ladder_3gb_medium_int8_entry():
+def test_ladder_3gb_int8_entry():
+    """The old 3-6 GiB 'medium int8 / fp16' rungs are one int8 plan now."""
     lane, copies, plan = _patched(3)
-    assert lane == ("medium", "int8"), lane
+    assert lane == (None, "int8"), lane
     assert plan[0] == ("cuda", "int8"), plan
 
 
@@ -95,7 +99,7 @@ def test_background_cpu_default_is_three_lanes(monkeypatch):
     [cpu,int8] x 3 (~3 GB RSS at the 1.5 GB/lane estimate vs the 22.5 GB
     free target). The env override VODRIP_TRANSCRIBE_WORKERS keeps winning
     over the default."""
-    at._device_override = ("cpu", "int8")
+    at._multi_tls.pin = ("cpu", "int8")
     monkeypatch.setenv("VODRIP_TRANSCRIBE_WORKERS", "")
     monkeypatch.setattr(at, "background_mode", lambda: True)
     monkeypatch.setattr(at, "_cpu_load_high", lambda: False)
@@ -109,13 +113,13 @@ def test_background_cpu_default_is_three_lanes(monkeypatch):
         monkeypatch.setenv("VODRIP_TRANSCRIBE_WORKERS", "1")
         assert at._worker_plan() == [("cpu", "int8")], at._worker_plan()
     finally:
-        at._device_override = None
+        delattr(at._multi_tls, "pin")
 
 
 def test_background_three_lanes_ram_clamped(monkeypatch):
     """3-lane default is RAM-clamped on a tight box (usable free < 3x the
     per-lane estimate) — never overshoots the machine."""
-    at._device_override = ("cpu", "int8")
+    at._multi_tls.pin = ("cpu", "int8")
     monkeypatch.setenv("VODRIP_TRANSCRIBE_WORKERS", "")
     monkeypatch.setattr(at, "background_mode", lambda: True)
     monkeypatch.setattr(at, "_cpu_load_high", lambda: False)
@@ -124,7 +128,7 @@ def test_background_three_lanes_ram_clamped(monkeypatch):
         plan = at._worker_plan()
         assert len(plan) <= 1, plan  # usable = 3*0.8 = 2.4 GB -> 1 lane
     finally:
-        at._device_override = None
+        delattr(at._multi_tls, "pin")
 
 
 def test_held_gpu_model_forces_cpu_lane():
@@ -137,36 +141,29 @@ def test_held_gpu_model_forces_cpu_lane():
 def test_second_copy_needs_idle_gpu_and_vram():
     """util >= 70% caps copies at 1; idle + ample VRAM allows 2+ copies.
 
-    Per-copy VRAM budget is model_est (6 GiB for turbo) + 2 GiB headroom:
-    16 GiB fits 2 copies, 32 GiB fits the configured 3."""
+    Per-copy VRAM budget is the parakeet est (2 GiB) + 2 GiB headroom:
+    16 GiB fits 3 copies, 32 GiB fits the configured 3 as well."""
     _, copies, _ = _patched(16, util=0.85, gpu_copies="3")
     assert copies == 1, copies
     _, copies, plan = _patched(16, util=0.3, gpu_copies="3")
-    assert copies == 2, copies
+    assert copies == 3, copies
     assert plan == [
-        ("cuda", "float16"), ("cuda", "float16"),
+        ("cuda", "int8"), ("cuda", "int8"), ("cuda", "int8"),
         ("cpu", "int8"), ("cpu", "int8"),
     ], plan
     _, copies, plan = _patched(32, util=0.3, gpu_copies="3")
     assert copies == 3, copies
     assert plan == [
-        ("cuda", "float16"), ("cuda", "float16"), ("cuda", "float16"),
+        ("cuda", "int8"), ("cuda", "int8"), ("cuda", "int8"),
         ("cpu", "int8"), ("cpu", "int8"),
     ], plan
 
 
-def test_vram_estimate_by_model_name():
-    at._worker_lane_model = None
-    for name, gb in (
-        ("large-v3-turbo", 6.0), ("large-v3", 10.0), ("medium", 5.0),
-        ("small", 2.0), ("base", 1.0), ("tiny", 0.6), ("weird-name", 2.0),
-    ):
-        try:
-            at.model_name = lambda _n=name: _n
-            est = at._gpu_model_vram_est()
-            assert abs(est / 1024 ** 3 - gb) < 0.01, (name, est)
-        finally:
-            reload(at)
+def test_vram_estimate_fixed_parakeet():
+    """The whisper model ladder is gone: one constant 2 GiB estimate, so a
+    GPU copy's budget (est + headroom) is 4 GiB."""
+    assert at._gpu_model_vram_est() == at._PARAKEET_GPU_VRAM_EST
+    assert at._gpu_model_vram_est() + at._GPU_VRAM_HEADROOM == 4 * 1024 ** 3
 
 
 def _fake_tasklist(stdout, mine="12345"):
@@ -239,7 +236,7 @@ def test_run_worker_swaps_pool_when_gpu_frees():
         if state["i"] < 2:  # initial plan + one watch pass: CPU-only
             state["i"] += 1
             return [("cpu", "int8"), ("cpu", "int8")]
-        return [("cuda", "float16"), ("cpu", "int8")]  # GPU freed: hybrid
+        return [("cuda", "int8"), ("cpu", "int8")]  # GPU freed: hybrid
 
     real_tpe = at.ThreadPoolExecutor
 
@@ -254,7 +251,6 @@ def test_run_worker_swaps_pool_when_gpu_frees():
     mp.setattr(at, "_claim_next_job", lambda: None)
     mp.setattr(at, "_maybe_close_idle_model", lambda: None)
     mp.setattr(at, "close_model", lambda: None)
-    mp.setattr(at, "_gpu_lane_plan", lambda: ("medium", "int8"))
     mp.setattr(at.archive_db, "worker_heartbeat", lambda *a, **k: None)
     try:
         t = threading.Thread(
@@ -280,7 +276,6 @@ def test_run_worker_swaps_pool_when_gpu_frees():
     ], calls[0]
     budget1, initargs1 = calls[1]
     assert budget1 == 2 and initargs1[0] == [
-        ("cuda", "float16"), ("cpu", "int8"),
+        ("cuda", "int8"), ("cpu", "int8"),
     ], calls[1]
-    assert initargs1[1] == "medium"  # lane model pinned on the new pool
-    assert at._worker_lane_model is None  # finally reset the pin
+    assert len(initargs1) == 1, "pool initargs carry only the plan (lane model gone)"
