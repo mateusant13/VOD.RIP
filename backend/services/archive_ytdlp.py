@@ -29,7 +29,7 @@ import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from services import archive_db, transcript_fix
 from services.chat_sinks.yt_live import _base_usec_from_info
@@ -906,7 +906,27 @@ def ingest_video(id_or_url: str, *, temp_dir: Optional[Path] = None) -> dict:
 
 # --- transcribe-time audio download ----------------------------------------
 
-def download_bestaudio(video_id: str, outdir: Path) -> Path:
+# Wall-clock cap for a bestaudio download: a throttled download (no byte
+# progress for minutes, or a crawl) must not pin a worker lane indefinitely.
+# Mirrors archive_transcribe._REMOTE_AUDIO_FETCH_TIMEOUT_S.
+_YT_DOWNLOAD_TIMEOUT_S = 30 * 60.0
+
+
+class _YtDownloadTimedOut(RuntimeError):
+    """Wall-clock cap exceeded during a bestaudio download.
+
+    TRANSIENT — the transcribe worker requeues the job (never fails it):
+    a slow CDN recovers, a dead one keeps the video's other jobs moving.
+    Raised from the progress hook, which yt-dlp propagates out of
+    extract_info (verified: hook exceptions abort the download)."""
+
+
+def download_bestaudio(
+    video_id: str, outdir: Path,
+    *,
+    progress_hook: Optional[Callable[[dict], None]] = None,
+    timeout_s: float = _YT_DOWNLOAD_TIMEOUT_S,
+) -> Path:
     """Download the best audio track of one video into outdir.
 
     Reuses the app's YouTube auth conditioning (cookies + po_token +
@@ -914,10 +934,31 @@ def download_bestaudio(video_id: str, outdir: Path) -> Path:
     guard: a gate/rate-limit failure arms the process-wide cooldown
     (services.yt_gate) and propagates so the transcribe worker requeues
     the job instead of failing it. Returns the downloaded media file
-    (webm/m4a — decode_audio handles either)."""
+    (webm/m4a — decode_audio handles either).
+
+    *progress_hook* receives every yt-dlp progress dict (status
+    'downloading'/'finished' — the transcribe worker uses it to refresh
+    the job heartbeat during the download, P1-2). *timeout_s* is a
+    wall-clock cap on the whole download; exceeding it raises
+    _YtDownloadTimedOut (transient — caller requeues, never fails)."""
     from services.ytdlp_guard import guarded_youtube_dl
 
     url = _video_url(video_id)
+    hooks: list[Callable[[dict], None]] = []
+    deadline = time.monotonic() + max(0.0, timeout_s)
+
+    def _hook(d: dict) -> None:
+        # Cap first: even a hook that only fires on byte progress still
+        # bounds the download once bytes ARE flowing (a fully-stalled
+        # download is bounded by socket_timeout + the retry ladder).
+        if time.monotonic() > deadline:
+            raise _YtDownloadTimedOut(
+                f"yt-dlp audio download exceeded {int(timeout_s)}s for {video_id}"
+            )
+        if progress_hook is not None:
+            progress_hook(d)
+
+    hooks.append(_hook)
     opts = {
         "format": "bestaudio/best",
         "quiet": True,
@@ -925,6 +966,7 @@ def download_bestaudio(video_id: str, outdir: Path) -> Path:
         "noplaylist": True,
         "socket_timeout": 30,
         "outtmpl": str(outdir / "%(id)s.%(ext)s"),
+        "progress_hooks": hooks,
         **_ytdlp_engine_opts(),
     }
     _apply_youtube_session(opts, video_id=video_id)

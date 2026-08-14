@@ -564,7 +564,21 @@ def _requeue_failed_transcribe_job(
     """Requeue one 'failed' transcribe job IN PLACE (stable job id — the
     worker never claims 'failed' rows, so this is the only way back into
     the queue). Returns True when the row was flipped; a raced enqueue
-    (row already queued by a search) leaves it untouched."""
+    (row already queued by a search) leaves it untouched.
+
+    P1-1: a job that exhausted max_attempts is NEVER requeued — the
+    worker's 3-attempt cap marked it failed as a final verdict, and
+    resurrecting it would restart the same doomed cycle (a permanently
+    failing remote VOD re-downloading ~350 MB of audio every hour)."""
+    row = archive_db.query(
+        "SELECT attempts, max_attempts FROM archive_jobs WHERE id = ?", (job_id,)
+    )
+    if row and int(row[0]["attempts"] or 0) >= int(row[0]["max_attempts"] or 3):
+        logger.info(
+            "scheduler skipped failed transcribe job %s — attempts exhausted",
+            job_id,
+        )
+        return False
     cur = archive_db.execute(
         "UPDATE archive_jobs SET status='queued', error=NULL, progress=0, "
         "updated_at=?, heartbeat=? WHERE id=? AND status='failed'",
@@ -580,10 +594,12 @@ def _enqueue_transcriptions() -> None:
     captionless rows (captions permanently unavailable). One per-pass budget
     shared by two passes:
 
-      1. Stale-failed requeue — every 'failed' transcribe job older than
-         FAILED_JOB_FRESH_S is requeued IN PLACE first, OUTSIDE the
+      1. Stale-failed requeue — 'failed' transcribe jobs older than
+         FAILED_JOB_FRESH_S are requeued IN PLACE first, OUTSIDE the
          duration window. A long VOD's job ranks beyond the LIMIT-50 window
-         and would starve forever otherwise (FIX C).
+         and would starve forever otherwise (FIX C). Capped at half the
+         per-pass budget (P1-1) so fresh candidates always get a share,
+         and jobs whose attempts are exhausted are never resurrected.
       2. Fresh window — duration-ASC candidates (shortest first), skipping
          videos with queued/running/fresh-failed work.
     """
@@ -591,16 +607,22 @@ def _enqueue_transcriptions() -> None:
     fresh_cutoff = now_utc - timedelta(seconds=FAILED_JOB_FRESH_S)
     enqueued = 0
     budget = _transcribe_budget()
+    # P1-1: pass 1 may use at most HALF the budget (0 in background mode,
+    # where the whole budget is 1) — fresh candidates always get a share
+    # instead of starving behind a wall of stale-failed requeues.
+    pass1_cap = budget // 2
     now_iso = now_utc.isoformat(timespec="seconds")
 
-    # Pass 1 — stale-failed requeue (window-independent).
+    # Pass 1 — stale-failed requeue (window-independent). Jobs whose
+    # attempts are exhausted are skipped by _requeue_failed_transcribe_job
+    # (P1-1 zombie guard) — a permanently-failing VOD never cycles here.
     for r in archive_db.query(
         """SELECT id, platform, video_id FROM archive_jobs
            WHERE kind='transcribe' AND status='failed' AND updated_at < ?
            ORDER BY updated_at ASC""",
         (fresh_cutoff.isoformat(timespec="seconds"),),
     ):
-        if enqueued >= budget:
+        if enqueued >= pass1_cap:
             break
         if not _transcribe_video_candidate(r["platform"], r["video_id"]):
             continue  # transcribed meanwhile / terminal verdict — leave failed

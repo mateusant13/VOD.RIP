@@ -531,6 +531,99 @@ def test_stale_failed_transcribe_job_requeued(scratch_db, tmp_path):
     assert job["id"] == job_id, "requeue must happen IN PLACE (stable job id)"
 
 
+def _seed_twitch(vid: str, duration_sec: float) -> None:
+    archive_db.upsert_video({
+        "platform": "twitch",
+        "video_id": vid,
+        "channel": "cellbit",
+        "title": f"vod {vid}",
+        "started_at": "2026-08-01T00:00:00Z",
+        "kind": "vod",
+        "duration_sec": duration_sec,
+    })
+
+
+def _stale_failed_job(job_id: str, attempts: int) -> None:
+    """A 'failed' transcribe job, stale beyond FAILED_JOB_FRESH_S, with the
+    given attempt tally (the worker's 3-attempt cap is max_attempts=3)."""
+    archive_db.execute(
+        "UPDATE archive_jobs SET status='failed', attempts=?, max_attempts=3, "
+        "error='decode error', updated_at='2020-01-01T00:00:00Z' WHERE id=?",
+        (attempts, job_id),
+    )
+
+
+def test_zombie_failed_transcribe_job_never_requeued(scratch_db):
+    """P1-1: a permanently-failing job (attempts exhausted — the worker's
+    3-attempt cap marked it failed as a final verdict) must never be
+    resurrected by the scheduler — neither by the stale-failed pass nor by
+    the fresh-window pass — or it would re-download the full audio every
+    hour forever."""
+    _seed_twitch("zv-0001", 3600.0)
+    job_id = "transcribe-twitch-zv-0001"
+    archive_db.enqueue_job(job_id, "transcribe", "twitch", "zv-0001", priority=0)
+    _stale_failed_job(job_id, attempts=4)
+
+    archive_scheduler._enqueue_transcriptions()
+
+    job = archive_db.latest_job("twitch", "zv-0001", kind="transcribe")
+    assert job is not None and job["status"] == "failed", (
+        "an attempts-exhausted job must stay failed"
+    )
+    assert job["id"] == job_id, "no duplicate row may be created"
+    rows = archive_db.query(
+        "SELECT COUNT(*) n FROM archive_jobs WHERE kind='transcribe' "
+        "AND platform='twitch' AND video_id='zv-0001'"
+    )
+    assert rows[0]["n"] == 1, "the zombie must not be re-enqueued anywhere"
+
+
+def test_pass1_requeue_capped_half_budget(scratch_db, monkeypatch):
+    """P1-1: pass-1 (stale-failed requeue) may use at most half the
+    per-pass budget — with a full wall of stale failures, the fresh-window
+    pass still enqueues its share."""
+    monkeypatch.delenv("VODRIP_BACKGROUND", raising=False)
+    # Video A: stale failed job, still under the attempt cap -> requeueable.
+    _seed_twitch("cap-a", 9000.0)
+    job_a = "transcribe-twitch-cap-a"
+    archive_db.enqueue_job(job_a, "transcribe", "twitch", "cap-a", priority=0)
+    _stale_failed_job(job_a, attempts=1)
+    # Video B: fresh candidate (no job yet, shortest duration wins).
+    _seed_twitch("cap-b", 60.0)
+
+    archive_scheduler._enqueue_transcriptions()
+
+    assert archive_db.latest_job("twitch", "cap-a", kind="transcribe")["status"] == "queued", (
+        "an under-cap stale failure is still requeued"
+    )
+    job_b = archive_db.latest_job("twitch", "cap-b", kind="transcribe")
+    assert job_b is not None and job_b["status"] == "queued", (
+        "P1-1: pass-2 must get its share of the budget when pass-1 is full"
+    )
+
+
+def test_background_pass1_never_starves_fresh(scratch_db, monkeypatch):
+    """P1-1 background mode: budget=1 must go ENTIRELY to the fresh
+    candidate — a stale-failed requeue can no longer consume the only slot
+    (the exact starvation the review found: 1 in background mode)."""
+    monkeypatch.setattr(archive_scheduler, "_background", lambda: True)
+    _seed_twitch("bg-a", 9000.0)
+    job_a = "transcribe-twitch-bg-a"
+    archive_db.enqueue_job(job_a, "transcribe", "twitch", "bg-a", priority=0)
+    _stale_failed_job(job_a, attempts=1)
+    _seed_twitch("bg-b", 60.0)
+
+    archive_scheduler._enqueue_transcriptions()
+
+    assert archive_db.latest_job("twitch", "bg-a", kind="transcribe")["status"] == "failed", (
+        "background pass-1 (cap 0) must not consume the single slot"
+    )
+    job_b = archive_db.latest_job("twitch", "bg-b", kind="transcribe")
+    assert job_b is not None and job_b["status"] == "queued", (
+        "the fresh candidate owns the whole background budget"
+    )
+
+
 def test_fresh_failed_transcribe_job_stays_queued_as_retry(scratch_db, tmp_path):
     """TASK10: a transient transcribe failure is auto-requeued by
     update_job (status='queued', attempts=1, next_retry_at deadline) — the

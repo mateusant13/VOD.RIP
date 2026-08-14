@@ -88,6 +88,7 @@ def _reset_router_state() -> None:
         ar._last_auto_kick = 0.0
         ar._backfill_inflight.clear()
         ar._backfill_attempted_at.clear()
+        ar._backfill_failed_resumes.clear()
 
 
 # --- 1. stable kick-lane job id + scheduler dedupe --------------------------
@@ -247,6 +248,68 @@ async def test_kick_backfill_and_preview_respect_marker(scratch_db, monkeypatch)
         )
     finally:
         _reset_router_state()
+
+
+# --- 4. P2-6: failed-resume loop breaker ------------------------------------
+
+
+def test_failed_resume_limit_stops_preview_and_auto_kick(scratch_db):
+    """P2-6: after _BACKFILL_FAILED_RESUME_LIMIT consecutive failed resume
+    fetches the re-kick loop must STOP: the panel goes terminal 'idle' (no
+    more polling), the preview kick is a no-op, and _maybe_auto_backfill
+    stops kicking the video — no more done->failed->re-kick churn on a tail
+    the API will not serve."""
+    import routers.archive as ar
+
+    _seed_video("4001")
+    with ar._backfill_lock:
+        ar._backfill_failed_resumes["4001"] = ar._BACKFILL_FAILED_RESUME_LIMIT
+
+    assert ar.preview_backfill_status("twitch", "4001")[0] == "idle", (
+        "the panel must stop polling after the failed-resume limit"
+    )
+    assert ar.kick_preview_backfill("twitch", "4001") == "", (
+        "the preview kick must be a no-op past the failed-resume limit"
+    )
+    kicked = ar._maybe_auto_backfill(
+        platform="twitch", channel=None, source="both", q="vod", video_id="4001"
+    )
+    assert kicked == [], "auto-kicks must stop past the failed-resume limit"
+    # Below the limit the same video still kicks (recovery is possible).
+    with ar._backfill_lock:
+        ar._backfill_failed_resumes["4001"] = ar._BACKFILL_FAILED_RESUME_LIMIT - 1
+    assert ar.preview_backfill_status("twitch", "4001")[0] == "running", (
+        "under the limit the panel keeps polling (self-healing tail)"
+    )
+
+
+async def test_run_backfill_tallies_and_resets_failure_streak(scratch_db, monkeypatch):
+    """_run_backfill counts each failed resume fetch and resets the streak
+    on a real (or terminal) completion."""
+    import routers.archive as ar
+
+    _seed_video("4002")
+    _reset_router_state()
+
+    def failing_backfill(channel, video_id, **kw):
+        raise RuntimeError("GQL service error")
+
+    monkeypatch.setattr(archive_twitch, "backfill_chat", failing_backfill)
+    await ar._run_backfill("4002", "cellbit")
+    with ar._backfill_lock:
+        assert ar._backfill_failed_resumes.get("4002") == 1, (
+            "a failed resume fetch must be tallied"
+        )
+
+    monkeypatch.setattr(
+        archive_twitch, "backfill_chat",
+        lambda channel, video_id, **kw: {"stopped": "end_of_chat", "inserted": 0},
+    )
+    await ar._run_backfill("4002", "cellbit")
+    with ar._backfill_lock:
+        assert ar._backfill_failed_resumes.get("4002") == 0, (
+            "a successful resume must clear the failure streak"
+        )
 
 
 # --- 3. heartbeat-stale reclaim ---------------------------------------------

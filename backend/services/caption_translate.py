@@ -32,6 +32,7 @@ activates only when the model files are already present (use
 """
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import threading
@@ -76,18 +77,31 @@ def enabled() -> bool:
     return os.environ.get(TRANSLATE_ENV, "1").strip() != "0"
 
 
-def translate_dir() -> Path:
-    """<whisper cache>/translate — the models-folder subdir for this feature.
-
-    VODRIP_TRANSLATE_MODEL_DIR overrides (tests pin scratch dirs); the
-    default follows the whisper model cache (Settings > Disk "AI Models
-    Folder"), so ALL models live under the models folder."""
-    override = os.environ.get(MODEL_DIR_ENV, "").strip()
+@functools.lru_cache(maxsize=None)
+def _resolve_translate_dir(override: str) -> Path:
+    """The env-keyed resolution underneath translate_dir — cached so the
+    live-captioner's ~2 s flush never re-runs the disk_inventory() syscall
+    ladder (whisper_cache_dir -> best_model_cache_drive enumerates drives
+    and queries free space). The env value is the cache key, so an override
+    change (tests, runtime) invalidates naturally; the presence checks in
+    nllb_dir()/slid_dir() stay LIVE (cheap is_file stats), so models that
+    appear mid-process are picked up on the next flush."""
     if override:
         return Path(override)
     from services.disk_hygiene import whisper_cache_dir  # lazy: keeps import light
 
     return whisper_cache_dir() / "translate"
+
+
+def translate_dir() -> Path:
+    """<whisper cache>/translate — the models-folder subdir for this feature.
+
+    VODRIP_TRANSLATE_MODEL_DIR overrides (tests pin scratch dirs); the
+    default follows the whisper model cache (Settings > Disk "AI Models
+    Folder"), so ALL models live under the models folder. The resolution
+    is memoized per env value (P2-7) — the settings-driven default only
+    changes on a settings change, which is rare/restart-level."""
+    return _resolve_translate_dir(os.environ.get(MODEL_DIR_ENV, "").strip())
 
 
 def nllb_dir() -> Optional[Path]:
@@ -309,15 +323,34 @@ class _CaptionTranslator:
             import ctranslate2
             import tokenizers
 
-            device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+            # P2-5: CUDA is the fast path, but the whisper/parakeet lanes
+            # hold most of the VRAM — a CUDA load can fail (OOM, driver
+            # contention) even when cuda is "available". Fall back to CPU
+            # with one log instead of dropping straight to raw captions for
+            # LOAD_RETRY_SEC: ~0.9 s/window still fits a 2 s caption budget.
+            devices = (
+                ("cuda", "cpu") if ctranslate2.get_cuda_device_count() > 0 else ("cpu",)
+            )
             # ponytail: the checkpoint is ct2-int8 (622 MB) — compute_type must
             # stay int8, matching the quantized weights; float16 would re-quantize
             # and is not available for this conversion.
             t0 = time.monotonic()
             tok = tokenizers.Tokenizer.from_file(str(d / "tokenizer.json"))
-            model = ctranslate2.Translator(
-                str(d), device=device, compute_type="int8",
-            )
+            model = None
+            device = "cpu"
+            for device in devices:
+                try:
+                    model = ctranslate2.Translator(
+                        str(d), device=device, compute_type="int8",
+                    )
+                    break
+                except Exception as exc:
+                    if device == "cuda":
+                        logger.warning(
+                            "NLLB CUDA load failed — falling back to CPU: %s", exc
+                        )
+                        continue
+                    raise
             logger.info(
                 "NLLB translator loaded in %.1fs (%s int8)", time.monotonic() - t0, device,
             )
