@@ -140,3 +140,9 @@ codeintel search "callers of schedule_youtube_window_hls_mux"
 - `--files a b c` works with space-separated paths
 - Use `--` to separate flags from question: `gpt -f a.py -- "review this"`
 - Progress prints to stderr, response to stdout
+
+## Browser Extensions
+
+- Kick Overlay (Twitch ad-kill): `vendor/kick-overlay/`
+- Cookies (VOD.RIP cookie/po_token): `vendor/cookie-extension/src/`
+
