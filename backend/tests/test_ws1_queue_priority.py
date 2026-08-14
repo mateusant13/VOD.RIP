@@ -6,9 +6,11 @@ Covers:
     the (status, priority, created_at) index;
   * enqueue_job(priority=...) threading + PK dedupe still preventing double jobs;
   * worker pick order: priority DESC, created_at ASC (FIFO within priority);
-  * preview hook: transcript-less archived video -> priority-1 transcribe job;
+  * preview hook: transcript-less archived video -> priority-200 transcribe
+    job (above the 100 search re-enqueue — the focused preview wins);
     existing queued job bumped; running job untouched; not-archived /
-    disabled / already-transcribed guards.
+    disabled / already-transcribed guards; twitch/kick enqueue even without
+    a local archive file (the worker downloads audio at job time).
 
 Env note: VODRIP_ARCHIVE_DB must be set before the first services.archive_db
 import (the module binds its connection at import), and the previous env
@@ -281,7 +283,7 @@ def test_preview_video_id_extraction():
     assert _preview_video_id("Twitch", "https://www.twitch.tv/videos/not-digits") is None
 
 
-def test_preview_hook_enqueues_priority_one_for_transcript_less():
+def test_preview_hook_enqueues_priority_two_hundred_for_transcript_less():
     for vid in (_YT1, _TT1):
         archive_db.execute("DELETE FROM videos WHERE video_id=?", (vid,))
         archive_db.execute("DELETE FROM transcripts WHERE video_id=?", (vid,))
@@ -297,14 +299,14 @@ def test_preview_hook_enqueues_priority_one_for_transcript_less():
     job = archive_db.query(
         "SELECT * FROM archive_jobs WHERE id = ?", (f"transcribe-youtube-{_YT1}",)
     )
-    assert job and job[0]["status"] == "queued" and job[0]["priority"] == 1, (
-        f"transcript-less previewed video must get a priority-1 job: {job}"
+    assert job and job[0]["status"] == "queued" and job[0]["priority"] == 200, (
+        f"transcript-less previewed video must get a priority-200 job: {job}"
     )
     job2 = archive_db.query(
         "SELECT * FROM archive_jobs WHERE id = ?", (f"transcribe-twitch-{_TT1}",)
     )
-    assert job2 and job2[0]["priority"] == 1, (
-        f"twitch previews must enqueue priority-1 transcribe jobs: {job2}"
+    assert job2 and job2[0]["priority"] == 200, (
+        f"twitch previews must enqueue priority-200 transcribe jobs: {job2}"
     )
     # a second preview must not double-enqueue (PK dedupe)
     with patch("deps.settings_mgr") as mgr:
@@ -316,6 +318,38 @@ def test_preview_hook_enqueues_priority_one_for_transcript_less():
         (_YT1,),
     )
     assert len(rows) == 1, "has_job dedupe must prevent double jobs"
+
+
+_KK1 = "1f2e3d4c-5b6a-7c8d-9e0f-1a2b3c4d5e6f"  # Kick uuid VOD id
+
+
+def test_preview_hook_enqueues_twitch_kick_without_file():
+    """FIX D: twitch/kick previews enqueue even when the archive row has no
+    file (Twitch ingest is metadata-only; an evicted row still has the VOD
+    online) — the worker downloads the audio at job time. YouTube keeps the
+    file gate (its captions-first policy decides ASR eligibility)."""
+    cases = (
+        ("twitch", _TT1, f"https://www.twitch.tv/videos/{_TT1}"),
+        ("kick", _KK1, f"https://kick.com/chan/videos/{_KK1}"),
+    )
+    for _plat, vid, _url in cases:
+        archive_db.execute("DELETE FROM videos WHERE video_id=?", (vid,))
+        archive_db.execute("DELETE FROM transcripts WHERE video_id=?", (vid,))
+        archive_db.execute("DELETE FROM archive_jobs WHERE video_id=?", (vid,))
+    # Missing file (evicted row) and NO file at all (metadata-only row).
+    _upsert("twitch", _TT1, archive_path="C:/__missing__/no-file.mp4")
+    _upsert("kick", _KK1, archive_path=None)
+    for plat, vid, url in cases:
+        with patch("deps.settings_mgr") as mgr:
+            mgr.get.return_value = SimpleNamespace(archive_smart_enrich=True)
+            _priority_transcribe_for_preview(_FakeSession(plat, url))
+    for vid in (_TT1, _KK1):
+        job = archive_db.query(
+            "SELECT * FROM archive_jobs WHERE video_id=?", (vid,)
+        )
+        assert job and job[0]["status"] == "queued" and job[0]["priority"] == 200, (
+            f"file-less {vid} preview must enqueue a priority-200 job: {job}"
+        )
 
 
 def test_preview_hook_bumps_queued_job():
@@ -332,8 +366,8 @@ def test_preview_hook_bumps_queued_job():
     job = archive_db.query(
         "SELECT * FROM archive_jobs WHERE id = ?", (f"transcribe-youtube-{_YT2}",)
     )[0]
-    assert job["status"] == "queued" and job["priority"] == 1, (
-        "an existing queued job must be bumped to priority 1"
+    assert job["status"] == "queued" and job["priority"] == 200, (
+        "an existing queued job must be bumped to priority 200"
     )
 
 

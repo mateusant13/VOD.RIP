@@ -32,6 +32,7 @@ def _force_cuda(monkeypatch) -> None:
 def _force_cpu(monkeypatch) -> None:
     monkeypatch.setattr(at, "_device_override", ("cpu", "int8"))
     monkeypatch.setattr(at, "_free_system_ram_bytes", lambda: 64 * GIB)
+    monkeypatch.setattr(at, "_cpu_load_high", lambda: False)  # not contended
 
 
 # --- _worker_plan shapes ----------------------------------------------------

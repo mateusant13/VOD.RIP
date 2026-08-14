@@ -350,6 +350,7 @@ def _parse_hls_master_variants(master_url: str, master_text: str) -> List[Dict[s
         height = int(m.group(2)) if m else 0
         bw = _HLS_BANDWIDTH_RE.search(info_line)
         fr = _HLS_FRAMERATE_RE.search(info_line)
+        nm = re.search(r'NAME="([^"]+)"', info_line)
         out.append({
             "height": height,
             "url": variant_url,
@@ -360,6 +361,9 @@ def _parse_hls_master_variants(master_url: str, master_text: str) -> List[Dict[s
             "acodec": "mp4a.40.2",
             "tbr": (int(bw.group(1)) / 1000.0) if bw else None,
             "fps": float(fr.group(1)) if fr else None,
+            # 'audio_only_64' etc. — lets the transcribe worker pick the
+            # audio-only variant for at-transcribe-time downloads.
+            "name": nm.group(1) if nm else "",
         })
     out.sort(key=lambda f: int(f.get("height") or 0), reverse=True)
     return out

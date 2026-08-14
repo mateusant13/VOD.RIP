@@ -550,11 +550,13 @@ def _cpu_auto_workers() -> int:
     raises the ceiling that used to be a flat 2. Env override
     (VODRIP_TRANSCRIBE_WORKERS) wins over this in _cpu_worker_ceiling.
 
-    Background (autostart) mode caps at 2 — nobody is at the keyboard, so
-    the box's threads go to the user's other work, not to extra model
-    copies; transcription just runs longer."""
+    Background (autostart) mode caps at 3 — nobody is at the keyboard, but
+    the 3-lane footprint (~3 GB RSS total at the 1.5 GB/lane estimate +
+    headroom) still fits the 22.5 GB-free reference box while draining the
+    queue faster than 2; VODRIP_TRANSCRIBE_WORKERS raises or lowers it and
+    the RAM/contention clamps still cap the actual slots."""
     if background_mode():
-        return 2
+        return 3
     threads = os.cpu_count() or 4
     if threads >= 32:
         return 4
@@ -810,6 +812,11 @@ def close_model() -> None:
                 logger.info("Unloading parakeet thread recognizer")
                 del parakeet
                 closed_any = True
+            vad, slot.vad = slot.vad, None
+            if vad is not None:
+                logger.info("Unloading VAD thread model")
+                del vad
+                closed_any = True
         _thread_slots.clear()
         parakeet, _parakeet_global = _parakeet_global, None
         if parakeet is not None:
@@ -855,13 +862,15 @@ _multi_tls = threading.local()  # per-thread: .active, .cpu_fallback, .pin
 
 
 class _ThreadModelSlot:
-    """One pool thread's lazy model state (whisper copy + parakeet recognizer)."""
-    __slots__ = ("model", "model_name", "parakeet")
+    """One pool thread's lazy model state (whisper copy + parakeet
+    recognizer + per-thread Silero VAD)."""
+    __slots__ = ("model", "model_name", "parakeet", "vad")
 
     def __init__(self) -> None:
         self.model: Any = None
         self.model_name: Optional[str] = None
         self.parakeet: Any = None  # sherpa-onnx OfflineRecognizer (provider per slot pin)
+        self.vad: Any = None       # per-thread Silero VAD (multi-copy mode only)
 
 
 _thread_slots: dict[int, _ThreadModelSlot] = {}
@@ -1700,8 +1709,20 @@ def _clips_to_audio(
 
 # --- VAD pre-pass ---------------------------------------------------------
 
+# _vad_lock serializes ONLY the lazy VAD load. Inference never holds it:
+# multi-copy lanes each own a per-thread Silero instance (stateful, not
+# thread-safe — see _ThreadModelSlot.vad / _get_vad) and the off-pool
+# callers that share the global instance (live captions) re-serialize in
+# vad_speech_seconds. Silero is ~2 MB per copy, so per-lane duplicates are
+# cheap vs the 3-lane throughput they unlock.
 _vad_lock = threading.Lock()
 _vad: Any = None
+
+# torch intra-op threads per VAD-carrying lane: 3 lanes x torch's default
+# 20 threads would oversubscribe the box; 4/lane is the A/B-sane ceiling
+# (VAD is CPU-bound and mostly sequential anyway — the batched pass is
+# ~170x realtime, far below any whisper/parakeet decode).
+_VAD_TORCH_THREADS = 4
 
 # Silero v5.1 (16 kHz) — mirror the legacy get_speech_timestamps call exactly:
 # threshold 0.5, neg threshold 0.35 (= threshold - 0.15), min speech 250 ms,
@@ -1720,6 +1741,25 @@ _VAD_MIN_SILENCE_MS = 200
 _VAD_PAD_MS = 30
 
 
+def _load_vad() -> Any:
+    """Build one Silero VAD model (torch .jit by default, ONNX opt-in).
+
+    Multi-lane workers pin torch intra-op threads to _VAD_TORCH_THREADS so
+    N lanes don't each grab all the box's cores (torch.set_num_threads is a
+    process-global knob — pinning it from the first loading lane covers the
+    others). Single-lane callers keep the torch default.
+    """
+    if os.environ.get("VODRIP_VAD_ONNX", "").strip() == "1":
+        return _load_onnx_vad()
+    from silero_vad import load_silero_vad
+
+    if _in_multi_mode():
+        import torch
+
+        torch.set_num_threads(_VAD_TORCH_THREADS)
+    return load_silero_vad(onnx=False)
+
+
 def _get_vad() -> Any:
     """Lazy Silero VAD model (bundled in the package — no download).
 
@@ -1734,16 +1774,26 @@ def _get_vad() -> Any:
     VODRIP_VAD_ONNX=1 switches to the bundled ONNX model via onnxruntime
     (CUDA ExecutionProvider when usable, CPU fallback) — same regions,
     still per-window because the ONNX graph runs one LSTM step per call.
+
+    Multi-copy mode (budget > 1) gives each pool thread its OWN instance —
+    the model is STATEFUL and not thread-safe, and a single shared copy
+    would serialize every lane's VAD pre-pass (plus live captions). The
+    per-thread copy lives in the thread's model slot (cleared by
+    close_model) and _vad_lock guards only the lazy load. Off-pool callers
+    (live captions, tests, direct transcribe_video calls) share the
+    process-global instance exactly as before.
     """
+    if _in_multi_mode():
+        slot = _thread_slot()
+        if slot.vad is None:
+            with _vad_lock:
+                if slot.vad is None:
+                    slot.vad = _load_vad()
+        return slot.vad
     global _vad
     with _vad_lock:
         if _vad is None:
-            if os.environ.get("VODRIP_VAD_ONNX", "").strip() == "1":
-                _vad = _load_onnx_vad()
-            else:
-                from silero_vad import load_silero_vad
-
-                _vad = load_silero_vad(onnx=False)
+            _vad = _load_vad()
         return _vad
 
 class _OnnxVad:
@@ -1751,8 +1801,8 @@ class _OnnxVad:
 
     Mirrors silero's OnnxWrapper (LSTM state + 64-sample context carried
     across per-window calls) but numpy-only — no torch conversion or .item()
-    in the loop. Not thread-safe: vad_speech_seconds serializes on
-    _vad_lock, same as the torch model."""
+    in the loop. Not thread-safe: off-pool callers that share the global
+    instance re-serialize in vad_speech_seconds; lanes never share."""
 
     def __init__(self, session: Any) -> None:
         import numpy as np
@@ -1990,16 +2040,23 @@ def vad_speech_seconds(audio: "Any") -> list[tuple[float, float]]:
     if audio is None or len(audio) == 0:
         return []  # empty audio -> no speech
     vad = _get_vad()
-    # The model is STATEFUL and not thread-safe: two workers running VAD
-    # concurrently corrupt each other's state (select() out-of-range crash,
-    # reproduced with 2 concurrent jobs). The whisper path builds per-thread
-    # model copies for the same reason; here one shared lock is enough —
-    # VAD is CPU-bound, so serializing it costs no throughput.
-    with _vad_lock:
+    # The model is STATEFUL and not thread-safe: two workers sharing one
+    # instance corrupt each other's state (select() out-of-range crash,
+    # reproduced with 2 concurrent jobs). Multi-copy lanes now each own a
+    # per-thread instance (_get_vad) so VAD runs in parallel — no lock on
+    # the lane path. Only the off-pool callers that share the global
+    # instance (live captions, direct calls) re-serialize here.
+    if _in_multi_mode():
         if isinstance(vad, _OnnxVad):
             probs = _vad_probs_onnx(audio, vad)
         else:
             probs = _vad_probs_torch(audio, vad)
+    else:
+        with _vad_lock:
+            if isinstance(vad, _OnnxVad):
+                probs = _vad_probs_onnx(audio, vad)
+            else:
+                probs = _vad_probs_torch(audio, vad)
     return _vad_regions(probs, len(audio))
 
 
@@ -2367,6 +2424,173 @@ def _transcribe_youtube_captionless(
                 shutil.rmtree(shard_dir, ignore_errors=True)
         return _transcribe_audio_source(
             "youtube", video_id, str(path), language,
+            progress_cb, events_cb, t0,
+            sharded=False, shard_dir=None,
+        )
+    finally:
+        shutil.rmtree(outdir, ignore_errors=True)
+
+
+# Wall-clock bound for an at-transcribe-time HLS audio fetch: a 6h VOD is
+# ~350 MB of audio, and a dead/slow CDN must not pin a lane forever. The
+# failure propagates to the job retry machinery (transient -> retry with
+# backoff; permanent -> 'blocked' verdict + failed job).
+_REMOTE_AUDIO_FETCH_TIMEOUT_S = 30 * 60.0
+
+
+def _is_remote_permanent_error(exc: Exception) -> bool:
+    """True when the VOD is definitively gone/restricted (never retry).
+
+    Twitch: TwitchVodUnavailable (sub-only / geo / removed) and the
+    no-playable-variants runtime error. Kick: the video API returning no
+    HLS source (deleted/unavailable VOD). Everything else (network blips,
+    gate/rate limits, the fetch timeout) is transient and retries."""
+    from services.twitch_gql_service import TwitchVodUnavailable
+
+    if isinstance(exc, TwitchVodUnavailable):
+        return True
+    msg = str(exc).lower()
+    return "no playable variant" in msg or "no hls source" in msg
+
+
+def _fetch_remote_audio_wav(platform: str, video_id: str, channel: str, out_wav: Path) -> None:
+    """Download the archived VOD's audio to a mono 16 kHz wav at transcribe time.
+
+    Twitch: GQL PlaybackAccessToken + usher VOD master (the same fast path
+    the preview proxy uses — twitch_gql_service.get_vod_playback_sync); the
+    audio-only variant is preferred so ffmpeg never pulls video packets,
+    else the LOWEST-bandwidth video variant (most Twitch VODs expose no
+    audio-only rendition) with -vn discarding the picture track.
+    Kick: the channel videos API resolves the VOD m3u8 (kick_api_service.
+    get_video_info_api) — Kick HLS has no audio-only variant, so ffmpeg
+    discards the video track (-vn). Both are bounded by
+    _REMOTE_AUDIO_FETCH_TIMEOUT_S. ffmpeg headers mirror the live-captions
+    rule: Twitch edge CDNs 403 an Origin header on segment fetches (the
+    usher master needs it, the nauth-signed segments must not carry it).
+    """
+    ffmpeg = _resolve_ffmpeg_exe()
+    headers: dict = {}
+    if platform == "twitch":
+        from services.twitch_gql_service import get_vod_playback_sync
+
+        master_url, headers, variants = get_vod_playback_sync(video_id)
+        audio_url = master_url
+        best_tbr = -1.0
+        fallback_url, fallback_tbr = None, float("inf")
+        for v in variants or []:
+            name = str(v.get("name") or "").lower()
+            tbr = float(v.get("tbr") or 0.0)
+            url = v.get("url")
+            if not url:
+                continue
+            if name.startswith("audio"):
+                if tbr > best_tbr:
+                    best_tbr, audio_url = tbr, url
+            elif tbr and tbr < fallback_tbr:
+                fallback_tbr, fallback_url = tbr, url
+        if best_tbr < 0 and fallback_url:
+            # No audio-only rendition (the common Twitch case): pull the
+            # lowest-bandwidth video variant; -vn discards the picture.
+            audio_url = fallback_url
+        headers = {k: val for k, val in headers.items() if k.lower() != "origin"}
+    else:
+        from services.kick_api_service import _BASE, get_video_info_api
+
+        url = f"{_BASE}/{channel}/videos/{video_id}"
+        info = get_video_info_api(url)
+        if not info.m3u8_url:
+            raise RuntimeError(f"Kick VOD {video_id} has no HLS source")
+        audio_url = info.m3u8_url
+        headers = {"referer": url, "origin": _BASE}
+    cmd = [ffmpeg, "-y", "-v", "error"]
+    for key, value in (headers or {}).items():
+        cmd += ["-headers", f"{key}: {value}"]
+    cmd += ["-i", audio_url, "-vn", "-ac", "1", "-ar", "16000",
+            "-f", "wav", str(out_wav)]
+    try:
+        proc = sp.run(cmd, capture_output=True, timeout=_REMOTE_AUDIO_FETCH_TIMEOUT_S)
+    except sp.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"{platform} VOD audio fetch exceeded "
+            f"{int(_REMOTE_AUDIO_FETCH_TIMEOUT_S)}s for {video_id}"
+        ) from exc
+    if proc.returncode != 0:
+        stderr = (proc.stderr or b"").decode("utf-8", "replace")[-400:]
+        raise RuntimeError(
+            f"ffmpeg HLS audio fetch failed for {platform}/{video_id}: {stderr}"
+        )
+    if not out_wav.is_file() or out_wav.stat().st_size == 0:
+        raise RuntimeError(f"ffmpeg produced no audio for {platform}/{video_id}")
+
+
+def _has_local_archive(platform: str, video_id: str) -> bool:
+    """True when the videos row owns an archive file on disk.
+
+    Mirrors transcribe_video's file gate so the dispatcher can route
+    file-less Twitch/Kick rows to the at-transcribe-time downloader."""
+    rows = archive_db.query(
+        "SELECT archive_path FROM videos WHERE platform = ? AND video_id = ?",
+        (platform, video_id),
+    )
+    if not rows:
+        return False
+    path = rows[0]["archive_path"] or ""
+    return bool(path.strip()) and os.path.isfile(path)
+
+
+def _transcribe_remote_twitch_kick(
+    platform: str,
+    video_id: str,
+    *,
+    language: Optional[str] = None,
+    progress_cb: Optional[Callable[[float, float, int, int], None]] = None,
+    events_cb: Optional[Callable[..., Optional[dict]]] = None,
+) -> dict:
+    """ASR for a Twitch/Kick VOD archived metadata-only (no local file).
+
+    Downloads the audio at transcribe time via the platform's HLS (GQL +
+    usher for Twitch, the channel videos API for Kick — see
+    _fetch_remote_audio_wav), decodes to a temp wav, then runs the shared
+    _transcribe_audio_source core (sharded when long). Permanent failures
+    (VOD deleted / sub-only / geo) mark the video transcript_kind='blocked'
+    so the scheduler never re-enqueues it (same contract as YouTube's
+    captionless route). The temp dir is removed in finally — also on
+    failure.
+    """
+    rows = archive_db.query(
+        "SELECT channel FROM videos WHERE platform = ? AND video_id = ?",
+        (platform, video_id),
+    )
+    if not rows:
+        raise FileNotFoundError(f"no archived video {platform}/{video_id}")
+    channel = rows[0]["channel"] or ""
+    outdir = Path(tempfile.mkdtemp(prefix=f"{platform}-transcribe-{video_id}-"))
+    try:
+        wav = outdir / "audio.wav"
+        try:
+            _fetch_remote_audio_wav(platform, video_id, channel, wav)
+        except Exception as exc:
+            if _is_remote_permanent_error(exc):
+                archive_db.mark_video_transcript_kind(platform, video_id, "blocked")
+                logger.warning(
+                    "%s %s audio unavailable (terminal, marked blocked): %s",
+                    platform, video_id, exc,
+                )
+            raise
+        logger.info("%s %s audio downloaded for ASR: %s", platform, video_id, wav)
+        t0 = time.monotonic()
+        if _should_shard(str(wav)):
+            shard_dir = Path(tempfile.mkdtemp(prefix="vodrip-shards-"))
+            try:
+                return _transcribe_audio_source(
+                    platform, video_id, str(wav), language,
+                    progress_cb, events_cb, t0,
+                    sharded=True, shard_dir=shard_dir,
+                )
+            finally:
+                shutil.rmtree(shard_dir, ignore_errors=True)
+        return _transcribe_audio_source(
+            platform, video_id, str(wav), language,
             progress_cb, events_cb, t0,
             sharded=False, shard_dir=None,
         )
@@ -3215,6 +3439,16 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
                 # at transcribe time via the app's yt-dlp session.
                 return _transcribe_youtube_captionless(
                     video_id,
+                    language=resolved_lang,
+                    progress_cb=_progress, events_cb=events_cb,
+                )
+            if not _has_local_archive(platform, video_id):
+                # FIX A: Twitch/Kick VODs archived metadata-only (no local
+                # file — ingest is metadata-only for Twitch, and evicted/
+                # relocated rows can point at a deleted file): download the
+                # audio at transcribe time instead of failing on the path.
+                return _transcribe_remote_twitch_kick(
+                    platform, video_id,
                     language=resolved_lang,
                     progress_cb=_progress, events_cb=events_cb,
                 )

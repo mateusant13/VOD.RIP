@@ -15,6 +15,12 @@ Covers (each fix asserts on DB rows only):
     in-memory dict as fast-path).
   - A stale failed transcribe job (>= FAILED_JOB_FRESH_S) is requeued
     IN PLACE by _enqueue_transcriptions; a fresh failure stays failed.
+  - FIX A: a 'known' Twitch row with no archive_path is a transcribe
+    candidate (audio downloaded at transcribe time).
+  - FIX B: a 'ready' row whose archive file is missing is requeued for
+    download-at-transcribe-time instead of skipped forever.
+  - FIX C: a stale-failed job for a long VOD (beyond the LIMIT-50 duration
+    window) is requeued by the window-independent failed-requeue pass.
 """
 
 import contextlib
@@ -374,6 +380,105 @@ def test_scheduler_still_enqueues_twitch_transcribe_job(scratch_db, tmp_path):
     assert job is not None, "Twitch must still get ASR jobs"
     assert job["id"] == "transcribe-twitch-tw-vid-0001", "stable job id"
     assert job["status"] == "queued"
+
+
+def test_scheduler_enqueues_known_twitch_row(scratch_db):
+    """FIX A: a 'known' Twitch row with NO archive_path (Twitch ingest is
+    metadata-only) is a transcribe candidate — the worker downloads the
+    audio at job time instead of failing on a missing file."""
+    archive_db.upsert_video({
+        "platform": "twitch",
+        "video_id": "tw-vid-0002",
+        "channel": "chan",
+        "title": "t",
+        "kind": "vod",
+        "status": "known",
+        "archive_path": None,
+        "duration_sec": 120.0,
+    })
+
+    archive_scheduler._enqueue_transcriptions()
+
+    job = archive_db.latest_job("twitch", "tw-vid-0002", kind="transcribe")
+    assert job is not None, "metadata-only Twitch rows must get ASR jobs"
+    assert job["id"] == "transcribe-twitch-tw-vid-0002", "stable job id"
+    assert job["status"] == "queued"
+
+
+def test_scheduler_requeues_ready_row_with_missing_file(scratch_db):
+    """FIX B: a 'ready' row whose archive file is gone (evicted / data-dir
+    relocation) is enqueued for download-at-transcribe-time instead of being
+    skipped forever by the is_file() gate."""
+    archive_db.upsert_video({
+        "platform": "kick",
+        "video_id": "1f2e3d4c-5b6a-7c8d-9e0f-1a2b3c4d5e6f",
+        "channel": "chan",
+        "title": "t",
+        "kind": "vod",
+        "status": "ready",
+        "archive_path": "C:/__missing__/evicted.mp4",
+        "duration_sec": 120.0,
+    })
+
+    archive_scheduler._enqueue_transcriptions()
+
+    job = archive_db.latest_job(
+        "kick", "1f2e3d4c-5b6a-7c8d-9e0f-1a2b3c4d5e6f", kind="transcribe"
+    )
+    assert job is not None, "a ready row with a missing file must be requeued"
+    assert job["status"] == "queued"
+
+
+def test_stale_failed_long_vod_requeued_outside_window(scratch_db, tmp_path):
+    """FIX C: a stale-failed job for a LONG video (ranked beyond the
+    LIMIT-50 duration window) is still requeued — the failed-requeue pass
+    runs OUTSIDE the window, so the queue can never starve it."""
+    media = tmp_path / "v.mp4"
+    media.write_bytes(b"not really media")
+    # 60 shorter ready candidates with queued jobs fill the window slice:
+    # a duration-ASC LIMIT-50 pass never sees the long video's row.
+    for i in range(60):
+        vid = f"fill-{i:02d}"
+        archive_db.upsert_video({
+            "platform": "youtube",
+            "video_id": vid,
+            "channel": "chan",
+            "title": "fill",
+            "kind": "vod",
+            "status": "ready",
+            "archive_path": str(media),
+            "duration_sec": 60.0 + i,
+        })
+        archive_db.enqueue_job(
+            f"transcribe-youtube-{vid}", "transcribe", "youtube", vid, priority=0
+        )
+
+    archive_db.upsert_video({
+        "platform": "youtube",
+        "video_id": _VID,
+        "channel": "chan",
+        "title": "long",
+        "kind": "vod",
+        "status": "ready",
+        "archive_path": str(media),
+        "duration_sec": 999999.0,
+    })
+    job_id = f"transcribe-youtube-{_VID}"
+    archive_db.enqueue_job(job_id, "transcribe", "youtube", _VID, priority=0)
+    archive_db.update_job(job_id, status="failed", error="whisper oom")
+    # Stale: failed longer than FAILED_JOB_FRESH_S ago.
+    archive_db.execute(
+        "UPDATE archive_jobs SET updated_at='2020-01-01T00:00:00Z' WHERE id=?",
+        (job_id,),
+    )
+
+    archive_scheduler._enqueue_transcriptions()
+
+    job = archive_db.latest_job("youtube", _VID, kind="transcribe")
+    assert job is not None and job["status"] == "queued", (
+        "a stale failed job beyond the window must still be requeued"
+    )
+    assert job["id"] == job_id, "requeue must happen IN PLACE (stable job id)"
 
 
 def test_caption_ingest_flips_queued_transcribe_job_to_done(scratch_db, monkeypatch):

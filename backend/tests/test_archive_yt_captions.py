@@ -141,20 +141,23 @@ def test_captions_first_toggle_off_runs_whisper(monkeypatch):
 
 
 def test_missing_archive_file_skips_gracefully(monkeypatch):
-    """FileNotFoundError (archive file evicted) -> failed job + skipped marker,
-    no traceback-level error and nothing propagates out of _process_job.
-    Runs on Twitch: YouTube ASR goes through the captionless download path
-    (no local archive_path), which is covered in test_yt_transcribe_policy."""
+    """FileNotFoundError (no archived row / archive file evicted) -> failed
+    job + skipped marker, no traceback-level error and nothing propagates
+    out of _process_job. Runs on Twitch: file-less rows route through the
+    at-transcribe-time downloader, which raises FileNotFoundError when the
+    video is gone (or its audio is unreachable). YouTube ASR goes through
+    the captionless download path (no local archive_path), covered in
+    test_yt_transcribe_policy."""
     job_id = _seed_job("twitch", "vid-missing")
     with patch.object(
-        archive_transcribe, "transcribe_video",
+        archive_transcribe, "_transcribe_remote_twitch_kick",
         side_effect=FileNotFoundError(
             f"archive file missing for twitch/vid-missing: {job_id}"),
-    ) as tv:
+    ) as remote:
         stats = archive_transcribe._process_job(
             {"id": job_id, "platform": "twitch", "video_id": "vid-missing"})
     assert stats["skipped"] == "archive-file-missing"
-    tv.assert_called_once()
+    remote.assert_called_once()
     assert _job_status(job_id) == "failed"
 
 
@@ -179,12 +182,12 @@ def test_captions_first_non_youtube_still_transcribes(monkeypatch):
     job_id = _seed_job("twitch", "vid4")
     with patch("deps.settings_mgr") as mgr, \
          patch.object(archive_db, "transcript_for", return_value=[{"seg_idx": 0}]) as tf, \
-         patch.object(archive_transcribe, "transcribe_video",
-                      return_value={"segments": 1}) as tv:
+         patch.object(archive_transcribe, "_transcribe_remote_twitch_kick",
+                      return_value={"segments": 1}) as remote:
         mgr.get.return_value = SimpleNamespace(yt_subtitles_first=True)
         archive_transcribe._process_job({"id": job_id, "platform": "twitch", "video_id": "vid4"})
     tf.assert_not_called()
-    tv.assert_called_once()
+    remote.assert_called_once()
     assert _job_status(job_id) == "done"
 
 
