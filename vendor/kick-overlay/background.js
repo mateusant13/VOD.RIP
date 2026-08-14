@@ -14,6 +14,9 @@ function normalizeYtUrl(value) {
   const m = v.match(/youtube\.com\/(@[^/?#]+|channel\/UC[0-9A-Za-z_-]{22}|c\/[^/?#]+|user\/[^/?#]+)/i);
   if (m) return `https://www.youtube.com/${m[1]}`;
   if (v.startsWith('@')) return `https://www.youtube.com/${v}`;
+  // Bare handle without @ (e.g. "JBSniperPRIME") — the popup hint says
+  // "URL, @handle or UC…", but users type the plain name; resolve it anyway.
+  if (/^[0-9A-Za-z._-]{2,64}$/.test(v)) return `https://www.youtube.com/@${v}`;
   return null;
 }
 
@@ -42,7 +45,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse({ id: null, error: 'bad-url' });
     return;
   }
-  fetch(url, { credentials: 'include' })
+  // credentials 'omit': the anonymous page carries the UC id (curl-verified);
+  // the logged-in variant can redirect to the consent wall and break the match.
+  fetch(url, { credentials: 'omit' })
     .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))
     .then((html) => {
       const m =

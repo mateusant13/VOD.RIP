@@ -87,7 +87,6 @@ const KO = {
   ytVol: 100,       // user's youtube volume (persisted, applied on show)
   ytState: { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, error: 0 },
   ytUnlock: false,
-  bridgeInjected: false,
   twLive: false,       // sticky: Twitch channel confirmed live on this page
   twWasPlaying: false, // Twitch was playing when we paused it → resume on switch back
   seeking: false,
@@ -244,19 +243,25 @@ function setBadge(text, color) {
 
 // ---- YouTube bridge ---------------------------------------------------------
 
-function injectBridge() {
-  if (KO.bridgeInjected) return;
-  KO.bridgeInjected = true;
-  const s = document.createElement('script');
-  s.src = chrome.runtime.getURL('yt-bridge.js');
-  (document.head || document.documentElement).appendChild(s);
-}
+// YouTube layer — driven DIRECTLY against the live_stream embed via the
+// IFrame API postMessage protocol, no page-world script needed (a <script
+// src="chrome-extension://…"> injection into the Twitch page is silently
+// CSP-blocked — the old yt-bridge.js never ran, so the embed never got
+// ready). Commands go to the iframe's contentWindow; the embed answers
+// with 'infoDelivery' messages the content script receives on the top
+// window (that is how the official IFrame API works — no same-origin
+// access required). Native embed controls stay enabled.
+const YT_FN = { play: 'playVideo', pause: 'pauseVideo', mute: 'mute', unmute: 'unMute', setVolume: 'setVolume', seekToLive: 'seekTo' };
 
 function ytCmd(cmd, arg) {
+  const f = document.getElementById('ko-yt');
+  if (!f || !f.contentWindow) return;
+  const fn = YT_FN[cmd];
+  if (!fn) return;
   try {
-    window.postMessage({ __koYtCmd: cmd, __koYtArg: arg }, '*');
+    f.contentWindow.postMessage({ event: 'command', func: fn, args: cmd === 'seekToLive' ? [Number.MAX_SAFE_INTEGER] : [arg] }, '*');
   } catch {
-    /* ignore */
+    /* frame gone */
   }
 }
 
@@ -264,6 +269,7 @@ function resolveYtChannel(raw) {
   return new Promise((res) => {
     try {
       chrome.runtime.sendMessage({ type: 'ko-resolve-yt', value: raw }, (r) => {
+        diag('yt_resolve', { raw, id: (r && r.id) ? r.id.slice(0, 10) : null, err: (r && r.error) || null });
         res((r && r.id) || null);
       });
     } catch {
@@ -287,8 +293,8 @@ async function ensureYtId() {
 }
 
 function ensureYtIframe() {
-  injectBridge();
   if (document.getElementById('ko-yt')) return;
+  if (!KO.wrap) mount(); // youtube-only path never mounted the wrap (kick paths did)
   const iframe = document.createElement('iframe');
   iframe.id = 'ko-yt';
   iframe.src =
@@ -299,6 +305,7 @@ function ensureYtIframe() {
   iframe.setAttribute('allow', 'autoplay; fullscreen; encrypted-media');
   iframe.setAttribute('allowfullscreen', '');
   KO.wrap.appendChild(iframe);
+  diag('yt_embed', { id: KO.ytId.slice(0, 8) });
 }
 
 function enableYtUnlock() {
@@ -315,32 +322,41 @@ function enableYtUnlock() {
 }
 
 let lastYtProbe = 0;
+let ytFirstInfo = false;
 window.addEventListener('message', (ev) => {
+  const f = document.getElementById('ko-yt');
+  if (!f || ev.source !== f.contentWindow) return;
   const d = ev.data;
-  if (!d || !d.__koYt) return;
-  if (d.t === 'ready') {
+  if (!d || typeof d !== 'object') return;
+  // The embed announces itself (the IFrame API handshake).
+  if (d.event === 'onReady' || d.event === 'initialDelivery') {
+    if (!ytFirstInfo) {
+      ytFirstInfo = true;
+      diag('yt_ready', {});
+    }
     KO.ytState.ready = true;
     ytCmd('setVolume', KO.ytVol); // restore the user's last yt volume on a fresh embed
-    throttledYtProbe();
-  } else if (d.t === 'status') {
-    const prevLive = KO.ytState.live;
-    KO.ytState.playing = !!d.playing;
-    KO.ytState.muted = !!d.muted;
-    KO.ytState.live = !!d.live;
-    KO.ytState.dur = d.dur || 0;
-    KO.ytState.ct = d.ct || 0;
-    KO.ytState.vq = d.vq || '';
-    if (!d.muted && typeof d.volume === 'number' && d.volume >= 0 && KO.ytVol !== d.volume) {
-      KO.ytVol = d.volume; // remember the user's yt volume slider
-      saveState();
-    }
-    if (KO.player === 'youtube') throttledYtProbe();
-    if (prevLive && !KO.ytState.live && KO.player === 'youtube') throttledYtProbe();
-    if (KO.player === 'youtube' && KO.ytState.live && KO.ytState.muted) enableYtUnlock();
-  } else if (d.t === 'error') {
-    KO.ytState.error = d.c || 0;
-    if (KO.player === 'youtube') throttledYtProbe();
+    return;
   }
+  if (d.event !== 'infoDelivery' || !d.info) return;
+  const info = d.info;
+  const st = info.playerState; // -1 unstarted, 0 ended, 1 playing, 2 paused, 3 buffering, 5 cued
+  const prevLive = KO.ytState.live;
+  // LIVE detection: a real stream is playing/buffering; the offline
+  // placeholder sits at -1 (unstarted) and never leaves it.
+  KO.ytState.playing = st === 1;
+  KO.ytState.muted = !!info.muted;
+  KO.ytState.live = st === 1 || st === 3;
+  KO.ytState.dur = info.duration || 0;
+  KO.ytState.ct = info.currentTime || 0;
+  KO.ytState.vq = info.playbackQuality || '';
+  if (typeof info.volume === 'number' && info.volume >= 0 && !info.muted && KO.ytVol !== info.volume) {
+    KO.ytVol = info.volume; // remember the user's yt volume slider
+    saveState();
+  }
+  if (KO.player === 'youtube') throttledYtProbe();
+  if (prevLive && !KO.ytState.live && KO.player === 'youtube') throttledYtProbe();
+  if (KO.player === 'youtube' && KO.ytState.live && KO.ytState.muted) enableYtUnlock();
 });
 
 function throttledYtProbe() {
@@ -586,6 +602,55 @@ function ensureAttached(el) {
 
 // ---- overlay lifecycle ------------------------------------------------------
 
+// ---- kick.com-identical player chrome (mined 2026-08-14) ---------------------
+// Markup + Tailwind classes copied from kick's real player chunk
+// (0x2w0nqf7e3t1.js) + compiled CSS (assets.kick.com): seekbar root
+// `group/seekbar absolute -top-7 left-0 h-5 w-full`, track `bg-subtle/50`
+// (rgba(146,158,166,.5)), fill + thumb `bg-green-500`/`bg-primary-base`
+// (#53fc18), loaded progress `bg-white/50` + indicator `bg-white/30`
+// (scaleX), hover time pill `-top-10 rounded-md p-1 text-xs font-bold`,
+// thumb hidden until hover (`lg:betterhover:group-hover/seekbar:block`),
+// volume slider `w-[100px] h-[3px] bg-[#24272C]` + `bg-white` fill, root
+// `bg-gradient-to-t from-black/80 to-black/0`, LIVE badge = OnlineIcon +
+// `text-sm font-semibold`, live elapsed `text-xs font-bold tabular-nums`.
+// Behavior mirrors the mined store: live → rewind = startPlayingDVR at
+// min(click, edge−30s); DVR → ≤30s from edge = goBackToLive, else DVR seek;
+// hover shows "LIVE" near the edge, a -countdown behind, the time in DVR.
+const KO_SVG = {
+  play: '<svg viewBox="0 0 20 20" fill="currentColor"><path d="M6.251 1H1.743v18h4.508l12.006-9z"/></svg>',
+  pause: '<svg viewBox="0 0 20 20" fill="currentColor"><path d="M7.66 1H4.15v18h3.51zm8.19 0h-3.51v18h3.51z"/></svg>',
+  sound: '<svg viewBox="0 0 20 20" fill="currentColor"><path d="M14.5 10A4.5 4.5 0 0 0 10 5.5v2.25A2.257 2.257 0 0 1 12.25 10 2.257 2.257 0 0 1 10 12.25v2.25a4.5 4.5 0 0 0 4.5-4.5"/><path d="M10 1v2.25A6.755 6.755 0 0 1 16.75 10 6.755 6.755 0 0 1 10 16.75V19c4.973 0 9-4.027 9-9s-4.027-9-9-9M1 5.5v9h2.25l4.5 4.5V1l-4.5 4.5z"/></svg>',
+  muted: '<svg viewBox="0 0 20 20" fill="currentColor"><path d="M10 14.503c2.486 0 4.5-2.013 4.5-4.497v-.102l-4.489 3.53v1.069zm7.346-9.68L19 3.518l-1.384-1.753-1.777 1.394A9 9 0 0 0 10 1v2.249a6.73 6.73 0 0 1 4.016 1.338l-1.879 1.472A4.45 4.45 0 0 0 10 5.497v2.249L7.75 9.51v-8.5l-4.5 4.497H1v9.32l1.395 1.755zM7.75 19v-3.789l-2.126 1.664z"/><path d="M16.514 8.32c.146.539.236 1.101.236 1.686 0 3.721-3.026 6.745-6.75 6.745V19c4.973 0 9-4.025 9-8.994a8.7 8.7 0 0 0-.608-3.17l-1.878 1.472z"/></svg>',
+  fs: '<svg viewBox="0 0 20 20" fill="currentColor"><path d="M16.188 12.25v3.938H12.25V19H19v-6.75zM7.75 16.188H3.813V12.25H1V19h6.75zM3.813 7.75V3.813H7.75V1H1v6.75zm8.437-3.937h3.938V7.75H19V1h-6.75z"/></svg>'
+};
+function fmtDur(sec, incH) {
+  // kick's formatVideoDuration: [HH if ≥1h]+[MM]+[SS], 0-padded
+  sec = Math.max(0, Math.floor(sec));
+  const hh = Math.floor(sec / 3600);
+  const mm = Math.floor((sec % 3600) / 60);
+  const ss = sec % 60;
+  const p = (n) => String(n).padStart(2, '0');
+  const out = p(mm) + ':' + p(ss);
+  return incH || hh > 0 ? p(hh) + ':' + out : out;
+}
+function setKickFill(frac) {
+  if (!KO.wrap) return;
+  const fillEl = KO.wrap.querySelector('#ko-fill');
+  const thumbEl = KO.wrap.querySelector('#ko-thumb');
+  if (fillEl) fillEl.style.width = (Math.max(0, Math.min(1, frac)) * 100) + '%';
+  if (thumbEl) thumbEl.style.left = (Math.max(0, Math.min(1, frac)) * 100) + '%';
+}
+function updateKickVolUI() {
+  if (!KO.wrap) return;
+  const v = KO.kickMuted || KO.kickVol === 0 ? 0 : KO.kickVol;
+  const fillEl = KO.wrap.querySelector('#ko-volfill');
+  const thumbEl = KO.wrap.querySelector('#ko-volthumb');
+  const muteBtn = KO.wrap.querySelector('#ko-mute');
+  if (fillEl) fillEl.style.width = (v * 100) + '%';
+  if (thumbEl) thumbEl.style.left = (v * 100) + '%';
+  if (muteBtn) muteBtn.innerHTML = v === 0 ? KO_SVG.muted : KO_SVG.sound;
+}
+
 function mount() {
   if (KO.wrap) return;
   const wrap = document.createElement('div');
@@ -595,16 +660,32 @@ function mount() {
   const bar = document.createElement('div');
   bar.id = 'ko-bar';
   bar.innerHTML =
-    '<span id="ko-badge">KICK</span>' +
-    '<button id="ko-play" title="Play/Pause">\u275A\u275A</button>' +
-    '<button id="ko-mute" title="Mute">Mute</button>' +
-    '<input id="ko-vol" type="range" min="0" max="100" value="100" title="Volume" />' +
-    '<input id="ko-seek" type="range" min="0" max="1" value="0" title="Seek (replay)" />' +
-    '<button id="ko-live" title="Back to the live edge" style="display:none">VOLTAR AO VIVO</button>' +
-    '<span id="ko-time">LIVE</span>' +
-    '<span style="flex:1"></span>' +
-    '<button id="ko-fs" title="Fullscreen">\u26F6</button>';
+    '<div id="ko-g1" class="ko-g">' +
+    '<button id="ko-play" class="ko-icn" title="Play/Pause"></button>' +
+    '<div id="ko-volwrap" class="ko-volwrap">' +
+    '<button id="ko-mute" class="ko-icn" title="Mute"></button>' +
+    '<div id="ko-vols"><div id="ko-voltrack"><div id="ko-volfill"></div><div id="ko-volthumb"></div></div></div>' +
+    '</div>' +
+    '<span id="ko-cur" class="ko-t"></span>' +
+    '<span class="ko-t ko-sep">/</span>' +
+    '<span id="ko-total" class="ko-t"></span>' +
+    '</div>' +
+    '<div id="ko-g2" class="ko-g"><button id="ko-fs" class="ko-icn" title="Fullscreen"></button></div>' +
+    '<div id="ko-seekbar">' +
+    '<span id="ko-hov" class="ko-hov"></span>' +
+    '<div id="ko-loaded" class="ko-prog"></div>' +
+    '<div id="ko-loadind" class="ko-prog"></div>' +
+    '<div id="ko-track"><div id="ko-fill"></div></div>' +
+    '<div id="ko-thumb"></div>' +
+    '</div>';
   wrap.appendChild(bar);
+  const top = document.createElement('div');
+  top.id = 'ko-top';
+  top.innerHTML =
+    '<button id="ko-livebadge" class="ko-livebadge"><span id="ko-live-dot" class="ko-live-dot"></span>' +
+    '<span id="ko-live-txt" class="ko-live-txt">LIVE</span></button>' +
+    '<span id="ko-elapsed" class="ko-elapsed"></span>';
+  wrap.appendChild(top);
   const rc = document.createElement('div');
   rc.id = 'ko-reconnecting';
   rc.textContent = 'RECONNECTING\u2026';
@@ -614,14 +695,108 @@ function mount() {
   KO.wrap = wrap;
   KO.hideTicks = 0;
 
-  let hotTimer = null;
-  const updateBar = () => {
+  const play = bar.querySelector('#ko-play');
+  play.innerHTML = KO_SVG.play;
+  play.addEventListener('click', () => {
     const playing = KO.kickState && KO.kickState.state === 'Playing';
-    bar.querySelector('#ko-play').textContent = playing ? '\u275A\u275A' : '\u25B6';
-    const silent = KO.kickMuted || KO.kickVol === 0;
-    bar.querySelector('#ko-mute').textContent = silent ? 'Unmute' : 'Mute';
-    bar.querySelector('#ko-vol').value = String(Math.round((silent ? 0 : KO.kickVol) * 100));
+    kickSend(playing ? { t: 'pause' } : { t: 'play' });
+  });
+  const muteBtn = bar.querySelector('#ko-mute');
+  muteBtn.innerHTML = KO_SVG.sound;
+  muteBtn.addEventListener('click', () => {
+    KO.kickMuted = !KO.kickMuted;
+    if (!KO.kickMuted && KO.kickVol === 0) KO.kickVol = 1;
+    kickSend({ t: 'mute', m: KO.kickMuted });
+    if (!KO.kickMuted) kickSend({ t: 'volume', v: KO.kickVol });
+    updateKickVolUI();
+    saveState(); // remember the user's kick mute choice
+  });
+  const volwrap = bar.querySelector('#ko-volwrap');
+  const volTrack = bar.querySelector('#ko-voltrack');
+  const volFrac = (e) => {
+    const r = volTrack.getBoundingClientRect();
+    return r.width ? Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) : 0;
   };
+  volwrap.addEventListener('pointerdown', (e) => {
+    if (e.target === muteBtn || e.target.closest('#ko-mute')) return;
+    e.preventDefault();
+    const v = volFrac(e);
+    KO.kickVol = v;
+    KO.kickMuted = v === 0;
+    kickSend({ t: 'volume', v: KO.kickVol });
+    kickSend({ t: 'mute', m: KO.kickMuted });
+    updateKickVolUI();
+  });
+  volwrap.addEventListener('pointerup', () => saveState());
+  const sb = bar.querySelector('#ko-seekbar');
+  const hov = bar.querySelector('#ko-hov');
+  let dragging = false;
+  const fracFromEvent = (e) => {
+    const r = sb.getBoundingClientRect();
+    return r.width ? Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) : 0;
+  };
+  const showHover = (frac) => {
+    const r = sb.getBoundingClientRect();
+    const pos = frac * KO.kickDur;
+    const dur = KO.kickDur || 1;
+    hov.textContent = KO.kickOnDvr
+      ? fmtDur(pos, dur >= 3600)
+      : pos >= dur - 0.01 * dur
+        ? 'LIVE'
+        : '-' + fmtDur(dur - pos, dur >= 3600);
+    hov.style.left = Math.max(14, Math.min(r.width - 14, frac * r.width)) + 'px';
+    hov.style.display = 'block';
+  };
+  sb.addEventListener('pointermove', (e) => {
+    if (dragging) {
+      setKickFill(fracFromEvent(e));
+      KO.seeking = true;
+      return;
+    }
+    showHover(fracFromEvent(e));
+  });
+  sb.addEventListener('pointerleave', () => {
+    if (!dragging) hov.style.display = 'none';
+  });
+  sb.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    dragging = true;
+    KO.seeking = true;
+    sb.classList.add('ko-drag');
+    try {
+      sb.setPointerCapture(e.pointerId);
+    } catch {
+      /* capture unsupported */
+    }
+    setKickFill(fracFromEvent(e));
+    showHover(fracFromEvent(e));
+  });
+  const endDrag = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    KO.seeking = false;
+    sb.classList.remove('ko-drag');
+    hov.style.display = 'none';
+    kickSeekTo(fracFromEvent(e) * KO.kickDur);
+  };
+  sb.addEventListener('pointerup', endDrag);
+  sb.addEventListener('pointercancel', () => {
+    dragging = false;
+    KO.seeking = false;
+    sb.classList.remove('ko-drag');
+    hov.style.display = 'none';
+  });
+  const badge = top.querySelector('#ko-livebadge');
+  badge.addEventListener('click', () => {
+    if (KO.kickOnDvr) kickBackToLive();
+  });
+  bar.querySelector('#ko-fs').addEventListener('click', () => {
+    if (document.fullscreenElement === KO.wrap) document.exitFullscreen().catch(() => {});
+    else if (KO.wrap) KO.wrap.requestFullscreen().catch(() => {});
+  });
+  startRectLoop();
+
+  let hotTimer = null;
   window.addEventListener('mousemove', (e) => {
     if (!KO.wrap) return;
     const r = KO.wrap.getBoundingClientRect();
@@ -632,44 +807,6 @@ function mount() {
       if (KO.wrap) KO.wrap.classList.remove('ko-hot');
     }, 2600);
   });
-  bar.querySelector('#ko-play').addEventListener('click', () => {
-    const playing = KO.kickState && KO.kickState.state === 'Playing';
-    kickSend(playing ? { t: 'pause' } : { t: 'play' });
-  });
-  bar.querySelector('#ko-mute').addEventListener('click', () => {
-    KO.kickMuted = !KO.kickMuted;
-    if (!KO.kickMuted && KO.kickVol === 0) KO.kickVol = 1;
-    kickSend({ t: 'mute', m: KO.kickMuted });
-    if (!KO.kickMuted) kickSend({ t: 'volume', v: KO.kickVol });
-    updateBar();
-    saveState(); // remember the user's kick mute choice
-  });
-  const vol = bar.querySelector('#ko-vol');
-  vol.addEventListener('input', () => {
-    KO.kickVol = Number(vol.value) / 100;
-    KO.kickMuted = vol.value === '0';
-    kickSend({ t: 'volume', v: KO.kickVol });
-    kickSend({ t: 'mute', m: KO.kickMuted });
-    updateBar();
-  });
-  vol.addEventListener('change', () => {
-    saveState(); // remember the user's kick volume slider
-  });
-  const seek = bar.querySelector('#ko-seek');
-  seek.addEventListener('input', () => {
-    KO.seeking = true; // drag preview — actual seek happens on release
-  });
-  seek.addEventListener('change', () => {
-    KO.seeking = false;
-    kickSeekTo(Number(seek.value));
-  });
-  const live = bar.querySelector('#ko-live');
-  live.addEventListener('click', () => kickBackToLive());
-  bar.querySelector('#ko-fs').addEventListener('click', () => {
-    if (document.fullscreenElement === KO.wrap) document.exitFullscreen().catch(() => {});
-    else if (KO.wrap) KO.wrap.requestFullscreen().catch(() => {});
-  });
-  startRectLoop();
 }
 
 function teardown() {
@@ -815,7 +952,7 @@ function updateKickBar() {
   // the whole broadcast, playhead riding the edge); window fallback before
   // the first DVR fetch. The max GROWS as the stream runs (wall-clock).
   // Cap at 48h and require finite values — poisoned/NaN player readings
-  // (a bad seek, getLiveLatency() quirks) must never reach the input.
+  // (a bad seek, getLiveLatency() quirks) must never reach the bar.
   let max = dur || 0;
   if (Number.isFinite(KO.kickStreamStart) && KO.kickDvrFetchedAt) {
     const elapsed = (Date.now() - KO.kickStreamStart) / 1000;
@@ -825,27 +962,41 @@ function updateKickBar() {
   if (!isFinite(max) || max > 172800) max = 172800; // 48h ceiling
   KO.kickDur = max;
   const head = KO.kickOnDvr ? pos : Math.max(0, max - (isFinite(lat) && lat >= 0 ? lat : 0));
-  const seek = KO.wrap.querySelector('#ko-seek');
-  const live = KO.wrap.querySelector('#ko-live');
-  if (seek) {
-    if (!KO.seeking) seek.value = String(Math.min(max, Math.max(0, Math.floor(head))));
-    seek.max = String(max);
+  if (!KO.seeking) setKickFill(max > 0 ? head / max : 0);
+  // Loaded progress (kick: bg-white/50 full + bg-white/30 indicator, scaleX).
+  // IVS reports no buffered range; live is always "loaded" to the edge, DVR
+  // gets a short lookahead.
+  const loadedSec = KO.kickOnDvr ? Math.min(max, pos + 5) : max;
+  const lf = max > 0 ? loadedSec / max : 1;
+  const loaded = KO.wrap.querySelector('#ko-loaded');
+  const loadind = KO.wrap.querySelector('#ko-loadind');
+  if (loaded) loaded.style.transform = 'scaleX(' + lf + ')';
+  if (loadind) loadind.style.transform = 'scaleX(' + lf + ')';
+  const cur = KO.wrap.querySelector('#ko-cur');
+  const total = KO.wrap.querySelector('#ko-total');
+  if (cur) cur.textContent = fmtDur(head, max >= 3600);
+  if (total) total.textContent = fmtDur(max, max >= 3600);
+  // Top-left: LIVE badge (green dot + "LIVE") or the clickable
+  // "Voltar ao vivo" while replaying (kick's Status button); the live
+  // elapsed ticks next to it.
+  const dot = KO.wrap.querySelector('#ko-live-dot');
+  const btxt = KO.wrap.querySelector('#ko-live-txt');
+  const badge = KO.wrap.querySelector('#ko-livebadge');
+  const elapsed = KO.wrap.querySelector('#ko-elapsed');
+  if (KO.kickOnDvr) {
+    if (dot) dot.style.background = '#3f4448';
+    if (btxt) btxt.textContent = 'Voltar ao vivo';
+    if (badge) badge.style.cursor = 'pointer';
+    if (elapsed) elapsed.textContent = '';
+  } else {
+    if (dot) dot.style.background = '#53fc18';
+    if (btxt) btxt.textContent = 'LIVE';
+    if (badge) badge.style.cursor = 'default';
+    if (elapsed && Number.isFinite(KO.kickStreamStart)) elapsed.textContent = fmtDur((Date.now() - KO.kickStreamStart) / 1000, max >= 3600);
   }
-  const behind = KO.kickOnDvr || (liveEdge !== null && lat > 3);
-  if (live) live.style.display = behind ? 'block' : 'none';
-  let t = Math.floor(head);
-  if (!isFinite(t) || t < 0) t = 0;
-  const hh = String(Math.floor(t / 3600)).padStart(2, '0');
-  const mm = String(Math.floor((t % 3600) / 60)).padStart(2, '0');
-  const ss = String(t % 60).padStart(2, '0');
-  const time = KO.wrap.querySelector('#ko-time');
-  if (time) time.textContent = (KO.kickOnDvr ? 'REPLAY \u00B7 ' : 'LIVE \u00B7 ') + `${hh}:${mm}:${ss}`;
-  const badgeEl = KO.wrap.querySelector('#ko-badge');
-  if (badgeEl) {
-    const qn = st.q && st.q.name;
-    const mode = KO.kickOnDvr ? 'REPLAY' : 'LIVE';
-    badgeEl.textContent = qn ? `KICK \u00B7 ${mode} \u00B7 ${qn}` : `KICK \u00B7 ${mode}`;
-  }
+  const playBtn = KO.wrap.querySelector('#ko-play');
+  if (playBtn) playBtn.innerHTML = st.state === 'Playing' ? KO_SVG.pause : KO_SVG.play;
+  updateKickVolUI();
 }
 
 function setPlayer(p) {
@@ -1133,21 +1284,52 @@ function injectStyles() {
     '#ko-wrap #ko-ivs{width:100%;height:100%;border:0;display:block;pointer-events:none;}' +
     '#ko-wrap.ko-yt iframe{width:100%;height:100%;border:0;display:block;pointer-events:auto;}' +
     '#ko-bar{position:absolute;left:0;right:0;bottom:0;pointer-events:auto;opacity:0;transition:opacity .18s ease;' +
-    'display:flex;align-items:center;gap:8px;padding:9px 12px;color:#fff;' +
-    'background:linear-gradient(0deg,rgba(0,0,0,.85),rgba(0,0,0,0));font:12px/1 system-ui,sans-serif;}' +
+    'display:flex;flex-direction:row;align-items:center;justify-content:space-between;padding:0 10px;color:#fff;' +
+    'background:linear-gradient(0deg,rgba(0,0,0,.8),rgba(0,0,0,0));' +
+    'font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}' +
     '#ko-wrap.ko-yt #ko-bar{display:none;}' + // YT has native controls incl. LIVE chip
     '#ko-wrap.ko-hot #ko-bar{opacity:1;}' +
     '#ko-reconnecting{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;' +
     'background:rgba(0,0,0,.82);color:#fff;font:700 15px system-ui,sans-serif;letter-spacing:.04em;pointer-events:none;}' +
-    '#ko-bar button{background:transparent;border:0;color:#fff;cursor:pointer;font:inherit;padding:3px 7px;border-radius:4px;white-space:nowrap;}' +
-    '#ko-bar button:hover{background:rgba(255,255,255,.18);}' +
-    '#ko-badge{font-weight:700;color:#53fc18;white-space:nowrap;}' +
-    '#ko-time{color:#cfcfcf;white-space:nowrap;}' +
-    '#ko-vol{width:60px;height:4px;accent-color:#9147ff;cursor:pointer;}' +
-    '#ko-seek{flex:1;height:4px;accent-color:#53fc18;cursor:pointer;min-width:40px;}' +
-    '#ko-live{position:absolute;right:16px;bottom:58px;font-weight:700;color:#fff;background:#ff0000;' +
-    'border-radius:999px;padding:8px 16px;box-shadow:0 2px 10px rgba(0,0,0,.55);}' +
-    '#ko-live:hover{background:#ff4d4d;}' +
+    '.ko-g{display:flex;flex-direction:row;align-items:center;}' +
+    '#ko-g1{gap:2px;}' +
+    '.ko-icn{background:transparent;border:0;color:#fff;cursor:pointer;display:flex;align-items:center;' +
+    'justify-content:center;width:40px;height:40px;border-radius:8px;padding:0;}' +
+    '.ko-icn:hover{background:rgba(255,255,255,.1);}' +
+    '.ko-icn svg{width:22px;height:22px;display:block;}' +
+    '.ko-t{font-size:12px;font-weight:700;white-space:nowrap;color:#fff;font-variant-numeric:tabular-nums;}' +
+    '#ko-g1 .ko-t{padding:0 6px;}' +
+    '.ko-sep{opacity:.6;}' +
+    '#ko-volwrap{position:relative;display:flex;align-items:center;height:40px;}' +
+    '#ko-vols{display:none;position:absolute;left:100%;top:0;height:100%;align-items:center;' +
+    'width:100px;padding:0 4px;cursor:pointer;}' +
+    '#ko-volwrap:hover #ko-vols{display:flex;}' +
+    '#ko-voltrack{position:relative;width:100%;height:3px;border-radius:999px;background:#24272c;}' +
+    '#ko-volfill{position:absolute;left:0;top:0;bottom:0;border-radius:999px;background:#fff;}' +
+    '#ko-volthumb{position:absolute;top:50%;width:16px;height:16px;border-radius:10px;background:#fff;' +
+    'transform:translate(-50%,-50%);box-shadow:0 1px 3px rgba(0,0,0,.4);}' +
+    '#ko-seekbar{position:absolute;top:-28px;left:0;right:0;height:20px;cursor:pointer;touch-action:none;}' +
+    '#ko-track{position:absolute;left:0;right:0;bottom:0;height:4px;border-radius:2px;background:rgba(146,158,166,.5);}' +
+    '#ko-seekbar:hover #ko-track{height:6px;bottom:-1px;}' +
+    '#ko-fill{position:absolute;left:0;top:0;bottom:0;background:#53fc18;border-radius:2px;}' +
+    '.ko-prog{position:absolute;left:0;right:0;bottom:0;height:4px;transform-origin:left;}' +
+    '#ko-loaded{background:rgba(255,255,255,.5);}' +
+    '#ko-loadind{background:rgba(255,255,255,.3);}' +
+    '#ko-thumb{position:absolute;bottom:-6px;width:16px;height:16px;border-radius:50%;background:#53fc18;' +
+    'transform:translateX(-50%);display:none;}' +
+    '#ko-seekbar:hover #ko-thumb,#ko-seekbar.ko-drag #ko-thumb{display:block;}' +
+    '#ko-hov{position:absolute;bottom:26px;left:0;transform:translateX(-50%);background:rgba(0,0,0,.78);' +
+    'border-radius:6px;padding:4px 6px;font-size:12px;font-weight:700;color:#fff;' +
+    'font-variant-numeric:tabular-nums;white-space:nowrap;display:none;pointer-events:none;z-index:2;}' +
+    '#ko-top{position:absolute;top:0;left:0;right:0;pointer-events:none;display:flex;flex-direction:row;' +
+    'align-items:center;gap:12px;padding:10px 14px;color:#fff;' +
+    'background:linear-gradient(180deg,rgba(0,0,0,.7),rgba(0,0,0,0));' +
+    'font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}' +
+    '#ko-livebadge{pointer-events:auto;display:flex;flex-direction:row;align-items:center;gap:6px;' +
+    'background:transparent;border:0;color:#fff;cursor:default;padding:0;}' +
+    '#ko-live-dot{width:10px;height:10px;border-radius:50%;background:#53fc18;}' +
+    '#ko-live-txt{font-size:14px;font-weight:600;white-space:nowrap;}' +
+    '#ko-elapsed{font-size:12px;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap;}' +
   '  (document.head || document.documentElement).appendChild(st);'
 }
 
@@ -1229,6 +1411,31 @@ window.addEventListener('kick-overlay:status', () => {
 
 (async function init() {
   await loadState();
+  // URL-param setup (?koyt=<yt channel>&kokick=<slug>&koplayer=<player>):
+  // write this channel's mapping by opening a twitch URL — no popup clicks
+  // needed (used to pre-configure channels, e.g. jb_sniper→JBSniperPRIME).
+  const qp = new URLSearchParams(location.search);
+  const qYt = qp.get('koyt');
+  const qKick = qp.get('kokick');
+  const qPlayer = qp.get('koplayer');
+  const setupSlug = currentSlug(); // KO.slug is still null at init
+  if (setupSlug && (qYt || qKick || qPlayer)) {
+    const m = KO.mappings[setupSlug];
+    const base = m && typeof m === 'object' ? { ...m } : { kick: setupSlug };
+    if (qKick) base.kick = qKick.toLowerCase();
+    if (qYt) {
+      base.yt = qYt;
+      delete base.ytId;
+    }
+    if (qYt || qKick) {
+      KO.mappings[setupSlug] = base;
+      KO.kickSlug = (qKick || base.kick || setupSlug).toLowerCase();
+      KO.ytRaw = qYt || base.yt || '';
+      KO.ytId = null;
+    }
+    if (qPlayer && ['kick', 'youtube', 'twitch'].includes(qPlayer)) KO.player = qPlayer;
+    saveState().then(() => apply());
+  }
   // Persist the resolved defaults (enabled: true) so the popup's toggle
   // always agrees with the content script.
   if (Object.keys(KO.mappings).length === 0) {
@@ -1261,6 +1468,18 @@ window.addEventListener('kick-overlay:status', () => {
         : null,
       yt: { ...KO.ytState },
       twLive: KO.twLive,
+      bar: KO.wrap
+        ? {
+            mode: KO.kickOnDvr ? 'dvr' : 'live',
+            cur: (KO.wrap.querySelector('#ko-cur') || {}).textContent || '',
+            total: (KO.wrap.querySelector('#ko-total') || {}).textContent || '',
+            fillPct: Math.round(parseFloat((KO.wrap.querySelector('#ko-fill') || {}).style?.width || '0')),
+            badge: (KO.wrap.querySelector('#ko-live-txt') || {}).textContent || '',
+            vol: Math.round(((KO.kickMuted || KO.kickVol === 0) ? 0 : KO.kickVol) * 100),
+            dur: Math.round(KO.kickDur || 0),
+            hot: KO.wrap.classList.contains('ko-hot'),
+          }
+        : null,
     });
   }, 8000);
   apply();
