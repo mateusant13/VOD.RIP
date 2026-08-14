@@ -1250,6 +1250,27 @@ function startRectLoop() {
   }, RECT_MS);
 }
 
+// The <video> element rect jitters during boot/ad transitions (Twitch
+// renders it at a transient smaller height — observed 1340x401 while the
+// player card stayed 1340x751). The player CARD (.video-ref / the
+// video-player wrapper) is layout-stable, so anchor the overlay to it;
+// fall back to the video rect when no card is found (e.g. the video is a
+// sidebar hover-preview).
+function twitchAnchorRect() {
+  const tv = twitchVideo();
+  if (!tv) return null;
+  let el = tv;
+  for (let i = 0; i < 5 && el; i++) {
+    const cls = (el.className || '').toString();
+    if (cls.includes('video-ref') || cls.includes('video-player')) {
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0 ? r : tv.getBoundingClientRect();
+    }
+    el = el.parentElement;
+  }
+  return tv.getBoundingClientRect();
+}
+
 function rectTick() {
   if (!KO.wrap) {
     stopRectLoop();
@@ -1261,14 +1282,34 @@ function rectTick() {
     const overlayShown = KO.player !== 'twitch' && KO.wrap.style.display !== 'none';
     if (overlayShown) {
       if (tv) {
-        KO.lastRect = tv.getBoundingClientRect();
-        const r = KO.lastRect;
+        const prev = KO.lastRect;
+        const r = twitchAnchorRect() || tv.getBoundingClientRect();
+        KO.lastRect = r;
         const s = KO.wrap.style;
         s.left = `${r.left}px`;
         s.top = `${r.top}px`;
         s.width = `${r.width}px`;
         s.height = `${r.height}px`;
         if (KO.wrap.style.display === 'none') showWrap();
+        // Ground truth when the page video population is unusual (a second
+        // visible video — hover preview, clips card — or a large shrink):
+        // the wrap should mirror the picked card rect exactly.
+        if (!KO.rectDiagAt || Date.now() - KO.rectDiagAt > 10000) {
+          const all = [...document.querySelectorAll('video')]
+            .filter((v) => v.getClientRects().length)
+            .map((v) => {
+              const rr = v.getBoundingClientRect();
+              return { w: Math.round(rr.width), h: Math.round(rr.height), rs: v.readyState, p: v.paused };
+            });
+          if (all.length > 1 || (prev && r.height < prev.height * 0.7)) {
+            KO.rectDiagAt = Date.now();
+            diag('rect_pop', {
+              picked: { w: Math.round(r.width), h: Math.round(r.height) },
+              all,
+              wrap: { w: Math.round(KO.wrap.offsetWidth), h: Math.round(KO.wrap.offsetHeight) },
+            });
+          }
+        }
       } else if (KO.twDeleted) {
         // User deleted the Twitch player from the popup: keep the overlay
         // pinned at its last rect (the whole point is seeing the overlay
