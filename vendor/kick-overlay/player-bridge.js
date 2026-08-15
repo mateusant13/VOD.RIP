@@ -28,6 +28,7 @@ if (HLS_MODE) {
   // Same bridge protocol as IVS: {t:'load'|'play'|'pause'|'mute'|'volume'|
   // 'seek'|'seekToLive'|'getState'} in, {t:'ready'} + ~1/s {t:'st'} + {t:'ev'}
   // out. hls.js plays the innertube hlsManifestUrl; native controls visible.
+  V.controls = true; // native controls give the yt layer the embed-era UX
   const h = new Hls({ maxBufferLength: 30, liveSyncDurationCount: 3 });
   let currentUrl = null;
   let reloaded = false;

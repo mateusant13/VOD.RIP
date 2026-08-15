@@ -72,7 +72,7 @@ const NOT_CHANNEL = new Set([
 
 // Build marker for the diag stream — lets us tell which code a tab runs
 // (content scripts of pre-reload tabs survive extension reloads).
-const KO_VER = '0.7.6+f3';
+const KO_VER = '0.7.8';
 const KO = {
   enabled: false,
   player: 'kick', // 'kick' | 'youtube' | 'twitch' — switching never rebuilds players
@@ -104,6 +104,11 @@ const KO = {
   dvrFetchedFor: null, // playback_url the DVR source was fetched for (once per url)
   ytVol: 100,       // user's youtube volume (persisted, applied on show)
   ytState: { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, error: 0 },
+  ytHlsUrl: null,   // last minted HLS manifest url (refreshed under the background cache TTL)
+  ytHlsAt: 0,       // epoch ms of the successful mint
+  ytHlsFailed: false, // last mint (or a fatal frame error) failed — fall back to kick
+  ytHlsFailedAt: 0,   // epoch ms of the failure (retry backoff)
+  ytLoadedUrl: null, // url currently handed to the yt frame (re-load on change)
   ytUnlock: false,
   twLive: false,       // sticky: Twitch channel confirmed live on this page
   twWasPlaying: false, // Twitch was playing when we paused it → resume on switch back
@@ -320,10 +325,19 @@ async function ensureYtId() {
 }
 
 // Mint the live HLS manifest through the background (MWEB player API call —
-// Chrome transport, anonymous). One-shot per probe cycle; the background
-// caches the URL for a few minutes.
+// Chrome transport, anonymous). The background caches the URL per video id
+// for 5 min; content refreshes under that TTL so a re-mint re-resolves the
+// live video id (stream restarts) without hammering innertube, and failures
+// retry after a short backoff. The old one-shot flags stuck forever — a
+// single failed mint ("sts not found", SW cold start, transient network)
+// killed the yt layer for the whole page session (observed in the diag log:
+// yt_hls err -> yt_fallback, then never retried).
+const YT_HLS_TTL_MS = 4 * 60 * 1000; // refresh before the background's 5-min cache expires
+const YT_HLS_RETRY_MS = 30 * 1000;   // hard-fail backoff (transient bot-gate/network)
 async function ensureYtHls() {
-  if (KO.ytHlsUrl || KO.ytHlsFailed) return;
+  const now = Date.now();
+  if (KO.ytHlsUrl && now - (KO.ytHlsAt || 0) < YT_HLS_TTL_MS) return; // fresh mint
+  if (KO.ytHlsFailed && now - (KO.ytHlsFailedAt || 0) < YT_HLS_RETRY_MS) return; // backoff
   try {
     const r = await new Promise((res) => {
       try {
@@ -334,13 +348,17 @@ async function ensureYtHls() {
     });
     if (r && r.url) {
       KO.ytHlsUrl = r.url;
+      KO.ytHlsAt = now;
+      KO.ytHlsFailed = false;
       diag('yt_hls', { url: r.url.slice(0, 60) });
     } else {
       KO.ytHlsFailed = true;
+      KO.ytHlsFailedAt = now;
       diag('yt_hls', { err: (r && r.error) || 'no-url' });
     }
   } catch (e) {
     KO.ytHlsFailed = true;
+    KO.ytHlsFailedAt = now;
     diag('yt_hls', { err: String(e).slice(0, 120) });
   }
 }
@@ -391,6 +409,7 @@ window.addEventListener('message', (ev) => {
     ytCmd('setVolume', KO.ytVol); // restore the user's last yt volume on a fresh frame
     if (KO.pendingYtUrl) {
       ytSend({ t: 'load', url: KO.pendingYtUrl });
+      KO.ytLoadedUrl = KO.pendingYtUrl;
       KO.pendingYtUrl = null;
     }
     return;
@@ -417,6 +436,13 @@ window.addEventListener('message', (ev) => {
   if (m.t === 'ev' && m.e === 'error') {
     console.log('[ko] yt (hls) error', m.d || '');
     diag('yt_hls_err', { msg: String(m.d || '').slice(0, 140) });
+    // The frame already did its one reload per url (player-bridge) — a
+    // second fatal error means the URL is dead. Mark the layer failed so
+    // the next probe falls back to kick (never leave the native Twitch
+    // player with ads visible) and re-mints after the backoff.
+    KO.ytHlsFailed = true;
+    KO.ytHlsFailedAt = Date.now();
+    throttledYtProbe();
   }
 });
 
@@ -465,6 +491,10 @@ window.addEventListener('message', (ev) => {
   if (KO.kickWin && ev.source !== KO.kickWin) return;
   const m = d.__koKick;
   if (m.t === 'ready') {
+    // Only the actual player frame may declare ready — before the first
+    // ready message KO.kickWin is null and the source guard below would
+    // accept ANY window (page-world spoof would hijack kickSend).
+    if (!KO.kickFrame || ev.source !== KO.kickFrame.contentWindow) return;
     KO.kickWin = ev.source;
     KO.kickReady = true;
     KO.lastKickSt = Date.now();
@@ -934,7 +964,10 @@ function teardown() {
   KO.ytUnlock = false;
   KO.ytWin = null;
   KO.ytHlsUrl = null;
+  KO.ytHlsAt = 0;
   KO.ytHlsFailed = false;
+  KO.ytHlsFailedAt = 0;
+  KO.ytLoadedUrl = null;
   KO.pendingYtUrl = null;
   KO.ytEmbedAt = 0;
   KO.kickWin = null;
@@ -1244,14 +1277,10 @@ async function probe() {
   }
   await ensureYtHls();
   ensureYtIframe();
-  if (KO.ytState.live) {
-    showYtLayer();
-    setBadge('YT', '#ff0000');
-    return;
-  }
-  // The HLS layer never initialized: the manifest mint failed (ytHlsFailed)
-  // or the frame never reached ready within YT_EMBED_GRACE. When the channel
-  // also has a kick mapping, hand over to kick instead of leaving the native
+  // The HLS layer never initialized: the manifest mint failed (ytHlsFailed —
+  // also set by the frame's fatal error handler after its one reload) or the
+  // frame never reached ready within YT_EMBED_GRACE. When the channel also
+  // has a kick mapping, hand over to kick instead of leaving the native
   // Twitch player (ads) visible.
   if (
     KO.kickSlug &&
@@ -1263,6 +1292,21 @@ async function probe() {
       embedMs: KO.ytEmbedAt ? Date.now() - KO.ytEmbedAt : 0,
     });
     setPlayer('kick');
+    return;
+  }
+  // The mint refreshed (TTL or post-failure re-mint) while the frame was
+  // alive: hand the NEW url to the frame — the old one is dead (stream
+  // restart) and would otherwise sit black forever.
+  if (KO.ytState.ready && KO.ytHlsUrl && KO.ytLoadedUrl !== KO.ytHlsUrl) {
+    ytSend({ t: 'load', url: KO.ytHlsUrl });
+    KO.ytLoadedUrl = KO.ytHlsUrl;
+  }
+  if (KO.ytState.live || (KO.ytState.ready && KO.ytHlsUrl && KO.ytLoadedUrl === KO.ytHlsUrl)) {
+    // live, or ready with the current url handed over and starting to load
+    // (kick-style transition grace: show now, hls.js goes live in a moment;
+    // a dead url posts a fatal error that flips ytHlsFailed → fallback).
+    showYtLayer();
+    setBadge('YT', '#ff0000');
     return;
   }
   setBadge('YT OFF', '#6b7280');
@@ -1544,8 +1588,8 @@ function injectStyles() {
     'background:transparent;border:0;color:#fff;cursor:default;padding:0;}' +
     '#ko-live-dot{width:10px;height:10px;border-radius:50%;background:#53fc18;}' +
     '#ko-live-txt{font-size:14px;font-weight:600;white-space:nowrap;}' +
-    '#ko-elapsed{font-size:12px;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap;}' +
-  '  (document.head || document.documentElement).appendChild(st);'
+    '#ko-elapsed{font-size:12px;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap;}';
+  (document.head || document.documentElement).appendChild(st);
 }
 
 // ---- popup actions ----------------------------------------------------------
