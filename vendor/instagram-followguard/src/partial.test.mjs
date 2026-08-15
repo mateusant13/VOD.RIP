@@ -1,14 +1,24 @@
-// IG FollowGuard — checkpoint/resume unit tests.
+// IG FollowGuard — checkpoint/resume + error-classification unit tests.
 'use strict';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildResume, RESUME_TTL_MS, fetchAllUsers, IgApiError, __setRetryBaseMsForTests } from './ig_api.mjs';
+import {
+  buildResume, RESUME_TTL_MS, fetchAllUsers, IgApiError,
+  __setRetryBaseMsForTests, __setFetchTimeoutMsForTests, __setPageDelayMsForTests,
+} from './ig_api.mjs';
+
+// Test seams — real backoff/timeout/pacing would make these tests take minutes.
+__setRetryBaseMsForTests(1);
+__setFetchTimeoutMsForTests(5);
+__setPageDelayMsForTests(0);
 
 const UID = '123';
 const P = 'igf.resume.'; // current (v2) checkpoint namespace
 const mk = (users, maxId, at = Date.now()) => ({ maxId, at, users });
 const u = (n) => ({ username: 'user' + n, pk: String(n) });
 const SESSION = { cookieHeader: 'a=1; b=2', csrftoken: 'tok' };
+// MAX_RETRIES=5 -> initial attempt + 5 retries = 6 payloads for transient shapes.
+const RETRY_ROUNDS = 6;
 
 // --- buildResume ---
 
@@ -90,9 +100,6 @@ test('buildResume: unknown kind ignored', () => {
 });
 
 test('buildResume: pre-v2 namespace keys ignored (torn-checkpoint upgrade guard)', () => {
-  // The committed pre-fix build wrote `seq: page` (restarting counter) and can
-  // leave contiguous labels with torn content; resuming those would produce an
-  // incomplete list. The v2 namespace bump must make them invisible.
   const meta = { keys: ['igf.part.following.123.0', 'igf.part.following.123.1'] };
   const values = {
     'igf.part.following.123.0': mk([u(1)], 'm1'),
@@ -101,7 +108,7 @@ test('buildResume: pre-v2 namespace keys ignored (torn-checkpoint upgrade guard)
   assert.deepEqual(buildResume(UID, meta, values), { following: null, followers: null });
 });
 
-// --- fetchAllUsers + resume + malformed-response guard ---
+// --- fetchAllUsers: resume + malformed-response guard ---
 
 function stubFetchQueue(payloads) {
   const queue = payloads.slice();
@@ -112,8 +119,7 @@ function stubFetchQueue(payloads) {
 }
 
 test('fetchAllUsers: malformed {} with resume rejects (no truncated completion)', async () => {
-  __setRetryBaseMsForTests(1);
-  stubFetchQueue([{}, {}, {}, {}]); // initial + 3 fast retries, all malformed
+  stubFetchQueue(Array(RETRY_ROUNDS).fill({}));
   const resume = { maxId: 'm0', nextSeq: 2, users: [u(1), u(2)] };
   await assert.rejects(
     fetchAllUsers('following', UID, SESSION, { resume }),
@@ -123,7 +129,7 @@ test('fetchAllUsers: malformed {} with resume rejects (no truncated completion)'
 });
 
 test('fetchAllUsers: malformed {} from scratch rejects (original guard)', async () => {
-  stubFetchQueue([{}, {}, {}, {}]);
+  stubFetchQueue(Array(RETRY_ROUNDS).fill({}));
   await assert.rejects(
     fetchAllUsers('following', UID, SESSION, {}),
     (err) => err instanceof IgApiError && err.code === 'http'
@@ -148,7 +154,6 @@ test('fetchAllUsers: happy path, onPart seq continues from resume.nextSeq', asyn
     resume,
     onPart: async ({ seq, maxId, users }) => { parts.push([seq, maxId, users.length]); },
   });
-  // seeded 1 + page 2 users (page 2 has next_max_id -> checkpointed with seq 1)
   assert.deepEqual([...out.keys()], ['user1', 'user2', 'user3', 'user4']);
   assert.deepEqual(parts, [[1, 'm1', 2]]); // seq continues, never restarts at 0
 });
@@ -164,4 +169,130 @@ test('fetchAllUsers: fresh run checkpoints from seq 0', async () => {
   });
   assert.deepEqual([...out.keys()], ['user1', 'user2']);
   assert.deepEqual(parts, [[0, 'm1', 1]]);
+});
+
+// --- fetchAllUsers: timeout / network / gate classification ---
+
+function stubFetchHang() {
+  // Never resolves on its own — only the AbortController can end it, exactly
+  // like a throttled IG connection holding the request open.
+  globalThis.fetch = (_url, opts) => new Promise((_, reject) => {
+    const s = opts && opts.signal;
+    if (s) s.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+  });
+}
+
+test('fetchAllUsers: hung request aborts to network and retries (no infinite stall)', async () => {
+  stubFetchHang();
+  await assert.rejects(
+    fetchAllUsers('following', UID, SESSION, {}),
+    (err) => err instanceof IgApiError && err.code === 'network',
+    'a hung fetch must fail into the retry path, never hang the sync'
+  );
+});
+
+test('fetchAllUsers: raw network rejection classified network and retried', async () => {
+  globalThis.fetch = async () => { throw new TypeError('Failed to fetch'); };
+  await assert.rejects(
+    fetchAllUsers('following', UID, SESSION, {}),
+    (err) => err instanceof IgApiError && err.code === 'network'
+  );
+});
+
+test('fetchAllUsers: feedback_required is terminal, no retry (one call)', async () => {
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return { ok: true, status: 200, text: async () => JSON.stringify({ status: 'fail', message: 'feedback_required', feedback_title: 'Sua conta foi temporariamente limitada.' }) };
+  };
+  await assert.rejects(
+    fetchAllUsers('following', UID, SESSION, {}),
+    (err) => err instanceof IgApiError && err.code === 'feedback-required'
+  );
+  assert.equal(calls, 1, 'bot gate must not be retried');
+});
+
+test('apiFetch: HTML login wall -> not-logged-in', async () => {
+  globalThis.fetch = async () => ({
+    ok: true, status: 200,
+    text: async () => '<!DOCTYPE html><html><body><a href="/accounts/login/">Entrar</a></body></html>',
+  });
+  await assert.rejects(
+    fetchAllUsers('following', UID, SESSION, {}),
+    (err) => err instanceof IgApiError && err.code === 'not-logged-in'
+  );
+});
+
+test('apiFetch: gate HTML -> feedback-required (friend\'s exact dead end now actionable)', async () => {
+  globalThis.fetch = async () => ({
+    ok: true, status: 200,
+    text: async () => '<!DOCTYPE html><html><body><title>temporarily limited</title>feedback_required</body></html>',
+  });
+  await assert.rejects(
+    fetchAllUsers('following', UID, SESSION, {}),
+    (err) => err instanceof IgApiError && err.code === 'feedback-required'
+  );
+});
+
+test('apiFetch: 401 -> not-logged-in', async () => {
+  globalThis.fetch = async () => ({
+    ok: false, status: 401,
+    text: async () => JSON.stringify({ status: 'fail', message: 'login_required' }),
+  });
+  await assert.rejects(
+    fetchAllUsers('following', UID, SESSION, {}),
+    (err) => err instanceof IgApiError && err.code === 'not-logged-in'
+  );
+});
+
+test('apiFetch: rate_limit_error body -> rate-limited', async () => {
+  stubFetchQueue(Array(RETRY_ROUNDS).fill({ status: 'fail', message: 'rate_limit_error' }));
+  await assert.rejects(
+    fetchAllUsers('following', UID, SESSION, {}),
+    (err) => err instanceof IgApiError && err.code === 'rate-limited'
+  );
+});
+
+// --- fetchAllUsers: data-integrity guards ---
+
+test('fetchAllUsers: page with invalid entries throws (cursor never advances past bad data)', async () => {
+  stubFetchQueue(Array(RETRY_ROUNDS).fill({ status: 'ok', users: [{ username: 'ok', pk: '1' }, null], next_max_id: 'm1' }));
+  await assert.rejects(
+    fetchAllUsers('following', UID, SESSION, {}),
+    (err) => err instanceof IgApiError && err.code === 'http',
+    'a page containing null entries must fail, not silently drop users'
+  );
+});
+
+test('fetchAllUsers: partial page with next_max_id continues and checkpoints', async () => {
+  // The friend's page 6: 21 users WITH next_max_id — must continue, never stall.
+  const partial = Array.from({ length: 21 }, (_, i) => u(100 + i));
+  stubFetchQueue([
+    { status: 'ok', users: partial, next_max_id: 'm6' },
+    { status: 'ok', users: [u(999)] },
+  ]);
+  const parts = [];
+  const out = await fetchAllUsers('following', UID, SESSION, {
+    onPart: async ({ seq, maxId, users }) => { parts.push([seq, maxId, users.length]); },
+  });
+  assert.equal(out.size, 22);
+  assert.deepEqual(parts, [[0, 'm6', 21]]);
+});
+
+test('fetchAllUsers: MAX_PAGES exhaustion throws limit (never completes short)', async () => {
+  // 500 pages, each with a next_max_id -> the loop hits the cap. The sync must
+  // FAIL (checkpoints intact), never diff/notify on a truncated list.
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return {
+      ok: true, status: 200,
+      text: async () => JSON.stringify({ status: 'ok', users: [{ username: 'u' + calls, pk: String(calls) }], next_max_id: 'm' + calls }),
+    };
+  };
+  await assert.rejects(
+    fetchAllUsers('following', UID, SESSION, {}),
+    (err) => err instanceof IgApiError && err.code === 'limit'
+  );
+  assert.equal(calls, 500);
 });

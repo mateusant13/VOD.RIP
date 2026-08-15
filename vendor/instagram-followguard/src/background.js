@@ -4,7 +4,7 @@
 // periodic alarms. Reads ONLY follow/follower relationships.
 'use strict';
 
-import { readSession, fetchAllUsers, IgApiError, buildResume } from './ig_api.mjs';
+import { readSession, fetchAllUsers, IgApiError, buildResume, apiFetch, transientRetry } from './ig_api.mjs';
 import { diffAndRecord, mergeEvents } from './diff.mjs';
 
 const K = {
@@ -129,22 +129,35 @@ async function clearPartials() {
 
 let runningSync = null;
 
+const TRANSIENT_CODES = new Set(['http', 'network', 'rate-limited']);
+const RETRY_ALARM = 'igf-sync-retry';
+
+// After a TRANSIENT failure (never login/checkpoint/gate/limit), schedule a
+// one-shot retry in 5 min. Checkpoints make the auto-resume safe — it picks
+// up from the last persisted page instead of re-fetching from page 1.
+function scheduleErrorRetry(code) {
+  if (!TRANSIENT_CODES.has(code)) return;
+  chrome.alarms.create(RETRY_ALARM, { delayInMinutes: 5 }).catch(() => {});
+}
+
 async function sync(trigger) {
   if (runningSync) return runningSync;
-  runningSync = (async () => {
+  const run = (async () => {
     const t0 = Date.now();
-    await setState({ status: 'syncing', trigger: trigger || 'manual', error: null });
-    const session = await readSession().catch((err) => err);
-    if (session instanceof IgApiError) {
-      await setState({ status: 'error', error: session.message, trigger: trigger || 'manual' });
-      runningSync = null;
-      return { ok: false, error: session.message };
-    }
-    const settings = await getSettings();
-    const st0 = await getState();
-    let uid = session.uid;
-    let username = st0.ownUsername || null; // runtime-resolved, never hardcoded
     try {
+      // Cancel any pending auto-retry — a fresh manual/alarm attempt supersedes it.
+      await chrome.alarms.clear(RETRY_ALARM);
+      await setState({ status: 'syncing', trigger: trigger || 'manual', error: null, syncProgress: null });
+      const session = await readSession().catch((err) => err);
+      if (session instanceof IgApiError) {
+        await setState({ status: 'error', error: session.message, errorCode: session.code, trigger: trigger || 'manual' });
+        scheduleErrorRetry(session.code);
+        return { ok: false, error: session.message };
+      }
+      const settings = await getSettings();
+      const st0 = await getState();
+      let uid = session.uid;
+      let username = st0.ownUsername || null; // runtime-resolved, never hardcoded
       if (uid && !username) {
         username = (await resolveOwnUser(null, session, uid)).username;
       } else if (!uid) {
@@ -204,7 +217,12 @@ async function sync(trigger) {
       // --- notifications for people we still follow who stopped following us ---
       const notifyable = events.filter((e) => e.stillFollowing);
       if (notifyable.length && settings.notificationsEnabled) {
-        await notifyUnfollows(notifyable);
+        try {
+          await notifyUnfollows(notifyable);
+        } catch {
+          // Notifications are best-effort — a failed create must not mark a
+          // COMPLETED sync as errored.
+        }
       }
 
       const notFollowingBack = [...following.keys()].filter((u) => !followers.has(u));
@@ -213,21 +231,25 @@ async function sync(trigger) {
         lastSyncAt: nowIso(),
         lastDurationMs: Date.now() - t0,
         error: null,
+        errorCode: null,
         syncProgress: null,
         followersCount: followers.size,
         followingCount: following.size,
         notFollowingBackCount: notFollowingBack.length,
         incomplete: false,
       });
-      runningSync = null;
       return { ok: true, following: following.size, followers: followers.size, notFollowingBack: notFollowingBack.length, newEvents: events.length };
     } catch (err) {
       const msg = err instanceof IgApiError ? err.message : String(err && err.message || err).slice(0, 200);
-      await setState({ status: 'error', error: msg, syncProgress: null });
-      runningSync = null;
+      const code = err instanceof IgApiError ? err.code : null;
+      await setState({ status: 'error', error: msg, syncProgress: null, errorCode: code });
+      scheduleErrorRetry(code); // transient only — login/checkpoint/gate never auto-retry
       return { ok: false, error: msg };
+    } finally {
+      runningSync = null;
     }
   })();
+  runningSync = run;
   return runningSync;
 }
 
@@ -235,41 +257,21 @@ async function sync(trigger) {
 async function resolveOwnUser(username, session, knownUid) {
   if (knownUid) {
     // /api/v1/users/{pk}/info/ echoes the profile (no username needed).
-    const res = await fetch(`https://www.instagram.com/api/v1/users/${knownUid}/info/`, {
-      method: 'GET',
-      headers: {
-        'accept': 'application/json',
-        'cookie': session.cookieHeader,
-        'referer': 'https://www.instagram.com/',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        'x-csrftoken': session.csrftoken || '',
-        'x-ig-app-id': '936619743392459',
-      },
-      credentials: 'include',
-    });
-    const body = await res.json();
+    // Classified + retried: a transient blip on the sync's FIRST step used to
+    // kill the whole sync with zero retries (raw fetch, no classification).
+    const body = await transientRetry(() => apiFetch(`/api/v1/users/${knownUid}/info/`, session));
     if (body && body.user && body.user.username) {
       return { uid: knownUid, username: body.user.username };
     }
+    throw new IgApiError('http', 'Instagram respondeu com uma resposta inesperada.');
   }
   if (username) {
     const params = new URLSearchParams({ username });
-    const res = await fetch(`https://www.instagram.com/api/v1/users/web_profile_info/?${params.toString()}`, {
-      method: 'GET',
-      headers: {
-        'accept': 'application/json',
-        'cookie': session.cookieHeader,
-        'referer': 'https://www.instagram.com/',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        'x-ig-app-id': '936619743392459',
-      },
-      credentials: 'include',
-    });
-    const body = await res.json();
-    if (body && body.data && body.data.user) {
-      return { uid: body.data.user.id, username: body.data.user.username };
+    const body = await transientRetry(() => apiFetch(`/api/v1/users/web_profile_info/?${params.toString()}`, session));
+    if (body && body.data && body.data.user && body.data.user.username) {
+      return { uid: String(body.data.user.id), username: body.data.user.username };
     }
-    throw new IgApiError('http', 'Não consegui resolver seu usuário no Instagram.');
+    throw new IgApiError('http', 'Instagram respondeu com uma resposta inesperada.');
   }
   throw new IgApiError('not-logged-in', 'Não encontrei seu ID de usuário. Abra instagram.com logado.');
 }
@@ -315,6 +317,7 @@ async function scheduleAlarm() {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === SYNC_ALARM) sync('alarm');
+  if (alarm.name === RETRY_ALARM) sync('retry');
 });
 
 chrome.runtime.onInstalled.addListener(async (details) => {

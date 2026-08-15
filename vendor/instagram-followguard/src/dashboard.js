@@ -174,7 +174,7 @@ function renderError() {
   if (state.status === 'error' && state.error) {
     el.error().style.display = 'block';
     el.errText().textContent = state.error;
-    const isLogin = /sessão|login|verificação/i.test(state.error);
+    const isLogin = /sessão|login|verificação|limitada|feedback|aguarde|temporariamente|verificação/i.test(state.error);
     el.errBtn().textContent = isLogin ? 'Abrir Instagram' : 'Tentar de novo';
     el.errBtn().onclick = isLogin ? openInstagram : () => sendSync();
   } else {
