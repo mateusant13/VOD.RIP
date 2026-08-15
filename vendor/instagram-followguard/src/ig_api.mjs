@@ -13,6 +13,11 @@ const PAGE_DELAY_MS = 250;          // pacing between pages (checkpoint safety)
 const MAX_PAGES = 500;              // hard cap per list (500*200 = 100k users)
 const MAX_RETRIES = 3;              // consecutive transient failures
 export const RESUME_TTL_MS = 60 * 60 * 1000; // discard checkpoints older than 1h
+// Internal test seam — real backoff is 5s*retries (too slow for unit tests).
+let retryBaseMs = 5000;
+export function __setRetryBaseMsForTests(v) {
+  retryBaseMs = v;
+}
 
 export class IgApiError extends Error {
   constructor(code, message) {
@@ -124,6 +129,7 @@ async function fetchPage(kind, uid, maxId, session, signal) {
 export async function fetchAllUsers(kind, uid, session, { signal, onProgress, resume, onPart } = {}) {
   const out = new Map();
   let maxId = null;
+  let seq = 0; // monotonic across runs — a restarted counter would clobber old checkpoints
   let retries = 0;
   const pick = (u) => ({
     pk: String(u.pk || ''),
@@ -134,6 +140,7 @@ export async function fetchAllUsers(kind, uid, session, { signal, onProgress, re
     profile_pic_url: u.profile_pic_url || '',
   });
   if (resume && resume.maxId && Array.isArray(resume.users)) {
+    seq = typeof resume.nextSeq === 'number' ? resume.nextSeq : 0;
     for (const u of resume.users) {
       if (!u || !u.username) continue;
       out.set(u.username, pick(u));
@@ -144,9 +151,13 @@ export async function fetchAllUsers(kind, uid, session, { signal, onProgress, re
     try {
       const { users, nextMaxId, usersPresent } = await fetchPage(kind, uid, maxId, session, signal);
       retries = 0;
-      // Malformed empty response (no users array at all) on an empty partial
-      // result would "complete" with zero accounts — treat it as transient.
-      if (out.size === 0 && users.length === 0 && !nextMaxId && !usersPresent) {
+      // Malformed response (no users array at all) would silently TRUNCATE
+      // the list — from scratch OR resumed (a seeded resume has out.size>0,
+      // so the guard must not depend on it). A genuine empty list always
+      // carries users: [] (usersPresent=true), so no false positive. Thrown
+      // as 'http' → retried as transient, then surfaces as sync error with
+      // checkpoints intact (next attempt resumes, never completes short).
+      if (!usersPresent && users.length === 0) {
         throw new IgApiError('http', 'Instagram respondeu com uma resposta inesperada.');
       }
       for (const u of users) {
@@ -155,7 +166,14 @@ export async function fetchAllUsers(kind, uid, session, { signal, onProgress, re
       }
       if (onProgress) onProgress({ kind, fetched: out.size });
       if (onPart && users.length && nextMaxId) {
-        onPart({ seq: page, maxId: nextMaxId, users: users.map(pick) }).catch(() => {});
+        try {
+          // Await before advancing: a not-awaited checkpoint write can still
+          // be in flight when the caller clears partials after success,
+          // resurrecting a stale key past clearPartials.
+          await onPart({ seq: seq++, maxId: nextMaxId, users: users.map(pick) });
+        } catch {
+          // checkpoint persistence is best-effort — resume granularity only
+        }
       }
       if (!nextMaxId) break;
       maxId = nextMaxId;
@@ -167,7 +185,7 @@ export async function fetchAllUsers(kind, uid, session, { signal, onProgress, re
       if (err.code === 'rate-limited' || err.code === 'network' || err.code === 'http') {
         retries += 1;
         if (retries > MAX_RETRIES) throw err;
-        await sleep(5000 * retries);
+        await sleep(retryBaseMs * retries);
         continue;
       }
       throw err;
@@ -184,7 +202,10 @@ export async function fetchAllUsers(kind, uid, session, { signal, onProgress, re
  *
  * meta   { keys: [partKey, ...] }        — index of persisted pages
  * values { [partKey]: { maxId, at, users } } — the pages themselves
- * Returns { following: {maxId, users}|null, followers: ... }.
+ * Returns { following: {maxId, users, nextSeq}|null, followers: ... }.
+ * nextSeq = number of persisted pages — the next run MUST keep numbering
+ * pages from there (a restarted page counter would overwrite old checkpoints
+ * and a later resume would assemble an INCOMPLETE list).
  */
 export function buildResume(uid, meta, values) {
   const out = { following: null, followers: null };
@@ -192,6 +213,7 @@ export function buildResume(uid, meta, values) {
   const byKind = { following: {}, followers: {} };
   for (const k of meta.keys) {
     const parts = k.split('.');
+    if (parts[1] !== 'resume') continue; // pre-v2 namespace (torn checkpoints) — never resume
     const kind = parts[2];
     const pk = parts[3];
     if (!byKind[kind] || pk !== String(uid)) continue; // unknown kind / other account
@@ -205,13 +227,15 @@ export function buildResume(uid, meta, values) {
     const users = [];
     let maxId = null;
     let prev = -1;
+    let nextSeq = 0;
     for (const s of seqs) {
       if (s !== prev + 1) break; // contiguous prefix only — never skip pages
       users.push(...byKind[kind][s].users);
       maxId = byKind[kind][s].maxId;
       prev = s;
+      nextSeq = s + 1;
     }
-    out[kind] = users.length ? { maxId, users } : null;
+    out[kind] = users.length ? { maxId, users, nextSeq } : null;
   }
   return out;
 }

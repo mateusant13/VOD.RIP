@@ -76,20 +76,31 @@ function nowIso() {
 // accounts; TTL-guarded; only the contiguous page prefix is ever resumed.
 // ---------------------------------------------------------------------------
 
-const PART_META = 'igf.part.meta';
-const PART_PREFIX = 'igf.part.';
+// 'igf.resume.' namespace (v2): the pre-fix build wrote `seq: page` — a
+// restarted loop counter clobbered old checkpoints, so storage can hold
+// contiguous labels with TORN content. Bumping the prefix invalidates any
+// such partials on upgrade (a torn checkpoint would resume an incomplete
+// list). Old keys are never read again (harmless orphans).
+const PART_META = 'igf.resume.meta';
+const PART_PREFIX = 'igf.resume.';
 const partKey = (kind, uid, seq) => `${PART_PREFIX}${kind}.${uid}.${seq}`;
 
+// Serializes the PART_META read-modify-write across the two parallel sync
+// branches — without it, a lost key in the index truncates the resume prefix
+// and the unindexed value key is never cleaned by clearPartials.
+let metaLock = Promise.resolve();
+
 // Best-effort: a failing checkpoint write only costs resume granularity.
-async function savePagePart(kind, uid, seq, maxId, users) {
+function savePagePart(kind, uid, seq, maxId, users) {
   const key = partKey(kind, uid, seq);
-  await chrome.storage.local.set({ [key]: { maxId, at: Date.now(), users } });
-  try {
+  metaLock = metaLock.then(async () => {
+    await chrome.storage.local.set({ [key]: { maxId, at: Date.now(), users } });
     const o = await chrome.storage.local.get(PART_META);
     const meta = o[PART_META] || { keys: [] };
     if (!meta.keys.includes(key)) meta.keys.push(key);
     await chrome.storage.local.set({ [PART_META]: meta });
-  } catch { /* index lost -> leaked page, TTL-guarded */ }
+  });
+  return metaLock;
 }
 
 async function readPartials(uid) {
@@ -410,3 +421,11 @@ scheduleAlarm().catch(() => {});
     }
   } catch { /* storage unavailable — next sync overwrites anyway */ }
 })();
+
+// One-time cleanup: drop pre-v2 checkpoint keys ('igf.part.*' — torn-content
+// hazard written by the build that restarted the page counter at 0). The new
+// namespace is 'igf.resume.'; old keys are never read, just garbage.
+chrome.storage.local.get(null).then((all) => {
+  const stale = Object.keys(all).filter((k) => k.startsWith('igf.part.'));
+  if (stale.length) chrome.storage.local.remove(stale);
+}).catch(() => {});

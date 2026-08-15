@@ -67,6 +67,12 @@ function placeholder(u) {
 }
 
 // Resolve profile pics as same-origin blob URLs (deduped per page instance).
+// LRU-capped: the Map holds only the most-recent 512 URLs, so pathological
+// scrolling on huge accounts can't grow the string Map unboundedly.
+// ponytail: evicted blobs are NOT revoked — revoking a URL that is still in
+// the DOM (re-rendered items) would break a visible avatar; blobs are freed
+// anyway when the document (popup/panel iframe) is destroyed.
+const PIC_CACHE_MAX = 512;
 const picCache = new Map(); // url -> Promise<blobUrl>
 function hydrateAvatars(root) {
   for (const img of root.querySelectorAll('img.avatar[data-pic]')) {
@@ -82,6 +88,10 @@ function hydrateAvatars(root) {
         .then((b) => URL.createObjectURL(b))
         .catch((err) => { picCache.delete(url); throw err; });
       picCache.set(url, p);
+      if (picCache.size > PIC_CACHE_MAX) {
+        const oldest = picCache.keys().next().value; // Map = insertion order
+        picCache.delete(oldest);
+      }
     }
     p.then((blobUrl) => { if (img.isConnected) img.src = blobUrl; })
       .catch(() => {
