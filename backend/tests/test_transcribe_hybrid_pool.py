@@ -19,7 +19,9 @@ GIB = 1024 ** 3
 
 def _force_cuda(monkeypatch) -> None:
     """Idle, unheld GPU with ample VRAM: the plan's GPU lane is usable."""
-    monkeypatch.setattr(at._multi_tls, "pin", ("cuda", "int8"))
+    # raising=False: pin is a per-thread attribute of threading.local and
+    # never exists on the pytest thread — default raising=True AttributeErrors.
+    monkeypatch.setattr(at._multi_tls, "pin", ("cuda", "int8"), raising=False)
     monkeypatch.setattr(at, "_free_system_ram_bytes", lambda: 64 * GIB)
     monkeypatch.setattr(at, "_gpu_free_vram_bytes", lambda: 64 * GIB)  # ample VRAM
     monkeypatch.setattr(at, "_gpu_held_by_other", lambda: False)       # no foreign tenant
@@ -28,7 +30,7 @@ def _force_cuda(monkeypatch) -> None:
 
 
 def _force_cpu(monkeypatch) -> None:
-    monkeypatch.setattr(at._multi_tls, "pin", ("cpu", "int8"))
+    monkeypatch.setattr(at._multi_tls, "pin", ("cpu", "int8"), raising=False)
     monkeypatch.setattr(at, "_free_system_ram_bytes", lambda: 64 * GIB)
     monkeypatch.setattr(at, "_cpu_load_high", lambda: False)  # not contended
 

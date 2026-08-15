@@ -19,11 +19,13 @@ def _set_free_ram(monkeypatch, free_bytes: int) -> None:
 
 
 def _force_cpu(monkeypatch) -> None:
-    monkeypatch.setattr(at._multi_tls, "pin", ("cpu", "int8"))
+    # raising=False: pin is a per-thread attribute of threading.local and
+    # never exists on the pytest thread — default raising=True AttributeErrors.
+    monkeypatch.setattr(at._multi_tls, "pin", ("cpu", "int8"), raising=False)
 
 
 def _force_cuda(monkeypatch) -> None:
-    monkeypatch.setattr(at._multi_tls, "pin", ("cuda", "int8"))
+    monkeypatch.setattr(at._multi_tls, "pin", ("cuda", "int8"), raising=False)
 
 
 # --- _ram_worker_clamp (pure clamp math) ------------------------------------
