@@ -4,7 +4,7 @@
 // periodic alarms. Reads ONLY follow/follower relationships.
 'use strict';
 
-import { readSession, fetchAllUsers, IgApiError, buildResume, apiFetch, transientRetry } from './ig_api.mjs';
+import { readSession, fetchAllUsers, IgApiError, buildResume, apiFetch, transientRetry, __setTransport } from './ig_api.mjs';
 import { diffAndRecord, mergeEvents } from './diff.mjs';
 
 const K = {
@@ -129,15 +129,142 @@ async function clearPartials() {
 
 let runningSync = null;
 
+// --- Page-context transport ---
+// The sync's HTTP requests run on an instagram.com tab via content_proxy.js:
+// same-origin fetch with the browser's real headers and native cookies —
+// byte-indistinguishable from the web app's own requests (see
+// content_proxy.js). One tab is used for the whole sync; a tab WE opened is
+// closed when the sync ends ("fecha a aba q tu abriu"), the user's own tab
+// is never touched.
+//
+// Tabs opened BEFORE an extension reload have no content_proxy listener
+// (content scripts inject only on load) — pinging selects only tabs that can
+// actually serve, and the transport self-heals mid-sync (a closed/navigated
+// tab re-ensures a fresh one instead of retrying into a dead listener).
+let syncTabId = null;   // tab the active sync is using
+let openedTabId = null; // tab we created for the sync (must be closed after)
+
+async function pingProxy(tabId) {
+  try {
+    const r = await chrome.tabs.sendMessage(tabId, { igf: 'ping' });
+    return !!(r && r.pong);
+  } catch {
+    return false;
+  }
+}
+
+async function waitForProxy(tabId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await pingProxy(tabId)) return true;
+    await sleep(400);
+  }
+  return false;
+}
+
+async function ensureIgTab() {
+  // Prefer an existing IG tab whose content script ANSWERS — a pre-reload
+  // tab (no listener) is skipped, never navigated.
+  const tabs = await chrome.tabs.query({ url: 'https://www.instagram.com/*' });
+  for (const t of tabs) {
+    if (await pingProxy(t.id)) {
+      syncTabId = t.id;
+      return;
+    }
+  }
+  // Reuse our own still-open tab, else open a fresh one (content script is
+  // guaranteed after the page loads; ping until it answers).
+  if (openedTabId != null) {
+    try {
+      await chrome.tabs.get(openedTabId);
+      syncTabId = openedTabId;
+      return;
+    } catch { openedTabId = null; }
+  }
+  const t = await chrome.tabs.create({ url: 'https://www.instagram.com/', active: false });
+  openedTabId = t.id;
+  syncTabId = t.id;
+  await waitForProxy(t.id, 10000);
+}
+
+function releaseIgTab() {
+  if (openedTabId != null) {
+    chrome.tabs.remove(openedTabId).catch(() => {});
+    openedTabId = null;
+  }
+  syncTabId = null;
+}
+
+// Runs fn with the page-context transport installed: an IG tab is ensured
+// (opened only when none exists AND the user asked — never on a timer), every
+// request inside fn goes through content_proxy.js, and the tab/transport are
+// released after. EVERY path that talks to IG must go through this — a
+// SW-originated fetch advertises sec-fetch-site: none with forged headers,
+// the exact fingerprint the page transport removes.
+//
+// Serialized with a promise lock (same pattern as metaLock for checkpoints):
+// withPageTransport installs a MODULE-GLOBAL transport, so a concurrent
+// caller's teardown must never land between two of our fetches — e.g.
+// igf-get-own resolving the user mid-sync used to null the transport under
+// sync()'s feet (internal-error + full backoff burn). The lock makes
+// install/run/teardown atomic per caller; queueing is short in practice
+// (get-own only takes this path while ownUsername is unset, and the sync
+// sets it during its own resolution phase).
+let transportLock = Promise.resolve();
+function withPageTransport(fn) {
+  const run = transportLock.then(async () => {
+    await ensureIgTab();
+    __setTransport(pageTransport);
+    try {
+      return await fn();
+    } finally {
+      __setTransport(null);
+      releaseIgTab();
+    }
+  });
+  // Keep the chain alive even if this caller's fn rejects.
+  transportLock = run.catch(() => {});
+  return run;
+}
+
+async function pageTransport(path, _session, _signal) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (syncTabId == null) await ensureIgTab();
+    try {
+      const r = await chrome.tabs.sendMessage(syncTabId, { igf: 'fetch', path });
+      if (!r || !r.ok) {
+        throw new IgApiError('network', r && r.error === 'timeout'
+          ? 'O Instagram não respondeu em 20s.'
+          : 'Falha de rede ao falar com o Instagram.');
+      }
+      return { status: r.status, text: r.text };
+    } catch (e) {
+      // Tab lost its listener (closed/navigated mid-sync) — heal so the
+      // retry hits a live tab instead of looping into the dead one.
+      syncTabId = null;
+      await ensureIgTab();
+    }
+  }
+  throw new IgApiError('network', 'Falha de rede ao falar com o Instagram.');
+}
+
 const TRANSIENT_CODES = new Set(['http', 'network', 'rate-limited']);
 const RETRY_ALARM = 'igf-sync-retry';
+// Escalating auto-retry delays (min): a fixed 5-min retry loop for hours is a
+// bot cadence; a human checks back later, then much later. retryN is
+// persisted and reset on success; cap at 2h.
+const RETRY_DELAYS_MIN = [5, 15, 45, 120];
 
 // After a TRANSIENT failure (never login/checkpoint/gate/limit), schedule a
-// one-shot retry in 5 min. Checkpoints make the auto-resume safe — it picks
-// up from the last persisted page instead of re-fetching from page 1.
+// one-shot retry. Checkpoints make the auto-resume safe — it picks up from
+// the last persisted page instead of re-fetching from page 1.
 function scheduleErrorRetry(code) {
   if (!TRANSIENT_CODES.has(code)) return;
-  chrome.alarms.create(RETRY_ALARM, { delayInMinutes: 5 }).catch(() => {});
+  getState().then(async (st) => {
+    const n = Math.min(Number(st.retryN) || 0, RETRY_DELAYS_MIN.length - 1);
+    await chrome.alarms.create(RETRY_ALARM, { delayInMinutes: RETRY_DELAYS_MIN[n] });
+    await setState({ retryN: n + 1 });
+  }).catch(() => {});
 }
 
 async function sync(trigger) {
@@ -148,6 +275,7 @@ async function sync(trigger) {
       // Cancel any pending auto-retry — a fresh manual/alarm attempt supersedes it.
       await chrome.alarms.clear(RETRY_ALARM);
       await setState({ status: 'syncing', trigger: trigger || 'manual', error: null, syncProgress: null });
+      return await withPageTransport(async () => {
       const session = await readSession().catch((err) => err);
       if (session instanceof IgApiError) {
         await setState({ status: 'error', error: session.message, errorCode: session.code, trigger: trigger || 'manual' });
@@ -237,8 +365,10 @@ async function sync(trigger) {
         followingCount: following.size,
         notFollowingBackCount: notFollowingBack.length,
         incomplete: false,
+        retryN: 0,
       });
       return { ok: true, following: following.size, followers: followers.size, notFollowingBack: notFollowingBack.length, newEvents: events.length };
+      });
     } catch (err) {
       const msg = err instanceof IgApiError ? err.message : String(err && err.message || err).slice(0, 200);
       const code = err instanceof IgApiError ? err.code : null;
@@ -315,9 +445,18 @@ async function scheduleAlarm() {
   }
 }
 
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === SYNC_ALARM) sync('alarm');
-  if (alarm.name === RETRY_ALARM) sync('retry');
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== SYNC_ALARM && alarm.name !== RETRY_ALARM) return;
+  // Background syncs run only while an IG tab exists — the requests must
+  // LOOK like page requests (see pageTransport). No IG tab open = nobody is
+  // on Instagram = skip; the next panel open / alarm with a tab handles it.
+  try {
+    const tabs = await chrome.tabs.query({ url: 'https://www.instagram.com/*' });
+    if (!tabs.length) return;
+  } catch {
+    return;
+  }
+  sync(alarm.name === SYNC_ALARM ? 'alarm' : 'retry');
 });
 
 chrome.runtime.onInstalled.addListener(async (details) => {
@@ -359,11 +498,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       let uid = session.uid;
       let username = null;
       try {
-        if (uid) {
-          username = (await resolveOwnUser(null, session, uid)).username;
-        } else {
+        // Same page-context transport as sync() — the user-resolution request
+        // must NOT be a SW fetch (fingerprint). The FAB/panel on an IG page
+        // reuses the user's own tab; nothing is closed.
+        username = await withPageTransport(async () => {
+          if (uid) {
+            return (await resolveOwnUser(null, session, uid)).username;
+          }
           throw new IgApiError('not-logged-in', 'Não encontrei seu ID de usuário. Abra instagram.com logado.');
-        }
+        });
       } catch (err) {
         sendResponse({
           ok: false,

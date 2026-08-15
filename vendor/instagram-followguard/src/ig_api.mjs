@@ -8,20 +8,22 @@ export const IG_WEB_APP_ID = '936619743392459'; // www.instagram.com web client 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
-const PAGE_SIZE = 200;              // max users per page the web API accepts
-// Pacing between pages: 250ms (~4 req/s sustained) trips IG's rate gate on
-// long lists (the friend's stall: full pages, then a shrunken 21-user page,
-// then a hung connection, then gate HTML). 800ms±jitter ≈ the web app's
-// scroll cadence — ~1-1.7 req/s.
-const PAGE_DELAY_MS = 800;
+const PAGE_SIZE = 24;               // web-app follow-list page size — the web UI requests 24 per scroll; 200/page in a burst is the scraper fingerprint that got the friend's account gated
+// Humanized pacing base (ms/page). Fixed-interval loops are the #1 bot
+// fingerprint; the web app paces by the user's SCROLL — variable gaps and
+// pauses. pageDelayMs is the BASE: real gaps are randomized around it and
+// ~10% of pauses are 2-5.5× longer ("reading" the list). count=24 × ~2.6s
+// avg ≈ a real person scrolling the dialog; 1048 accounts take ~2min (the
+// web app itself would take as long).
+const PAGE_DELAY_MS = 2000;
 const FETCH_TIMEOUT_MS = 20000;     // per-request timeout — a throttled IG connection hangs forever without one
-const MAX_PAGES = 500;              // hard cap per list (500*200 = 100k users)
+const MAX_PAGES = 500;              // hard cap per list (500*24 = 12k users)
 const MAX_RETRIES = 5;              // consecutive transient failures
 // Backoff per error class: http/network are soft transients; rate-limited and
 // gate responses need MINUTES (short retries just re-enter the gate).
 const RETRY_BACKOFF_MS = {
-  http: [10e3, 30e3, 60e3, 60e3, 60e3],
-  network: [10e3, 30e3, 60e3, 60e3, 60e3],
+  http: [30e3, 60e3, 120e3, 240e3, 240e3],
+  network: [30e3, 60e3, 120e3, 240e3, 240e3],
   'rate-limited': [60e3, 120e3, 180e3, 300e3, 300e3],
 };
 export const RESUME_TTL_MS = 60 * 60 * 1000; // discard checkpoints older than 1h
@@ -32,6 +34,28 @@ let pageDelayMs = PAGE_DELAY_MS;
 export function __setRetryBaseMsForTests(v) { retryBaseMs = v; }
 export function __setFetchTimeoutMsForTests(v) { fetchTimeoutMs = v; }
 export function __setPageDelayMsForTests(v) { pageDelayMs = v; }
+
+// Transport indirection. Production (background.js) swaps in a page-context
+// transport: the fetch is executed by content_proxy.js on an instagram.com
+// TAB, same-origin, so requests carry the browser's REAL headers
+// (sec-fetch-site: same-origin, real UA, sec-ch-ua, accept-language,
+// referer) and native cookies. A service-worker fetch would advertise
+// `sec-fetch-site: none` + a forged cookie header + a fabricated UA — a
+// fingerprint no browser ever produces. With the page transport the request
+// is byte-identical to the web app's own. The default transport exists for
+// tests and runs only when no transport is installed.
+let transport = null;
+export function __setTransport(fn) { transport = fn; }
+
+// Humanized inter-page pause: never a fixed interval. Short gaps (0.6-1.8×
+// base) most of the time, ~10% of pauses are 2-5.5× base — the "hesitating /
+// reading" behavior of a real person scrolling a list.
+function humanPauseMs() {
+  if (pageDelayMs <= 0) return 0;
+  const r = Math.random();
+  if (r < 0.1) return Math.round(pageDelayMs * (2 + Math.random() * 3.5));
+  return Math.round(pageDelayMs * (0.6 + Math.random() * 1.2));
+}
 function backoffFor(code, retries) {
   if (retryBaseMs !== 5000) return retryBaseMs; // test seam
   const seq = RETRY_BACKOFF_MS[code] || RETRY_BACKOFF_MS.http;
@@ -99,35 +123,63 @@ export async function apiFetch(path, session, { signal } = {}) {
     'x-ig-www-claim': '0',
     'x-requested-with': 'XMLHttpRequest',
   };
-  let res;
+  let status, text;
   try {
-    res = await timedFetch(`https://www.instagram.com${path}`, {
-      method: 'GET',
-      headers,
-      credentials: 'include',
-    }, signal);
+    if (transport) {
+      // Page-context transport (content_proxy.js on an IG tab). Same-origin
+      // fetch → browser-real headers + native cookies. The tab's proxy aborts
+      // at the same 20s policy; the SW-side race is a belt for a dead tab.
+      let timer;
+      const timeoutP = new Promise((_, rej) => {
+        timer = setTimeout(
+          () => rej(new IgApiError('network', `O Instagram não respondeu em ${Math.round(fetchTimeoutMs / 1000)}s.`)),
+          fetchTimeoutMs,
+        );
+      });
+      try {
+        const r = await Promise.race([transport(path, session, signal), timeoutP]);
+        status = r.status;
+        text = String(r.text ?? '');
+      } finally {
+        clearTimeout(timer);
+      }
+    } else {
+      // Production guard: in Chrome, an IG request must NEVER be a SW fetch
+      // (sec-fetch-site: none + forged headers = fingerprint). All production
+      // paths install the page transport via withPageTransport(); this branch
+      // exists for unit tests (no chrome global) and fails loudly otherwise.
+      if (typeof chrome !== 'undefined') {
+        throw new IgApiError('http', 'IGF interno: requisição sem transporte de página.');
+      }
+      const res = await timedFetch(`https://www.instagram.com${path}`, {
+        method: 'GET',
+        headers,
+        credentials: 'include',
+      }, signal);
+      status = res.status;
+      text = await res.text().catch(() => ''); // a text() failure is also transient
+    }
   } catch (err) {
     // Timeout abort OR raw network failure (offline/DNS/reset). Both are
     // transient and must reach the retry path — 'network' used to be dead
     // because raw TypeErrors have no .code and died without a retry.
+    if (err instanceof IgApiError) throw err; // page transport already classified
     if (err && err.name === 'AbortError') {
       throw new IgApiError('network', `O Instagram não respondeu em ${Math.round(fetchTimeoutMs / 1000)}s.`);
     }
     throw new IgApiError('network', 'Falha de rede ao falar com o Instagram.');
   }
   let body = null;
-  const text = await res.text().catch(() => ''); // a text() failure is also transient
   if (!text) throw new IgApiError('network', 'Falha de rede ao falar com o Instagram.');
   try {
     body = JSON.parse(text);
   } catch {
     body = null; // non-JSON (login wall / challenge / gate HTML)
   }
-  const status = res.status;
   if (status === 429) throw new IgApiError('rate-limited', 'Instagram limitou as requisições (429).');
   if (status === 401) throw new IgApiError('not-logged-in', 'Sessão do Instagram expirou. Faça login e tente de novo.');
   if (status === 403) throw new IgApiError('checkpoint', 'Instagram pediu verificação (403).');
-  if (!res.ok) {
+  if (status < 200 || status >= 300) {
     // 4xx/5xx with an actionable fail body beats the generic HTTP message.
     const why = body && (body.message || body.error_type);
     const low = String(why || '').toLowerCase();
@@ -141,13 +193,25 @@ export async function apiFetch(path, session, { signal } = {}) {
     if (low.includes('login_required')) {
       throw new IgApiError('not-logged-in', 'Sessão do Instagram expirou. Faça login e tente de novo.');
     }
-    if (low.includes('checkpoint') || low.includes('challenge')) {
+    if (low.includes('checkpoint') || low.includes('challenge') || low.includes('confirmar que é você')) {
       throw new IgApiError('checkpoint', 'Instagram pediu verificação. Abra instagram.com no navegador.');
     }
-    if (low.includes('rate_limit_error')) {
-      throw new IgApiError('rate-limited', 'Instagram limitou as requisições. Aguarde alguns minutos e tente de novo.');
+    // Throttle family: rate_limit_error, "wait a few minutes", pt-BR "aguarde",
+    // and the BARE {"status":"fail"} with no message — IG's most common
+    // throttling response, previously mislabeled as the friend's exact
+    // "resposta inválida" dead end. Now a proper rate-limited state: the
+    // 5-min auto-retry resumes from the last checkpoint when the gate lifts.
+    if (low.includes('rate_limit_error') || low.includes('rate limit') ||
+        low.includes('few minutes') || low.includes('try again') ||
+        low.includes('aguarde') || low.includes('alguns minutos') ||
+        (body && !why)) {
+      // (body && !why): BARE {"status":"fail"} — IG's most common throttling
+      // shape. body=null (HTML) must NOT land here — it falls to the sniff
+      // below.
+      throw new IgApiError('rate-limited', 'O Instagram limitou as requisições temporariamente. A extensão vai tentar de novo sozinha em alguns minutos, retomando de onde parou — não precisa fazer nada.');
     }
-    if (low.includes('feedback_required') || low.includes('action_blocked')) {
+    if (low.includes('feedback_required') || low.includes('action_blocked') ||
+        low.includes('spam') || low.includes('automático') || low.includes('sinalizada')) {
       // Bot gate — retrying it is provably useless and deepens the gate.
       const title = (body && body.feedback_title) || 'Sua conta foi temporariamente limitada.';
       throw new IgApiError('feedback-required', `${title} Aguarde algumas horas e tente de novo, ou abra o Instagram.`);
@@ -160,14 +224,19 @@ export async function apiFetch(path, session, { signal } = {}) {
       if (t.includes('accounts/login') || t.includes('login_required')) {
         throw new IgApiError('not-logged-in', 'Sessão do Instagram expirou. Faça login e tente de novo.');
       }
-      if (t.includes('checkpoint') || t.includes('challenge')) {
+      if (t.includes('checkpoint') || t.includes('challenge') || t.includes('confirmar que é você')) {
         throw new IgApiError('checkpoint', 'Instagram pediu verificação. Abra instagram.com no navegador.');
       }
-      if (t.includes('feedback_required') || t.includes('temporarily limited') || t.includes('temporariamente limitada') || t.includes('action_blocked')) {
+      if (t.includes('feedback_required') || t.includes('temporarily limited') || t.includes('temporariamente limitada') ||
+          t.includes('action_blocked') || t.includes('sinalizada') || t.includes('spam') ||
+          t.includes('tentamos processar') || t.includes('automatizado') || t.includes('bloqueada')) {
         throw new IgApiError('feedback-required', 'Sua conta foi temporariamente limitada. Aguarde algumas horas e tente de novo, ou abra o Instagram.');
       }
     }
-    throw new IgApiError('http', 'Instagram respondeu: resposta inválida');
+    // Unclassified fallback — carry a diagnostic snippet so a recurring error
+    // can be identified from the panel text (status + first chars of body).
+    const snippet = text.slice(0, 100).replace(/\s+/g, ' ').trim();
+    throw new IgApiError('http', `Instagram respondeu: resposta inválida (HTTP ${status} · "${snippet}")`);
   }
   return body;
 }
@@ -181,7 +250,7 @@ export async function transientRetry(fn) {
     try {
       return await fn();
     } catch (err) {
-      if (err && (err.code === 'rate-limited' || err.code === 'network' || err.code === 'http')) {
+      if (err && (err.code === 'network' || err.code === 'http')) {
         retries += 1;
         if (retries > MAX_RETRIES) throw err;
         await sleep(backoffFor(err.code, retries));
@@ -286,12 +355,13 @@ export async function fetchAllUsers(kind, uid, session, { signal, onProgress, re
         break;
       }
       maxId = nextMaxId;
-      await sleep(pageDelayMs);
+      await sleep(humanPauseMs());
     } catch (err) {
       if (signal && signal.aborted) throw err;
-      // rate-limited/network/http are transient (IG occasionally serves a 200
-      // with HTML or a fail body); checkpoint/login/feedback/limit are terminal.
-      if (err.code === 'rate-limited' || err.code === 'network' || err.code === 'http') {
+      // network/http are transient; rate-limited/checkpoint/login/feedback/limit
+      // are terminal — a gate must NOT be retried in a loop (useless + deepens
+      // it); the caller's 5-min auto-retry alarm handles "try again later".
+      if (err.code === 'network' || err.code === 'http') {
         retries += 1;
         if (retries > MAX_RETRIES) throw err;
         await sleep(backoffFor(err.code, retries));

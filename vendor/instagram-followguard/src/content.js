@@ -196,7 +196,26 @@
     own = await resolveOwn();
     tick();
     setInterval(tick, 750); // SPA navigation watcher (no reloads on IG)
-    setInterval(() => { if (!own) resolveOwn().then(adoptOwn); }, 5000);
+    // Retry own-resolution with CAPPED exponential backoff (5s → 60s max),
+    // never a fixed 5s loop — a fixed-cadence request stream while the user
+    // is unresolved is itself a fingerprint, and hammering a gate deepens it.
+    let ownRetryMs = 5000;
+    const scheduleOwnRetry = () => {
+      if (own) return;
+      setTimeout(async () => {
+        if (own) return;
+        let r = null;
+        try { r = await resolveOwn(); } catch { r = null; }
+        if (r) {
+          ownRetryMs = 5000;
+          adoptOwn(r);
+          return;
+        }
+        ownRetryMs = Math.min(ownRetryMs * 2, 60000);
+        scheduleOwnRetry();
+      }, ownRetryMs);
+    };
+    scheduleOwnRetry();
     setInterval(refreshBadge, 30000);
   })();
 })();

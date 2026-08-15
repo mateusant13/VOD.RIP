@@ -3,8 +3,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildResume, RESUME_TTL_MS, fetchAllUsers, IgApiError,
-  __setRetryBaseMsForTests, __setFetchTimeoutMsForTests, __setPageDelayMsForTests,
+  buildResume, RESUME_TTL_MS, fetchAllUsers, IgApiError, apiFetch,
+  __setRetryBaseMsForTests, __setFetchTimeoutMsForTests, __setPageDelayMsForTests, __setTransport,
 } from './ig_api.mjs';
 
 // Test seams — real backoff/timeout/pacing would make these tests take minutes.
@@ -253,6 +253,53 @@ test('apiFetch: rate_limit_error body -> rate-limited', async () => {
   );
 });
 
+test('apiFetch: bare {"status":"fail"} -> rate-limited (the friend\'s recurring case)', async () => {
+  // IG's most common throttling shape — no message at all. Previously fell
+  // through to the generic "resposta inválida"; now an honest, auto-retried
+  // rate-limited state. Terminal (no retry storm), the 5-min alarm resumes.
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return { ok: true, status: 200, text: async () => JSON.stringify({ status: 'fail' }) };
+  };
+  await assert.rejects(
+    fetchAllUsers('following', UID, SESSION, {}),
+    (err) => err instanceof IgApiError && err.code === 'rate-limited'
+  );
+  assert.equal(calls, 1, 'bare fail must not be retried in a loop');
+});
+
+test('apiFetch: "wait a few minutes" fail body -> rate-limited', async () => {
+  stubFetchQueue([{ status: 'fail', message: 'Please wait a few minutes before you try again.' }]);
+  await assert.rejects(
+    fetchAllUsers('following', UID, SESSION, {}),
+    (err) => err instanceof IgApiError && err.code === 'rate-limited'
+  );
+});
+
+test('apiFetch: pt-BR gate HTML -> feedback-required', async () => {
+  globalThis.fetch = async () => ({
+    ok: true, status: 200,
+    text: async () => '<!DOCTYPE html><html><body>Sua conta foi sinalizada. Tentamos processar sua solicitação, mas não conseguimos.</body></html>',
+  });
+  await assert.rejects(
+    fetchAllUsers('following', UID, SESSION, {}),
+    (err) => err instanceof IgApiError && err.code === 'feedback-required'
+  );
+});
+
+test('apiFetch: unclassified fallback carries diagnostic snippet', async () => {
+  globalThis.fetch = async () => ({
+    ok: true, status: 200,
+    text: async () => '{"status":"fail","message":"forma de resposta desconhecida"}',
+  });
+  await assert.rejects(
+    fetchAllUsers('following', UID, SESSION, {}),
+    (err) => err instanceof IgApiError && err.code === 'http' &&
+      /HTTP 200/.test(err.message) && /forma de resposta desconhecida/.test(err.message)
+  );
+});
+
 // --- fetchAllUsers: data-integrity guards ---
 
 test('fetchAllUsers: page with invalid entries throws (cursor never advances past bad data)', async () => {
@@ -295,4 +342,108 @@ test('fetchAllUsers: MAX_PAGES exhaustion throws limit (never completes short)',
     (err) => err instanceof IgApiError && err.code === 'limit'
   );
   assert.equal(calls, 500);
+});
+
+// --- Page-context transport (SOTA humanization) ---
+// Production runs every sync request through content_proxy.js on an IG tab
+// ({status, text} shape). apiFetch must treat that shape exactly like a
+// Response and keep the full classification — SW-vs-page transport must be
+// transparent to the error taxonomy.
+
+test('apiFetch: injected transport {status,text} normalized + classified', async () => {
+  __setTransport(() => Promise.resolve({ status: 200, text: JSON.stringify({ status: 'fail' }) }));
+  try {
+    await assert.rejects(
+      apiFetch('/api/v1/friendships/123/following/', SESSION),
+      (err) => err instanceof IgApiError && err.code === 'rate-limited'
+    );
+  } finally {
+    __setTransport(null);
+  }
+});
+
+test('apiFetch: injected transport gate HTML is sniffed (not mislabeled)', async () => {
+  __setTransport(() => Promise.resolve({
+    status: 200,
+    text: '<!DOCTYPE html><html><body><title>temporarily limited</title>feedback_required</body></html>',
+  }));
+  try {
+    await assert.rejects(
+      apiFetch('/api/v1/friendships/123/following/', SESSION),
+      (err) => err instanceof IgApiError && err.code === 'feedback-required'
+    );
+  } finally {
+    __setTransport(null);
+  }
+});
+
+test('apiFetch: injected transport HTTP error keeps classification', async () => {
+  __setTransport(() => Promise.resolve({ status: 401, text: JSON.stringify({ status: 'fail', message: 'login_required' }) }));
+  try {
+    await assert.rejects(
+      apiFetch('/api/v1/friendships/123/following/', SESSION),
+      (err) => err instanceof IgApiError && err.code === 'not-logged-in'
+    );
+  } finally {
+    __setTransport(null);
+  }
+});
+
+test('apiFetch: injected transport rejection -> network', async () => {
+  __setTransport(() => Promise.reject(new IgApiError('network', 'Falha de rede ao falar com o Instagram.')));
+  try {
+    await assert.rejects(
+      apiFetch('/api/v1/friendships/123/following/', SESSION),
+      (err) => err instanceof IgApiError && err.code === 'network'
+    );
+  } finally {
+    __setTransport(null);
+  }
+});
+
+test('apiFetch: injected transport happy path returns parsed body', async () => {
+  __setTransport(() => Promise.resolve({
+    status: 200,
+    text: JSON.stringify({ status: 'ok', users: [{ username: 'a', pk: '1' }], next_max_id: 'm1' }),
+  }));
+  try {
+    const body = await apiFetch('/api/v1/friendships/123/following/', SESSION);
+    assert.equal(body.status, 'ok');
+    assert.equal(body.users[0].username, 'a');
+  } finally {
+    __setTransport(null);
+  }
+});
+
+test('fetchAllUsers: full walk through injected transport (two pages)', async () => {
+  let n = 0;
+  __setTransport(() => {
+    n += 1;
+    if (n === 1) {
+      return Promise.resolve({ status: 200, text: JSON.stringify({ status: 'ok', users: [u(1), u(2)], next_max_id: 'm1' }) });
+    }
+    return Promise.resolve({ status: 200, text: JSON.stringify({ status: 'ok', users: [u(3)] }) });
+  });
+  try {
+    const out = await fetchAllUsers('following', UID, SESSION, {});
+    assert.deepEqual([...out.keys()], ['user1', 'user2', 'user3']);
+    assert.equal(n, 2);
+  } finally {
+    __setTransport(null);
+  }
+});
+
+test('fetchAllUsers: requests web-native page shape (count=24, search_surface)', async () => {
+  let lastPath = '';
+  __setTransport((path) => {
+    lastPath = path;
+    return Promise.resolve({ status: 200, text: JSON.stringify({ status: 'ok', users: [] }) });
+  });
+  try {
+    await fetchAllUsers('following', UID, SESSION, {});
+  } finally {
+    __setTransport(null);
+  }
+  assert.match(lastPath, /count=24/);
+  assert.match(lastPath, /search_surface=follow_list_page/);
 });
