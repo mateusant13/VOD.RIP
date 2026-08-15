@@ -1,7 +1,7 @@
 {
   "name": "IG FollowGuard",
   "description": "Dashboard de quem não te segue de volta no Instagram + notificação quando alguém deixa de te seguir (últimas 100).",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "manifest_version": 3,
   "minimum_chrome_version": "102",
   "permissions": [
