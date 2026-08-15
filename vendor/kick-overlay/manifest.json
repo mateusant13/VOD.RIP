@@ -15,7 +15,7 @@
   "https://www.twitch.tv/*",
   "https://live-video.net/*",
   "https://*.live-video.net/*",
-  "https://www.youtube.com/*",
+  "https://*.youtube.com/*",
   "https://*.googlevideo.com/*"
  ],
  "background": {
