@@ -1,19 +1,27 @@
 // Behavioral harness for the kick-overlay content.js fixes (injectStyles,
-// ensureYtHls TTL/backoff, yt fatal-error fallback, yt URL reload). Runs the
-// real content.js source with a stubbed DOM/chrome environment and asserts on
-// observable behavior. `node content-fix-test.js` (no frameworks).
+// ensureYtHls TTL/backoff, yt fallback GATE + non-persisting handover, URL
+// reload, #ko-status chip + <=4-char badge tokens, sticky tw_delete via
+// MutationObserver, yt frame-death watchdog). Runs the real content.js source
+// with a stubbed DOM/chrome environment and asserts on observable behavior.
+// `node content-fix-test.cjs` (no frameworks).
 'use strict';
 const fs = require('fs');
 const assert = require('assert');
 
 const swCalls = []; // chrome.runtime.sendMessage recorder
+const badgeTexts = []; // chrome.action.setBadgeText recorder (clipping check)
+const runtimeMsgListeners = []; // chrome.runtime.onMessage recorders
+const moInstances = []; // MutationObserver instances (tw-delete re-apply)
 const storage = { ko: undefined };
 const framePosts = []; // postMessage sent to the fake yt frame
 const appends = []; // elements appended to document.head
+const fakeVideos = []; // page-world <video> population (twitch player)
 let fakeFrame = null;
 
 const el = (tag) => ({
   tag,
+  tagName: (tag || 'div').toUpperCase(),
+  nodeType: 1,
   id: '',
   textContent: '',
   innerHTML: '',
@@ -21,16 +29,37 @@ const el = (tag) => ({
   dataset: {},
   className: '',
   isConnected: true,
+  removed: 0,
   contentWindow: null,
   classList: { add() {}, remove() {}, contains: () => false },
   appendChild() {},
-  remove() {},
+  remove() { this.removed = (this.removed || 0) + 1; this.isConnected = false; },
   addEventListener() {},
   setAttribute() {},
   getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 60 }),
   getClientRects: () => [],
-  querySelector: () => null,
+  querySelector: () => el('div'), // mount() wires buttons from inner queries
   querySelectorAll: () => [],
+});
+
+// A page <video> (the Twitch player). remove() also drops it from the DOM
+// population, mirroring reality (twitchVideo() must stop seeing it).
+const videoEl = (id) => ({
+  ...el('video'),
+  id,
+  paused: true,
+  readyState: 4,
+  currentTime: 10,
+  muted: false,
+  getClientRects: () => [{}],
+  getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 60 }),
+  pause() { this.paused = true; },
+  remove() {
+    this.removed = (this.removed || 0) + 1;
+    this.isConnected = false;
+    const i = fakeVideos.indexOf(this);
+    if (i >= 0) fakeVideos.splice(i, 1);
+  },
 });
 
 const doc = {
@@ -43,7 +72,7 @@ const doc = {
   createElement: (t) => el(t),
   getElementById: (id) => (id === 'ko-yt' ? fakeFrame : null),
   querySelector: () => null,
-  querySelectorAll: () => [],
+  querySelectorAll: (sel) => (sel === 'video' ? fakeVideos : []),
   addEventListener() {},
   removeEventListener() {},
 };
@@ -60,7 +89,7 @@ const chromeStub = {
       }
     },
     lastError: null,
-    onMessage: { addListener() {} },
+    onMessage: { addListener: (l) => runtimeMsgListeners.push(l) },
     getURL: (p) => 'chrome-extension://test/' + p,
   },
   storage: {
@@ -71,7 +100,7 @@ const chromeStub = {
     onChanged: { addListener() {} },
   },
   action: {
-    setBadgeText() {},
+    setBadgeText(o) { badgeTexts.push(o && o.text); },
     setBadgeBackgroundColor() {},
   },
   tabs: { query: () => Promise.resolve([]) },
@@ -79,10 +108,17 @@ const chromeStub = {
 global.chrome = chromeStub;
 global.window = global; // content.js binds window listeners — alias to global
 global.document = doc;
+global.innerWidth = 1280;
+global.innerHeight = 720;
 global.location = { pathname: '/rodil', search: '', href: 'https://www.twitch.tv/rodil', hash: '' };
 const msgListeners = [];
 global.addEventListener = (t, l) => { if (t === 'message') msgListeners.push(l); };
 global.removeEventListener = () => {};
+global.MutationObserver = class {
+  constructor(cb) { this.cb = cb; moInstances.push(this); }
+  observe(target, opts) { this.target = target; this.opts = opts; }
+  disconnect() {}
+};
 // kick.com is 403-gated from this IP; the content script catches fetch
 // failures internally, so a rejecting stub keeps the boot probe deterministic.
 global.fetch = () => Promise.reject(new Error('stub-fetch'));
@@ -90,7 +126,7 @@ global.fetch = () => Promise.reject(new Error('stub-fetch'));
 const src = fs.readFileSync('content.js', 'utf8');
 // Run in a Function scope so top-level consts/functions are accessible.
 const scope = {};
-const fn = new Function('window', 'document', 'location', 'navigator', src + '\n;return {KO, probe, apply, ensureYtHls, injectStyles, teardown, setPlayer};');
+const fn = new Function('window', 'document', 'location', 'navigator', src + '\n;return {KO, probe, apply, ensureYtHls, injectStyles, teardown, setPlayer, rectTick};');
 const api = fn(global, doc, global.location, global.navigator);
 const KO = api.KO;
 
@@ -104,7 +140,8 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
   assert.ok(styleEl, 'ko-style must be appended to document.head');
   assert.ok(!styleEl.textContent.includes('appendChild(st)'), 'CSS must not contain the stray appendChild text');
   assert.ok(styleEl.textContent.includes('#ko-wrap{position:fixed'), 'CSS body present');
-  console.log('A injectStyles: style appended, no stray JS in CSS — OK');
+  assert.ok(styleEl.textContent.includes('#ko-wrap.ko-yt #ko-top{display:none;}'), 'stale LIVE pill hidden in yt mode');
+  console.log('A injectStyles: style appended, no stray JS in CSS, yt-mode top hidden — OK');
 
   // ---- C: ensureYtHls TTL + backoff -----------------------------------------
   KO.slug = 'rodil';
@@ -134,7 +171,7 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
   assert.strictEqual(KO.ytHlsFailed, false, 'successful retry clears the failed flag');
   console.log('C ensureYtHls: TTL dedupe + failure backoff + retry — OK');
 
-  // ---- B/D: probe youtube branch — fallback + URL reload --------------------
+  // ---- B/D: probe youtube branch — fallback gate + URL reload ---------------
   const wrap = {
     style: { display: 'none' },
     classList: { add() {}, remove() {}, contains: () => false },
@@ -167,15 +204,37 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
   assert.strictEqual(KO.player, 'youtube', 'no fallback while the layer is recoverable');
   console.log('D probe: refreshed url reloaded into the live frame, layer shown — OK');
 
-  // fatal error after the frame's one reload -> fallback to kick
+  // fatal error after the frame's one reload — same-handle kickSlug: the
+  // fallback gate must KEEP youtube mode (a same-handle kick is no real
+  // kick mapping — its probe would find the same offline channel).
   framePosts.length = 0;
   KO.ytHlsFailed = true;
   KO.ytHlsFailedAt = Date.now();
   KO.ytLoadedUrl = 'https://hls.example/u1';
+  KO.ytState = { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, error: 0 };
+  KO.ytEmbedAt = Date.now() - 10000; // embed grace expired too
   await api.probe();
-  assert.strictEqual(KO.player, 'kick', 'ytHlsFailed must hand over to kick');
-  assert.ok(!framePosts.some((m) => m.__koKick && m.__koKick.t === 'load'), 'no load sent after fallback');
-  console.log('B probe: fatal hls error (ytHlsFailed) reaches the kick fallback — OK');
+  assert.strictEqual(KO.player, 'youtube', 'same-handle kickSlug must NOT hand over to kick');
+  assert.ok(!framePosts.some((m) => m.__koKick && m.__koKick.t === 'load'), 'no load sent after fatal error');
+  assert.strictEqual(wrap.style.display, 'none', 'failed yt layer hides the wrap (chip carries the state)');
+  // A REAL kick mapping (kickSlug != slug) DOES hand over — in memory only.
+  storage.ko = undefined;
+  KO.kickSlug = 'realkick';
+  global.fetch = () => Promise.resolve({
+    ok: true,
+    json: async () => ({ livestream: { playback_url: 'https://ivs.example/live', id: 's1' } }),
+  });
+  await api.probe();
+  await settle(50); // the fire(apply) handover probe settles
+  assert.strictEqual(KO.player, 'kick', 'real kick mapping hands over to kick');
+  assert.ok(!(storage.ko && storage.ko.player === 'kick'), 'handover must not persist to storage');
+  assert.strictEqual(wrap.style.display, 'block', 'kick layer shown after the handover');
+  global.fetch = () => Promise.reject(new Error('stub-fetch'));
+  KO.kickSlug = 'rodil';
+  KO.kickFrame = null;
+  KO.kickWin = null;
+  KO.activeUrl = null;
+  console.log('B probe: fallback gate — same-handle stays youtube, real mapping hands over w/o persisting — OK');
 
   // ---- G: kick frame ready only from the actual frame -----------------------
   // The kick message listener was registered at eval on `window` (=global);
@@ -189,6 +248,8 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // ---- teardown resets the new fields ---------------------------------------
   KO.ytHlsUrl = 'u'; KO.ytHlsAt = 1; KO.ytHlsFailed = true; KO.ytHlsFailedAt = 2; KO.ytLoadedUrl = 'u';
+  KO.lastYtSt = 123;
+  KO.statusChip = { remove() {} };
   KO.kickFrame = null; KO.wrap = null;
   api.teardown();
   assert.strictEqual(KO.ytHlsUrl, null);
@@ -196,7 +257,198 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
   assert.strictEqual(KO.ytHlsFailed, false);
   assert.strictEqual(KO.ytHlsFailedAt, 0);
   assert.strictEqual(KO.ytLoadedUrl, null);
-  console.log('teardown: yt mint bookkeeping reset — OK');
+  assert.strictEqual(KO.lastYtSt, 0, 'teardown resets the yt silence clock');
+  assert.strictEqual(KO.statusChip, null, 'teardown removes the status chip');
+  console.log('teardown: yt mint bookkeeping + chip + yt watchdog clock reset — OK');
+
+  // ---- H: yt→kick fallback gate ---------------------------------------------
+  KO.slug = 'rodil';
+  KO.player = 'youtube';
+  KO.kickSlug = 'rodil';            // same-handle fallback — no real kick mapping
+  KO.ytRaw = '@x';
+  KO.ytId = 'UCxxxxxxxxxxxxxxxxxxxxxx';
+  KO.mappings['rodil'] = { yt: '@x' };
+  KO.ytHlsFailed = true;
+  KO.ytHlsFailedAt = Date.now();    // inside the 30s backoff window
+  KO.ytHlsUrl = null;
+  KO.ytHlsAt = 0;
+  KO.ytEmbedAt = Date.now() - 10000; // embed grace expired too
+  KO.ytState = { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, error: 0 };
+  KO.ytLoadedUrl = null;
+  KO.twDeleted = false;
+  KO.wrap = null;                   // youtube-only path mounts the wrap on demand
+  storage.ko = undefined;
+  fakeFrame = null;
+  fakeVideos.length = 0;
+  const playsBefore = swCalls.filter((m) => m && m.type === 'ko-yt-play').length;
+  await api.probe();
+  assert.strictEqual(KO.player, 'youtube', 'no real kick mapping -> stay in youtube mode (no kick bounce)');
+  assert.ok(KO.wrap, 'youtube branch mounts the wrap');
+  assert.strictEqual(KO.wrap.style.display, 'none', 'failed mint hides the wrap');
+  assert.ok(!(storage.ko && storage.ko.player === 'kick'), 'no persisted handover');
+  const playsAfterFail = swCalls.filter((m) => m && m.type === 'ko-yt-play').length;
+  assert.strictEqual(playsAfterFail, playsBefore, 'backoff must prevent a mint hit during the gate probe');
+  // The reported failure case: wrap hidden, but the chip still reports state.
+  assert.ok(KO.statusChip, 'chip created after the enabled check');
+  assert.strictEqual(KO.statusChip.textContent, 'YT ✕', 'chip shows the failed yt state');
+  assert.strictEqual(KO.statusChip.style.display, 'block', 'chip visible with the wrap hidden');
+  assert.strictEqual(KO.statusChip.style.color, '#f87171', 'chip red for the failed yt state');
+  // 30s backoff expires -> the probe loop re-enters the youtube branch and re-mints.
+  KO.ytHlsFailedAt = Date.now() - 31000;
+  await api.probe();
+  assert.strictEqual(KO.player, 'youtube', 're-mint keeps youtube mode');
+  assert.strictEqual(KO.ytHlsUrl, 'https://hls.example/u1', 'backoff-expired re-mint succeeded');
+  assert.strictEqual(KO.ytHlsFailed, false, 'successful re-mint clears the failed flag');
+  assert.strictEqual(KO.statusChip.textContent, 'YT…', 'chip flips to the connecting state');
+  assert.strictEqual(KO.statusChip.style.color, '#fbbf24', 'chip amber while minting');
+  console.log('H fallback gate: same-handle stays youtube, no persist, backoff re-mint, chip YT ✕/YT… — OK');
+
+  // ---- I: #ko-status chip state transitions (driven from setBadge) ----------
+  KO.mappings['rodil'] = { kick: 'realkick', yt: '@x' };
+  KO.ytHlsFailed = false;
+  KO.ytHlsFailedAt = 0;
+  // KICK Playing -> green KICK
+  KO.player = 'kick';
+  KO.kickSlug = 'realkick';
+  KO.activeUrl = 'https://ivs.example/live';
+  KO.kickUrlT = Date.now();
+  KO.kickEverPlayed = true;
+  KO.kickState = { state: 'Playing', paused: false, muted: false, pos: 10, lat: 2, dur: 120 };
+  await api.probe();
+  assert.strictEqual(KO.statusChip.textContent, 'KICK', 'chip KICK while kick Playing');
+  assert.strictEqual(KO.statusChip.style.color, '#53fc18', 'chip green while kick Playing');
+  assert.strictEqual(KO.statusChip.style.display, 'block', 'chip visible');
+  // KICK connecting (url/ready pending) -> amber KICK…
+  KO.kickState = { state: 'Idle', paused: true, muted: true, pos: 0, lat: 0, dur: 0 };
+  KO.kickUrlT = Date.now(); // fresh url inside the transition grace
+  await api.probe();
+  assert.strictEqual(KO.statusChip.textContent, 'KICK…', 'chip KICK… while kick connecting');
+  assert.strictEqual(KO.statusChip.style.color, '#fbbf24', 'chip amber while kick connecting');
+  // KICK failed/offline -> gray KICK ✕
+  KO.activeUrl = null;
+  KO.kickUrlT = 0;
+  KO.kickState = null;
+  KO.kickEverPlayed = false;
+  await api.probe();
+  assert.strictEqual(KO.statusChip.textContent, 'KICK ✕', 'chip KICK ✕ when kick offline');
+  assert.strictEqual(KO.statusChip.style.color, '#f87171', 'chip red when kick offline');
+  assert.strictEqual(KO.wrap.style.display, 'none', 'wrap hidden when kick offline');
+  // YT live -> red YT
+  KO.player = 'youtube';
+  KO.ytRaw = '@x';
+  KO.ytId = 'UCxxxxxxxxxxxxxxxxxxxxxx';
+  KO.ytHlsUrl = 'https://hls.example/u1';
+  KO.ytHlsAt = Date.now();
+  KO.ytHlsFailed = false;
+  KO.ytState = { ready: true, playing: true, muted: false, live: true, dur: 0, ct: 0, error: 0 };
+  KO.ytLoadedUrl = 'https://hls.example/u1';
+  await api.probe();
+  assert.strictEqual(KO.statusChip.textContent, 'YT', 'chip YT while yt live');
+  assert.strictEqual(KO.statusChip.style.color, '#ff0000', 'chip red while yt live');
+  // YT minting/loading (not live yet) -> amber YT…
+  KO.ytState = { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, error: 0 };
+  KO.ytEmbedAt = Date.now(); // embed grace not expired
+  await api.probe();
+  assert.strictEqual(KO.statusChip.textContent, 'YT…', 'chip YT… while minting/loading');
+  assert.strictEqual(KO.statusChip.style.color, '#fbbf24', 'chip amber while minting/loading');
+  // twitch mode -> chip hidden
+  KO.player = 'twitch';
+  await api.probe();
+  assert.strictEqual(KO.statusChip.style.display, 'none', 'chip hidden in twitch mode');
+  KO.player = 'youtube';
+  console.log('I status chip: KICK/KICK…/KICK ✕ + YT/YT…/YT ✕ transitions, hidden in twitch mode — OK');
+
+  // ---- J: badge texts all fit Chrome's 4-char clip --------------------------
+  const seen = new Set(badgeTexts);
+  for (const t of seen) {
+    assert.ok(typeof t === 'string' && t.length <= 4, `badge text '${t}' must fit the 4-char clip`);
+    assert.ok(['', 'KICK', 'YT', 'TW', 'OFF'].includes(t), `badge '${t}' must be a normalized token`);
+  }
+  assert.ok(!seen.has('KICK OFF') && !seen.has('RECONNECT') && !seen.has('YT OFF') && !seen.has('YT?'), 'no legacy clipped badge tokens');
+  console.log('J badge clipping: every emitted badge <=4 chars, normalized tokens only — OK');
+
+  // ---- K: ko-delete-twitch stickiness ----------------------------------------
+  KO.slug = 'rodil';
+  KO.player = 'youtube';
+  KO.kickSlug = 'rodil';            // same-handle — gate keeps youtube mode
+  KO.ytRaw = '@x';
+  KO.ytId = 'UCxxxxxxxxxxxxxxxxxxxxxx';
+  KO.mappings['rodil'] = { yt: '@x' };
+  KO.ytHlsFailed = true;
+  KO.ytHlsFailedAt = Date.now();    // backoff — the mint will not retry mid-test
+  KO.ytHlsUrl = null;
+  KO.ytHlsAt = 0;
+  KO.ytEmbedAt = Date.now() - 10000;
+  KO.ytState = { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, error: 0 };
+  KO.ytLoadedUrl = null;
+  KO.twDeleted = false;
+  KO.lastRect = null;
+  KO.kickFrame = null;
+  KO.kickWin = null;
+  fakeFrame = null;
+  fakeVideos.length = 0;
+  const delVideo = videoEl('tw-main-video');
+  fakeVideos.push(delVideo);
+  await api.probe(); // youtube branch mounts the wrap; failed mint + not deleted -> hidden
+  assert.ok(KO.wrap, 'wrap mounted in youtube mode');
+  assert.strictEqual(KO.wrap.style.display, 'none', 'failed mint hides the wrap before the delete');
+  assert.strictEqual(delVideo.removed, 0, 'probe alone never touches the twitch video');
+
+  const delListener = runtimeMsgListeners[0];
+  assert.ok(delListener, 'popup action listener registered');
+  await new Promise((res) => delListener({ type: 'ko-delete-twitch' }, {}, () => res()));
+  await settle(50); // let the handler's apply() settle
+  assert.strictEqual(KO.twDeleted, true);
+  assert.strictEqual(delVideo.removed, 1, 'delete removes the current twitch video');
+  assert.ok(KO.lastRect && KO.lastRect.width === 1280 && KO.lastRect.height === 720, 'lastRect primed with the viewport');
+  assert.strictEqual(KO.wrap.style.display, 'block', 'wrap kept visible in the loading state');
+  assert.strictEqual(KO.wrap.style.width, '1280px', 'wrap covers the viewport width');
+  assert.strictEqual(KO.wrap.style.height, '720px', 'wrap covers the viewport height');
+  assert.strictEqual(KO.statusChip.textContent, 'YT ✕', 'chip reports the yt failure with the wrap up');
+  assert.strictEqual(KO.statusChip.style.display, 'block', 'chip visible with the wrap up');
+
+  // SPA re-render: a NEW video element appears -> the observer re-applies the delete.
+  assert.ok(moInstances.length >= 1, 'tw-delete MutationObserver registered');
+  const mo = moInstances[moInstances.length - 1];
+  const reVideo = videoEl('tw-main-video-rendered');
+  fakeVideos.push(reVideo);
+  mo.cb([{ addedNodes: [reVideo] }]);
+  assert.strictEqual(reVideo.removed, 1, 'observer re-applies the delete on SPA re-render');
+
+  // Observer is idle while the user is in twitch mode.
+  KO.player = 'twitch';
+  const twVideo = videoEl('tw-main-video-2');
+  fakeVideos.push(twVideo);
+  mo.cb([{ addedNodes: [twVideo] }]);
+  assert.strictEqual(twVideo.removed, 0, "observer no-ops while player === 'twitch'");
+  KO.player = 'youtube';
+  console.log('K tw_delete: video removed, viewport-pinned wrap kept up, observer re-applies on re-render — OK');
+
+  // ---- L: yt frame-death watchdog -------------------------------------------
+  KO.player = 'youtube';
+  KO.ytState = { ready: true, playing: true, muted: false, live: true, dur: 0, ct: 0, error: 0 };
+  KO.lastYtSt = Date.now() - 31000; // bridge silent > 30s
+  KO.ytWin = { postMessage() {} };
+  KO.ytHlsUrl = 'https://hls.example/u1';
+  KO.ytHlsAt = Date.now();
+  KO.ytHlsFailed = false;
+  KO.kickSlug = 'rodil'; // same-handle — gate keeps youtube
+  KO.wrap = KO.wrap || wrap;
+  KO.wrap.style.display = 'block'; // watchdog only runs while the layer is shown
+  fakeFrame = { ...el('iframe'), id: 'ko-yt' };
+  api.rectTick();
+  assert.strictEqual(fakeFrame.removed, 1, 'watchdog removes the dead yt frame');
+  assert.strictEqual(KO.ytState.ready, false, 'watchdog resets ready');
+  assert.strictEqual(KO.ytWin, null, 'watchdog clears ytWin');
+  assert.strictEqual(KO.lastYtSt, 0, 'watchdog resets the silence clock');
+  // A recent st heartbeat keeps the frame alive.
+  KO.ytState = { ready: true, playing: true, muted: false, live: true, dur: 0, ct: 0, error: 0 };
+  KO.ytWin = { postMessage() {} };
+  KO.lastYtSt = Date.now();
+  fakeFrame = { ...el('iframe'), id: 'ko-yt' };
+  api.rectTick();
+  assert.strictEqual(fakeFrame.removed, 0, 'recent st heartbeat keeps the frame');
+  console.log('L yt watchdog: 30s silence removes the frame, resets ready/ytWin — OK');
 
   console.log('\nALL CONTENT.JS FIX CHECKS PASSED');
   process.exit(0);

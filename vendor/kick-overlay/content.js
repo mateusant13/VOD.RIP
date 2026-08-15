@@ -72,7 +72,7 @@ const NOT_CHANNEL = new Set([
 
 // Build marker for the diag stream — lets us tell which code a tab runs
 // (content scripts of pre-reload tabs survive extension reloads).
-const KO_VER = '0.7.9';
+const KO_VER = '0.8.0';
 const KO = {
   enabled: false,
   player: 'kick', // 'kick' | 'youtube' | 'twitch' — switching never rebuilds players
@@ -83,11 +83,13 @@ const KO = {
   ytId: null,
   activeUrl: null, // kick playback_url currently loaded in the frame
   wrap: null,      // overlay container — persists across switches
+  statusChip: null, // #ko-status pill — a SIBLING of the wrap (survives hideWrap)
   kickFrame: null, // <iframe src=player.html> (IVS engine, same as kick.com)
   kickWin: null,   // kickFrame.contentWindow (set on first ready message)
   kickReady: false,
   kickState: null, // last {state, paused, muted, volume, pos, lat, q, qcount} from the frame
   lastKickSt: 0,   // epoch ms of the last st message (frame-death watchdog)
+  lastYtSt: 0,     // epoch ms of the last yt st message (yt frame-death watchdog)
   pendingUrl: null,// playback_url queued until the frame reports ready
   kickVol: 1,
   kickMuted: false, // user's kick mute choice (persisted; hidden-mute is separate)
@@ -259,6 +261,49 @@ async function kickPlaybackUrl(slug) {
   return { live: false };
 }
 
+// Badge texts are clipped by Chrome at 4 chars — every badge is one of the
+// normalized <=4-char tokens below, with the PHASE carried by the color:
+//   KICK green = Playing | KICK amber = connecting (url/ready pending)
+//   KICK gray  = failed/offline | YT red = live | YT amber = minting/loading
+//   YT gray    = failed | TW/OFF gray | '' clear.
+// The #ko-status pill is driven from the SAME call (single choke point) so
+// the chip and the badge can never disagree.
+const CHIP_STATES = {
+  'KICK|#059669': ['KICK', '#53fc18'],
+  'KICK|#d97706': ['KICK…', '#fbbf24'],
+  'KICK|#6b7280': ['KICK ✕', '#f87171'],
+  'YT|#ff0000': ['YT', '#ff0000'],
+  'YT|#d97706': ['YT…', '#fbbf24'],
+  'YT|#6b7280': ['YT ✕', '#f87171'],
+};
+
+// Pin the chip to the top-right of the player rect; lastRect keeps the pin
+// after ko-delete-twitch (viewport-primed when no rect was ever measured).
+function positionStatusChip() {
+  const c = KO.statusChip;
+  if (!c || c.style.display === 'none') return;
+  const r = twitchAnchorRect() || KO.lastRect || { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+  const right = typeof r.right === 'number' ? r.right : r.left + r.width;
+  c.style.left = `${Math.max(0, right - (c.offsetWidth || 0) - 8)}px`;
+  c.style.top = `${r.top + 8}px`;
+}
+
+function updateStatusChip(text, color) {
+  const c = KO.statusChip;
+  if (!c) return;
+  const st = CHIP_STATES[text + '|' + color];
+  // Chip only exists for mapped channels with an overlay player active —
+  // twitch mode / unmapped / disabled pages get no pill.
+  if (!st || !KO.enabled || !KO.slug || !KO.mappings[KO.slug] || KO.player === 'twitch') {
+    if (c.style.display !== 'none') c.style.display = 'none';
+    return;
+  }
+  c.textContent = st[0];
+  c.style.color = st[1];
+  if (c.style.display === 'none') c.style.display = 'block';
+  positionStatusChip();
+}
+
 function setBadge(text, color) {
   try {
     chrome.action.setBadgeBackgroundColor({ color: color || [0, 0, 0, 0] });
@@ -266,6 +311,7 @@ function setBadge(text, color) {
   } catch {
     /* badge is cosmetic */
   }
+  updateStatusChip(text, color);
 }
 
 // ---- YouTube bridge ---------------------------------------------------------
@@ -414,6 +460,7 @@ window.addEventListener('message', (ev) => {
     return;
   }
   if (m.t === 'st' && m.st) {
+    KO.lastYtSt = Date.now(); // yt frame-death watchdog clock
     const st = m.st;
     const prevLive = KO.ytState.live;
     // hls.js state mapping — a paused-but-loaded video is still live.
@@ -697,6 +744,24 @@ function ensureAttached(el) {
   if (el && !el.isConnected) overlayAnchor().appendChild(el);
 }
 
+// #ko-status pill — always-visible phase indicator. Appended to overlayAnchor
+// as a SIBLING of #ko-wrap (never a wrap child) so it survives hideWrap and
+// keeps reporting the failure state when the layer is gone. Created by
+// probe() after the enabled check; removed by teardown().
+function ensureStatusChip() {
+  if (KO.statusChip) return;
+  const c = document.createElement('div');
+  c.id = 'ko-status';
+  c.style.cssText =
+    'position:fixed;z-index:6;pointer-events:none;display:none;' +
+    'font:700 12px system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;' +
+    'background:rgba(0,0,0,.65);border:1px solid rgba(255,255,255,.18);' +
+    'border-radius:999px;padding:3px 10px;white-space:nowrap;color:#fff;';
+  c.style.display = 'none'; // cssText already carries it; explicit for clarity
+  overlayAnchor().appendChild(c);
+  KO.statusChip = c;
+}
+
 // ---- overlay lifecycle ------------------------------------------------------
 
 // ---- kick.com-identical player chrome (mined 2026-08-14) ---------------------
@@ -957,10 +1022,19 @@ function teardown() {
     KO.wrap.remove();
     KO.wrap = null;
   }
+  if (KO.statusChip) {
+    try {
+      KO.statusChip.remove();
+    } catch {
+      /* already gone */
+    }
+    KO.statusChip = null;
+  }
   // the frame dies with the removed iframe; no ytCmd('destroy') exists
   KO.ytState = { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, error: 0 };
   KO.ytUnlock = false;
   KO.ytWin = null;
+  KO.lastYtSt = 0;
   KO.ytHlsUrl = null;
   KO.ytHlsAt = 0;
   KO.ytHlsFailed = false;
@@ -984,10 +1058,6 @@ function teardown() {
   KO.twLive = false;
   KO.twWasPlaying = false;
   unmuteAll();
-  for (const b of ['ko-twitchbtn', 'ko-kickbtn', 'ko-ytbtn']) {
-    const el = document.getElementById(b);
-    if (el) el.style.display = 'none';
-  }
 }
 
 function showWrap() {
@@ -1007,6 +1077,14 @@ function hideWrap() {
   if (KO.ytState.ready && KO.ytState.playing) ytCmd('pause');
   ytCmd('mute');
   syncMute();
+}
+
+// probe()'s wrap-hide sites: with the Twitch player deleted, hiding the wrap
+// shows a blank page (there is no native player left) — keep the loading-state
+// wrap up and let the chip carry the phase instead.
+function hideWrapForProbe() {
+  if (KO.twDeleted && KO.player !== 'twitch') return;
+  if (KO.wrap) hideWrap();
 }
 
 function showKickLayer() {
@@ -1053,11 +1131,11 @@ function showYtLayer() {
 async function reconnect() {
   if (KO.reconnectCount >= MAX_RECONNECT) {
     teardown();
-    setBadge('KICK OFF', '#6b7280');
+    setBadge('KICK', '#6b7280');
     return;
   }
   KO.reconnectCount++;
-  setBadge('RECONNECT', '#d97706');
+  setBadge('KICK', '#d97706');
   if (KO.wrap) {
     const rc = KO.wrap.querySelector('#ko-reconnecting');
     if (rc) rc.style.display = 'flex';
@@ -1067,7 +1145,7 @@ async function reconnect() {
   const k = await kickPlaybackUrl(KO.kickSlug);
   if (!k.live || !k.url) {
     teardown();
-    setBadge('KICK OFF', '#6b7280');
+    setBadge('KICK', '#6b7280');
     return;
   }
   await new Promise((r) => setTimeout(r, 2000)); // back off, then re-attach
@@ -1175,6 +1253,7 @@ async function probe() {
     teardown();
     return;
   }
+  ensureStatusChip(); // always-visible phase pill (survives hideWrap)
   // NOTE (2026-08-13): no Twitch-live gate here anymore. It used to
   // teardown() the whole overlay whenever the native player paused or
   // swapped elements during ad transitions, which made the manual KICK
@@ -1185,7 +1264,7 @@ async function probe() {
 
   if (KO.player === 'twitch') {
     // Native player; overlay players paused (rect loop keeps them so).
-    if (KO.wrap) hideWrap();
+    hideWrapForProbe();
     const kl = await kickPlaybackUrl(KO.kickSlug);
     const yl = KO.ytState.live;
     setBadge(kl.live ? 'KICK' : yl ? 'YT' : 'TW', kl.live ? '#059669' : yl ? '#ff0000' : '#6b7280');
@@ -1210,7 +1289,7 @@ async function probe() {
       diag('kick_stall', { slug: KO.kickSlug, state: KO.kickState.state, ct: KO.kickState.ct });
       teardown();
       if (KO.wrap) hideWrap();
-      setBadge('KICK OFF', '#6b7280');
+      setBadge('KICK', '#6b7280');
       return;
     }
     // Already playing on a live url? Keep it — IVS playback_urls rotate on
@@ -1232,7 +1311,7 @@ async function probe() {
     // reconnects on budget, frozen-while-playing (>8s) reconnects on budget.
     if (KO.activeUrl && KO.kickUrlT && Date.now() - KO.kickUrlT < 25000) {
       showKickLayer();
-      setBadge('KICK', '#059669');
+      setBadge('KICK', '#d97706'); // url still loading — connecting phase
       return;
     }
     // Stuck not-playing watchdog: the url loaded but the player never left
@@ -1251,37 +1330,44 @@ async function probe() {
       KO.kickStreamId = k.streamId || null;
       ensureKick(k.url);
       showKickLayer();
-      setBadge('KICK', '#059669');
+      setBadge('KICK', '#d97706'); // fresh url attached — frame still loading
       return;
     }
     console.log('[ko] kick offline or unreachable', KO.kickSlug, JSON.stringify(k));
     diag('kick_offline', { slug: KO.kickSlug, live: k.live, url: k.url ? 'yes' : 'no' });
-    setBadge('KICK OFF', '#6b7280');
-    if (KO.wrap) hideWrap();
+    // Honest offline badge: after a yt→kick fallback the layer the user
+    // actually chose is the failed one — say so instead of a KICK that
+    // implies their own kick choice.
+    setBadge(KO.ytHlsFailed ? 'YT' : 'KICK', '#6b7280');
+    hideWrapForProbe();
     return;
   }
 
   // youtube mode
   if (!KO.ytRaw) {
-    setBadge('YT?', '#6b7280'); // no mapping — map the channel in the popup
-    if (KO.wrap) hideWrap();
+    setBadge('YT', '#6b7280'); // no mapping — map the channel in the popup
+    hideWrapForProbe();
     return;
   }
   await ensureYtId();
   if (!KO.ytId) {
-    setBadge('YT?', '#6b7280'); // could not resolve handle → check the popup value
-    if (KO.wrap) hideWrap();
+    setBadge('YT', '#6b7280'); // could not resolve handle → check the popup value
+    hideWrapForProbe();
     return;
   }
   await ensureYtHls();
   ensureYtIframe();
   // The HLS layer never initialized: the manifest mint failed (ytHlsFailed —
   // also set by the frame's fatal error handler after its one reload) or the
-  // frame never reached ready within YT_EMBED_GRACE. When the channel also
-  // has a kick mapping, hand over to kick instead of leaving the native
-  // Twitch player (ads) visible.
+  // frame never reached ready within YT_EMBED_GRACE. Hand over to kick ONLY
+  // when a REAL kick mapping exists (kickSlug differs from the twitch slug):
+  // KO.kickSlug always falls back to the twitch slug, so a same-handle
+  // "mapping" would bounce to a kick probe of the same channel that is
+  // offline → wrap hidden → native Twitch visible. The handover must NOT
+  // persist: the user's stored player choice stays 'youtube' (storage keeps
+  // the user's choice; only the in-memory layer switches).
   if (
-    KO.kickSlug &&
+    KO.kickSlug && KO.kickSlug !== KO.slug &&
     (KO.ytHlsFailed || (KO.ytEmbedAt && !KO.ytState.ready && Date.now() - KO.ytEmbedAt > YT_EMBED_GRACE))
   ) {
     diag('yt_fallback', {
@@ -1289,7 +1375,8 @@ async function probe() {
       fail: !!KO.ytHlsFailed,
       embedMs: KO.ytEmbedAt ? Date.now() - KO.ytEmbedAt : 0,
     });
-    setPlayer('kick');
+    KO.player = 'kick'; // no saveState() — storage keeps the user's choice
+    fire(apply);
     return;
   }
   // The mint refreshed (TTL or post-failure re-mint) while the frame was
@@ -1307,8 +1394,10 @@ async function probe() {
     setBadge('YT', '#ff0000');
     return;
   }
-  setBadge('YT OFF', '#6b7280');
-  if (KO.wrap) hideWrap();
+  // Not live yet: amber while minting/loading (retry after the 30s backoff),
+  // gray when the mint failed and no real kick mapping exists to fall back to.
+  setBadge('YT', KO.ytHlsFailed ? '#6b7280' : '#d97706');
+  hideWrapForProbe();
 }
 
 async function apply() {
@@ -1442,7 +1531,6 @@ function rectTick() {
             });
           }
         }
-        if (KO.wrap.style.display === 'none') showWrap();
         // Ground truth when the page video population is unusual (a second
         // visible video — hover preview, clips card — or a large shrink):
         // the wrap should mirror the picked card rect exactly.
@@ -1465,8 +1553,18 @@ function rectTick() {
       } else if (KO.twDeleted) {
         // User deleted the Twitch player from the popup: keep the overlay
         // pinned at its last rect (the whole point is seeing the overlay
-        // WITHOUT the Twitch player underneath).
+        // WITHOUT the Twitch player underneath). Re-apply the rect every
+        // tick — the delete handler primes lastRect with the viewport when
+        // no player rect was ever measured, so the wrap covers the page.
         KO.hideTicks = 0;
+        const lr = KO.lastRect;
+        if (lr) {
+          const s = KO.wrap.style;
+          s.left = `${lr.left}px`;
+          s.top = `${lr.top}px`;
+          s.width = `${lr.width}px`;
+          s.height = `${lr.height}px`;
+        }
         if (KO.wrap.style.display === 'none') showWrap();
       } else {
         // Debounce the hide: ad transitions / player re-layouts can briefly
@@ -1511,6 +1609,19 @@ function rectTick() {
         KO.pendingUrl = KO.activeUrl;
         kickFrame();
       }
+      // yt frame-death watchdog (mirror of the kick one): the bridge went
+      // silent while shown. Remove #ko-yt and reset the ready state — the
+      // next probe recreates the frame. Hidden tabs throttle the frame's
+      // 1s state timer, so only run while the tab is visible.
+      if (!document.hidden && KO.player === 'youtube' && KO.ytState.ready && KO.lastYtSt && Date.now() - KO.lastYtSt > 30000) {
+        console.log('[ko] yt bridge silent — rebuilding frame');
+        const yf = document.getElementById('ko-yt');
+        if (yf) yf.remove();
+        KO.ytState = { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, error: 0 };
+        KO.ytWin = null;
+        KO.lastYtSt = 0;
+        fire(probe); // recreate now instead of waiting for the 20s poll
+      }
     } else {
       // twitch mode: overlay players stay paused; resume Twitch if ours.
       if (KO.kickFrame && KO.kickState && KO.kickState.state === 'Playing') {
@@ -1521,6 +1632,9 @@ function rectTick() {
       resumeTwitchIfOurs();
       syncMute();
     }
+    // The chip lives outside the wrap — keep it pinned to the player rect
+    // on every tick, whether the wrap is shown or hidden.
+    positionStatusChip();
 }
 
 function stopRectLoop() {
@@ -1545,6 +1659,7 @@ function injectStyles() {
     'background:linear-gradient(0deg,rgba(0,0,0,.8),rgba(0,0,0,0));' +
     'font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}' +
     '#ko-wrap.ko-yt #ko-bar{display:none;}' + // YT has native controls incl. LIVE chip
+    '#ko-wrap.ko-yt #ko-top{display:none;}' + // stale LIVE pill in yt mode
     '#ko-wrap.ko-hot #ko-bar{opacity:1;}' +
     '#ko-reconnecting{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;' +
     'background:rgba(0,0,0,.82);color:#fff;font:700 15px system-ui,sans-serif;letter-spacing:.04em;pointer-events:none;}' +
@@ -1594,22 +1709,59 @@ function injectStyles() {
 // ko-delete-twitch: remove the native Twitch player element so the user can
 // SEE that the visible video is the overlay's, not Twitch's. Restored on
 // page reload (Twitch rebuilds its player). The overlay stays pinned at the
-// last player rect.
+// last player rect. Twitch's SPA re-renders the player element, so while a
+// non-twitch layer is active a MutationObserver re-applies the delete.
+let twDeleteObserver = null;
+
+function killTwitchVideo(v) {
+  if (!v) return;
+  try {
+    v.pause();
+  } catch {
+    /* already gone */
+  }
+  try {
+    v.remove();
+  } catch {
+    /* already gone */
+  }
+}
+
+function ensureTwDeleteObserver() {
+  if (twDeleteObserver) return;
+  twDeleteObserver = new MutationObserver((muts) => {
+    // Only re-apply while an overlay layer is active — in twitch mode the
+    // user explicitly chose the native player (their problem if it is gone).
+    if (!KO.twDeleted || KO.player === 'twitch') return;
+    for (const m of muts) {
+      for (const n of m.addedNodes) {
+        if (!n || n.nodeType !== 1) continue;
+        if (n.tagName === 'VIDEO') {
+          killTwitchVideo(n);
+          continue;
+        }
+        // Re-renders may wrap the player — scan the added subtree shallowly.
+        if (n.querySelectorAll) {
+          for (const v of n.querySelectorAll('video')) killTwitchVideo(v);
+        }
+      }
+    }
+  });
+  twDeleteObserver.observe(document.body, { childList: true, subtree: true });
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg && msg.type === 'ko-delete-twitch') {
     KO.twDeleted = true;
     const v = twitchVideo();
-    if (v) {
-      try {
-        v.pause();
-      } catch {
-        /* already gone */
-      }
-      try {
-        v.remove();
-      } catch {
-        /* already gone */
-      }
+    if (v) killTwitchVideo(v);
+    // Twitch SPA re-renders the player element — re-apply the delete while a
+    // non-twitch layer is active (the observer survives the element swap).
+    ensureTwDeleteObserver();
+    // Prime the pin: when no player rect was ever measured (deleted before
+    // the first tick), the overlay covers the whole page instead of floating.
+    if (!KO.lastRect) {
+      KO.lastRect = { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
     }
     // The point of the button is SEEING the overlay without the Twitch
     // player — if the current player is 'twitch' the overlay would stay
@@ -1617,6 +1769,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (KO.player === 'twitch') {
       KO.player = 'kick';
       saveState();
+    }
+    // Youtube layer not shown (mint pending/failed)? Keep the wrap visible
+    // in its loading state instead of hiding — the chip shows YT…/YT ✕ and
+    // the black layer covers the deleted player slot (probe()'s hide sites
+    // respect twDeleted via hideWrapForProbe()).
+    if (KO.player === 'youtube' && KO.wrap && KO.wrap.style.display === 'none') {
+      const s = KO.wrap.style;
+      s.left = `${KO.lastRect.left}px`;
+      s.top = `${KO.lastRect.top}px`;
+      s.width = `${KO.lastRect.width}px`;
+      s.height = `${KO.lastRect.height}px`;
+      showWrap();
     }
     apply();
     diag('tw_delete', {});
