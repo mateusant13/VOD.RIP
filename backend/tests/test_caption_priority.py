@@ -19,11 +19,17 @@ GIB = 1024 ** 3
 
 
 def _force_cuda(monkeypatch) -> None:
-    monkeypatch.setattr(at._multi_tls, "pin", ("cuda", "int8"))
+    # raising=False: pin is a per-thread attribute of threading.local and
+    # never exists on the pytest thread — default raising=True AttributeErrors.
+    monkeypatch.setattr(at._multi_tls, "pin", ("cuda", "int8"), raising=False)
+    # Fixed thread count: the CPU cap (budget = 0.4 x threads) must be
+    # deterministic on any runner — 20 threads -> budget 8, auto lanes 3.
+    monkeypatch.setattr("os.cpu_count", lambda: 20)
 
 
 def _force_cpu(monkeypatch) -> None:
-    monkeypatch.setattr(at._multi_tls, "pin", ("cpu", "int8"))
+    monkeypatch.setattr(at._multi_tls, "pin", ("cpu", "int8"), raising=False)
+    monkeypatch.setattr("os.cpu_count", lambda: 20)
 
 
 def _idle_planner(monkeypatch, vram_gib: float) -> None:

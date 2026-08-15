@@ -88,6 +88,32 @@ IDLE_ENV = "VODRIP_WHISPER_IDLE_CLOSE"
 GPU_COPIES_ENV = "VODRIP_TRANSCRIBE_GPU_COPIES"
 PARAKEET_ENV = "VODRIP_PARAAKEET"          # "0" kills the parakeet lane (clean job failure)
 PARAKEET_CACHE_ENV = "VODRIP_SHERRPA_CACHE"  # sherpa-onnx model cache override
+CPU_CAP_ENV = "VODRIP_TRANSCRIBE_CPU_CAP"  # ASR CPU-thread fraction of logical threads (hard cap)
+try:
+    _CPU_CAP_FRAC = float((os.environ.get(CPU_CAP_ENV, "") or "0.4").strip() or "0.4")
+except (ValueError, OverflowError):
+    _CPU_CAP_FRAC = 0.4  # bad env value must not crash the import
+if not math.isfinite(_CPU_CAP_FRAC):
+    _CPU_CAP_FRAC = 0.4  # inf/nan would blow the budget to the whole box
+
+
+def _cpu_thread_budget() -> int:
+    """Hard ceiling of ASR CPU threads: 40% of logical threads (default), any machine.
+
+    _CPU_CAP_FRAC (the import-time parse) is the unset-env fallback; a live
+    env value is re-parsed per call so VODRIP_TRANSCRIBE_CPU_CAP changes
+    apply without a reload. Bad values (unparsable, inf, NaN) fall back to
+    the 0.4 default."""
+    frac = _CPU_CAP_FRAC
+    raw = os.environ.get(CPU_CAP_ENV, "").strip()
+    if raw:
+        try:
+            frac = float(raw)
+        except (ValueError, OverflowError):
+            frac = 0.4
+        if not math.isfinite(frac):
+            frac = 0.4
+    return max(1, int(frac * (os.cpu_count() or 4)))
 # Music/no-speech verdict for captionless YouTube ASR: below this fraction
 # of speech (speech_sec / total_sec) the audio is treated as instrumental
 # music — the video is marked transcript_kind='music' (job done, no ASR
@@ -814,7 +840,11 @@ def _worker_plan() -> list[tuple[str, str]]:
     WORKERS (same dynamic default). Every CPU slot is RAM-clamped; the clamp is
     conservative on purpose because CPU and GPU copies share the same host
     RAM (ponytail: per-slot RSS is an estimate — if a box OOMs, lower
-    VODRIP_TRANSCRIBE_WORKERS or VODRIP_TRANSCRIBE_GPU_COPIES).
+    VODRIP_TRANSCRIBE_WORKERS or VODRIP_TRANSCRIBE_GPU_COPIES). CPU slots are
+    additionally capped at the VODRIP_TRANSCRIBE_CPU_CAP thread budget (40%
+    of logical threads by default), GPU slots included: the CPU side shrinks
+    by the GPU slot count, so len(plan) x threads-per-slot (every recognizer
+    spawns num_threads) never exceeds the CPU fraction, on any machine.
 
     A plan of exactly [("cuda","int8")] (gpu_slots==1 and cpu_slots==0) is
     the single-global-model path: budget 1, one recognizer. Any other plan
@@ -823,11 +853,16 @@ def _worker_plan() -> list[tuple[str, str]]:
     if device == "cpu":
         workers = _cpu_worker_ceiling() or _cpu_auto_workers()  # 0 == auto on CPU-only hosts
         slots = _ram_worker_clamp(workers, _CPU_WORKER_RSS_EST)
+        slots = min(slots, _cpu_thread_budget())  # hard cap: each slot uses >= 1 thread
         if _cpu_load_high() or caption_session_active():
             slots = min(slots, 1)  # contended box / live captions — at most one quiet thread
         return [("cpu", "int8")] * slots
     gpu_slots = _gpu_copies()
     cpu_slots = _ram_worker_clamp(_cpu_worker_ceiling(), _CPU_WORKER_RSS_EST)
+    # len(plan) <= budget: GPU recognizers spawn num_threads too, so the CPU
+    # side must shrink below the budget by the GPU slot count (each slot
+    # uses >= 1 thread; the floor-1 product then never exceeds the cap).
+    cpu_slots = min(cpu_slots, max(0, _cpu_thread_budget() - gpu_slots))
     if _cpu_load_high() or caption_session_active():
         cpu_slots = min(cpu_slots, 1)
     plan: list[tuple[str, str]] = [("cpu", "int8")] * cpu_slots
@@ -856,10 +891,12 @@ def _pool_plan(max_workers: Optional[int]) -> list[tuple[str, str]]:
     """The worker pool's device plan for run_worker.
 
     max_workers overrides the natural plan for tests/launchers: all threads
-    on the effective device (legacy semantics — the budget was a raw count)."""
+    on the effective device (legacy semantics — the budget was a raw count),
+    still clamped to the CPU hard cap so the 40% ceiling holds for overrides
+    too (floor 1)."""
     if max_workers is None:
         return _worker_plan()
-    return [_effective_device()] * max(1, int(max_workers))
+    return [_effective_device()] * min(max(1, int(max_workers)), _cpu_thread_budget())
 
 
 # How often the plan-watch thread re-evaluates the pool plan while the worker
@@ -1257,7 +1294,12 @@ def _parakeet_gpu_allowed() -> bool:
 PARAKEET_BATCH_ENV = "VODRIP_PARAAKEET_BATCH"  # optional cap (0/absent = VRAM-derived)
 _PARAAKEET_BATCH_MAX = 32  # clamp ceiling — never more windows per call
 _PARAAKEET_WINDOW_VRAM_EST = int(64 * 1024 ** 2)  # per 30 s window: features + activations (generous)
-_PARAAKEET_BATCH_VRAM_SAFETY = int(512 * 1024 ** 2)  # free VRAM never committed to the batch
+# Free VRAM never committed to the batch: 2 GiB headroom (raised from 512 MiB
+# after the 2026-08-15 BFCArena AllocateRawInternal crash allocating 2.5 GiB —
+# a spike on top of the old margin crossed the card's ceiling and killed the
+# process; the halved-batch retry in _transcribe_batch_parakeet is the
+# graceful second line of defense).
+_PARAAKEET_BATCH_VRAM_SAFETY = int(2 * 1024 ** 3)
 
 
 def _caption_session_held() -> bool:
@@ -1407,12 +1449,17 @@ def _parakeet_langs() -> frozenset[str]:
 
 
 def _parakeet_threads() -> int:
-    """sherpa-onnx decode threads per CPU lane: the box's cores divided by
-    the CPU lane count, capped at the A/B-measured 8-thread sweet spot.
-    Machine-aware: a 20-thread box with 3 CPU lanes gets 6."""
-    lanes = max(1, _cpu_worker_ceiling() or _cpu_auto_workers())  # 0 == auto on CPU-only hosts
+    """sherpa-onnx decode threads per recognizer: the FULL pool slot count
+    (GPU + CPU — every recognizer spawns num_threads, so the 40% cap must
+    count all lanes), the box's cores divided by that, capped at the
+    A/B-measured 8-thread sweet spot AND the hard thread budget. Called from
+    _load_parakeet under _model_lock; _worker_plan() takes only leaf locks
+    (_vram_lock/_cpu_load_lock — never _model_lock), so no lock cycle.
+    Machine-aware: a 20-thread box with a 4-slot plan (1 GPU + 3 CPU) gets
+    2 -> 8 ASR threads total = 40% (was 6 CPU-only -> 18/20, 90%)."""
+    lanes = len(_worker_plan())  # every slot's recognizer spawns num_threads threads
     cores = os.cpu_count() or 4
-    return max(1, min(_PARAAKEET_MAX_THREADS, cores // lanes))
+    return max(1, min(_PARAAKEET_MAX_THREADS, cores // lanes, _cpu_thread_budget() // lanes))
 
 
 class _AsrRoutingError(Exception):
@@ -1737,19 +1784,49 @@ def _transcribe_batch_parakeet(
     out: list[tuple[list[dict], Optional[str]]] = []
     if batch_size > 1:
         # Batched GPU path: decode_streams over sub-batches; results are
-        # read per stream IN INPUT ORDER, so timestamps stay monotonic.
-        for i in range(0, len(chunks), batch_size):
-            sub = chunks[i:i + batch_size]
+        # read per stream IN INPUT ORDER, so timestamps stay monotonic. A
+        # VRAM allocation failure (BFCArena AllocateRawInternal / CUDA OOM —
+        # observed 2026-08-15) halves the sub-batch instead of killing the
+        # process: results stay 1:1 with input chunks because the left
+        # half's output precedes the right half's.
+        _alloc_markers = (
+            "Failed to allocate", "out of memory", "OOM", "CudaError",
+            "cudaErrorMemoryAllocation", "AllocateRaw",
+        )
+
+        def _decode_streams_safe(sub: list[tuple[float, float]], offset: int) -> list[tuple[list[dict], Optional[str]]]:
+            """Decode one sub-batch (create streams, decode, read results,
+            extract text), retrying in halves on allocation/OOM errors. A
+            single chunk that still fails re-raises (the job fails cleanly)."""
             streams = []
-            for j, (cs, ce) in enumerate(sub):
+            for (cs, ce) in sub:
                 s0, s1 = int(cs * SAMPLE_RATE), int(ce * SAMPLE_RATE)
                 stream = rec.create_stream()
                 stream.accept_waveform(SAMPLE_RATE, audio[s0:s1])
                 streams.append(stream)
-            rec.decode_streams(streams)
-            for j, (cs, ce) in enumerate(sub):
-                base = 0.0 if clip_offsets is None else clip_offsets[i + j]
-                out.append((_clip_items(streams[j], cs, ce, base), language))
+            try:
+                rec.decode_streams(streams)
+                items = []
+                for j, (cs, ce) in enumerate(sub):
+                    base = 0.0 if clip_offsets is None else clip_offsets[offset + j]
+                    items.append((_clip_items(streams[j], cs, ce, base), language))
+                return items
+            except Exception as exc:
+                if len(sub) <= 1 or not any(m in str(exc) for m in _alloc_markers):
+                    raise
+                logger.warning(
+                    "parakeet GPU batch decode OOM at batch %d (%d windows) — retrying in halves",
+                    batch_size, len(sub),
+                )
+                # Release the failed batch's streams (features/audio pin VRAM)
+                # BEFORE the halved retries allocate fresh ones.
+                del streams, stream
+                mid = len(sub) // 2
+                return _decode_streams_safe(sub[:mid], offset) + _decode_streams_safe(sub[mid:], offset + mid)
+
+        for i in range(0, len(chunks), batch_size):
+            sub = chunks[i:i + batch_size]
+            out.extend(_decode_streams_safe(sub, i))
         return out
     for i, (cs, ce) in enumerate(chunks):
         base = 0.0 if clip_offsets is None else clip_offsets[i]
@@ -4589,6 +4666,26 @@ def _run_module_selfcheck() -> None:
         assert 1 <= _parakeet_threads() <= _PARAAKEET_MAX_THREADS, (
             "thread budget must be positive and capped at the A/B sweet spot"
         )
+        assert _parakeet_threads() * len(_worker_plan()) <= _cpu_thread_budget(), (
+            "slots (GPU + CPU) x threads per slot must never exceed the CPU hard cap"
+        )
+        # CPU hard cap env: VODRIP_TRANSCRIBE_CPU_CAP scales the budget with
+        # the box's logical threads; a bad value falls back to the 0.4 default.
+        _saved_cap_env = os.environ.get(CPU_CAP_ENV)
+        try:
+            os.environ[CPU_CAP_ENV] = "0.5"
+            assert _cpu_thread_budget() == max(1, int(0.5 * (os.cpu_count() or 4))), (
+                "the CPU cap env must scale the thread budget"
+            )
+            os.environ[CPU_CAP_ENV] = "banana"
+            assert _cpu_thread_budget() == max(1, int(0.4 * (os.cpu_count() or 4))), (
+                "a bad CPU cap value must fall back to the 0.4 default"
+            )
+        finally:
+            if _saved_cap_env is None:
+                os.environ.pop(CPU_CAP_ENV, None)
+            else:
+                os.environ[CPU_CAP_ENV] = _saved_cap_env
         # tokens.txt present -> the candidate set must narrow to the model's
         # actual lang tokens (a swapped model missing a language is a clean
         # unsupported-language failure for that job).
