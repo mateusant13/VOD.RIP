@@ -1058,7 +1058,13 @@ def _thread_mark_cpu_fallback() -> None:
     _multi_tls.cpu_fallback = True
 
 
-_pool_thread_seq = count()  # plan-slot index handed to each new pool thread
+# Plan-slot index handed to each new pool thread. run_worker resets this
+# before every _make_pool() so a rebuilt pool realigns thread 0 -> plan[0]
+# (a desynced seq pinned new-pool threads to the wrong slots — the 2nd real
+# cause of 'twitch on CPU' with the GPU idle); the % len(plan) modulo in
+# _worker_thread_init still guards direct _make_pool callers/tests that
+# create two pools without run_worker.
+_pool_thread_seq = count()
 
 
 def _thread_pin() -> Optional[tuple[str, str]]:
@@ -4040,8 +4046,9 @@ def run_worker(
     proposes the new plan and the main loop swaps the executor: in-flight
     jobs run out on the old pool (shutdown(wait=False)), fresh claims go to
     the new one — a GPU that becomes free turns the worker GPU-on without a
-    restart. max_workers plans are static (tests/launchers pin them).
+    max_workers plans are static (tests/launchers pin them).
     """
+    global _pool_thread_seq
     _reap_stale_shard_dirs()  # one cleanup pass per boot; orphaned shards only
     _parakeet_cuda_available()  # cache wheel+compute before the first plan
     plan = _pool_plan(max_workers)
@@ -4078,6 +4085,7 @@ def run_worker(
     if max_workers is None:
         watch.start()
 
+    _pool_thread_seq = count()  # realign: new pool pins thread 0 -> plan[0]
     pool = _make_pool(plan, budget)
     try:
         with pool:
@@ -4107,6 +4115,7 @@ def run_worker(
                     old_pool = pool
                     old_pool.shutdown(wait=False)  # in-flight run out there
                     plan, budget, multi = new_plan, len(new_plan), len(new_plan) > 1
+                    _pool_thread_seq = count()  # realign pins to the new plan
                     pool = _make_pool(plan, budget)
                     logger.info(
                         "archive transcribe worker: plan changed -> [%s] "
