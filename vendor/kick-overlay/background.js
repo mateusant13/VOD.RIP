@@ -70,7 +70,9 @@ const KO_MWEB_TPL = {
 };
 // The MWEB player API rejects the call without the page's signature timestamp
 // (sts) — observed UNPLAYABLE "A página precisa ser atualizada" without it.
-const KO_STS_RE = /"sts":(\d+)/;
+// Real-world diag: "sts not found" (01:21 in ko-diag.log) — the watch page
+// shape varies; tolerate whitespace around the value (same field, same page).
+const KO_STS_RE = /"sts":\s*(\d+)/;
 const KO_VD_RE = /"visitorData":"([^"]+)"/;
 const KO_VER_RE = /"INNERTUBE_CONTEXT_CLIENT_VERSION":"([^"]+)"/;
 const KO_VID_RE = /[?&]v=([0-9A-Za-z_-]{11})/;

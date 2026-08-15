@@ -8,27 +8,15 @@
 </style>
 </head>
 <body>
-<script>
-  // The IVS engine logs its own diagnostics to the console (gap jumps,
-  // stall warnings, JSON parse retries, polyfill "unhandled rejection"
-  // notices). Its real failures already arrive at the content script as
-  // {t:'ev', e:'error'} messages via player-bridge.js, so silence
-  // error/warn here to keep the chrome://extensions error badge clean.
-  // The last suppressed error is kept for player-bridge to inspect.
-  window.__koIvErr = '';
-  console.error = (...a) => { window.__koIvErr = String(a[0] || '').slice(0, 200); };
-  console.warn = () => {};
-</script>
+<!-- pre.js must load FIRST, before the vendored engines: MV3 extension_pages
+     CSP (script-src 'self') forbids inline scripts, so the console silencing
+     that used to live in an inline <script> never ran — dead code AND a CSP
+     violation (its refusal error hit the very badge it was meant to keep
+     clean). The HLS-mode native-controls flag moved into player-bridge.js. -->
+<script src="pre.js"></script>
 <video id="v" autoplay playsinline></video>
 <script src="ivs/index.js"></script>
 <script src="hls/hls.min.js"></script>
-<script>
-  // HLS mode (player.html?m=hls): the YouTube layer plays the innertube
-  // manifest with hls.js; native controls give it the same UX the embed had.
-  if (new URLSearchParams(location.search).get('m') === 'hls') {
-    document.getElementById('v').controls = true;
-  }
-</script>
 <script src="player-bridge.js"></script>
 </body>
 </html>
