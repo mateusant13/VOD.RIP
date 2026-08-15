@@ -22,6 +22,9 @@ def _force_cuda(monkeypatch) -> None:
     # raising=False: pin is a per-thread attribute of threading.local and
     # never exists on the pytest thread — default raising=True AttributeErrors.
     monkeypatch.setattr(at._multi_tls, "pin", ("cuda", "int8"), raising=False)
+    # Fixed thread count: the CPU cap (budget = 0.4 x threads) must be
+    # deterministic on any runner — 20 threads -> budget 8, auto lanes 3.
+    monkeypatch.setattr("os.cpu_count", lambda: 20)
     monkeypatch.setattr(at, "_free_system_ram_bytes", lambda: 64 * GIB)
     monkeypatch.setattr(at, "_gpu_free_vram_bytes", lambda: 64 * GIB)  # ample VRAM
     monkeypatch.setattr(at, "_gpu_held_by_other", lambda: False)       # no foreign tenant
@@ -31,6 +34,7 @@ def _force_cuda(monkeypatch) -> None:
 
 def _force_cpu(monkeypatch) -> None:
     monkeypatch.setattr(at._multi_tls, "pin", ("cpu", "int8"), raising=False)
+    monkeypatch.setattr("os.cpu_count", lambda: 20)
     monkeypatch.setattr(at, "_free_system_ram_bytes", lambda: 64 * GIB)
     monkeypatch.setattr(at, "_cpu_load_high", lambda: False)  # not contended
 
@@ -93,6 +97,7 @@ def test_plan_env_forced_cpu_matches_cpu_host(monkeypatch):
     monkeypatch.setenv("VODRIP_WHISPER_DEVICE", "cpu")
     monkeypatch.setattr(at, "_free_system_ram_bytes", lambda: 64 * GIB)
     monkeypatch.setattr(at, "_cpu_load_high", lambda: False)  # deterministic under suite load
+    monkeypatch.setattr("os.cpu_count", lambda: 20)  # budget 8, auto lanes 3 — any runner
     at._detect_device.cache_clear()
     try:
         assert at._worker_plan() == [("cpu", "int8")] * at._cpu_auto_workers()
