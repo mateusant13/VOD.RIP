@@ -72,7 +72,7 @@ const NOT_CHANNEL = new Set([
 
 // Build marker for the diag stream — lets us tell which code a tab runs
 // (content scripts of pre-reload tabs survive extension reloads).
-const KO_VER = '0.7.8';
+const KO_VER = '0.7.9';
 const KO = {
   enabled: false,
   player: 'kick', // 'kick' | 'youtube' | 'twitch' — switching never rebuilds players
@@ -371,7 +371,6 @@ function ensureYtIframe() {
   iframe.id = 'ko-yt';
   iframe.src = chrome.runtime.getURL('player.html?m=hls');
   iframe.setAttribute('allow', 'autoplay; fullscreen; encrypted-media');
-  iframe.setAttribute('allowfullscreen', '');
   KO.wrap.appendChild(iframe);
   KO.pendingYtUrl = KO.ytHlsUrl; // handed to the frame on its 'ready'
   KO.ytEmbedAt = Date.now(); // fallback clock: hls must init within YT_EMBED_GRACE
@@ -471,7 +470,6 @@ function kickFrame() {
   fr.id = 'ko-ivs';
   fr.src = chrome.runtime.getURL('player.html');
   fr.setAttribute('allow', 'autoplay; fullscreen');
-  fr.setAttribute('allowfullscreen', '');
   KO.wrap.appendChild(fr);
   KO.kickFrame = fr;
   KO.kickWin = null;

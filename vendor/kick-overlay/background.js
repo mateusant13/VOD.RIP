@@ -70,9 +70,10 @@ const KO_MWEB_TPL = {
 };
 // The MWEB player API rejects the call without the page's signature timestamp
 // (sts) — observed UNPLAYABLE "A página precisa ser atualizada" without it.
-// Real-world diag: "sts not found" (01:21 in ko-diag.log) — the watch page
-// shape varies; tolerate whitespace around the value (same field, same page).
-const KO_STS_RE = /"sts":\s*(\d+)/;
+// Real-world diag: "sts not found" — the ytcfg field was RENAMED to uppercase
+// "STS" (verified: watch page ytcfg carries "STS":20676; lowercase is legacy).
+const KO_STS_RE = /"STS":\s*(\d+)/;
+const KO_STS_LEGACY_RE = /"sts":\s*(\d+)/;
 const KO_VD_RE = /"visitorData":"([^"]+)"/;
 const KO_VER_RE = /"INNERTUBE_CONTEXT_CLIENT_VERSION":"([^"]+)"/;
 const KO_VID_RE = /[?&]v=([0-9A-Za-z_-]{11})/;
@@ -113,7 +114,7 @@ async function koMintManifest(videoId) {
   if (!vd || !ver) throw new Error('mweb config parse fail');
   // 2) Signature timestamp from the watch page ytcfg.
   const watch = await koFetchText(`https://www.youtube.com/watch?v=${videoId}`);
-  const sts = (watch.match(KO_STS_RE) || [])[1];
+  const sts = (watch.match(KO_STS_RE) || watch.match(KO_STS_LEGACY_RE) || [])[1];
   if (!sts) throw new Error('sts not found');
   // 3) MWEB player API call (anonymous, Chrome transport).
   const body = JSON.parse(JSON.stringify(KO_MWEB_TPL));
