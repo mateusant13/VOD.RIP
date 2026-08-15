@@ -138,7 +138,16 @@ function renderHeader() {
   pill.className = 'pill';
   const t = el.pillText();
   switch (state.status) {
-    case 'syncing': pill.classList.add('sync'); t.textContent = 'sincronizando…'; break;
+    case 'syncing':
+      pill.classList.add('sync');
+      if (state.syncProgress) {
+        const p = state.syncProgress;
+        const label = p.phase === 'followers' ? 'seguidores' : 'seguindo';
+        t.textContent = `sincronizando… ${label}: ${Number(p.fetched || 0).toLocaleString('pt-BR')}`;
+      } else {
+        t.textContent = 'sincronizando…';
+      }
+      break;
     case 'ok': pill.classList.add('ok'); t.textContent = 'atualizado'; break;
     case 'error': pill.classList.add('err'); t.textContent = 'erro'; break;
     case 'idle': t.textContent = 'aguardando'; break;

@@ -4,7 +4,7 @@
 // periodic alarms. Reads ONLY follow/follower relationships.
 'use strict';
 
-import { readSession, fetchAllUsers, IgApiError } from './ig_api.mjs';
+import { readSession, fetchAllUsers, IgApiError, buildResume } from './ig_api.mjs';
 import { diffAndRecord, mergeEvents } from './diff.mjs';
 
 const K = {
@@ -70,6 +70,49 @@ function nowIso() {
 }
 
 // ---------------------------------------------------------------------------
+// Sync checkpoints: persist per-page progress so a failed/restarted sync
+// RESUMES from the last page instead of re-fetching everything from scratch
+// (the "fez tudo do scratch" complaint). Keyed by uid — never resumes across
+// accounts; TTL-guarded; only the contiguous page prefix is ever resumed.
+// ---------------------------------------------------------------------------
+
+const PART_META = 'igf.part.meta';
+const PART_PREFIX = 'igf.part.';
+const partKey = (kind, uid, seq) => `${PART_PREFIX}${kind}.${uid}.${seq}`;
+
+// Best-effort: a failing checkpoint write only costs resume granularity.
+async function savePagePart(kind, uid, seq, maxId, users) {
+  const key = partKey(kind, uid, seq);
+  await chrome.storage.local.set({ [key]: { maxId, at: Date.now(), users } });
+  try {
+    const o = await chrome.storage.local.get(PART_META);
+    const meta = o[PART_META] || { keys: [] };
+    if (!meta.keys.includes(key)) meta.keys.push(key);
+    await chrome.storage.local.set({ [PART_META]: meta });
+  } catch { /* index lost -> leaked page, TTL-guarded */ }
+}
+
+async function readPartials(uid) {
+  try {
+    const o = await chrome.storage.local.get(PART_META);
+    const meta = o[PART_META];
+    if (!meta || !meta.keys.length) return { following: null, followers: null };
+    const values = await chrome.storage.local.get(meta.keys);
+    return buildResume(uid, meta, values);
+  } catch {
+    return { following: null, followers: null };
+  }
+}
+
+async function clearPartials() {
+  try {
+    const o = await chrome.storage.local.get(PART_META);
+    const meta = o[PART_META];
+    if (meta && meta.keys.length) await chrome.storage.local.remove([...meta.keys, PART_META]);
+  } catch { /* best-effort */ }
+}
+
+// ---------------------------------------------------------------------------
 // Sync: fetch the COMPLETE following + followers lists, diff, notify.
 // ---------------------------------------------------------------------------
 
@@ -104,8 +147,23 @@ async function sync(trigger) {
       if (uid) await setState({ ownUserId: String(uid) });
       if (username) await setState({ ownUsername: username });
 
-      const following = await fetchAllUsers('following', uid, session, { onProgress: () => {} });
-      const followers = await fetchAllUsers('followers', uid, session, { onProgress: () => {} });
+      // Both lists in PARALLEL (a sequential full-following-then-full-followers
+      // walk doubles the wall time on large accounts). Progress is persisted
+      // per page so the dashboard can show live counts; each page is also
+      // checkpointed so a failure/restart resumes instead of restarting.
+      const partials = await readPartials(uid);
+      const [following, followers] = await Promise.all([
+        fetchAllUsers('following', uid, session, {
+          resume: partials.following,
+          onProgress: ({ kind, fetched }) => setState({ syncProgress: { phase: kind, fetched } }),
+          onPart: ({ seq, maxId, users }) => savePagePart('following', uid, seq, maxId, users),
+        }),
+        fetchAllUsers('followers', uid, session, {
+          resume: partials.followers,
+          onProgress: ({ kind, fetched }) => setState({ syncProgress: { phase: kind, fetched } }),
+          onPart: ({ seq, maxId, users }) => savePagePart('followers', uid, seq, maxId, users),
+        }),
+      ]);
 
       const stored = await chrome.storage.local.get([K.prevFollowers, K.history]);
       const prev = stored[K.prevFollowers] || {};
@@ -130,6 +188,7 @@ async function sync(trigger) {
         [K.history]: newHistory,
         [K.events]: allEvents,
       });
+      await clearPartials(); // sync complete — no resume needed anymore
 
       // --- notifications for people we still follow who stopped following us ---
       const notifyable = events.filter((e) => e.stillFollowing);
@@ -143,6 +202,7 @@ async function sync(trigger) {
         lastSyncAt: nowIso(),
         lastDurationMs: Date.now() - t0,
         error: null,
+        syncProgress: null,
         followersCount: followers.size,
         followingCount: following.size,
         notFollowingBackCount: notFollowingBack.length,
@@ -152,7 +212,7 @@ async function sync(trigger) {
       return { ok: true, following: following.size, followers: followers.size, notFollowingBack: notFollowingBack.length, newEvents: events.length };
     } catch (err) {
       const msg = err instanceof IgApiError ? err.message : String(err && err.message || err).slice(0, 200);
-      await setState({ status: 'error', error: msg });
+      await setState({ status: 'error', error: msg, syncProgress: null });
       runningSync = null;
       return { ok: false, error: msg };
     }
@@ -338,3 +398,15 @@ chrome.notifications.onClicked.addListener((id) => {
 
 // Initial alarm (SW may restart without onInstalled).
 scheduleAlarm().catch(() => {});
+
+// A SW restart mid-sync would leave status='syncing' forever (the UI shows an
+// endless spinner). On every SW start, clear any stale syncing state — a live
+// sync can't coexist with a restart, so this is always safe.
+(async () => {
+  try {
+    const st = await getState();
+    if (st.status === 'syncing') {
+      await setState({ status: 'idle', syncProgress: null });
+    }
+  } catch { /* storage unavailable — next sync overwrites anyway */ }
+})();
