@@ -308,7 +308,7 @@ def _real_env():
         archive_db._schema_ready = False
 
 
-def test_parakeet_e2e_real(_real_env) -> None:
+def test_parakeet_e2e_real(_real_env=None) -> None:
     if pathlib.Path(os.environ["VODRIP_ARCHIVE_DB"]) != archive_db._db_path():
         raise AssertionError("archive DB env mismatch — run the test file directly")
     try:

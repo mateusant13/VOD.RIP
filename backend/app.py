@@ -212,8 +212,38 @@ def _spawn_detached_background() -> Optional[int]:
     return proc.pid
 
 
+def _preload_sherpa_onnx_ort() -> None:
+    """Load sherpa-onnx's bundled onnxruntime.dll + providers_shared BEFORE
+    anything imports the pip onnxruntime (archive_embed warm).
+
+    Both onnxruntime.dll share the basename — whichever loads first wins for
+    the whole process. If the pip ORT wins, sherpa's CUDA EP (built against
+    the bundled ORT, 14.4 MB, not the pip 16 MB build) binds to the wrong
+    providers_shared and fail-fasts on first inference (0xc0000409).
+    Importing sherpa first and preloading its providers_shared by absolute
+    path makes every later loader (pip pybind included) reuse the sherpa's
+    copies — both lanes work. Verified: CUDA decode + pip embed session over
+    the sherpa DLLs.
+    """
+    try:
+        import ctypes
+        from pathlib import Path
+
+        import sherpa_onnx  # noqa: F401  (loads onnxruntime.dll of sherpa)
+
+        lib_dir = Path(sherpa_onnx.__file__).parent / "lib"
+        shared = lib_dir / "onnxruntime_providers_shared.dll"
+        if shared.exists():
+            ctypes.WinDLL(str(shared))
+    except Exception:
+        logger.debug("sherpa-onnx ORT preload skipped", exc_info=True)
+
+
 @asynccontextmanager
 async def _app_lifespan(_app: FastAPI):
+    # Preload sherpa-onnx's bundled ORT before any thread can import the pip
+    # onnxruntime — see _preload_sherpa_onnx_ort.
+    _preload_sherpa_onnx_ort()
     # Boot maintenance — disk hygiene (orphaned temp/preview/selfcheck
     # sweeps), archive retention, chat dedupe, FTS optimize, and the
     # embed-model warm all run on a daemon
