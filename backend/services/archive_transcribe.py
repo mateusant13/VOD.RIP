@@ -255,6 +255,11 @@ def _cache_dir() -> Path:
 # allowance at claim time decides the lane — never a static count.
 _GPU_VRAM_HEADROOM = int(2 * 1024 ** 3)   # must stay free for the tenants
 _GPU_UTIL_SECOND_COPY = 0.70              # below this, a 2nd copy may add
+# Thermal ceiling: sustained 100% util for hours heats the card and can
+# destabilize the Windows driver (TDR resets, black screens). The decode
+# loop paces batches so measured utilization stays at/below this fraction.
+_GPU_MAX_UTIL = 0.90
+_GPU_MAX_UTIL_WAIT_S = 30.0               # ceiling on the pacing wait per batch
 _GPU_VRAM_MEDIAN_SAMPLES = 6              # reads spread over ~60 s
 _GPU_VRAM_MEDIAN_GAP_S = 10.0
 
@@ -417,6 +422,36 @@ def _gpu_util() -> Optional[float]:
         _gpu_util_cache = util if util is not None else 0.0
         _gpu_util_at = now
     return util
+
+
+def _gpu_thermal_guard() -> None:
+    """Pace GPU decode so utilization stays <= _GPU_MAX_UTIL (0.90).
+
+    The user's card must never sit at 100% util for long stretches —
+    sustained full load heats the card and can destabilize the Windows
+    driver (TDR/black-screen) while the queue keeps feeding batches. Called
+    before each decode batch: when the measured utilization is above the
+    ceiling, sleep in 1 s steps until it drops (bounded by
+    _GPU_MAX_UTIL_WAIT_S so a foreign sustained load can't stall the queue
+    forever — we degrade to the ceiling, not to zero). No-op when the
+    provider isn't CUDA or utilization is unmeasurable (nvidia-smi absent:
+    a fake adapter has no GPU work to throttle).
+    """
+    if _parakeet_provider() != "cuda":
+        return
+    util = _gpu_util()
+    if util is None or util <= _GPU_MAX_UTIL:
+        return
+    waited = 0.0
+    while util is not None and util > _GPU_MAX_UTIL and waited < _GPU_MAX_UTIL_WAIT_S:
+        time.sleep(1.0)
+        waited += 1.0
+        util = _gpu_util()
+    if util is not None and util > _GPU_MAX_UTIL:
+        logger.warning(
+            "GPU util %.0f%% still above %.0f%% after %.0fs — proceeding anyway",
+            util * 100, _GPU_MAX_UTIL * 100, waited,
+        )
 
 
 # GPU sequential-dispatch gate (user requirement): GPU slots process ONE
@@ -639,7 +674,16 @@ def _gpu_copies() -> int:
     if _gpu_held_by_other() or caption_session_active():
         return 0  # a foreign process OR the live captioner holds the GPU — don't stack
     if _gpu_lane_plan() is None:
-        return 0  # measured median free VRAM < 2 GiB — CPU lane only
+        # Measured free VRAM < 2 GiB. When the dip is OUR OWN resident CUDA
+        # recognizer (the ORT CUDA EP arena grows to ~90% of free VRAM at
+        # session create), the model is already loaded and reusable — keep
+        # one GPU copy so the next job waits on the sequential gate instead
+        # of silently degrading to a CPU lane. Only a genuinely foreign VRAM
+        # hog (checked above) or a cold process with no resident model below
+        # the floor falls back to CPU.
+        if _cuda_resident():
+            return 1
+        return 0  # no resident model — measured median free VRAM < 2 GiB, CPU lane only
     allowance = _gpu_vram_allowance()
     if configured > 1:
         util = _gpu_util()
@@ -898,7 +942,7 @@ def close_model() -> None:
     slot is created). The process-global parakeet recognizer (single-model
     mode) is dropped as well. (The whisper model cache was removed with the
     faster-whisper engine.)"""
-    global _vad, _parakeet_global
+    global _vad, _parakeet_global, _cuda_recognizers_resident
     closed_any = False
     with _model_lock:
         for slot in _thread_slots.values():
@@ -918,6 +962,8 @@ def close_model() -> None:
             logger.info("Unloading parakeet recognizer")
             del parakeet
             closed_any = True
+    with _cuda_resident_lock:
+        _cuda_recognizers_resident = 0  # every recognizer was dropped above
     with _vad_lock:
         vad, _vad = _vad, None
         if vad is not None:
@@ -1043,6 +1089,26 @@ _parakeet_ok: Optional[bool] = None  # sherpa-onnx import probe (None = unprobed
 _parakeet_global: Any = None  # process-global recognizer (single-model mode)
 _parakeet_last_used = 0.0
 
+# CUDA recognizers currently resident in THIS process (not a foreign tenant).
+# The ORT CUDA EP arena grows to ~90% of free VRAM at session create, so a
+# resident CUDA recognizer makes the measured free-VRAM allowance read below
+# the GPU floor even though the model is already loaded and reusable. The
+# planner and the GPU-slot gate must not exile the lane for OUR OWN arena —
+# only a genuinely foreign VRAM hog (or no resident model below the floor)
+# degrades the queue to CPU. Guarded by a DEDICATED lock: _load_parakeet
+# runs inside _model_lock (non-reentrant), so the counter cannot touch it.
+_cuda_recognizers_resident = 0
+_cuda_resident_lock = threading.Lock()
+
+
+def _cuda_resident() -> bool:
+    """True when THIS process holds a CUDA parakeet recognizer.
+
+    Set by _load_parakeet on a successful CUDA load, cleared by close_model
+    which drops every recognizer. Lock is dedicated (see above)."""
+    with _cuda_resident_lock:
+        return _cuda_recognizers_resident > 0
+
 
 def _parakeet_available() -> bool:
     """True when the parakeet lane can run.
@@ -1164,6 +1230,12 @@ def _parakeet_gpu_allowed() -> bool:
     probe-failure paths elsewhere (env cap trusted)."""
     if not _parakeet_cuda_available():
         return False
+    if _cuda_resident():
+        # Our own CUDA recognizer is already loaded — the floor guards the
+        # LOAD, not the reuse: the next job rides the resident model (the
+        # sequential gate serializes) and the batch sizes down to whatever
+        # VRAM remains. Free VRAM below 2 GiB here is our own ORT arena.
+        return True
     now = time.monotonic()
     with _vram_lock:
         fresh = (
@@ -1479,6 +1551,7 @@ def _load_parakeet(provider: str = "cpu") -> Any:
     wheels bundle a CUDA onnxruntime); 'cpu' everywhere else. A CUDA load
     failure degrades THIS recognizer to CPU and flips the cached probe, so
     later jobs route per reality instead of failing."""
+    global _cuda_recognizers_resident
     import sherpa_onnx
 
     d = _parakeet_model_dir()
@@ -1498,6 +1571,9 @@ def _load_parakeet(provider: str = "cpu") -> Any:
         kwargs["provider"] = provider
     try:
         rec = sherpa_onnx.OfflineRecognizer.from_transducer(**kwargs)
+        if provider != "cpu":
+            with _cuda_resident_lock:
+                _cuda_recognizers_resident += 1
     except Exception as exc:
         if provider == "cpu":
             raise
@@ -1623,6 +1699,12 @@ def _transcribe_batch_parakeet(
     ponytail: whisper split segments on its own sentence boundaries; here
     one VAD chunk is one segment. Upgrade path: split a segment at word
     gaps > 1 s if the UI ever needs finer granularity."""
+    global _parakeet_last_used
+    # The idle-closer keys off this timestamp — but the decode loop holds
+    # the recognizer it already loaded and never re-enters _parakeet_model,
+    # so a long job (> idle timeout) looked "idle" and got unloaded mid-run
+    # (plan collapse to CPU + crashed process). Any inference IS use.
+    _parakeet_last_used = time.monotonic()
     def _clip_items(stream: Any, cs: float, ce: float, base: float) -> list[dict]:
         res = stream.result
         text = (res.text or "").strip()
@@ -3000,6 +3082,9 @@ def _transcribe_audio_source(
             speech_done += ce - cs
             ci += 1
             continue
+        # Thermal ceiling: never feed the next batch while the card is
+        # pinned above 90% util (driver/Windows stability, user requirement).
+        _gpu_thermal_guard()
         # Batch consecutive missing clips into one GPU call; resume gaps only
         # shrink the run, never break the per-clip insert/manifest contract.
         run: list[tuple[int, tuple[float, float]]] = []
@@ -4210,6 +4295,7 @@ def _run_module_selfcheck() -> None:
     app imports stay cheap — the block used to run unconditionally,
     spawning an nvidia-smi probe + a scratch mkdtemp on every import."""
     global _cpu_load_high, _cuda_runtime_vram, _free_system_ram_bytes
+    global _cuda_recognizers_resident
     global _gpu_free_vram_bytes, _gpu_held_by_other, _gpu_util
     global _nvidia_smi_vram, _parakeet_cuda_ok, _parakeet_ok
     global _parakeet_provider, _vram_free_at, _vram_free_bytes
@@ -4344,6 +4430,25 @@ def _run_module_selfcheck() -> None:
         assert _worker_plan() == [("cpu", "int8")] * _cpu_auto_workers(), (
             "sub-2 GiB VRAM must drop the GPU copy, CPU side covers"
         )
+        # OUR OWN resident CUDA recognizer (the ORT arena is the VRAM hog):
+        # the lane stays even below the 2 GiB floor — the model is already
+        # loaded and the sequential gate reuses it; a fresh-cache read of the
+        # resident arena must not exile the queue to CPU.
+        _saved_cuda_resident = _cuda_recognizers_resident
+        try:
+            with _cuda_resident_lock:
+                _cuda_recognizers_resident = 1
+            assert _worker_plan() == [("cuda", "int8")] + [("cpu", "int8")] * _cpu_auto_workers(), (
+                "own resident CUDA recognizer keeps the GPU lane under the floor"
+            )
+            os.environ[WORKERS_ENV] = "0"
+            assert _worker_plan() == [("cuda", "int8")], (
+                "WORKERS=0 + resident CUDA recognizer -> exclusive-GPU plan"
+            )
+            os.environ.pop(WORKERS_ENV, None)
+        finally:
+            with _cuda_resident_lock:
+                _cuda_recognizers_resident = _saved_cuda_resident
         # GPU-lane VRAM floor (parakeet-only): 2 GiB floor -> lane off; at/above
         # it the lane is the fixed int8 plan on every tier.
         _gpu_free_vram_bytes = lambda: int(3.0 * 1024 ** 3)
@@ -4597,6 +4702,51 @@ def _run_module_selfcheck() -> None:
         "release must free the gate for the next video"
     )
     _gpu_gate_release("kick", "v2")
+
+    # GPU thermal guard: paces batches so util stays <= 90% — a no-op on
+    # CPU lanes, sleeps while the card is pinned above the ceiling, and
+    # gives up (degrades, never stalls) after the bounded wait.
+    _saved_guard_prov, _saved_guard_util = _parakeet_provider, _gpu_util
+    _saved_guard_sleep = time.sleep
+    _guard_util_reads: list[float] = []
+
+    def _guard_util_seq() -> Optional[float]:
+        return _guard_util_reads.pop(0) if _guard_util_reads else None
+
+    try:
+        _parakeet_provider = lambda: "cuda"
+        _gpu_util = _guard_util_seq
+        _guard_sleep_calls: list[float] = []
+        time.sleep = lambda s: _guard_sleep_calls.append(s)  # no real waiting
+
+        _guard_util_reads[:] = [0.95, 0.95, 0.80]  # pinned, pinned, drops
+        _gpu_thermal_guard()
+        assert _guard_sleep_calls == [1.0, 1.0], (
+            "a hot GPU must pace 1 s per poll until util drops under the ceiling"
+        )
+
+        _guard_sleep_calls.clear()
+        _guard_util_reads[:] = [0.85]  # already under the ceiling
+        _gpu_thermal_guard()
+        assert _guard_sleep_calls == [], "under the ceiling no sleep happens"
+
+        _guard_sleep_calls.clear()
+        _guard_util_reads[:] = [0.99] * 100  # never drops below the ceiling
+        _gpu_thermal_guard()
+        assert len(_guard_sleep_calls) == int(_GPU_MAX_UTIL_WAIT_S), (
+            "the pacing wait must be bounded — a foreign sustained load "
+            "degrades to the ceiling instead of stalling the queue"
+        )
+
+        _parakeet_provider = lambda: "cpu"
+        _guard_sleep_calls.clear()
+        _guard_util_reads[:] = [0.99, 0.99]
+        _gpu_thermal_guard()
+        assert _guard_sleep_calls == [], "CPU lanes never pace GPU utilization"
+    finally:
+        _parakeet_provider = _saved_guard_prov
+        _gpu_util = _saved_guard_util
+        time.sleep = _saved_guard_sleep
 
 if os.environ.get("VODRIP_TRANSCRIBE_SELFCHECK", "").strip().lower() in ("1", "true", "yes", "on"):
     _run_module_selfcheck()
