@@ -727,20 +727,35 @@ def _rss_cap_bytes() -> int:
     return int(total * 0.4)
 
 
+_dynamic_gpu_cap_cache = 0.80  # default fallback until first probe
+_dynamic_gpu_cap_at = 0.0
+_DYNAMIC_GPU_CAP_REFRESH_S = 60.0
+
+
 def _vram_cap_bytes() -> int:
-    """Hard VRAM usage ceiling for GPU jobs (bytes). Default: 80% of total
-    GPU VRAM. Override via VODRIP_TRANSCRIBE_VRAM_CAP_MB (integer MB).
-    Returns 0 when no GPU is detected (no VRAM cap enforced)."""
+    """Hard VRAM usage ceiling for GPU jobs (bytes). Uses a dynamic cap
+    (get_dynamic_gpu_cap) that adjusts based on other GPU process usage,
+    refreshed every 60 s. Override via VODRIP_TRANSCRIBE_VRAM_CAP_MB
+    (integer MB). Returns 0 when no GPU is detected (no VRAM cap enforced)."""
     env_val = os.environ.get(_VRAM_CAP_ENV, "").strip()
     if env_val:
         try:
             return int(float(env_val)) * 1024 * 1024
         except (ValueError, OverflowError):
             pass
+    global _dynamic_gpu_cap_cache, _dynamic_gpu_cap_at
+    now = time.monotonic()
+    if now - _dynamic_gpu_cap_at >= _DYNAMIC_GPU_CAP_REFRESH_S or _dynamic_gpu_cap_at == 0.0:
+        try:
+            from services.gpu_detect import get_dynamic_gpu_cap
+            _dynamic_gpu_cap_cache = get_dynamic_gpu_cap()
+            _dynamic_gpu_cap_at = now
+        except Exception:
+            pass  # keep previous cached value
     present, total_vram, _free = _real_gpu_info()
     if not present or total_vram <= 0:
         return 0  # no GPU — no VRAM cap
-    return int(total_vram * 0.8)
+    return int(total_vram * _dynamic_gpu_cap_cache)
 
 
 def _process_rss_bytes() -> int:
