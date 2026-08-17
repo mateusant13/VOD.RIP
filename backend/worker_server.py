@@ -83,6 +83,118 @@ def _singleton_mutex_held() -> bool:
         return False
 
 
+# --- resource watchdog (RAM cap enforcement) --------------------------------
+# Monitors the child archive_transcribe process RSS every 60s. If RSS
+# exceeds the cap for 3 consecutive checks, kill the child with taskkill.
+# The cap is read from the same env knob the child uses (VODRIP_TRANSCRIBE_RSS_CAP_MB).
+_WATCHDOG_INTERVAL_S = 60.0
+_WATCHDOG_KILL_THRESHOLD = 3  # consecutive over-cap checks before kill
+_RSS_CAP_ENV = "VODRIP_TRANSCRIBE_RSS_CAP_MB"
+
+
+def _rss_cap_bytes() -> int:
+    """Hard RSS ceiling (bytes) — mirrors archive_transcribe._rss_cap_bytes."""
+    env_val = os.environ.get(_RSS_CAP_ENV, "").strip()
+    if env_val:
+        try:
+            return int(float(env_val)) * 1024 * 1024
+        except (ValueError, OverflowError):
+            pass
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", wintypes.DWORD),
+                    ("dwMemoryLoad", wintypes.DWORD),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = MEMORYSTATUSEX()
+            status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.ullTotalPhys * 0.4)
+        else:
+            total = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+            return int(total * 0.4)
+    except Exception:
+        pass
+    return 0
+
+
+def _process_rss_bytes(pid: int) -> int:
+    """RSS of an arbitrary process by PID (bytes, 0 = unknown).
+    Windows: tasklist CSV. POSIX: /proc/[pid]/statm."""
+    try:
+        if os.name == "nt":
+            import subprocess as _sp
+            out = _sp.check_output(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                text=True, timeout=5, stderr=_sp.DEVNULL,
+            )
+            for line in out.strip().splitlines():
+                parts = line.split(",")
+                if len(parts) >= 5:
+                    mem_str = parts[4].strip().strip('"')
+                    # tasklist uses locale thousands separator (e.g. "17.800 K")
+                    num_str = mem_str[:-1].replace(".", "").replace(",", "")
+                    if mem_str.endswith("K"):
+                        return int(num_str) * 1024
+                    elif mem_str.endswith("M"):
+                        return int(float(num_str)) * 1024 * 1024
+                    elif mem_str.endswith("G"):
+                        return int(float(num_str)) * 1024 * 1024 * 1024
+        else:
+            with open(f"/proc/{pid}/statm") as f:
+                pages = int(f.read().split()[1])
+                return pages * os.sysconf("SC_PAGE_SIZE")
+    except Exception:
+        pass
+    return 0
+
+
+def _resource_watchdog(
+    logf, proc: subprocess.Popen, stop_event: threading.Event
+) -> None:
+    """Daemon thread: poll child RSS every 60s; kill after 3 consecutive over-cap."""
+    cap = _rss_cap_bytes()
+    if cap <= 0:
+        return  # no cap configured — watchdog is a no-op
+    consecutive_over = 0
+    while not stop_event.wait(_WATCHDOG_INTERVAL_S):
+        if proc.poll() is not None:
+            return  # child already exited
+        rss = _process_rss_bytes(proc.pid)
+        if rss <= 0:
+            consecutive_over = 0  # can't measure — reset counter
+            continue
+        if rss > cap:
+            consecutive_over += 1
+            _log(logf, f"watchdog: child RSS {rss / 1024**2:.0f} MB exceeds cap "
+                 f"{cap / 1024**2:.0f} MB ({consecutive_over}/{_WATCHDOG_KILL_THRESHOLD})")
+            if consecutive_over >= _WATCHDOG_KILL_THRESHOLD:
+                _log(logf, f"watchdog: killing child pid {proc.pid} — RSS over cap "
+                     f"for {_WATCHDOG_KILL_THRESHOLD} consecutive checks")
+                try:
+                    if os.name == "nt":
+                        os.system(f"taskkill /PID {proc.pid} /F /T")
+                    else:
+                        os.kill(proc.pid, 9)
+                except Exception:
+                    _log(logf, "watchdog: kill failed")
+                return
+        else:
+            consecutive_over = 0  # back under cap — reset counter
+
+
 def main() -> int:
     LOG_DIR.mkdir(exist_ok=True)
     if _singleton_mutex_held():
@@ -136,9 +248,21 @@ def main() -> int:
             threading.Thread(target=_pump, args=(proc.stdout, logf), daemon=True).start()
             _log(logf, f"child pid {proc.pid}")
 
+            # Resource watchdog: monitor child RSS and kill if over cap
+            # for 3 consecutive 60s checks.
+            watchdog_stop = threading.Event()
+            watchdog = threading.Thread(
+                target=_resource_watchdog,
+                args=(logf, proc, watchdog_stop),
+                daemon=True,
+                name="resource-watchdog",
+            )
+            watchdog.start()
+
             try:
                 rc = proc.wait()
             except KeyboardInterrupt:
+                watchdog_stop.set()
                 _log(logf, "Ctrl+C received — stopping child gracefully")
                 if os.name == "nt":
                     try:
@@ -154,6 +278,7 @@ def main() -> int:
                 _log(logf, "worker stopped")
                 return 0
 
+            watchdog_stop.set()
             if rc == 0:
                 _log(logf, "worker exited cleanly (queue drained, rc=0) — not restarting")
                 return 0

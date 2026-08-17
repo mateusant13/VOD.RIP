@@ -66,7 +66,7 @@ def _maybe_spawn_worker() -> None:
 
     if not archive_db.has_pending_jobs():
         return
-    if archive_db.worker_live(age_s=45):
+    if archive_db.worker_live(age_s=120):
         return
     # Crash-loop cooldown: worker_server stamps 'worker-gave-up' after 3
     # consecutive crashes; don't spawn a replacement every 60s tick while

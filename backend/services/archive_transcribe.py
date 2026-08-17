@@ -671,6 +671,112 @@ def _gpu_lane_plan() -> Optional[tuple[Optional[str], str]]:
     return None, "int8"
 
 
+# --- resource caps (RAM / VRAM hard ceilings) ------------------------------
+# Prevents unbounded resource consumption: a single transcribe worker can
+# use 17 GB RAM + 100% GPU without these guards. Each cap is env-overridable
+# so operators can tune per-machine.
+
+_RSS_CAP_ENV = "VODRIP_TRANSCRIBE_RSS_CAP_MB"
+_VRAM_CAP_ENV = "VODRIP_TRANSCRIBE_VRAM_CAP_MB"
+_RSS_CHECK_INTERVAL_S = 30.0  # sleep on RSS over-cap before retry
+
+
+def _total_system_ram_bytes() -> int:
+    """Total physical RAM in bytes (0 = unknown). Same platform probes as
+    _free_system_ram_bytes but returns total instead of available."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", wintypes.DWORD),
+                    ("dwMemoryLoad", wintypes.DWORD),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = MEMORYSTATUSEX()
+            status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.ullTotalPhys)
+        else:
+            return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except Exception:
+        return 0
+
+
+def _rss_cap_bytes() -> int:
+    """Hard RSS ceiling for this process (bytes). Default: 40% of system RAM.
+    Override via VODRIP_TRANSCRIBE_RSS_CAP_MB (integer megabytes)."""
+    env_val = os.environ.get(_RSS_CAP_ENV, "").strip()
+    if env_val:
+        try:
+            return int(float(env_val)) * 1024 * 1024
+        except (ValueError, OverflowError):
+            pass
+    total = _total_system_ram_bytes()
+    if total <= 0:
+        return 0  # unknown — no cap enforced
+    return int(total * 0.4)
+
+
+def _vram_cap_bytes() -> int:
+    """Hard VRAM usage ceiling for GPU jobs (bytes). Default: 80% of total
+    GPU VRAM. Override via VODRIP_TRANSCRIBE_VRAM_CAP_MB (integer MB).
+    Returns 0 when no GPU is detected (no VRAM cap enforced)."""
+    env_val = os.environ.get(_VRAM_CAP_ENV, "").strip()
+    if env_val:
+        try:
+            return int(float(env_val)) * 1024 * 1024
+        except (ValueError, OverflowError):
+            pass
+    present, total_vram, _free = _real_gpu_info()
+    if not present or total_vram <= 0:
+        return 0  # no GPU — no VRAM cap
+    return int(total_vram * 0.8)
+
+
+def _process_rss_bytes() -> int:
+    """Current process RSS in bytes (0 = unknown). Uses psutil when
+    available; falls back to 0 so callers never crash."""
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss
+    except Exception:
+        return 0
+
+
+def _check_resource_caps() -> bool:
+    """True when the process is within its RSS and VRAM caps.
+
+    Callable from the worker loop for health checks. A False return means
+    the caller should back off (sleep) rather than claim new work."""
+    rss_cap = _rss_cap_bytes()
+    if rss_cap > 0:
+        rss = _process_rss_bytes()
+        if rss > rss_cap:
+            return False
+    vram_cap = _vram_cap_bytes()
+    if vram_cap > 0:
+        used_vram = _gpu_vram_allowance()
+        # VRAM cap is checked against used = total - free, so we compare
+        # total_vram - free_vram against the cap.  _gpu_free_vram_bytes()
+        # returns the *free* portion; total is cached in _real_gpu_info().
+        present, total_vram, _free = _real_gpu_info()
+        if present:
+            used = total_vram - _free
+            if used > vram_cap:
+                return False
+    return True
+
+
 # --- live-caption session reservation ---------------------------------------
 # The real-time captioner (services.live_captions) is the MAX-priority tenant
 # while a livestream is watched: its parakeet ASR must never wait behind
@@ -4281,6 +4387,17 @@ def _run_worker(
 
         def _refill() -> None:
             while len(pending) < budget:
+                rss_cap = _rss_cap_bytes()
+                if rss_cap > 0:
+                    rss = _process_rss_bytes()
+                    if rss > rss_cap:
+                        logger.warning(
+                            "archive_transcribe RSS over cap: %.1f MB > %.1f MB — "
+                            "sleeping %ss before retry",
+                            rss / 1024**2, rss_cap / 1024**2, _RSS_CHECK_INTERVAL_S,
+                        )
+                        time.sleep(_RSS_CHECK_INTERVAL_S)
+                        continue
                 job = _claim_next_job()
                 if job is None:
                     return
