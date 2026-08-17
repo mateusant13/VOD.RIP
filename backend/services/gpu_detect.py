@@ -257,3 +257,88 @@ def get_encoder_detection(ffmpeg_bin: Optional[str] = None, *, fresh: bool = Fal
     if fresh:
         clear_encoder_detection_cache()
     return _cached_encoder_detection(ffmpeg_bin)
+
+
+# --- dynamic GPU headroom cap -----------------------------------------------
+# VRAM usage parsed from nvidia-smi; 'other_process_mb' = VRAM held by
+# processes OTHER than our own (excludes os.getpid() and parent).
+_SMI_MEMORY_TIMEOUT = 5.0
+
+
+def get_gpu_memory_usage() -> dict:
+    """Parse nvidia-smi for VRAM usage; returns
+    {total_mb, used_mb, free_mb, other_process_mb}.
+
+    Returns zeroed dict when nvidia-smi is unavailable or the parse fails."""
+    result = {"total_mb": 0, "used_mb": 0, "free_mb": 0, "other_process_mb": 0}
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total,memory.used,memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=_SMI_MEMORY_TIMEOUT,
+            creationflags=_NO_WINDOW,
+        )
+        if out.returncode != 0:
+            return result
+        parts = [p.strip() for p in (out.stdout or "").strip().split(",")]
+        if len(parts) < 3:
+            return result
+        total_mb = int(parts[0])
+        used_mb = int(parts[1])
+        free_mb = int(parts[2])
+        result["total_mb"] = total_mb
+        result["used_mb"] = used_mb
+        result["free_mb"] = free_mb
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return result
+    # VRAM used by foreign processes: parse compute-apps, exclude our PID chain.
+    my_pids = {os.getpid(), os.getppid()}
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,used_gpu_memory",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=_SMI_MEMORY_TIMEOUT,
+            creationflags=_NO_WINDOW,
+        )
+        if out.returncode == 0:
+            for line in (out.stdout or "").strip().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) < 2:
+                    continue
+                try:
+                    pid = int(parts[0])
+                    mem_mib = int(parts[1])
+                except ValueError:
+                    continue
+                if pid not in my_pids and mem_mib > 0:
+                    result["other_process_mb"] += mem_mib
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    return result
+
+
+_DYNAMIC_CAP_MIN = 0.30
+_DYNAMIC_CAP_MAX = 0.90
+
+
+def get_dynamic_gpu_cap() -> float:
+    """VRAM fraction this process may use (0.30–0.90).
+
+    If no other GPU process: 0.90 (90% headroom).
+    If other process uses X% of total VRAM: max(0.30, 1.0 - X - 0.05).
+    Always at least 0.30 so we keep 30% for ourselves."""
+    usage = get_gpu_memory_usage()
+    total = usage["total_mb"]
+    if total <= 0:
+        return _DYNAMIC_CAP_MIN  # no GPU — conservative fallback
+    other_pct = usage["other_process_mb"] / total
+    cap = max(_DYNAMIC_CAP_MIN, 1.0 - other_pct - 0.05)
+    return min(_DYNAMIC_CAP_MAX, cap)
+
+
+# ponytail: import-time self-check — validates cap bounds on every import.
+# Upgrade path: pytest parametrized test when the test suite grows.
+_cap = get_dynamic_gpu_cap()
+assert _DYNAMIC_CAP_MIN <= _cap <= _DYNAMIC_CAP_MAX, (
+    f"get_dynamic_gpu_cap() returned {_cap}, expected [{_DYNAMIC_CAP_MIN}, {_DYNAMIC_CAP_MAX}]"
+)
