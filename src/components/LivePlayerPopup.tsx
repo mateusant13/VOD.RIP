@@ -1087,40 +1087,48 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       enableWorker: true,
       startLevel: 0,
       lowLatencyMode: true,
-      // Live latency target: ONE segment behind the live edge instead of
-      // zero. count 0 gave a hair-thin forward buffer (~0.33s LL part) that
-      // ANY proxy/browser hiccup drained to zero → 'buffering' spinner →
-      // 1.5× catch-up churn. count 1 (≈0.7-1s at LL parts, ~2s at non-LL
-      // segments) is still a sub-second-to-~1s intentional delay — the user
-      // asked for less than 1s and this stays ≤1s on LL — while giving the
-      // decode/proxy pipeline a real cushion so transient jitter no longer
-      // rebuffers. hls.js VALIDATES count 0/1 fine (the only constraint is
-      // liveMaxLatencyDurationCount > liveSyncDurationCount — 6 > 1 passes)
-      // and its targetLatency getter treats 0 as "no count override",
-      // falling back to the LL partHoldBack/holdBack; 1 is an explicit
-      // segment-count target. lowLatencyMode also enables LL-HLS part
-      // handling; the backend prefers Twitch LL masters and non-LL playlists
-      // play identically with it on. hls.js THROWS when count and duration
-      // sync variants are mixed, so the count knobs are the only live-sync
-      // geometry here — computeLiveEdgeSec mirrors hls.js's targetLatency
-      // (count × level targetduration, 1 × td ≈ 1 segment) to keep the edge
-      // math exact. maxLiveSyncPlaybackRate 1.5 recovers from any drift by
-      // playing up to 1.5× instead of stalling; liveMaxLatencyDurationCount
-      // 6 (≈12s at 2s segments) is the force-resync ceiling for slow
-      // networks. maxBufferLength 20 keeps the buffer deep so the tighter
-      // target does not reintroduce the old 3s-target rebuffer flash
-      // (feat/live-buffering).
-      maxBufferLength: 30,
-      maxMaxBufferLength: 60,
+      // Live latency target: TWO segments behind the live edge. count 1
+      // (~2s at non-LL) is too aggressive through a proxy — one slow segment
+      // fetch drains the thin buffer and triggers rebuffering. count 2
+      // (~4s) gives ~2s extra cushion for proxy latency while staying well
+      // under the 12s force-resync ceiling. hls.js count knobs are the
+      // popup's only live-sync geometry — computeLiveEdgeSec mirrors this
+      // (count × targetduration) to keep the edge math exact. count 2 is
+      // the standard for proxy-mediated live playback per hls.js docs.
+      maxBufferLength: 20,
+      maxMaxBufferLength: 40,
       // Retained back-buffer = the arrow-seek window: LIVE without a DVR
       // archive still lets ArrowLeft/Right rewind ~30s into the stream (the
       // rail stays disabled — see the keydown listener below).
       backBufferLength: LIVE_BACK_BUFFER_SEC,
       startFragPrefetch: true,
-      fragLoadingTimeOut: 30000,
-      manifestLoadingTimeOut: 15000,
+      // hls.js 1.6 deprecated fragLoadingTimeOut/manifestLoadingTimeOut in
+      // favor of fragLoadPolicy/playlistLoadPolicy with granular control.
+      // Fast-fail: TTFB 8s (detect dead CDN fast), total load 15s, 2 retries
+      // with 0/1s delay. Live segments must arrive quickly — a 30s timeout
+      // means a dead request holds the buffer while it drains.
+      fragLoadPolicy: {
+        default: {
+          maxTimeToFirstByteMs: 8000,
+          maxLoadTimeMs: 15000,
+          timeoutRetry: { maxNumRetry: 2, retryDelayMs: 0, maxRetryDelayMs: 0 },
+          errorRetry: { maxNumRetry: 3, retryDelayMs: 1000, maxRetryDelayMs: 4000 },
+        },
+      },
+      playlistLoadPolicy: {
+        default: {
+          maxTimeToFirstByteMs: 5000,
+          maxLoadTimeMs: 8000,
+          timeoutRetry: { maxNumRetry: 2, retryDelayMs: 0, maxRetryDelayMs: 0 },
+          errorRetry: { maxNumRetry: 3, retryDelayMs: 1000, maxRetryDelayMs: 4000 },
+        },
+      },
       testBandwidth: false,
-      liveSyncDurationCount: 1,
+      // liveSyncDurationCount 2 = ~4s behind edge at 2s segments. count 1
+      // is too aggressive through a proxy — one slow segment fetch drains
+      // the thin buffer and triggers rebuffering. 2 gives ~2s extra cushion
+      // for proxy latency while staying <5s behind the live edge.
+      liveSyncDurationCount: 2,
       // hls.js REQUIRES liveMaxLatencyDurationCount > liveSyncDurationCount
       // (config validation throws otherwise) — 6 ≈ 12s at 2s segments.
       liveMaxLatencyDurationCount: 6,
@@ -1134,7 +1142,9 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       // (duration = buffered end) instead of Infinity, so setting currentTime
       // can seek back into the retained back-buffer above.
       liveDurationInfinity: false,
-      maxLiveSyncPlaybackRate: 1.2,
+      // 1.1× catch-up: slow enough to avoid the "audio/video running" feel
+      // that 1.2-1.5× produces; still recovers from drift within ~10s.
+      maxLiveSyncPlaybackRate: 1.1,
       startPosition: -1,
       autoStartLoad: !replay,
     });

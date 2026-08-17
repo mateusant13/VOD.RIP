@@ -3743,11 +3743,24 @@ def _guess_content_type(url: str, header_ct: str = "") -> str:
     return "application/octet-stream"
 
 
-def _is_rangeable_cdn_media(url: str) -> bool:
-    """True for CDN URLs that must be fetched with Range (never buffer whole file)."""
+def _is_rangeable_cdn_media(url: str) -> True:
+    """True for CDN URLs that should be streamed (never buffer whole file).
+
+    Includes googlevideo (YouTube), Twitch (ttvnw/edge), and Kick CDN.
+    All non-playlist segments benefit from streaming: the browser starts
+    decoding before the full segment arrives, reducing TTFB and buffer
+    pressure on live streams."""
     lower = url.lower()
     host = urlparse(url).hostname or ""
-    return "googlevideo.com" in host or "videoplayback" in lower
+    if "googlevideo.com" in host or "videoplayback" in lower:
+        return True
+    # Twitch CDN segments (ttvnw.net, twitchcdn.net, jtvnw.net)
+    if any(d in host for d in ("ttvnw.net", "twitchcdn.net", "jtvnw.net")):
+        return True
+    # Kick CDN segments (live-video.net, kick.com CDN)
+    if "live-video.net" in host or "kick.com" in host:
+        return True
+    return False
 
 
 def _formats_are_dash_https(formats: List[dict]) -> bool:

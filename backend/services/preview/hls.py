@@ -82,9 +82,9 @@ def _get_upstream_session():
 # per-read value keeps that libcurl window tight; the wall-clock budgets below
 # are enforced by _read_upstream_body's watchdog thread, so a 0 B/s CDN stall
 # can never hang session creation or playback past the budget.
-_UPSTREAM_READ_TIMEOUT_SEC = 10
-_UPSTREAM_PLAYLIST_DEADLINE_SEC = 20.0  # master/media playlists, LL-HLS probes, archive
-_UPSTREAM_SEGMENT_DEADLINE_SEC = 25.0  # segment/key/init fetches (proxy_segment)
+_UPSTREAM_READ_TIMEOUT_SEC = 8
+_UPSTREAM_PLAYLIST_DEADLINE_SEC = 12.0  # master/media playlists, LL-HLS probes, archive
+_UPSTREAM_SEGMENT_DEADLINE_SEC = 12.0  # segment/key/init fetches (proxy_segment)
 
 
 def _read_upstream_body(
