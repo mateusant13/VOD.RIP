@@ -690,12 +690,17 @@ async def test_available_endpoint_shape(monkeypatch):
         monkeypatch.setattr(live_captions, "captions_available", lambda plat: (True, ""))
         res = await client.get("/api/live/captions/available", params={"platform": "kick", "channel": "srdoglol"})
         assert res.status_code == 200
-        assert res.json() == {"available": True, "reason": None}
+        body = res.json()
+        assert body["available"] is True
+        assert body["reason"] is None
+        assert "low_latency" in body  # low-latency subtitle feature
 
         monkeypatch.setattr(live_captions, "captions_available", lambda plat: (False, "model missing"))
         res = await client.get("/api/live/captions/available", params={"platform": "kick", "channel": "srdoglol"})
         assert res.status_code == 200
-        assert res.json() == {"available": False, "reason": "model missing"}
+        body = res.json()
+        assert body["available"] is False
+        assert body["reason"] == "model missing"
 
 
 @pytest.mark.anyio
