@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import type * as PreviewPlayerUtils from '../previewPlayerUtils';
 import TwitchClipPopup, { CLIP_PANEL_MIN_H, CLIP_PANEL_MIN_W } from './TwitchClipPopup';
 
@@ -11,6 +11,7 @@ vi.mock('../previewPlayerUtils', async (importOriginal) => {
   return {
     ...actual,
     createPreviewSessionWithRetry: vi.fn().mockRejectedValue(new Error('private video')),
+    playPreviewWithAudio: vi.fn().mockResolvedValue(undefined),
   };
 });
 
@@ -157,5 +158,40 @@ describe('TwitchClipPopup resize', () => {
     });
     expect(panel.style.width).toBe(`${window.innerWidth - 32}px`);
     expect(panel.style.height).toBe(`${window.innerHeight - 32}px`);
+  });
+});
+
+describe('TwitchClipPopup hover volume', () => {
+  it('shows the volume slider on mouseEnter and hides on mouseLeave', async () => {
+    renderPopup();
+    const volWrapper = document.body.querySelector('[data-volume-menu]') as HTMLElement;
+    expect(volWrapper).toBeTruthy();
+
+    // Slider hidden by default
+    expect(volWrapper.querySelector("input[type='range']")).toBeNull();
+
+    // mouseEnter → slider visible
+    fireEvent.mouseEnter(volWrapper);
+    expect(volWrapper.querySelector("input[type='range']")).toBeTruthy();
+
+    // mouseLeave → slider hidden
+    fireEvent.mouseLeave(volWrapper);
+    expect(volWrapper.querySelector("input[type='range']")).toBeNull();
+  });
+
+  it('click speaker toggles mute and slider shows muted value', async () => {
+    renderPopup();
+    const volWrapper = document.body.querySelector('[data-volume-menu]') as HTMLElement;
+    const speakerBtn = volWrapper.querySelector('button') as HTMLButtonElement;
+    expect(speakerBtn).toBeTruthy();
+
+    // Click to mute
+    fireEvent.click(speakerBtn);
+
+    // Hover to reveal and check slider value
+    fireEvent.mouseEnter(volWrapper);
+    const slider = volWrapper.querySelector("input[type='range']") as HTMLInputElement;
+    expect(slider).toBeTruthy();
+    expect(Number(slider.value)).toBe(0);
   });
 });

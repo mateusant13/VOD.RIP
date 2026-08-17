@@ -79,12 +79,10 @@ function renderPopup() {
       vod={VOD}
       zIndex={100}
       stackIndex={0}
-      volumeMenuCloseTick={0}
       onClose={() => {}}
       onHandoffToMain={() => {}}
       onRegisterPause={() => {}}
       onUnregisterPause={() => {}}
-      onVolumeMenuOpen={() => {}}
       onBringToFront={() => {}}
       onOpenHit={() => {}}
     />
@@ -181,12 +179,10 @@ describe("ChannelExplorePopup AI ask", () => {
         vod={{ ...VOD, channel: undefined }}
         zIndex={100}
         stackIndex={0}
-        volumeMenuCloseTick={0}
         onClose={() => {}}
         onHandoffToMain={() => {}}
         onRegisterPause={() => {}}
         onUnregisterPause={() => {}}
-        onVolumeMenuOpen={() => {}}
         onBringToFront={() => {}}
         onOpenHit={() => {}}
       />
@@ -239,12 +235,10 @@ describe("ChannelExplorePopup mini-preview transport buttons", () => {
         vod={VOD}
         zIndex={100}
         stackIndex={0}
-        volumeMenuCloseTick={0}
         onClose={() => {}}
         onHandoffToMain={onHandoffToMain}
         onRegisterPause={() => {}}
         onUnregisterPause={() => {}}
-        onVolumeMenuOpen={() => {}}
         onBringToFront={() => {}}
         onOpenHit={() => {}}
       />
@@ -253,5 +247,48 @@ describe("ChannelExplorePopup mini-preview transport buttons", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Open in main preview to download" }));
     expect(onHandoffToMain).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("ChannelExplorePopup hover volume", () => {
+  it("shows the volume slider on mouseEnter and hides on mouseLeave", async () => {
+    stubFetch();
+    renderPopup();
+    await waitFor(() => expect(screen.getByText("Channel VOD explore")).toBeInTheDocument());
+
+    const volWrapper = document.querySelector("[data-volume-menu]") as HTMLElement;
+    expect(volWrapper).toBeTruthy();
+
+    // Slider hidden by default
+    expect(volWrapper.querySelector("input[type='range']")).toBeNull();
+
+    // mouseEnter → slider visible
+    fireEvent.mouseEnter(volWrapper);
+    expect(volWrapper.querySelector("input[type='range']")).toBeTruthy();
+
+    // mouseLeave → slider hidden
+    fireEvent.mouseLeave(volWrapper);
+    expect(volWrapper.querySelector("input[type='range']")).toBeNull();
+  });
+
+  it("click speaker toggles mute", async () => {
+    stubFetch();
+    renderPopup();
+    await waitFor(() => expect(screen.getByText("Channel VOD explore")).toBeInTheDocument());
+
+    const volWrapper = document.querySelector("[data-volume-menu]") as HTMLElement;
+    const speakerBtn = volWrapper.querySelector("button") as HTMLButtonElement;
+    expect(speakerBtn).toBeTruthy();
+
+    // Initially unmuted — icon should be Volume2 (no VolumeX path)
+    expect(speakerBtn.querySelector("svg")).toBeTruthy();
+
+    // Click to mute
+    fireEvent.click(speakerBtn);
+    // Hover to reveal and check slider value
+    fireEvent.mouseEnter(volWrapper);
+    const slider = volWrapper.querySelector("input[type='range']") as HTMLInputElement;
+    expect(slider).toBeTruthy();
+    expect(Number(slider.value)).toBe(0);
   });
 });
