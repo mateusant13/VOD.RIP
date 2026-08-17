@@ -245,6 +245,12 @@ _LIVE_REFRESH_WAIT_SEC = 20.0
 # are never double-fetched.
 _LIVE_REFRESH_INFLIGHT: dict[str, "Future"] = {}
 _LIVE_STATUS_LOCK = threading.Lock()
+# channel_id -> monotonic timestamp when the channel was last added via
+# POST /api/settings.  trigger_live_detection() stamps here; the cache-read
+# fast-path (req 3) skips the TTL check so a freshly-added channel always
+# gets a live fetch instead of waiting up to 60s for the next poll cycle.
+_LIVE_RECENTLY_ADDED: dict[str, float] = {}
+_LIVE_RECENTLY_ADDED_WINDOW_SEC = 60.0
 _LIVE_WARM_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="live-warm")
 # Platform fetches inside one channel run concurrently across this pool (the
 # warm pool + this pool bound total concurrency: 4 channels x 3 platforms
@@ -356,10 +362,18 @@ def _fetch_or_cached_channel_live_payload(
     """
     cid = str(channel.get("id") or "")
     now = time.monotonic()
+    # Fast-path (req 3): newly-added channels (<60s) skip the cache so the
+    # first poll always fetches fresh live state instead of returning empty.
+    recently_added = False
     with _LIVE_STATUS_LOCK:
-        cached = _LIVE_STATUS_CACHE.get(cid)
-        if cached and (now - cached[0]) < max_age_sec:
-            return cached[1]
+        added_ts = _LIVE_RECENTLY_ADDED.get(cid)
+        if added_ts is not None:
+            recently_added = (now - added_ts) < _LIVE_RECENTLY_ADDED_WINDOW_SEC
+    if not recently_added:
+        with _LIVE_STATUS_LOCK:
+            cached = _LIVE_STATUS_CACHE.get(cid)
+            if cached and (now - cached[0]) < max_age_sec:
+                return cached[1]
     fut = _submit_refresh(cid, channel)
     if fut is not None:
         try:
@@ -458,6 +472,7 @@ def _refresh_channel_live_cache(
         return {"live": [], "channel_id": channel_id}
     with _LIVE_STATUS_LOCK:
         _LIVE_STATUS_CACHE[channel_id] = (time.monotonic(), payload)
+        _LIVE_RECENTLY_ADDED.pop(channel_id, None)  # fast-path consumed
     return payload
 
 
@@ -473,6 +488,42 @@ def warm_channel_live_status(channel_id: str) -> None:
     if channel is None:
         return
     _submit_refresh(str(channel_id), channel)
+
+
+def _assert_live_cache_populated(channel_id: str, deadline_sec: float = 10.0) -> None:
+    """Background verifier: poll until channel_id appears in _LIVE_STATUS_CACHE
+    or deadline elapses. Runs on a daemon thread so it never blocks the caller."""
+    deadline = time.monotonic() + deadline_sec
+    while time.monotonic() < deadline:
+        with _LIVE_STATUS_LOCK:
+            if channel_id in _LIVE_STATUS_CACHE:
+                return
+        time.sleep(0.2)
+    # Assertion failed — log loudly so the issue is visible in tests/logs.
+    with _LIVE_STATUS_LOCK:
+        present = channel_id in _LIVE_STATUS_CACHE
+    assert present, (
+        f"trigger_live_detection: {channel_id} not in _LIVE_STATUS_CACHE "
+        f"after {deadline_sec}s — live badge will be delayed"
+    )
+
+
+def trigger_live_detection(channel_id: str) -> None:
+    """Immediately kick a background refresh for ONE newly-added channel.
+
+    Called by the settings router when a channel is added via POST /api/settings
+    so the frontend sees its LIVE badge within ~10s instead of waiting for the
+    next 60s poll cycle.  Also stamps the fast-path so the first cache read
+    after add skips the TTL check and always fetches fresh.
+    """
+    with _LIVE_STATUS_LOCK:
+        _LIVE_RECENTLY_ADDED[channel_id] = time.monotonic()
+    warm_channel_live_status(channel_id)
+    # Verify the background refresh lands in cache within 10s (assert req 4).
+    t = threading.Thread(
+        target=_assert_live_cache_populated, args=(channel_id, 10.0), daemon=True
+    )
+    t.start()
 
 
 def _reap_burst_pools(warm_pool: ThreadPoolExecutor, plat_pool: ThreadPoolExecutor) -> None:
