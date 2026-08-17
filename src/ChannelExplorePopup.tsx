@@ -121,7 +121,6 @@ interface ChannelExplorePopupProps {
   vod: ExplorePopupVod;
   zIndex: number;
   stackIndex: number;
-  volumeMenuCloseTick: number;
   onClose: () => void;
   /** Hand the mini preview to the app MAIN preview: plays `timeSec` (VOD
    *  absolute). `chat` carries the chat-range markers selected in the mini
@@ -134,7 +133,6 @@ interface ChannelExplorePopupProps {
   ) => void;
   onRegisterPause: (id: string, pause: () => void) => void;
   onUnregisterPause: (id: string) => void;
-  onVolumeMenuOpen: (id: string, open: boolean) => void;
   onBringToFront: () => void;
   /** Open an archive hit in the explore-player flow (App owns the popup stack). */
   onOpenHit: (hit: ArchiveSearchHit, video: ArchiveVideoRow | undefined) => void;
@@ -159,12 +157,10 @@ export default function ChannelExplorePopup({
   vod,
   zIndex,
   stackIndex,
-  volumeMenuCloseTick,
   onClose,
   onHandoffToMain,
   onRegisterPause,
   onUnregisterPause,
-  onVolumeMenuOpen,
   onBringToFront,
   onOpenHit,
 }: ChannelExplorePopupProps) {
@@ -184,7 +180,7 @@ export default function ChannelExplorePopup({
   const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(false);
   const [volume, setVolume] = useState(PREVIEW_DEFAULT_VOLUME);
-  const [volumeMenuOpen, setVolumeMenuOpen] = useState(false);
+  const [volumeHovered, setVolumeHovered] = useState(false);
   const [qualityMenuOpen, setQualityMenuOpen] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   /** Twitch clip editor open — transient notice in the transport row. */
@@ -499,31 +495,18 @@ export default function ChannelExplorePopup({
     return () => onUnregisterPause(id);
   }, [id, onRegisterPause, onUnregisterPause]);
 
+  // Click-outside: close the quality menu on ANY mousedown outside
+  // its own [data-quality-menu] wrapper.
   useEffect(() => {
-    onVolumeMenuOpen(id, volumeMenuOpen || qualityMenuOpen);
-  }, [id, volumeMenuOpen, qualityMenuOpen, onVolumeMenuOpen]);
-
-  useEffect(() => {
-    setVolumeMenuOpen(false);
-    setQualityMenuOpen(false);
-  }, [volumeMenuCloseTick]);
-
-  // Click-outside: close the volume/quality menus on ANY mousedown outside
-  // their own [data-player-menu] wrappers — including clicks on other
-  // buttons INSIDE this popup (same rule App.tsx applies to its own player
-  // menus). The App-side volumeMenuCloseTick effect above still works as a
-  // second path (App may tick it when one of ITS menus closes).
-  useEffect(() => {
-    if (!volumeMenuOpen && !qualityMenuOpen) return;
+    if (!qualityMenuOpen) return;
     const onPointerDown = (e: MouseEvent) => {
       const target = e.target as HTMLElement;
-      if (target.closest('[data-player-menu]')) return;
-      setVolumeMenuOpen(false);
+      if (target.closest('[data-quality-menu]')) return;
       setQualityMenuOpen(false);
     };
     document.addEventListener('mousedown', onPointerDown);
     return () => document.removeEventListener('mousedown', onPointerDown);
-  }, [volumeMenuOpen, qualityMenuOpen]);
+  }, [qualityMenuOpen]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1594,21 +1577,28 @@ export default function ChannelExplorePopup({
   );
 
   const volumeUi = (fs: boolean) => (
-    <div className="relative" data-player-menu>
+    <div
+      className="relative"
+      data-volume-menu
+      onMouseEnter={() => setVolumeHovered(true)}
+      onMouseLeave={() => setVolumeHovered(false)}
+    >
       <button
         type="button"
         onClick={(e) => {
           e.stopPropagation();
-          setQualityMenuOpen(false);
-          setVolumeMenuOpen((o) => !o);
+          if (muted) {
+            setVolumeLevel(volumeRef.current || PREVIEW_DEFAULT_VOLUME);
+          } else {
+            setVolumeLevel(0);
+          }
         }}
-        disabled={!ready}
         className={fs ? fsCtrlBtn : ctrlBtn(false)}
-        title={t('Volume')}
+        title={muted ? t('Unmute') : t('Mute')}
       >
         {muted || volume <= 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
       </button>
-      {volumeMenuOpen && (
+      {volumeHovered && (
         <div
           className={`absolute bottom-full left-0 mb-1.5 z-30 flex items-center gap-2 px-2.5 py-2 shadow-lg ${
             fs ? 'border border-white/20 bg-black/85 backdrop-blur-sm' : 'border-2 border-zinc-600 bg-zinc-950'
@@ -1643,7 +1633,7 @@ export default function ChannelExplorePopup({
       disabled={!ready}
       buttonClassName={fs ? fsCtrlBtn : ctrlBtn(false)}
       iconSize={18}
-      onMenuOpen={() => setVolumeMenuOpen(false)}
+      onMenuOpen={() => {}}
       popoverClassName={fs
         ? 'border border-white/20 bg-black/85 backdrop-blur-sm'
         : 'border-2 border-zinc-600 bg-zinc-950'}

@@ -255,6 +255,8 @@ export default function TwitchClipPopup({
   const [buffering, setBuffering] = useState(false);
   const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(false);
+  const [volume, setVolume] = useState(initialVolume);
+  const [volumeHovered, setVolumeHovered] = useState(false);
   const [currentTime, setCurrentTime] = useState(currentTimeRef.current);
   const [retryTick, setRetryTick] = useState(0);
   // The <video> is autoPlay: with the click's user activation the browser can
@@ -526,6 +528,18 @@ export default function TwitchClipPopup({
     if (!video) return;
     video.muted = !video.muted;
     setMuted(video.muted);
+  }, []);
+
+  const setVolumeLevel = useCallback((level: number) => {
+    const v = Math.max(0, Math.min(1, level));
+    const video = videoRef.current;
+    if (video) {
+      video.volume = v;
+      video.muted = v <= 0;
+    }
+    volumeRef.current = v > 0 ? v : volumeRef.current;
+    setVolume(v);
+    setMuted(v <= 0);
   }, []);
 
   // ── Trimmer ──
@@ -1077,7 +1091,7 @@ export default function TwitchClipPopup({
             {t('Buffering…')}
           </div>
         )}
-        {/* Transport: play/pause + mute */}
+        {/* Transport: play/pause — only after loading completes */}
         {!loading && !error && (
           <div
             className="absolute bottom-0 left-0 right-0 z-10 flex items-center gap-1.5 px-2 py-1.5 bg-gradient-to-t from-black/85 to-black/0"
@@ -1091,20 +1105,46 @@ export default function TwitchClipPopup({
             >
               {playing ? <Pause size={13} /> : <Play size={13} />}
             </button>
-            <button
-              type="button"
-              onClick={toggleMute}
-              disabled={!ready}
-              className="flex items-center gap-1 border-2 border-zinc-600 bg-zinc-900/80 px-1.5 py-1 text-zinc-200 hover:border-white disabled:opacity-40 disabled:pointer-events-none"
-              title={muted ? t('Unmute') : t('Mute')}
-            >
-              {muted ? <VolumeX size={13} /> : <Volume2 size={13} />}
-            </button>
             <span className="ml-auto text-[9px] font-mono text-zinc-400 tabular-nums">
               {formatHmsFull(currentTime)}
             </span>
           </div>
         )}
+        {/* Volume: always rendered (mute/unmute is useful even while loading) */}
+        <div className="absolute bottom-0 left-0 z-10 px-2 py-1.5">
+          <div
+            className="relative flex items-center"
+            data-volume-menu
+            onMouseEnter={() => setVolumeHovered(true)}
+            onMouseLeave={() => setVolumeHovered(false)}
+          >
+            <button
+              type="button"
+              onClick={toggleMute}
+              className="flex items-center gap-1 border-2 border-zinc-600 bg-zinc-900/80 px-1.5 py-1 text-zinc-200 hover:border-white disabled:opacity-40 disabled:pointer-events-none"
+              title={muted ? t('Unmute') : t('Mute')}
+            >
+              {muted ? <VolumeX size={13} /> : <Volume2 size={13} />}
+            </button>
+            {volumeHovered && (
+              <div
+                className="absolute bottom-full left-0 mb-1.5 z-30 flex items-center gap-2 px-2.5 py-2 shadow-lg border-2 border-zinc-600 bg-zinc-950"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={muted ? 0 : volume}
+                  disabled={!ready}
+                  onChange={(e) => setVolumeLevel(parseFloat(e.target.value))}
+                  className="w-24 accent-white h-1.5"
+                />
+              </div>
+            )}
+          </div>
+        </div>
       </div>
 
       {/* Trim rail: 5..60s selection on the 120s click window */}

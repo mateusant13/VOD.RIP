@@ -457,7 +457,6 @@ export default function App() {
   const [previewFullscreen, setPreviewFullscreen] = useState(false);
   const [previewFsControlsVisible, setPreviewFsControlsVisible] = useState(true);
   const [previewQualityMenuOpen, setPreviewQualityMenuOpen] = useState(false);
-  const [previewVolumeMenuOpen, setPreviewVolumeMenuOpen] = useState(false);
   const [channelVodPanelOpen, setChannelVodPanelOpen] = useState(false);
   const [previewChannelBadge, setPreviewChannelBadge] = useState<ChannelPreviewBadge | null>(null);
   /** URL tab hidden from bar after picking a VOD from channels; restored only on page refresh. */
@@ -720,10 +719,7 @@ export default function App() {
    *  local-file). zIndex = EXPLORE_POPUP_Z + rank — the last pointer-down
    *  wins across types, so any player can be dragged above any other. */
   const [popupZOrder, setPopupZOrder] = useState<Record<string, number>>({});
-  const [anyExploreVolumeMenuOpen, setAnyExploreVolumeMenuOpen] = useState(false);
-  const [exploreVolumeMenuCloseTick, setExploreVolumeMenuCloseTick] = useState(0);
   const explorePauseMapRef = useRef(new Map<string, () => void>());
-  const exploreVolumeMenusRef = useRef(new Set<string>());
   const popupZCounterRef = useRef(0);
   const [initialPanelLayout] = useState(loadPanelLayout);
   const [previewPanelWidth, setPreviewPanelWidth] = useState(initialPanelLayout.previewPanelWidth);
@@ -1348,7 +1344,6 @@ export default function App() {
     setPreviewLevels([]);
     setPreviewQualityLevel(0);
     setPreviewQualityMenuOpen(false);
-    setPreviewVolumeMenuOpen(false);
     previewSessionMetaRef.current = null;
     previewSessionIdRef.current = null;
     previewRequestedHeightRef.current = 0;
@@ -3306,24 +3301,18 @@ export default function App() {
     return () => ro.disconnect();
   }, [previewOpen]);
 
-  const anyPlayerMenuOpen = previewQualityMenuOpen || previewVolumeMenuOpen || anyExploreVolumeMenuOpen;
+  const anyPlayerMenuOpen = previewQualityMenuOpen;
 
   useEffect(() => {
     if (!anyPlayerMenuOpen) return;
     const onPointerDown = (e: MouseEvent) => {
       const target = e.target as HTMLElement;
-      // A menu stays open only while the pointerdown lands inside its own
-      // layout (wrapper + toggle button); any other click — other player
-      // buttons included — closes it.
-      if (previewVolumeMenuOpen && target.closest('[data-volume-menu]')) return;
       if (previewQualityMenuOpen && target.closest('[data-quality-menu]')) return;
       setPreviewQualityMenuOpen(false);
-      setPreviewVolumeMenuOpen(false);
-      setExploreVolumeMenuCloseTick((t) => t + 1);
     };
     document.addEventListener('mousedown', onPointerDown);
     return () => document.removeEventListener('mousedown', onPointerDown);
-  }, [previewVolumeMenuOpen, previewQualityMenuOpen, anyExploreVolumeMenuOpen]);
+  }, [previewQualityMenuOpen]);
 
   useEffect(() => {
     if (!previewOpen || !previewVideoReady) return;
@@ -3349,11 +3338,6 @@ export default function App() {
     explorePauseMapRef.current.delete(id);
   }, []);
 
-  const handleExploreVolumeMenuOpen = useCallback((id: string, open: boolean) => {
-    if (open) exploreVolumeMenusRef.current.add(id);
-    else exploreVolumeMenusRef.current.delete(id);
-    setAnyExploreVolumeMenuOpen(exploreVolumeMenusRef.current.size > 0);
-  }, []);
 
   /**
    * THE single shared raise-to-front mechanism for every floating window
@@ -3383,8 +3367,6 @@ export default function App() {
 
   const closeExplorePopup = useCallback((id: string) => {
     explorePauseMapRef.current.delete(id);
-    exploreVolumeMenusRef.current.delete(id);
-    setAnyExploreVolumeMenuOpen(exploreVolumeMenusRef.current.size > 0);
     dropPopupZ(id);
     setExplorePopups((prev) => prev.filter((p) => p.id !== id));
   }, [dropPopupZ]);
@@ -3432,7 +3414,6 @@ export default function App() {
         const dropped = next.slice(0, next.length - MAX_EXPLORE_POPUPS);
         dropped.forEach((entry) => {
           explorePauseMapRef.current.delete(entry.id);
-          exploreVolumeMenusRef.current.delete(entry.id);
         });
         setPopupZOrder((zPrev) => {
           const zNext = { ...zPrev };
@@ -3489,7 +3470,6 @@ export default function App() {
         const dropped = after.slice(0, after.length - MAX_EXPLORE_POPUPS);
         dropped.forEach((entry) => {
           explorePauseMapRef.current.delete(entry.id);
-          exploreVolumeMenusRef.current.delete(entry.id);
         });
         setPopupZOrder((zPrev) => {
           const zNext = { ...zPrev };
@@ -6313,37 +6293,40 @@ export default function App() {
   const previewCtrlBtn = (fsOverlay: boolean, large = false) =>
     platformPreviewCtrlBtn(layoutPlatform, fsOverlay, large);
 
-  const renderVolumeControl = (opts: {
+  function VolumeControlPopover(opts: {
     volume: number;
     muted: boolean;
-    menuOpen: boolean;
-    setMenuOpen: Dispatch<SetStateAction<boolean>>;
+    onMuteToggle: () => void;
     onVolumeChange: (level: number) => void;
     disabled: boolean;
     buttonClassName: string;
     popoverFs?: boolean;
-    onMenuOpen?: () => void;
-  }) => {
+  }) {
+    const [hovered, setHovered] = useState(false);
     const displayVol = opts.muted ? 0 : opts.volume;
     const popoverClass = opts.popoverFs
       ? 'border border-white/20 bg-black/85 backdrop-blur-sm'
       : 'border-2 border-zinc-600 bg-zinc-950';
     return (
-      <div className="relative" data-player-menu data-volume-menu>
+      <div
+        className="relative"
+        data-volume-menu
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
+      >
         <button
           type="button"
           onClick={(e) => {
             e.stopPropagation();
-            opts.onMenuOpen?.();
-            opts.setMenuOpen((o) => !o);
+            opts.onMuteToggle();
           }}
           disabled={opts.disabled}
           className={opts.buttonClassName}
-          title={t('Volume')}
+          title={opts.muted ? t('Unmute') : t('Mute')}
         >
           {opts.muted || opts.volume <= 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
         </button>
-        {opts.menuOpen && (
+        {hovered && (
           <div
             className={`absolute bottom-full left-0 mb-1.5 z-30 flex items-center gap-2 px-2.5 py-2 shadow-lg ${popoverClass}`}
             onClick={(e) => e.stopPropagation()}
@@ -6362,7 +6345,7 @@ export default function App() {
         )}
       </div>
     );
-  };
+  }
 
   const previewTrimView: TrimViewWindow = useMemo(
     () => zoomWindowFromView(previewTrimZoom, previewTrimAnchorFrac, vodDurationSec),
@@ -6605,17 +6588,22 @@ export default function App() {
           className={previewCtrlBtn(previewFullscreen, true)}>
           {previewPlaying ? <Pause size={18} /> : <Play size={18} />}
         </button>
-        {renderVolumeControl({
-          volume: previewVolume,
-          muted: previewMuted,
-          menuOpen: previewVolumeMenuOpen,
-          setMenuOpen: setPreviewVolumeMenuOpen,
-          onVolumeChange: setPreviewVolumeLevel,
-          disabled: !previewVideoReady,
-          buttonClassName: previewCtrlBtn(previewFullscreen, true),
-          popoverFs: previewFullscreen,
-          onMenuOpen: () => setPreviewQualityMenuOpen(false),
-        })}
+        <VolumeControlPopover
+          volume={previewVolume}
+          muted={previewMuted}
+          onMuteToggle={() => {
+            setPreviewMuted((m) => {
+              const next = !m;
+              const video = previewVideoRef.current;
+              if (video) video.muted = next;
+              return next;
+            });
+          }}
+          onVolumeChange={setPreviewVolumeLevel}
+          disabled={!previewVideoReady}
+          buttonClassName={previewCtrlBtn(previewFullscreen, true)}
+          popoverFs={previewFullscreen}
+        />
       </div>
       <div className="flex items-center gap-1.5 ml-auto relative z-20 overflow-visible">
         {urlPlatform === 'twitch' && !isLive && (
@@ -6668,7 +6656,7 @@ export default function App() {
           disabled={!previewVideoReady}
           buttonClassName={previewCtrlBtn(previewFullscreen, true)}
           iconSize={18}
-          onMenuOpen={() => setPreviewVolumeMenuOpen(false)}
+          onMenuOpen={() => {}}
           popoverPlacement="up"
           popoverClassName={previewFullscreen
             ? 'border border-white/20 bg-black/85 backdrop-blur-sm'
@@ -7744,12 +7732,10 @@ export default function App() {
               vod={entry.vod}
               zIndex={EXPLORE_POPUP_Z + (popupZOrder[entry.id] ?? 0)}
               stackIndex={entry.layoutIndex}
-              volumeMenuCloseTick={exploreVolumeMenuCloseTick}
               onClose={() => closeExplorePopup(entry.id)}
               onHandoffToMain={(vod: ExplorePopupVod, timeSec: number, trim?: { start: number; end: number } | null, chat?: ChatMarkers | null) => carryExploreToUrl(vod, timeSec, trim, chat)}
               onRegisterPause={registerExplorePause}
               onUnregisterPause={unregisterExplorePause}
-              onVolumeMenuOpen={handleExploreVolumeMenuOpen}
               onBringToFront={() => bringPopupToFront(entry.id)}
               onOpenHit={openArchiveHit}
             />
