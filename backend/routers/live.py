@@ -121,10 +121,12 @@ async def live_captions_available(
     chan = (channel or "").strip().lower()
     if plat not in _CAPTION_PLATFORMS or not chan:
         raise HTTPException(status_code=400, detail="platform must be one of twitch/kick and channel is required")
-    from services.live_captions import captions_available
+    import os
+    from services.live_captions import captions_available, LOW_LATENCY_ENV
 
     ok, reason = await asyncio.to_thread(captions_available, plat)
-    return {"available": ok, "reason": reason or None}
+    low_latency = (os.environ.get(LOW_LATENCY_ENV, "0") or "0").strip() == "1"
+    return {"available": ok, "reason": reason or None, "low_latency": low_latency}
 
 
 async def _captions_sse_gen(request: Request, captioner) -> "AsyncGenerator[str, None]":

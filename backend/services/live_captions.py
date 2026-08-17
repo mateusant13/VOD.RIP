@@ -51,6 +51,7 @@ SUPPORTED_PLATFORMS = ("twitch", "kick")
 WINDOW_SEC_ENV = "VODRIP_CAPTION_WINDOW_SEC"
 POLL_SEC_ENV = "VODRIP_CAPTION_POLL_SEC"
 MAX_BACKLOG_SEC_ENV = "VODRIP_CAPTION_MAX_BACKLOG_SEC"
+LOW_LATENCY_ENV = "VODRIP_CAPTION_LOW_LATENCY"
 # ~2s of speech is a usable caption block (~2-4 words per second of speech);
 # a 1s window would yield 2-3 words — too short to read.
 #
@@ -66,6 +67,7 @@ MAX_BACKLOG_SEC_ENV = "VODRIP_CAPTION_MAX_BACKLOG_SEC"
 # VIDEO clock (frag PDT), so the visible lag is just this transcribe trail,
 # self-adaptive per machine (stalls pause the overlay automatically).
 WINDOW_SEC = 2.0
+WINDOW_SEC_REDUCED = 1.0  # low-latency mode: flush every ~1s instead of ~2s
 POLL_SEC = 1.0  # media-playlist poll cadence (~1 segment ahead of the player)
 # Cap on untranscribed stale audio: after the live freezes/buffers, one poll
 # returns the whole gap; transcribing it segment-by-segment keeps captions
@@ -75,6 +77,7 @@ POLL_SEC = 1.0  # media-playlist poll cadence (~1 segment ahead of the player)
 # feels live; the player's own live-sync seek skips the same audio.
 _MAX_BACKLOG_SEC = 10.0
 _FLUSH_FAIL_LIMIT = 3  # consecutive ASR flush failures -> offline (never a silent dead stream)
+_FLUSH_FAIL_LIMIT_LOW_LATENCY = 5  # smaller windows = more empty/short transcriptions, tolerate more
 _MASTER_TTL_SEC = 300.0  # re-resolve the live master (fresh usher tokens)
 _MASTER_403_TTL_SEC = 60.0  # ...or sooner after a 403 (expired token)
 _OFFLINE_STRIKES = 3  # consecutive offline resolutions -> offline event + stop
@@ -479,13 +482,19 @@ class LiveCaptioner:
         # (event, data) tuples — consumed by the SSE generator. Bounded so a
         # slow subscriber drops blocks instead of stalling the worker.
         self.events: asyncio.Queue = asyncio.Queue(maxsize=_QUEUE_MAX)
-        self.window_sec = window_sec if window_sec is not None else _env_float(WINDOW_SEC_ENV, WINDOW_SEC)
+        self._low_latency = (os.environ.get(LOW_LATENCY_ENV, "0") or "0").strip() == "1"
+        _default_window = WINDOW_SEC_REDUCED if self._low_latency else WINDOW_SEC
+        self.window_sec = window_sec if window_sec is not None else _env_float(WINDOW_SEC_ENV, _default_window)
         self.poll_sec = poll_sec if poll_sec is not None else _env_float(POLL_SEC_ENV, POLL_SEC)
         self.max_backlog_sec = (
             max_backlog_sec
             if max_backlog_sec is not None
             else _env_float(MAX_BACKLOG_SEC_ENV, _MAX_BACKLOG_SEC)
         )
+        # ponytail: low-latency uses smaller windows which produce more
+        # empty/short transcriptions; raise the failure threshold so the
+        # captioner doesn't go offline on transient short windows.
+        self._flush_fail_limit = _FLUSH_FAIL_LIMIT_LOW_LATENCY if self._low_latency else _FLUSH_FAIL_LIMIT
         self._life_lock = threading.Lock()
         self._refcount = 0
         self._stop = threading.Event()
@@ -776,16 +785,17 @@ class LiveCaptioner:
             # ASR failure (model load hiccup, VAD error) — drop the window,
             # keep rolling; but a persistently broken engine must not leave
             # the SSE alive with keepalives and NO captions forever: after
-            # _FLUSH_FAIL_LIMIT consecutive failures, surface it as an
+            # _flush_fail_limit consecutive failures, surface it as an
             # offline event so the frontend hides the overlay (never a
-            # silent dead stream).
+            # silent dead stream). Low-latency mode raises the threshold
+            # (smaller windows produce more transient short/empty frames).
             self._flush_failures += 1
             logger.warning(
                 "live captions %s/%s flush failed (%d/%d): %s",
                 self.platform, self.channel, self._flush_failures,
-                _FLUSH_FAIL_LIMIT, exc,
+                self._flush_fail_limit, exc,
             )
-            if self._flush_failures >= _FLUSH_FAIL_LIMIT:
+            if self._flush_failures >= self._flush_fail_limit:
                 logger.error(
                     "live captions %s/%s disabled — %d consecutive ASR failures: %s",
                     self.platform, self.channel, self._flush_failures, exc,
