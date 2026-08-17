@@ -160,6 +160,19 @@ async def update_settings(update: SettingsUpdate):
             kick_scheduler_pass()
         except Exception:
             logger.debug("archive scheduler kick skipped", exc_info=True)
+        # New channel: immediately kick a live-status refresh so the frontend
+        # sees the LIVE badge within ~10s instead of waiting for the next
+        # 60s poll cycle.
+        try:
+            from routers.live import trigger_live_detection
+
+            old_ids = {str(c.get("id") or "") for c in (current.saved_channels or []) if c.get("id")}
+            for ch in (update.saved_channels or []):
+                cid = str(ch.get("id") or "")
+                if cid and cid not in old_ids:
+                    trigger_live_detection(cid)
+        except Exception:
+            logger.debug("live detection trigger skipped", exc_info=True)
         # New channel: warm its recent YouTube previews right away so the
         # first open is instant — the next periodic prewarm would take up to
         # 15 min to reach it. Selection is capped + dead-vid filtered inside;
@@ -246,6 +259,22 @@ async def update_settings(update: SettingsUpdate):
                 detail="Cannot enable experimental AI without an API key — add your OpenAI-compatible key first.",
             )
         current.experimental_ai_enabled = bool(update.experimental_ai_enabled)
+    if update.window_policy is not None:
+        valid_values = {"normal", "reduced", "off"}
+        policy = update.window_policy
+        merged = dict(current.window_policy)
+        for key in ("when_minimized", "when_closed"):
+            val = policy.get(key, merged.get(key, "normal"))
+            merged[key] = val if val in valid_values else "normal"
+        current.window_policy = merged
+        # Sync module-level runtime policy so get_window_policy() picks up changes.
+        try:
+            from services.app_lifecycle import _WINDOW_POLICY
+            _WINDOW_POLICY.update(merged)
+        except (ImportError, AttributeError):
+            pass
+    if update.caption_low_latency is not None:
+        current.caption_low_latency = bool(update.caption_low_latency)
     settings_mgr.save(current)
     download_mgr.apply_settings(settings_mgr)
     return _redact_ai_key(current)
