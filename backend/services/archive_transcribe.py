@@ -2216,13 +2216,15 @@ def _load_vad() -> Any:
 
     Torch intra-op threads are bounded by the recognizer's stable plan even
     for off-pool live-caption callers; ONNX sessions already use one thread."""
-    if os.environ.get("VODRIP_VAD_ONNX", "").strip() == "1":
-        return _load_onnx_vad()
-    from silero_vad import load_silero_vad
+    threads = _vad_thread_count()
+    with transcription_cpu_limiter(threads):
+        if os.environ.get("VODRIP_VAD_ONNX", "").strip() == "1":
+            return _load_onnx_vad()
+        from silero_vad import load_silero_vad
 
-    import torch
-    torch.set_num_threads(_vad_thread_count())
-    return load_silero_vad(onnx=False)
+        import torch
+        torch.set_num_threads(threads)
+        return load_silero_vad(onnx=False)
 
 
 def _get_vad() -> Any:

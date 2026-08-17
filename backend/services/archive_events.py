@@ -242,14 +242,18 @@ def _sed_model() -> Any:
         from panns_inference import SoundEventDetection
 
         ckpt = _ensure_checkpoint()
+        from services.archive_transcribe import (
+            _parakeet_threads, transcription_cpu_limiter,
+        )
+        threads = _parakeet_threads()
         try:
             import torch
-            from services.archive_transcribe import _parakeet_threads
-            torch.set_num_threads(_parakeet_threads())
+            torch.set_num_threads(threads)
         except Exception:
             pass
         t0 = time.monotonic()
-        _sed = SoundEventDetection(checkpoint_path=ckpt, device=want)
+        with transcription_cpu_limiter(threads):
+            _sed = SoundEventDetection(checkpoint_path=ckpt, device=want)
         _sed_device = want
         logger.info("PANNs SED loaded from %s in %.1fs (device=%s)",
                     ckpt, time.monotonic() - t0, want)
