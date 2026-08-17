@@ -129,11 +129,28 @@ def _parse_master_audio_url(master_text: str, master_url: str) -> Optional[str]:
             best = (score, uri)
     if best is not None:
         return urljoin(master_url, best[1])
+    # Audio-only rendition absent — fall back to the LOWEST BANDWIDTH
+    # STREAM-INF variant (least likely to cause buffering on the CDN).
+    _bw_re = re.compile(r"BANDWIDTH=(\d+)")
+    lowest_bw: Optional[tuple[int, str]] = None
     for block in master_text.split("#EXT-X-STREAM-INF")[1:]:
-        for line in block.splitlines()[1:]:
-            stripped = line.strip()
-            if stripped:
-                return urljoin(master_url, stripped)
+        bw = 0
+        uri = ""
+        for bline in block.splitlines():
+            bstripped = bline.strip()
+            if not bstripped:
+                continue
+            m = _bw_re.search(bstripped)
+            if m:
+                bw = int(m.group(1))
+            elif not bstripped.startswith("#"):
+                uri = bstripped
+                break
+        if uri:
+            if lowest_bw is None or bw < lowest_bw[0]:
+                lowest_bw = (bw, uri)
+    if lowest_bw is not None:
+        return urljoin(master_url, lowest_bw[1])
     return None
 
 
@@ -265,45 +282,48 @@ def _resolve_live_master(platform: str, channel: str) -> Optional[dict]:
     return {"url": info["url"], "headers": info.get("headers") or {}}
 
 
-def _transcribe_window(audio: "Any", duration: float) -> str:
+def _transcribe_window(audio: "Any", duration: float) -> tuple[str, Optional[str]]:
     """VAD-split one decoded window and transcribe the speech with parakeet.
 
     archive_transcribe is imported HERE, inside the worker thread (never on
     the asyncio loop): the import is heavy (torch/numpy) and the model lock
-    must not be held during network I/O. Empty return = no speech (dead air /
-    music) — the caller emits no caption block.
+    must not be held during network I/O. Returns (text, lang) — text is
+    empty when no speech (dead air / music); lang is the ASR-detected
+    language family (from parakeet batch), or None.
     """
     from services import archive_transcribe as at
 
     speech = at.vad_speech_seconds(audio)
     if not speech:
-        return ""
+        return "", None
     rec = at._parakeet_model()
     results = at._transcribe_batch_parakeet(rec, audio, speech, None)
     texts: list[str] = []
-    for items, _lang in results:
+    detected_lang: Optional[str] = None
+    for items, lang in results:
+        if detected_lang is None and lang:
+            detected_lang = lang
         for item in items:
             text = (item.get("text") or "").strip()
             if text:
                 texts.append(text)
-    return " ".join(texts)
+    return " ".join(texts), detected_lang
 
 
-def _warm_asr() -> None:
+def _warm_asr() -> bool:
     """Pre-load the parakeet engine + Silero VAD once per worker start so the
-    FIRST flush is not a 2-6s cold model load. Runs in the captioner's worker
-    thread (never on the SSE request path). Failure is non-fatal — the first
-    flush retries the same calls through the normal path, and the flush
+    FIRST flush is not a 2-6s cold model load. Runs in a daemon thread
+    (never blocks API bind or the HLS poll loop). Failure is non-fatal — the
+    first flush retries the same calls through the normal path, and the flush
     failure counter still surfaces a persistently broken engine."""
     try:
         from services import archive_transcribe as at
-
-        at._parakeet_model()
-        at._get_vad()
+        return at.prewarm_parakeet()
     except Exception as exc:
         logger.debug(
             "live captions ASR pre-warm failed (first flush loads lazily): %s", exc
         )
+        return False
 
 
 def _resolve_evidence(platform: str, channel: str) -> Optional[str]:
@@ -346,31 +366,46 @@ def _warm_translate(evidence: Optional[str], target_family: Optional[str] = None
 
 
 def _maybe_translate(
-    captioner: "LiveCaptioner", text: str, audio: "Any"
+    captioner: "LiveCaptioner", text: str, audio: "Any", *, lang: Optional[str] = None
 ) -> tuple[str, bool]:
-    """Language-gated best-effort translation of one caption window.
+    """Language-gated translation of one caption window.
 
-    Target: the per-session ?lang= override (``captioner._target_family``)
-    when set, else the app language. Gate: channel-language evidence first;
-    without it, the SLID majority over recent speech windows (see
-    caption_translate.needs_translation — the source-vs-target comparison
-    makes an explicit target behave exactly like the app family). Any
-    failure degrades to the raw ASR text — captions never block on
-    translation. Returns (caption_text, translated)."""
+    Sticky session lock: once ``_session_family`` is set, only translate when
+    it differs from the target. If not yet locked, collect SLID votes (when
+    SLID is available) and do NOT translate — the ASR thread locks via
+    ``lock_source_family`` after 3 agreeing detections. Any failure degrades
+    to the raw ASR text — captions never block on translation.
+
+    ``lang`` is the ASR-detected language from ``_transcribe_window`` — fed
+    into ``lock_source_family`` for immediate evidence when available.
+    Returns (caption_text, translated)."""
     try:
         from services import caption_translate as ct
 
         if not ct.enabled() or ct.nllb_dir() is None:
             return text, False
         evidence = captioner._evidence_family
-        if evidence is None and ct.slid_dir() is not None:
-            fam = ct.detect_language(audio)
-            if fam:
-                captioner._lang_votes.append(fam)
+        # Lock session family from evidence (immediate) or SLID votes (majority).
+        if captioner._session_family is None:
+            if evidence is not None:
+                locked = ct.lock_source_family(evidence, captioner._lang_votes, asr_lang=lang)
+                if locked:
+                    captioner._session_family = locked
+            elif ct.slid_dir() is not None:
+                fam = ct.detect_language(audio)
+                if fam:
+                    captioner._lang_votes.append(fam)
+                locked = ct.lock_source_family(
+                    evidence, captioner._lang_votes, asr_lang=lang,
+                )
+                if locked:
+                    captioner._session_family = locked
         app = captioner._target_family or ct.app_language_family()
-        if not ct.needs_translation(evidence, app, captioner._lang_votes):
+        # Translate iff session family is locked and differs from target
+        sf = captioner._session_family
+        if sf is None or sf == app:
             return text, False
-        out = ct.translate(text, app)
+        out = ct.translate(text, app, source_family=sf)
         return (out, True) if out else (text, False)
     except Exception as exc:
         logger.debug(
@@ -512,6 +547,13 @@ class LiveCaptioner:
         self._refcount = 0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # ASR thread (separate from fetch/decode): processes windows from a
+        # FIFO queue so fetch/decode is never blocked by CUDA inference.
+        self._asr_thread: Optional[threading.Thread] = None
+        self._asr_stop = threading.Event()
+        self._asr_window_ready = threading.Event()
+        self._asr_queue: deque = deque(maxlen=3)  # FIFO, max 2-3 windows, drop oldest
+        self._buffer_lock = threading.Lock()
         # Worker-owned state (touched only by the worker thread).
         self._seen: set[str] = set()
         self._buffer: Any = None  # np float32 16 kHz samples of the window
@@ -527,8 +569,11 @@ class LiveCaptioner:
         # Translation state (worker-owned): channel-language evidence resolved
         # once at start; SLID detections for the last 5 speech windows feed
         # the majority gate when evidence is unknown (caption_translate).
+        # _session_family: sticky language lock — once locked (3 agreeing
+        # detections), IGNORE later SLID flips for the session.
         self._evidence_family: Optional[str] = None
         self._lang_votes: Deque[str] = deque(maxlen=5)
+        self._session_family: Optional[str] = None
         # Per-session translate-target override (?lang= on the SSE) — the
         # LAST explicit selection wins for all subscribers of the shared
         # captioner; None = follow the app language at flush time. ponytail:
@@ -572,6 +617,10 @@ class LiveCaptioner:
                 self._transient_strikes = 0
                 self._evidence_family = None
                 self._lang_votes = deque(maxlen=5)
+                self._session_family = None  # sticky language lock: reset on session start
+                self._asr_queue.clear()
+                self._asr_stop.clear()
+                self._asr_window_ready.clear()
                 self._target_family = lang  # fresh session: explicit selection or app-language default
                 self._stop.clear()
                 self._thread = threading.Thread(
@@ -591,15 +640,116 @@ class LiveCaptioner:
             self._refcount -= 1
             if self._refcount == 0:
                 self._stop.set()
+                self._asr_stop.set()
+                self._asr_window_ready.set()  # unblock ASR thread so it sees stop
                 _session_end()
 
-    # --- worker ----------------------------------------------------------
+    # --- ASR thread --------------------------------------------------------
+
+    def _start_asr_thread(self) -> None:
+        """Start the dedicated ASR thread that dequeues windows and transcribes."""
+        self._asr_stop.clear()
+        self._asr_thread = threading.Thread(
+            target=self._asr_worker, daemon=True,
+            name=f"live-captions-asr-{self.platform}-{self.channel}",
+        )
+        self._asr_thread.start()
+
+    def _stop_asr_thread(self) -> None:
+        """Stop the ASR thread (called on release or crash)."""
+        self._asr_stop.set()
+        self._asr_window_ready.set()  # unblock wait
+        th = self._asr_thread
+        if th is not None:
+            th.join(timeout=3.0)
+        self._asr_thread = None
+
+    def _asr_get_window(self) -> Optional[tuple[Any, float]]:
+        """Block until a window is available or stop is set. Returns
+        (audio, buffer_sec) or None on shutdown."""
+        while not self._asr_stop.is_set():
+            if self._asr_queue:
+                return self._asr_queue.popleft()
+            self._asr_window_ready.clear()
+            self._asr_window_ready.wait(timeout=0.5)
+        return None
+
+    def _asr_worker(self) -> None:
+        """ASR thread: dequeue windows, wait for warm, transcribe, emit.
+
+        Window timing (start/end) is computed at INGEST time and passed in
+        the queue, so the ASR thread's scheduling jitter never shifts
+        captions on the timeline."""
+        from services import archive_transcribe as at
+        try:
+            at.prewarm_parakeet()
+        except Exception:
+            pass  # non-fatal — first real flush will retry
+        while not self._asr_stop.is_set():
+            item = self._asr_get_window()
+            if item is None or self._asr_stop.is_set():
+                return
+            audio, buffer_sec, win_start_off, origin = item
+            if audio is None or self._asr_stop.is_set():
+                return
+            try:
+                text, lang = _transcribe_window(audio, buffer_sec)
+            except Exception as exc:
+                self._flush_failures += 1
+                logger.warning(
+                    "live captions %s/%s ASR flush failed (%d/%d): %s",
+                    self.platform, self.channel, self._flush_failures,
+                    self._flush_fail_limit, exc,
+                )
+                if self._flush_failures >= self._flush_fail_limit:
+                    logger.error(
+                        "live captions %s/%s disabled — %d consecutive ASR failures: %s",
+                        self.platform, self.channel, self._flush_failures, exc,
+                    )
+                    self._emit("offline", {"reason": f"asr failure: {exc}"})
+                    self._stop.set()
+                continue
+            self._flush_failures = 0
+            if not text:
+                continue
+            text, translated = _maybe_translate(self, text, audio, lang=lang)
+            if not text:
+                continue
+            logger.info(
+                "live captions %s/%s transcribed %.1fs window via parakeet%s: %s",
+                self.platform, self.channel, buffer_sec,
+                " + translate" if translated else "", text[:80],
+            )
+            start = win_start_off + (origin or 0.0)
+            end = start + buffer_sec
+            payload = {
+                "text": text,
+                "start": round(start, 3),
+                "end": round(end, 3),
+            }
+            if translated:
+                payload["translated"] = True
+            if origin is not None:
+                payload["latency_ms"] = round((time.time() - end) * 1000)
+            self._emit("caption", payload)
+
+    # --- worker --------------------------------------------------------------
 
     def _run(self) -> None:
         try:
             self._evidence_family = _resolve_evidence(self.platform, self.channel)
-            _warm_asr()
+            # Lock immediately from channel evidence if known
+            if self._evidence_family:
+                from services import caption_translate as _ct
+                if self._evidence_family in getattr(_ct, '_TARGET_TOKEN', {}):
+                    self._session_family = self._evidence_family
+            # Warm ASR in background (never blocks HLS poll start)
+            threading.Thread(
+                target=_warm_asr, daemon=True,
+                name=f"live-captions-warm-{self.platform}-{self.channel}",
+            ).start()
             _warm_translate(self._evidence_family, self._target_family)
+            self._start_asr_thread()
             self._run_loop()
         except Exception:
             logger.exception(
@@ -607,6 +757,7 @@ class LiveCaptioner:
             )
             self._emit("offline", {})
         finally:
+            self._stop_asr_thread()
             _unregister(self)
 
     def _run_loop(self) -> None:
@@ -763,11 +914,12 @@ class LiveCaptioner:
         return segments
 
     def _ingest(self, seg: dict) -> None:
-        """Download, decode and buffer one segment; flush a caption when the
-        window fills. Checks _stop between the blocking steps so a release
-        (stream switch / popup close) ends the session promptly: a segment
-        already being fetched is dropped after the fetch, never decoded or
-        transcribed, and the shared window state is left untouched."""
+        """Download, decode and buffer one segment. When the window fills,
+        snapshot the audio + duration for the ASR thread (never block on
+        transcription here — fetch/decode stays fast). Checks _stop between
+        the blocking steps so a release (stream switch / popup close) ends
+        the session promptly: a segment already being fetched is dropped
+        after the fetch, never decoded or transcribed."""
         import numpy as np
 
         master = self._master
@@ -784,83 +936,28 @@ class LiveCaptioner:
             # pdt is the segment's wall-clock start; stream time 0 = pdt
             # minus the duration already consumed before this segment.
             self._origin = seg["pdt"] - self._stream_sec
-        if self._buffer is None:
-            self._buffer = samples
-        else:
-            self._buffer = np.concatenate([self._buffer, samples])
-        self._buffer_sec += dur
-        self._stream_sec += dur
-        if self._buffer_sec >= self.window_sec:
-            self._flush()
-
-    def _flush(self) -> None:
-        """Transcribe the buffered window and emit one caption block.
-
-        The window rolls either way: dead air / no speech emits nothing (a
-        silent stretch must not accumulate forever), speech emits one block
-        with the window's absolute stream time (PDT-anchored when the
-        playlist carries PROGRAM-DATE-TIME, else stream-relative seconds).
-        A release (stream switch / popup close) mid-window skips the ASR
-        pass entirely — the old session never transcribes audio after the
-        subscriber left, and the shared buffer is left for the restart."""
-        if self._stop.is_set():
-            return  # session ended — never roll/transcribe a stale window
-        audio = self._buffer
-        buffer_sec = self._buffer_sec
-        win_start_off = self._stream_sec - buffer_sec
-        self._buffer = None
-        self._buffer_sec = 0.0
-        try:
-            text = _transcribe_window(audio, buffer_sec)
-        except Exception as exc:
-            # ASR failure (model load hiccup, VAD error) — drop the window,
-            # keep rolling; but a persistently broken engine must not leave
-            # the SSE alive with keepalives and NO captions forever: after
-            # _flush_fail_limit consecutive failures, surface it as an
-            # offline event so the frontend hides the overlay (never a
-            # silent dead stream). Low-latency mode raises the threshold
-            # (smaller windows produce more transient short/empty frames).
-            self._flush_failures += 1
-            logger.warning(
-                "live captions %s/%s flush failed (%d/%d): %s",
-                self.platform, self.channel, self._flush_failures,
-                self._flush_fail_limit, exc,
-            )
-            if self._flush_failures >= self._flush_fail_limit:
-                logger.error(
-                    "live captions %s/%s disabled — %d consecutive ASR failures: %s",
-                    self.platform, self.channel, self._flush_failures, exc,
-                )
-                self._emit("offline", {"reason": f"asr failure: {exc}"})
-                self._stop.set()
-            return
-        self._flush_failures = 0
-        if not text:
-            return
-        text, translated = _maybe_translate(self, text, audio)
-        if not text:
-            return
-        logger.info(
-            "live captions %s/%s transcribed %.1fs window via parakeet%s: %s",
-            self.platform, self.channel, buffer_sec,
-            " + translate" if translated else "", text[:80],
-        )
-        start = win_start_off + (self._origin or 0.0)
-        end = start + buffer_sec
-        payload = {
-            "text": text,
-            "start": round(start, 3),
-            "end": round(end, 3),
-        }
-        if translated:
-            payload["translated"] = True
-        if self._origin is not None:
-            # Wall-clock pipeline latency: ms since the window's audio
-            # completed. The frontend anchors captions to the VIDEO clock,
-            # so the visible lag is just this trail. Stream-relative times
-            # (no PDT anchor) cannot measure wall latency — key omitted.
-            payload["latency_ms"] = round((time.time() - end) * 1000)
-        self._emit("caption", payload)
+        with self._buffer_lock:
+            if self._buffer is None:
+                self._buffer = samples
+            else:
+                self._buffer = np.concatenate([self._buffer, samples])
+            self._buffer_sec += dur
+            self._stream_sec += dur
+            if self._buffer_sec >= self.window_sec:
+                # Snapshot for the ASR thread (safe: _buffer_lock held,
+                # ASR thread reads only after we clear). Compute start/end
+                # timing HERE so ASR scheduling jitter never shifts captions.
+                audio = self._buffer
+                buffer_sec = self._buffer_sec
+                self._buffer = None
+                self._buffer_sec = 0.0
+                win_start_off = self._stream_sec - buffer_sec
+                origin = self._origin
+                # Bounded FIFO: drop oldest if queue is full (max 3 windows)
+                if len(self._asr_queue) >= 3:
+                    self._asr_queue.popleft()
+                self._asr_queue.append((audio, buffer_sec, win_start_off, origin))
+                self._asr_window_ready.set()
 
     def _emit(self, event: str, data: dict) -> None:
         def _put(q: asyncio.Queue, ev: str, payload: dict) -> None:

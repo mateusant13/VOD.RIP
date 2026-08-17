@@ -220,7 +220,7 @@ class _FakeNllb:
         self.fail = fail
         self.calls = 0
 
-    def run(self, text, tgt):
+    def run(self, text, tgt, src_tok=None):
         self.calls += 1
         if self.fail:
             return None  # mirrors _run_translate's internal catch -> degrade
@@ -244,6 +244,9 @@ def test_translate_caches_and_bounds(monkeypatch):
     # different family -> different key -> new call
     assert t.translate("hello", "es") == "Ola mundo"
     assert fake.calls == 2
+    # different source_family -> different cache key -> new call
+    assert t.translate("hello", "pt", source_family="en") == "Ola mundo"
+    assert fake.calls == 3
 
     # LRU cap: CACHE_MAX+50 unique texts through translate() keep the cache
     # bounded by CACHE_MAX
@@ -308,6 +311,7 @@ def _captioner():
     c.channel = "srdogg"
     c._evidence_family = None
     c._target_family = None  # no per-session ?lang= override → app language
+    c._session_family = None  # sticky language lock — unlocked initially
     c._lang_votes = collections.deque(maxlen=ct.SLID_VOTE_SPAN)
     return c
 
@@ -342,7 +346,7 @@ def test_maybe_translate_translates_different_language(monkeypatch):
     monkeypatch.setattr(ct, "enabled", lambda: True)
     monkeypatch.setattr(ct, "nllb_dir", lambda: object())
     monkeypatch.setattr(ct, "app_language_family", lambda: "pt")
-    monkeypatch.setattr(ct, "translate", lambda text, fam: f"PT({text})")
+    monkeypatch.setattr(ct, "translate", lambda text, fam, source_family=None: f"PT({text})")
     c = _captioner()
     c._evidence_family = "en"
     out, translated = live_captions._maybe_translate(c, "hello world", b"audio")
@@ -354,7 +358,7 @@ def test_maybe_translate_translate_failure_keeps_raw(monkeypatch):
     monkeypatch.setattr(ct, "enabled", lambda: True)
     monkeypatch.setattr(ct, "nllb_dir", lambda: object())
     monkeypatch.setattr(ct, "app_language_family", lambda: "pt")
-    monkeypatch.setattr(ct, "translate", lambda text, fam: None)  # NLLB failed
+    monkeypatch.setattr(ct, "translate", lambda text, fam, source_family=None: None)  # NLLB failed
     c = _captioner()
     c._evidence_family = "en"
     out, translated = live_captions._maybe_translate(c, "hello world", b"audio")
@@ -363,17 +367,24 @@ def test_maybe_translate_translate_failure_keeps_raw(monkeypatch):
 
 
 def test_maybe_translate_slid_vote_flips_gate(monkeypatch):
-    """No evidence -> SLID majority decides: 3 en votes translate, 2 do not."""
+    """No evidence -> SLID majority decides: 3 en votes lock session family,
+    then translation activates (sticky lock ignores later SLID flips)."""
     monkeypatch.setattr(ct, "enabled", lambda: True)
     monkeypatch.setattr(ct, "nllb_dir", lambda: object())
     monkeypatch.setattr(ct, "slid_dir", lambda: object())
     monkeypatch.setattr(ct, "app_language_family", lambda: "pt")
     monkeypatch.setattr(ct, "detect_language", lambda audio: "en")
-    monkeypatch.setattr(ct, "translate", lambda text, fam: f"PT({text})")
+    monkeypatch.setattr(ct, "translate", lambda text, fam, source_family=None: f"PT({text})")
 
     c = _captioner()
+    # 1st call: 1 vote, not enough to lock → no translate
     assert live_captions._maybe_translate(c, "hi", b"a") == ("hi", False)
+    # 2nd call: 2 votes, not enough to lock → no translate
     assert live_captions._maybe_translate(c, "hi", b"a") == ("hi", False)
+    # 3rd call: 3 votes → locks session_family="en" → translates
+    assert live_captions._maybe_translate(c, "hi", b"a") == ("PT(hi)", True)
+    # Sticky: 4th call with "pt" SLID vote → session still locked on "en"
+    monkeypatch.setattr(ct, "detect_language", lambda audio: "pt")
     assert live_captions._maybe_translate(c, "hi", b"a") == ("PT(hi)", True)
 
 
@@ -396,6 +407,8 @@ def test_hypothesis_decode_strips_forced_target_and_specials(monkeypatch):
     t = ct._CaptionTranslator()
     monkeypatch.setattr(t, "_ensure_nllb", lambda: (_Tok(), _Tr(), "cpu"))
     assert t._run_translate("hello", "por_Latn") == "Ola mundo, este e um teste"
+    # Source token: when src_tok is given, it is prepended before translation
+    assert t._run_translate("hello", "por_Latn", src_tok="eng_Latn") == "Ola mundo, este e um teste"
 
 
 def test_hypothesis_decode_empty_ok(monkeypatch):
@@ -410,3 +423,87 @@ def test_hypothesis_decode_empty_ok(monkeypatch):
     t = ct._CaptionTranslator()
     monkeypatch.setattr(t, "_ensure_nllb", lambda: (_Tok(), _Tr(), "cpu"))
     assert t._run_translate("hello", "por_Latn") == ""  # never raises
+
+
+# --- source token prepend ---------------------------------------------------
+
+
+def test_source_token_prepend(monkeypatch):
+    """When source_family is given, source_token is prepended to the encoded
+    tokens so NLLB knows the source language (prevents PT→EN re-render)."""
+    seen_tokens = []
+
+    class _Tok:
+        def encode(self, text):
+            return type("e", (), {"tokens": ["▁Hello"]})()
+
+    class _Tr:
+        def translate_batch(self, src, target_prefix=None, **kw):
+            seen_tokens.append(list(src[0]))
+            return [type("r", (), {"hypotheses": [
+                [target_prefix[0][0], "▁Ola"], "</s>",
+            ]})()]
+
+    t = ct._CaptionTranslator()
+    monkeypatch.setattr(t, "_ensure_nllb", lambda: (_Tok(), _Tr(), "cpu"))
+
+    # Without source_family: tokens start with encoded text
+    t._run_translate("hello", "por_Latn")
+    assert seen_tokens[-1] == ["▁Hello"]
+
+    # With source_family="en": por_Latn is NOT the source — eng_Latn is prepended
+    t._run_translate("hello", "por_Latn", src_tok="eng_Latn")
+    assert seen_tokens[-1] == ["eng_Latn", "▁Hello"]
+
+    # When source_token already matches the first token, no duplicate
+    class _Tok2:
+        def encode(self, text):
+            return type("e", (), {"tokens": ["eng_Latn", "▁Hello"]})()
+
+    t2 = ct._CaptionTranslator()
+    monkeypatch.setattr(t2, "_ensure_nllb", lambda: (_Tok2(), _Tr(), "cpu"))
+    t2._run_translate("hello", "por_Latn", src_tok="eng_Latn")
+    assert seen_tokens[-1] == ["eng_Latn", "▁Hello"]  # no duplicate
+
+
+def test_lock_source_family_from_evidence():
+    """lock_source_family returns evidence when it's a known family."""
+    votes = collections.deque(["es", "es", "en"])
+    assert ct.lock_source_family("pt", votes) == "pt"
+    assert ct.lock_source_family("en", votes) == "en"
+    # Unknown family not in _TARGET_TOKEN → falls through to votes
+    assert ct.lock_source_family("ja", votes) is None  # ja not in _TARGET_TOKEN
+
+
+def test_lock_source_family_from_votes():
+    """lock_source_family returns the majority vote when >= SLID_VOTE_MIN."""
+    votes = collections.deque(["es", "es", "es", "en"])
+    assert ct.lock_source_family(None, votes) == "es"
+    # Fewer than SLID_VOTE_MIN → None
+    votes = collections.deque(["es", "en"])
+    assert ct.lock_source_family(None, votes) is None
+
+
+def test_lock_source_family_from_asr_lang():
+    """asr_lang is added to the vote pool for lock resolution."""
+    votes = collections.deque(["en"])
+    # 1 vote + 1 asr_lang = 2 total, still < 3 → None
+    assert ct.lock_source_family(None, votes, asr_lang="en") is None
+    # 2 votes + 1 asr_lang = 3 → locks
+    votes = collections.deque(["en", "en"])
+    assert ct.lock_source_family(None, votes, asr_lang="en") == "en"
+
+
+def test_translate_with_source_family(monkeypatch):
+    """translate() passes source_family through to the translator cache key."""
+    fake = _FakeNllb()
+    t = _make_translator(monkeypatch, fake)
+
+    # Same text, same target, different source → separate cache entries
+    t.translate("hello", "pt", source_family="en")
+    t.translate("hello", "pt", source_family="es")
+    assert fake.calls == 2  # two separate NLLB calls
+
+    # Same text, same target, same source → cache hit
+    t.translate("hello", "pt", source_family="en")
+    assert fake.calls == 2  # no extra call

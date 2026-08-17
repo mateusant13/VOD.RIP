@@ -1141,12 +1141,9 @@ def close_model() -> None:
     """Unload the cached models, freeing RAM. Safe mid-transcription: workers
     hold a local reference, so the object lives until their last use.
 
-    Also drops the cached VAD model (lazy-reloaded by the next job) and, in
-    multi-copy mode, every pool thread's parakeet recognizer too (threads
-    lazily reload on their next job — the registry is cleared, so a fresh
-    slot is created). The process-global parakeet recognizer (single-model
-    mode) is dropped as well. (The whisper model cache was removed with the
-    faster-whisper engine.)"""
+    When _parakeet_resident is set (live captions active), the process-global
+    recognizer and VAD are kept loaded — only thread slots are cleared. This
+    avoids a cold CUDA EP reload on the next caption session."""
     global _vad, _parakeet_global, _cuda_recognizers_resident
     closed_any = False
     with _model_lock:
@@ -1162,19 +1159,21 @@ def close_model() -> None:
                 del vad
                 closed_any = True
         _thread_slots.clear()
-        parakeet, _parakeet_global = _parakeet_global, None
-        if parakeet is not None:
-            logger.info("Unloading parakeet recognizer")
-            del parakeet
-            closed_any = True
-    with _cuda_resident_lock:
-        _cuda_recognizers_resident = 0  # every recognizer was dropped above
-    with _vad_lock:
-        vad, _vad = _vad, None
-        if vad is not None:
-            logger.info("Unloading VAD model")
-            del vad
-            closed_any = True
+        if not _parakeet_resident:
+            parakeet, _parakeet_global = _parakeet_global, None
+            if parakeet is not None:
+                logger.info("Unloading parakeet recognizer")
+                del parakeet
+                closed_any = True
+    if not _parakeet_resident:
+        with _cuda_resident_lock:
+            _cuda_recognizers_resident = 0  # every recognizer was dropped above
+        with _vad_lock:
+            vad, _vad = _vad, None
+            if vad is not None:
+                logger.info("Unloading VAD model")
+                del vad
+                closed_any = True
     if closed_any:
         gc.collect()
 
@@ -1183,10 +1182,48 @@ def _maybe_close_idle_model() -> None:
     """Close the process-global parakeet recognizer after
     VODRIP_WHISPER_IDLE_CLOSE seconds without use. Thread models die with
     the pool (close_model on worker shutdown)."""
+    if _parakeet_resident:
+        return
     idle_sec = _idle_close_seconds()
     if _parakeet_global is not None and time.monotonic() - _parakeet_last_used > idle_sec:
         logger.info("Parakeet recognizer idle for %.0fs — unloading", idle_sec)
         close_model()
+
+
+def keep_parakeet_resident(active: bool) -> None:
+    """Pin/unpin the parakeet engine so idle-close and close_model skip it.
+
+    Called by the live captions subsystem when a session starts/ends. While
+    resident, the process-global recognizer and Silero VAD stay loaded; the
+    archive pool may still use its own per-thread copies."""
+    global _parakeet_resident
+    _parakeet_resident = bool(active)
+
+
+def prewarm_parakeet() -> bool:
+    """Pre-load parakeet + Silero VAD + CUDA EP so live captions start
+    instantly. Returns True when the recognizer is resident and ready.
+
+    NEVER downloads — returns False when the model files are absent.
+    The dummy 1s silence transcribe primes the CUDA execution provider
+    (the first real transcribe on a fresh EP can add ~2s latency)."""
+    if _parakeet_resolve_dir() is None:
+        return False
+    try:
+        keep_parakeet_resident(True)
+        _parakeet_model()
+        _get_vad()
+        # Prime CUDA EP (swallow errors — the real first caption will retry).
+        try:
+            import numpy as _np
+            silence = _np.zeros(16000, dtype=_np.float32)
+            _transcribe_batch_parakeet(_parakeet_global, silence, [(0.0, 1.0)], None)
+        except Exception:
+            pass
+        return True
+    except Exception as exc:
+        logger.debug("prewarm_parakeet failed: %s", exc)
+        return False
 
 
 # --- per-thread model copies (multi-copy mode, budget > 1) ------------------
@@ -1298,6 +1335,7 @@ _PARAAKEET_MAX_THREADS = 8
 
 _parakeet_ok: Optional[bool] = None  # sherpa-onnx import probe (None = unprobed)
 _parakeet_global: Any = None  # process-global recognizer (single-model mode)
+_parakeet_resident = False  # live captions pin: skip idle close + unload
 _parakeet_last_used = 0.0
 
 # CUDA recognizers currently resident in THIS process (not a foreign tenant).

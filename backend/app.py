@@ -244,6 +244,20 @@ async def _app_lifespan(_app: FastAPI):
     # Preload sherpa-onnx's bundled ORT before any thread can import the pip
     # onnxruntime — see _preload_sherpa_onnx_ort.
     _preload_sherpa_onnx_ort()
+
+    # Pre-warm parakeet for live captions (never blocks API bind).
+    def _prewarm_parakeet_bg() -> None:
+        try:
+            from services.archive_transcribe import prewarm_parakeet
+            if prewarm_parakeet():
+                logger.info("Parakeet pre-warmed for live captions")
+            else:
+                logger.debug("Parakeet pre-warm skipped (model files absent)")
+        except Exception:
+            logger.debug("Parakeet pre-warm failed", exc_info=True)
+
+    threading.Thread(target=_prewarm_parakeet_bg, daemon=True, name="parakeet-prewarm").start()
+
     # Boot maintenance — disk hygiene (orphaned temp/preview/selfcheck
     # sweeps), archive retention, chat dedupe, FTS optimize, and the
     # embed-model warm all run on a daemon

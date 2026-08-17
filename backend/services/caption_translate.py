@@ -132,6 +132,14 @@ def app_language_family() -> str:
     return _UI_FAMILY.get(ui, "pt")
 
 
+_SOURCE_TOKEN = {"pt": "por_Latn", "es": "spa_Latn", "en": "eng_Latn"}
+
+
+def source_token(family: str) -> Optional[str]:
+    """NLLB source token for a family ('pt' -> 'por_Latn'). None when unknown."""
+    return _SOURCE_TOKEN.get(family)
+
+
 def target_token(family: str) -> str:
     """NLLB target token for a family ('pt' -> 'por_Latn')."""
     return _TARGET_TOKEN.get(family, "por_Latn")
@@ -154,6 +162,28 @@ def needs_translation(
         return False
     fam, n = Counter(votes).most_common(1)[0]
     return n >= SLID_VOTE_MIN and fam != app
+
+
+def lock_source_family(
+    evidence: Optional[str],
+    votes: Deque[str],
+    *,
+    asr_lang: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve the source language family for the session: evidence wins if
+    known; else majority >= SLID_VOTE_MIN among votes + asr_lang; else None."""
+    if evidence and evidence in _TARGET_TOKEN:
+        return evidence
+    if asr_lang and asr_lang in _TARGET_TOKEN:
+        all_votes = list(votes) + [asr_lang]
+    else:
+        all_votes = list(votes)
+    if not all_votes:
+        return None
+    fam, n = Counter(all_votes).most_common(1)[0]
+    if n >= SLID_VOTE_MIN and fam in _TARGET_TOKEN:
+        return fam
+    return None
 
 
 def download_models() -> None:
@@ -212,10 +242,10 @@ def detect_language(audio: "Any") -> Optional[str]:
         return _get_translator().detect_language(audio)
 
 
-def translate(text: str, family: str) -> Optional[str]:
+def translate(text: str, family: str, *, source_family: Optional[str] = None) -> Optional[str]:
     """Translate *text* into the app family; None on any failure (raw)."""
     with _translator_lock:
-        return _get_translator().translate(text, family)
+        return _get_translator().translate(text, family, source_family=source_family)
 
 
 class _CaptionTranslator:
@@ -263,17 +293,18 @@ class _CaptionTranslator:
             return None
         return (lang or "").strip().lower() or None
 
-    def translate(self, text: str, family: str) -> Optional[str]:
-        """Translate *text* to the app family. Cached by (family, text);
+    def translate(self, text: str, family: str, *, source_family: Optional[str] = None) -> Optional[str]:
+        """Translate *text* to the app family. Cached by (family, source_family, text);
         None on any failure (caller falls back to the raw ASR text)."""
         text = (text or "").strip()
         if not text:
             return None
-        key = (family, text)
+        key = (family, source_family, text)
         hit = self._cache.get(key)
         if hit is not None:
             return hit
-        out = self._run_translate(text, target_token(family))
+        stok = source_token(source_family) if source_family else None
+        out = self._run_translate(text, target_token(family), src_tok=stok)
         if not out:
             return None
         self._cache[key] = out
@@ -382,17 +413,19 @@ class _CaptionTranslator:
             self._nllb_broken_at = time.monotonic()
             return None
 
-    def _run_translate(self, text: str, tgt: str) -> Optional[str]:
+    def _run_translate(self, text: str, tgt: str, *, src_tok: Optional[str] = None) -> Optional[str]:
         nllb = self._ensure_nllb()
         if nllb is None:
             return None
         tok, model, _device = nllb
         try:
-            src = tok.encode(text).tokens
+            tokens = tok.encode(text).tokens
+            if src_tok and (not tokens or tokens[0] != src_tok):
+                tokens = [src_tok] + tokens
             from services.archive_transcribe import transcription_cpu_limiter
             with transcription_cpu_limiter(1):
                 out = model.translate_batch(
-                    [src], target_prefix=[[tgt]], beam_size=1,
+                    [tokens], target_prefix=[[tgt]], beam_size=1,
                     max_decoding_length=128,
                 )
             toks = list(out[0].hypotheses[0])

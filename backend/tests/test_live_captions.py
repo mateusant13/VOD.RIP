@@ -16,7 +16,9 @@ Covers:
   validation/gate, direct generator drive for frame forwarding + release).
 """
 import asyncio
+import collections
 import json
+import threading
 
 import numpy as np
 import pytest
@@ -37,6 +39,14 @@ MASTER_NO_AUDIO = """#EXTM3U
 video-720.m3u8
 #EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080
 video-1080.m3u8
+"""
+
+# Same variants but swapped order — fallback must pick the LOWEST bandwidth.
+MASTER_NO_AUDIO_SWAPPED = """#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080
+video-1080.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720
+video-720.m3u8
 """
 
 PLAYLIST_1 = """#EXTM3U
@@ -181,7 +191,7 @@ def _install_pipeline(monkeypatch, pipeline: _FakePipeline, **kw):
     # and translation pre-warm are likewise stubbed (a real archive-DB read
     # would create the live archive file in unit tests); the translation
     # path itself has its own tests in test_caption_translate.py.
-    monkeypatch.setattr(live_captions, "_warm_asr", lambda: None)
+    monkeypatch.setattr(live_captions, "_warm_asr", lambda: True)
     monkeypatch.setattr(live_captions, "_warm_translate", lambda evidence, target_family=None: None)
     monkeypatch.setattr(live_captions, "_resolve_evidence", lambda platform, channel: None)
     # _maybe_translate must never touch the real SLID/NLLB models in unit
@@ -189,12 +199,15 @@ def _install_pipeline(monkeypatch, pipeline: _FakePipeline, **kw):
     # run real inference on the fake audio buffer).
     monkeypatch.setattr(
         live_captions, "_maybe_translate",
-        lambda captioner, text, audio: (text, False),
+        lambda captioner, text, audio, lang=None: (text, False),
     )
     monkeypatch.setattr(live_captions, "_resolve_live_master", pipeline.resolve_master)
     monkeypatch.setattr(live_captions, "_fetch", pipeline.fetch)
     monkeypatch.setattr(live_captions, "_decode_audio_bytes", pipeline.decode)
-    monkeypatch.setattr(live_captions, "_transcribe_window", pipeline.transcribe_window)
+    monkeypatch.setattr(live_captions, "_transcribe_window", lambda audio, dur: (pipeline.transcribe_window(audio, dur), None))
+    # Mock the ASR thread prewarm so it doesn't load real models
+    from services import archive_transcribe as _at
+    monkeypatch.setattr(_at, "prewarm_parakeet", lambda: True)
     return live_captions
 
 
@@ -530,7 +543,7 @@ async def test_captioner_drops_stale_backlog_and_resyncs_to_live_edge(monkeypatc
 
 def test_transcribe_window_uses_parakeet_path(monkeypatch):
     """VAD speech regions -> _parakeet_model + _transcribe_batch_parakeet ->
-    concatenated text; empty VAD yields no caption text."""
+    concatenated text + detected lang; empty VAD yields no caption text."""
     from services import archive_transcribe as at
     from services import live_captions
 
@@ -545,24 +558,27 @@ def test_transcribe_window_uses_parakeet_path(monkeypatch):
             ([], "pt"),  # a silent chunk produces no items
         ],
     )
-    assert live_captions._transcribe_window(audio, 3.0) == "olá pessoal"
+    text, detected_lang = live_captions._transcribe_window(audio, 3.0)
+    assert text == "olá pessoal"
+    assert detected_lang == "pt"
 
     monkeypatch.setattr(at, "vad_speech_seconds", lambda a: [])
-    assert live_captions._transcribe_window(audio, 3.0) == ""
+    text, detected_lang = live_captions._transcribe_window(audio, 3.0)
+    assert text == ""
+    assert detected_lang is None
 
 
 def test_warm_asr_preloads_engine_and_vad_once(monkeypatch):
-    """The worker pre-warms the parakeet model + Silero VAD at start so the
-    first flush is not a 2-6s cold load — both engine pieces load exactly
-    once (a second call hits the engine's own cache)."""
+    """The worker pre-warms via prewarm_parakeet (resident pin + model + VAD +
+    CUDA EP prime) at start so the first flush is not a 2-6s cold load."""
     from services import archive_transcribe as at
     from services import live_captions
 
     calls: list[str] = []
-    monkeypatch.setattr(at, "_parakeet_model", lambda: calls.append("model"))
-    monkeypatch.setattr(at, "_get_vad", lambda: calls.append("vad"))
-    live_captions._warm_asr()
-    assert calls == ["model", "vad"]
+    monkeypatch.setattr(at, "prewarm_parakeet", lambda: (calls.append("prewarm"), True)[-1])
+    result = live_captions._warm_asr()
+    assert result is True
+    assert calls == ["prewarm"]
 
 
 @pytest.mark.anyio
@@ -771,7 +787,8 @@ async def test_captioner_acquire_lang_sets_target_family(monkeypatch):
 @pytest.mark.anyio
 async def test_maybe_translate_uses_session_target_family(monkeypatch):
     """_maybe_translate translates into the captioner's ?lang= override
-    (per-session selector) instead of the app language when one is set."""
+    (per-session selector) instead of the app language when one is set.
+    Sticky lock: once locked from evidence, the session family stays fixed."""
     from services import caption_translate as ct
     from services import live_captions
 
@@ -779,12 +796,7 @@ async def test_maybe_translate_uses_session_target_family(monkeypatch):
     monkeypatch.setattr(ct, "nllb_dir", lambda: object())  # truthy — models "present"
     monkeypatch.setattr(ct, "slid_dir", lambda: None)
     monkeypatch.setattr(ct, "app_language_family", lambda: "pt")
-    monkeypatch.setattr(ct, "translate", lambda text, family: f"[{family}] {text}")
-    gates: list = []
-    monkeypatch.setattr(
-        ct, "needs_translation",
-        lambda evidence, app, votes: (gates.append(app), True)[1],
-    )
+    monkeypatch.setattr(ct, "translate", lambda text, family, source_family=None: f"[{family}] {text}")
 
     captioner = live_captions.LiveCaptioner(
         "twitch", "srdogg", asyncio.get_running_loop(),
@@ -794,13 +806,13 @@ async def test_maybe_translate_uses_session_target_family(monkeypatch):
     out, translated = live_captions._maybe_translate(captioner, "hello", None)
     assert translated is True
     assert out == "[es] hello"
-    assert gates == ["es"]
+    # Session family locked from evidence
+    assert captioner._session_family == "en"
 
     # Without an override the app language drives the target.
     captioner._target_family = None
     out, translated = live_captions._maybe_translate(captioner, "hello", None)
     assert out == "[pt] hello"
-    assert gates == ["es", "pt"]
 
 
 class _FakeRequest:
@@ -857,3 +869,138 @@ async def test_captions_sse_gen_releases_on_disconnect():
     frames = [f async for f in live_router._captions_sse_gen(_Disconnected(), fake)]
     assert frames == []
     assert fake.released == 1
+
+
+# ---------------------------------------------------------------------------
+# New: lowest-bandwidth fallback
+# ---------------------------------------------------------------------------
+
+
+def test_parse_master_falls_back_to_lowest_bandwidth():
+    """When no audio-only rendition exists, the fallback must pick the
+    LOWEST bandwidth STREAM-INF variant — not the first one."""
+    from services.live_captions import _parse_master_audio_url
+
+    url = _parse_master_audio_url(MASTER_NO_AUDIO, "https://edge/master.m3u8")
+    assert url == "https://edge/video-720.m3u8"
+
+    # Swapped order: lowest is now the second variant — must still pick 720.
+    url = _parse_master_audio_url(MASTER_NO_AUDIO_SWAPPED, "https://edge/master.m3u8")
+    assert url == "https://edge/video-720.m3u8"
+
+
+# ---------------------------------------------------------------------------
+# New: sticky session language lock
+# ---------------------------------------------------------------------------
+
+
+def test_sticky_session_lock_from_evidence(monkeypatch):
+    """Channel evidence locks session_family immediately; later SLID votes
+    cannot flip it (sticky lock)."""
+    from services import caption_translate as ct
+    from services import live_captions
+
+    monkeypatch.setattr(ct, "enabled", lambda: True)
+    monkeypatch.setattr(ct, "nllb_dir", lambda: object())
+    monkeypatch.setattr(ct, "slid_dir", lambda: object())
+    monkeypatch.setattr(ct, "app_language_family", lambda: "pt")
+    monkeypatch.setattr(ct, "translate", lambda text, fam, source_family=None: f"X({text})")
+    # SLID would say "en" but evidence "pt" wins
+    monkeypatch.setattr(ct, "detect_language", lambda audio: "en")
+
+    c = live_captions.LiveCaptioner.__new__(live_captions.LiveCaptioner)
+    c.platform = "twitch"
+    c.channel = "test"
+    c._evidence_family = "en"  # stream is English, app is PT
+    c._target_family = None
+    c._session_family = None
+    c._lang_votes = collections.deque(maxlen=5)
+
+    # Evidence "en" != app "pt" → translate, session locked on "en"
+    out, translated = live_captions._maybe_translate(c, "hello", b"audio")
+    assert translated is True
+    assert c._session_family == "en"  # locked from evidence
+
+    # SLID now says "pt" but session stays "en" (sticky lock)
+    monkeypatch.setattr(ct, "detect_language", lambda audio: "pt")
+    out, translated = live_captions._maybe_translate(c, "fala", b"audio")
+    assert translated is True  # session still "en" != "pt" → translates
+    assert c._session_family == "en"  # sticky — did not flip to "pt"
+
+
+def test_sticky_session_lock_from_slid_votes(monkeypatch):
+    """SLID votes accumulate; once 3 agree, session locks and stays."""
+    from services import caption_translate as ct
+    from services import live_captions
+
+    monkeypatch.setattr(ct, "enabled", lambda: True)
+    monkeypatch.setattr(ct, "nllb_dir", lambda: object())
+    monkeypatch.setattr(ct, "slid_dir", lambda: object())
+    monkeypatch.setattr(ct, "app_language_family", lambda: "pt")
+    monkeypatch.setattr(ct, "translate", lambda text, fam, source_family=None: f"X({text})")
+    monkeypatch.setattr(ct, "detect_language", lambda audio: "en")
+
+    c = live_captions.LiveCaptioner.__new__(live_captions.LiveCaptioner)
+    c.platform = "twitch"
+    c.channel = "test"
+    c._evidence_family = None
+    c._target_family = None
+    c._session_family = None
+    c._lang_votes = collections.deque(maxlen=5)
+
+    # 1 vote: not enough
+    live_captions._maybe_translate(c, "a", b"audio")
+    assert c._session_family is None
+
+    # 2 votes: still not enough
+    live_captions._maybe_translate(c, "b", b"audio")
+    assert c._session_family is None
+
+    # 3 votes → locks
+    live_captions._maybe_translate(c, "c", b"audio")
+    assert c._session_family == "en"
+
+    # 4th call: SLID says "pt" now — session stays "en" (sticky)
+    monkeypatch.setattr(ct, "detect_language", lambda audio: "pt")
+    live_captions._maybe_translate(c, "d", b"audio")
+    assert c._session_family == "en"
+
+
+# ---------------------------------------------------------------------------
+# New: parallel warm vs HLS poll
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_parallel_warm_vs_hls_poll(monkeypatch):
+    """ASR warm runs on a daemon thread so the HLS poll loop starts
+    immediately (fetching happens in parallel with warm)."""
+    warm_started = threading.Event()
+    warm_block = threading.Event()
+
+    def blocking_warm():
+        warm_started.set()
+        warm_block.wait(timeout=2.0)  # block until test releases
+
+    pipeline = _FakePipeline([PLAYLIST_1, PLAYLIST_2], ["w1"])
+    live_captions = _install_pipeline(monkeypatch, pipeline)
+    monkeypatch.setattr(live_captions, "_warm_asr", blocking_warm)
+
+    loop = asyncio.get_running_loop()
+    captioner = live_captions.LiveCaptioner(
+        "twitch", "paratest", loop, window_sec=1.5, poll_sec=0.02,
+    )
+    captioner.acquire()
+    try:
+        # The fetch should have happened even though warm is still blocked
+        assert warm_started.wait(timeout=2.0), "warm should have started"
+        # Wait for the caption event — proves HLS poll ran in parallel
+        ev, block = await _wait_event(captioner.events, timeout=5.0)
+        assert ev == "caption"
+        assert block["text"] == "w1"
+    finally:
+        warm_block.set()  # release the warm
+        captioner.release()
+        th = captioner._thread
+        if th is not None:
+            th.join(timeout=3.0)
