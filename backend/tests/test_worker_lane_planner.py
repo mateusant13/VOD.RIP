@@ -237,10 +237,11 @@ def test_run_worker_swaps_pool_when_gpu_frees():
     class RecordingTPE(real_tpe):
         def __init__(self, *a, **kw):
             calls.append((kw.get("max_workers"), kw.get("initargs")))
+            lifecycle.append(("create", id(self)))
             super().__init__(*a, **kw)
 
         def shutdown(self, wait=True, *, cancel_futures=False):
-            lifecycle.append((id(self), wait))
+            lifecycle.append(("shutdown", id(self), wait))
             return super().shutdown(wait=wait, cancel_futures=cancel_futures)
 
     mp.setattr(at, "_pool_plan", _fake_plan)
@@ -273,9 +274,11 @@ def test_run_worker_swaps_pool_when_gpu_frees():
         ("cpu", "int8"), ("cpu", "int8"),
     ], calls[0]
 
-    assert len(lifecycle) == 2, lifecycle
-    assert lifecycle[0][1] is True and lifecycle[1][1] is True, lifecycle
-    assert lifecycle[0][0] != lifecycle[1][0], lifecycle
+    assert [event[0] for event in lifecycle] == [
+        "create", "shutdown", "create", "shutdown",
+    ], lifecycle
+    assert all(event[-1] is True for event in lifecycle if event[0] == "shutdown"), lifecycle
+    assert lifecycle[0][1] != lifecycle[2][1], lifecycle
     budget1, initargs1 = calls[1]
     assert budget1 == 2 and initargs1[0] == [
         ("cuda", "int8"), ("cpu", "int8"),
