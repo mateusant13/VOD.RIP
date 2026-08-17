@@ -32,6 +32,7 @@ Design notes:
 from __future__ import annotations
 
 import logging
+import threading
 import os
 import time
 from pathlib import Path
@@ -85,6 +86,8 @@ DEFAULT_CLASSES = [
 
 _sed: Any = None  # lazily-built SoundEventDetection (module-global, like the whisper cache)
 _sed_device: Optional[str] = None  # device the loaded _sed copy was built for
+_sed_lock = threading.RLock()
+_sed_infer_lock = threading.Lock()
 
 
 # --- configuration -------------------------------------------------------
@@ -222,6 +225,11 @@ def _ensure_checkpoint() -> str:
 
 
 def _sed_model() -> Any:
+    with _sed_lock:
+        return _sed_model_unlocked()
+
+
+def _sed_model_unlocked() -> Any:
     """Lazy singleton SoundEventDetection (heavy imports stay out of module load).
 
     GPU-01: the singleton is per-device — a CPU-lane job that found the CUDA
@@ -261,25 +269,19 @@ def _sed_model() -> Any:
 
 
 def _release_sed_on_idle() -> None:
-    """Drop the SED singleton when the calling thread is a CPU-pinned lane.
-
-    GPU-01: the module-global CUDA copy must not outlive the GPU lane that
-    loaded it — otherwise a later CPU-lane events job reuses it and keeps
-    holding VRAM / running inference on the RTX while parakeet waits. GPU
-    lanes keep their copy (the lane owns the card anyway)."""
+    """Drop the SED singleton when the calling thread is a CPU-pinned lane."""
     global _sed, _sed_device
-    if _sed is None:
-        return
-    try:
-        from services.archive_transcribe import _thread_pin
-
-        pin = _thread_pin()
-        if pin is not None and pin[0] != "cuda":
-            logger.info("PANNs SED released on idle (CPU lane)")
-            _sed = None
-            _sed_device = None
-    except Exception:
-        pass
+    with _sed_lock:
+        if _sed is None:
+            return
+        try:
+            from services.archive_transcribe import _thread_pin
+            if _thread_pin() == ("cpu", "int8"):
+                _sed = None
+                _sed_device = None
+                logger.info("PANNs SED released on idle (CPU lane)")
+        except Exception:
+            pass
 
 
 # --- pure detection core (no model — unit-testable) ----------------------
@@ -391,7 +393,7 @@ def detect_events(
             chunk = seg[ws : ws + win_samples]
             if len(chunk) < win_samples:  # pad the tail window with zeros
                 chunk = np.pad(chunk, (0, win_samples - len(chunk)))
-            with transcription_cpu_limiter(_parakeet_threads()):
+            with _sed_infer_lock, transcription_cpu_limiter(_parakeet_threads()):
                 frame = sed.inference(chunk[None, :])  # (1, n_frames, 527)
             frame = np.asarray(frame[0])[:, cls_idx]
             events.extend(extract_events(

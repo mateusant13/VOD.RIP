@@ -82,6 +82,19 @@ def test_shared_cpu_limiter_serializes_offpool_stages(monkeypatch):
     for thread in threads:
         thread.join()
     assert peak == 1
+
+
+def test_limiter_rejects_stage_from_stale_plan(monkeypatch):
+    monkeypatch.setattr("os.cpu_count", lambda: 20)
+    monkeypatch.setenv(at.CPU_CAP_ENV, "0.4")
+    with at.transcription_cpu_limiter(2):
+        monkeypatch.setenv(at.CPU_CAP_ENV, "0.05")
+        try:
+            with at.transcription_cpu_limiter(2):
+                raise AssertionError("stale plan entered the limiter")
+        except RuntimeError:
+            pass
+        assert at._cpu_limiter_active == 2
     assert at._cpu_limiter_active == 0
 
 # --- _worker_plan shapes ----------------------------------------------------

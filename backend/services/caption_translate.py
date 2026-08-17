@@ -389,9 +389,12 @@ class _CaptionTranslator:
         tok, model, _device = nllb
         try:
             src = tok.encode(text).tokens
-            out = model.translate_batch(
-                [src], target_prefix=[[tgt]], beam_size=1, max_decoding_length=128,
-            )
+            from services.archive_transcribe import transcription_cpu_limiter
+            with transcription_cpu_limiter(1):
+                out = model.translate_batch(
+                    [src], target_prefix=[[tgt]], beam_size=1,
+                    max_decoding_length=128,
+                )
             toks = list(out[0].hypotheses[0])
             if toks and toks[0] == tgt:  # forced target token leads the hypothesis
                 toks = toks[1:]

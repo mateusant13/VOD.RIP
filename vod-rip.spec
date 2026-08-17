@@ -148,6 +148,13 @@ def _asr_gpu_binaries():
             for pkg_dir in sorted(nvidia_root.iterdir()):
                 if not pkg_dir.is_dir():
                     continue
+                # Skip CUDA 13 wheels (nvidia-cudnn-cu13, nvidia-cublas 13.x,
+                # nvidia-cuda-runtime 13.x, ...): the stack here is pinned to
+                # cu12 (torch 2.7+cu128, sherpa-onnx +cuda12.cudnn9) and the
+                # cu13 trees can slip in via an unrelated wheel's extra
+                # (onnxruntime-gpu[extra] pulled nvidia-cudnn-cu13 once, +850MB).
+                if pkg_dir.name == "cu13" or pkg_dir.name.endswith("-cu13"):
+                    continue
                 lib_dir = pkg_dir / subdir
                 if lib_dir.is_dir():
                     result.append(

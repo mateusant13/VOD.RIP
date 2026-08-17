@@ -167,6 +167,7 @@ class _LogCollector(logging.Handler):
 
 def _collector() -> _LogCollector:
     handler = _LogCollector()
+    at.logger.setLevel(logging.INFO)
     at.logger.addHandler(handler)
     return handler
 

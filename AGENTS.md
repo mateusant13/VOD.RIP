@@ -146,3 +146,18 @@ codeintel search "callers of schedule_youtube_window_hls_mux"
 - Kick Overlay (Twitch ad-kill): `vendor/kick-overlay/`
 - Cookies (VOD.RIP cookie/po_token): `vendor/cookie-extension/src/` — installed from the `VOD.RIP-cookies` subfolder (staging: `%APPDATA%\VOD.RIP\cookie-extension\VOD.RIP-cookies\`)
 
+## Heavy project data lives OFF C: (learned 2026-08-15)
+
+**C: is the system NVMe — never put heavy project artifacts there.** It has ~15GB free and the repo bloated to 18.7GB on C: (9GB `dist` + 9GB `_internal` + `build` + a stray CUDA-13 stack). Disk map:
+
+- **G:** (NVMe) — models `G:\VOD.RIP-models`, data `G:\VOD.RIP-data`, benchmarks `G:\vodrip-bench`, downloads
+- **H:** (NVMe) — frozen bundle installs `H:\VOD.RIP-build\dist\VOD-RIP` (build-install.ps1 default)
+- **I:** (HDD, 4TB) — bulk/long-term storage
+
+Rules:
+
+- Build outputs (`dist\`, `_internal\`, `build\`) are gitignored and regenerable — **delete them from the repo after `scripts/build-install.ps1` installs to H:**; do not leave ~18GB of build trees on C:.
+- Model caches, ASR scratch, benchmark audio, VOD archives, DBs → **G:** stable roots (NOT `G:\Temp` — pytest's session-end wipe deletes `vodrip-*` there; `tempfile.gettempdir()` = `G:\Temp` on this box).
+- `vod-rip.spec` skips `cu13`/`*-cu13` nvidia packages (stack pinned to cu12) — keep it; a cu13 tree adds ~850MB to every bundle.
+- Pagefile: `H:\pagefile.sys` 16GB fixed (same NVMe as C: so it mounts at boot).
+

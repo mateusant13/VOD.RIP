@@ -125,28 +125,33 @@ _cpu_limiter_active = 0
 
 @contextmanager
 def transcription_cpu_limiter(weight: int = 1) -> Iterator[None]:
-    """Bound CPU-heavy transcription stages across pool and off-pool callers.
-
-    ``weight`` is the stage's own thread budget (ASR/VAD) or one for ffmpeg
-    and live-caption work.  The limiter is process-wide and re-reads the
-    clamped cap while waiting, so a plan change cannot multiply active work.
-    """
+    """Bound CPU-heavy transcription stages across pool and off-pool callers."""
     global _cpu_limiter_active
     requested = max(1, int(weight))
     with _cpu_limiter_condition:
-        while True:
-            limit = _cpu_thread_budget()
-            units = min(requested, limit)  # minimum-progress floor on tiny hosts
-            if _cpu_limiter_active + units <= limit:
-                _cpu_limiter_active += units
-                break
+        limit = _cpu_thread_budget()
+        if requested > limit:
+            raise RuntimeError(
+                f"transcription stage needs {requested} CPU threads, "
+                f"but the current cap is {limit}; rebuild the worker plan"
+            )
+        while _cpu_limiter_active + requested > limit:
             _cpu_limiter_condition.wait()
+            limit = _cpu_thread_budget()
+            if requested > limit:
+                raise RuntimeError(
+                    f"transcription stage needs {requested} CPU threads, "
+                    f"but the current cap is {limit}; rebuild the worker plan"
+                )
+        _cpu_limiter_active += requested
     try:
         yield
     finally:
         with _cpu_limiter_condition:
-            _cpu_limiter_active -= units
+            _cpu_limiter_active -= requested
             _cpu_limiter_condition.notify_all()
+
+
 # Music/no-speech verdict for captionless YouTube ASR: below this fraction
 # of speech (speech_sec / total_sec) the audio is treated as instrumental
 # music — the video is marked transcript_kind='music' (job done, no ASR
@@ -4081,7 +4086,123 @@ def _reap_stale_shard_dirs(max_age_s: float = 24 * 3600.0) -> None:
         pass
 
 
+_WORKER_MUTEX_NAME = r"Local\VODRIP.archive-transcribe"
+_CPU_CAP_JOB_HANDLE = None
+
+
+def _apply_windows_cpu_cap() -> None:
+    """Apply a hard process CPU rate before any worker threads are spawned."""
+    global _CPU_CAP_JOB_HANDLE
+    if os.name != "nt" or _CPU_CAP_JOB_HANDLE is not None:
+        return
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+    kernel32.SetInformationJobObject.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32,
+    ]
+    kernel32.SetInformationJobObject.restype = ctypes.c_bool
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel32.IsProcessInJob.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_bool),
+    ]
+    kernel32.IsProcessInJob.restype = ctypes.c_bool
+    kernel32.AssignProcessToJobObject.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p,
+    ]
+    kernel32.AssignProcessToJobObject.restype = ctypes.c_bool
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    process = kernel32.GetCurrentProcess()
+    in_job = ctypes.c_bool()
+    if not kernel32.IsProcessInJob(process, None, ctypes.byref(in_job)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if in_job.value:
+        logger.warning("process already belongs to a Windows job; using its CPU policy")
+        return
+    handle = kernel32.CreateJobObjectW(None, None)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    class _CpuRate(ctypes.Structure):
+        _fields_ = [
+            ("ControlFlags", ctypes.c_uint32),
+            ("CpuRate", ctypes.c_uint32),
+        ]
+
+    rate = max(
+        1,
+        min(
+            4000,
+            int(10000 * _cpu_thread_budget() / max(1, os.cpu_count() or 1)),
+        ),
+    )
+    info = _CpuRate(0x1 | 0x4, rate)  # ENABLE | HARD_CAP
+    if not kernel32.SetInformationJobObject(
+        handle, 15, ctypes.byref(info), ctypes.sizeof(info),
+    ):
+        error = ctypes.get_last_error()
+        kernel32.CloseHandle(handle)
+        raise ctypes.WinError(error)
+    if not kernel32.AssignProcessToJobObject(handle, process):
+        error = ctypes.get_last_error()
+        kernel32.CloseHandle(handle)
+        raise ctypes.WinError(error)
+    _CPU_CAP_JOB_HANDLE = handle
+    logger.info("Windows hard CPU job cap enabled: %.2f%%", rate / 100.0)
+
+
+@contextmanager
+def _transcription_worker_owner() -> Iterator[None]:
+    """Serialize detached and in-process workers on Windows."""
+    if os.name != "nt":
+        yield
+        return
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [
+        ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p,
+    ]
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel32.ReleaseMutex.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    handle = kernel32.CreateMutexW(None, False, _WORKER_MUTEX_NAME)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    owned = False
+    try:
+        result = kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)
+        if result not in (0, 0x80):  # WAIT_OBJECT_0 / WAIT_ABANDONED
+            raise ctypes.WinError(ctypes.get_last_error())
+        owned = True
+        _apply_windows_cpu_cap()
+        yield
+    finally:
+        if owned:
+            kernel32.ReleaseMutex(handle)
+        kernel32.CloseHandle(handle)
+
+
 def run_worker(
+    *,
+    once: bool = False,
+    poll_interval: float = 2.0,
+    max_workers: Optional[int] = None,
+) -> None:
+    with _transcription_worker_owner():
+        _run_worker(
+            once=once,
+            poll_interval=poll_interval,
+            max_workers=max_workers,
+        )
+
+
+def _run_worker(
     *,
     once: bool = False,
     poll_interval: float = 2.0,
