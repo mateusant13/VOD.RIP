@@ -167,6 +167,17 @@ class AppSettings(BaseModel):
     experimental_ai_enabled: bool = False
     ai_api_key: str = ""
     ai_api_key_set: bool = False
+    # Live-caption low-latency mode: 1s windows instead of 2s, raising the
+    # flush-fail tolerance to compensate for shorter/emptier frames. Drops
+    # total caption lag from ~1-2s to ~0.5-1s behind the live edge.
+    caption_low_latency: bool = False
+    # Window-active runtime policy: controls behavior when window is
+    # minimized or closed (hidden to tray). Keys: 'when_minimized',
+    # 'when_closed'. Values: 'normal' (default), 'reduced', 'off'.
+    window_policy: Dict[str, str] = Field(default_factory=lambda: {
+        "when_minimized": "normal",
+        "when_closed": "normal",
+    })
 
 
 class SettingsUpdate(BaseModel):
@@ -214,6 +225,8 @@ class SettingsUpdate(BaseModel):
     download_transcript_sidecar: Optional[bool] = None
     experimental_ai_enabled: Optional[bool] = None
     ai_api_key: Optional[str] = None
+    caption_low_latency: Optional[bool] = None
+    window_policy: Optional[Dict[str, str]] = None
 
 
 class OpenFolderRequest(BaseModel):

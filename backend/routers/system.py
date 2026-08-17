@@ -158,3 +158,14 @@ async def ytdlp_status():
         return {"available": True, "version": yt_dlp.version.__version__}
     except ImportError:
         return {"available": False, "version": None}
+
+
+@router.get("/api/system/window-state")
+async def window_state():
+    """Current VOD.RIP window state for runtime policy decisions."""
+    from services.app_lifecycle import is_window_active, is_window_minimized, get_window_policy
+    return {
+        "active": is_window_active(),
+        "minimized": is_window_minimized(),
+        "policy": get_window_policy(),
+    }

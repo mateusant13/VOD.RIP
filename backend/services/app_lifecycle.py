@@ -18,6 +18,87 @@ _show_window_cb: Optional[Callable[[], None]] = None
 _save_geometry_cb: Optional[Callable[[], None]] = None
 _flush_geometry_cb: Optional[Callable[[], None]] = None
 
+# Window-active runtime policy: controls how VOD.RIP behaves when the window
+# is minimized or closed (hidden to tray).
+# ponytail: could be a dataclass/enum, but a dict is enough for three keys
+_WINDOW_POLICY: Dict[str, str] = {
+    "when_minimized": "normal",   # 'normal' | 'reduced' | 'off'
+    "when_closed": "normal",      # 'normal' | 'reduced' | 'off'
+}
+_WINDOW_POLICY_SYNCED = False
+
+
+def _sync_window_policy_from_settings() -> None:
+    """Load persisted window_policy into the runtime dict (once)."""
+    global _WINDOW_POLICY_SYNCED
+    if _WINDOW_POLICY_SYNCED:
+        return
+    _WINDOW_POLICY_SYNCED = True
+    try:
+        from services.settings import SettingsManager
+        saved = SettingsManager().get().window_policy
+        if saved:
+            _WINDOW_POLICY.update(saved)
+    except (ImportError, AttributeError, Exception):
+        pass
+
+
+def is_window_active() -> bool:
+    """True if the VOD.RIP window is the current foreground window.
+
+    Returns False on non-Windows, if no window handle is found, or if
+    the platform API call fails."""
+    if os.name != "nt":
+        return False
+    hwnd = _find_vodrip_hwnd_windows()
+    if not hwnd:
+        return False
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        fg = user32.GetForegroundWindow()
+        return fg == hwnd
+    except OSError:
+        return False
+
+
+def is_window_minimized() -> bool:
+    """True if the VOD.RIP window exists but is minimized (iconic).
+
+    Returns False on non-Windows, if no window handle is found, or if
+    the platform API call fails."""
+    if os.name != "nt":
+        return False
+    hwnd = _find_vodrip_hwnd_windows()
+    if not hwnd:
+        return False
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        return bool(user32.IsIconic(hwnd))
+    except OSError:
+        return False
+
+
+def get_window_policy() -> str:
+    """Return the effective policy string for the current window state.
+
+    Priority: when_closed (hidden to tray) > when_minimized (visible but
+    iconic) > 'normal'. When no window handle exists the window is treated
+    as closed."""
+    _sync_window_policy_from_settings()
+    hwnd = _find_vodrip_hwnd_windows() if os.name == "nt" else 0
+    if not hwnd:
+        return _WINDOW_POLICY["when_closed"]
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        if user32.IsIconic(hwnd):
+            return _WINDOW_POLICY["when_minimized"]
+    except OSError:
+        pass
+    return "normal"
+
 
 def register_window(window: Any) -> None:
     global _window
