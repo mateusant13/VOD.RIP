@@ -1003,12 +1003,17 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   }, []);
 
   // Debounced waiting→overlay (mirrors attachPreviewBufferingListeners).
+  /** Debounced waiting→overlay. 400ms threshold suppresses transient stalls
+   *  (proxy jitter, segment decode hiccup) that resolve in <1s — only shows
+   *  the spinner when the stall is sustained enough to actually interrupt the
+   *  viewing experience. Live proxy adds ~50-200ms per segment fetch; shorter
+   *  debounces cause false-positive flicker. */
   const showBuffering = useCallback(() => {
     if (bufferingTimerRef.current != null) return;
     bufferingTimerRef.current = window.setTimeout(() => {
       bufferingTimerRef.current = null;
       setBuffering(true);
-    }, 150);
+    }, 400);
   }, []);
   const clearBuffering = useCallback(() => {
     if (bufferingTimerRef.current != null) {
@@ -1105,15 +1110,15 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       // networks. maxBufferLength 20 keeps the buffer deep so the tighter
       // target does not reintroduce the old 3s-target rebuffer flash
       // (feat/live-buffering).
-      maxBufferLength: 20,
-      maxMaxBufferLength: 40,
+      maxBufferLength: 30,
+      maxMaxBufferLength: 60,
       // Retained back-buffer = the arrow-seek window: LIVE without a DVR
       // archive still lets ArrowLeft/Right rewind ~30s into the stream (the
       // rail stays disabled — see the keydown listener below).
       backBufferLength: LIVE_BACK_BUFFER_SEC,
       startFragPrefetch: true,
-      fragLoadingTimeOut: 20000,
-      manifestLoadingTimeOut: 10000,
+      fragLoadingTimeOut: 30000,
+      manifestLoadingTimeOut: 15000,
       testBandwidth: false,
       liveSyncDurationCount: 1,
       // hls.js REQUIRES liveMaxLatencyDurationCount > liveSyncDurationCount

@@ -50,6 +50,31 @@ from services.preview.session import (
 )
 from services.preview._state import _validate_proxy_url
 
+# Connection pool for upstream HTTP requests — reuses TCP connections across
+# segment/playlist fetches to avoid TCP+TLS handshake overhead per request.
+# ponytail: one session per module; move to per-(host,impersonate) if
+# profiling shows connection contention under high concurrency.
+_upstream_session = None
+_upstream_session_lock = threading.Lock()
+
+
+def _get_upstream_session():
+    """Lazy-init a curl_cffi Session for connection pooling."""
+    global _upstream_session
+    if _upstream_session is not None:
+        return _upstream_session
+    with _upstream_session_lock:
+        if _upstream_session is not None:
+            return _upstream_session
+        try:
+            from curl_cffi.requests import Session
+            _upstream_session = Session(impersonate="chrome")
+        except ImportError:
+            import requests
+            _upstream_session = requests.Session()
+    return _upstream_session
+
+
 # Upstream stall bounds. curl_cffi's tuple timeout is NOT a per-read timeout:
 # with stream=True it maps to CURLOPT_LOW_SPEED_LIMIT=1 + LOW_SPEED_TIME=ceil
 # (connect+read) — a sub-1B/s transfer aborts only after the whole window, and
@@ -59,7 +84,7 @@ from services.preview._state import _validate_proxy_url
 # can never hang session creation or playback past the budget.
 _UPSTREAM_READ_TIMEOUT_SEC = 10
 _UPSTREAM_PLAYLIST_DEADLINE_SEC = 20.0  # master/media playlists, LL-HLS probes, archive
-_UPSTREAM_SEGMENT_DEADLINE_SEC = 15.0  # segment/key/init fetches (proxy_segment)
+_UPSTREAM_SEGMENT_DEADLINE_SEC = 25.0  # segment/key/init fetches (proxy_segment)
 
 
 def _read_upstream_body(
@@ -235,24 +260,37 @@ def _http_get_bytes(
     )
     timeout = (_UPSTREAM_CONNECT_TIMEOUT_SEC, _UPSTREAM_READ_TIMEOUT_SEC)
     try:
-        from curl_cffi import requests as cffi_requests
-
-        # QUIC/HTTP3 for googlevideo CDN
+        # QUIC/HTTP3 for googlevideo CDN — not supported by pooled session,
+        # fall back to per-request for googlevideo hosts.
         http_version = None
         if "googlevideo.com" in url:
             http_version = "v3"
 
-        resp = cffi_requests.get(
-            url,
-            headers=headers,
-            impersonate="chrome",
-            stream=True,
-            timeout=timeout,
-            http_version=http_version,
-        )
+        session = _get_upstream_session()
+        if http_version:
+            # Per-request with explicit http_version (QUIC not poolable)
+            try:
+                from curl_cffi import requests as cffi_requests
+                resp = cffi_requests.get(
+                    url,
+                    headers=headers,
+                    impersonate="chrome",
+                    stream=True,
+                    timeout=timeout,
+                    http_version=http_version,
+                )
+            except ImportError:
+                import requests
+                resp = requests.get(url, headers=headers, stream=True, timeout=timeout)
+        else:
+            # Pooled connection — avoids TCP+TLS handshake per segment
+            if hasattr(session, 'get'):
+                resp = session.get(url, headers=headers, stream=True, timeout=timeout)
+            else:
+                import requests
+                resp = requests.get(url, headers=headers, stream=True, timeout=timeout)
     except ImportError:
         import requests
-
         resp = requests.get(url, headers=headers, stream=True, timeout=timeout)
 
     if resp.status_code in _AUTH_ERROR_CODES:
