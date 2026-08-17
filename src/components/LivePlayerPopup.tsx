@@ -1628,18 +1628,45 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     void createHlsPlayer(replaySnapshotUrl(sid), Math.max(0, sec));
     video.play().catch(() => {});
     // Re-snapshot while parked so the rail keeps growing with the broadcast.
+    // Lightweight path: reload the snapshot URL on the EXISTING HLS instance
+    // instead of destroyHls + createHlsPlayer (which caused a 1-2s stall
+    // every 30s). hls.loadSource() re-fetches the manifest and re-parses it
+    // without tearing down the player, buffer, or event handlers. The
+    // MANIFEST_PARSED handler re-applies replay positioning via startLoad().
     if (replayTimerRef.current != null) window.clearInterval(replayTimerRef.current);
     replayTimerRef.current = window.setInterval(() => {
       const v = videoRef.current;
-      if (!v || modeRef.current !== 'replay') return;
+      const hls = hlsRef.current;
+      if (!v || !hls || modeRef.current !== 'replay') return;
       // A user seek is in flight (250ms debounce) — skip this tick or the
-      // resnapshot recreate would win the race against the seek's instance.
+      // resnapshot would race against the seek's own loadSource.
       if (pendingReplaySeekRef.current != null) return;
-      // ponytail: reloadWindowHlsAtPosition patches the level URL in-place — on
-      // an ended snapshot the buffered timeline is already full, no new frag
-      // buffers, and FRAG_BUFFERED never fires (45s hang). A full re-create
-      // (same path as drag-past-edge) deterministically re-syncs duration.
-      switchToReplay(Math.max(0, v.currentTime));
+      const sid = sessionIdRef.current;
+      if (!sid || !archiveReadyRef.current) return;
+      const pos = Math.max(0, v.currentTime);
+      // Cache-bust forces a fresh ENDLIST snapshot from the backend.
+      hls.loadSource(replaySnapshotUrl(sid));
+      // The MANIFEST_PARSED handler calls startLoad(startPos) with the
+      // closure-captured startPos from the INITIAL createHlsPlayer call.
+      // For resnapshots we need the CURRENT position — override after parse.
+      const HlsCtor = hlsCtorRef.current;
+      if (HlsCtor) {
+        let landed = false;
+        const onParsed = () => {
+          if (landed) return;
+          landed = true;
+          window.clearTimeout(safety);
+          hls.off(HlsCtor.Events.MANIFEST_PARSED, onParsed);
+          hls.startLoad(pos);
+        };
+        const safety = window.setTimeout(() => {
+          if (!landed) {
+            landed = true;
+            hls.off(HlsCtor.Events.MANIFEST_PARSED, onParsed);
+          }
+        }, 10_000);
+        hls.on(HlsCtor.Events.MANIFEST_PARSED, onParsed);
+      }
     }, REPLAY_RESNAPSHOT_MS);
   }, [createHlsPlayer, replaySnapshotUrl]);
 
