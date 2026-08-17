@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import sys
 import threading
-
+import time
 from services import archive_transcribe as at
 
 GIB = 1024 ** 3
@@ -38,6 +38,51 @@ def _force_cpu(monkeypatch) -> None:
     monkeypatch.setattr(at, "_free_system_ram_bytes", lambda: 64 * GIB)
     monkeypatch.setattr(at, "_cpu_load_high", lambda: False)  # not contended
 
+
+
+def test_cpu_cap_env_above_40_percent_is_clamped(monkeypatch):
+    monkeypatch.setattr("os.cpu_count", lambda: 20)
+    monkeypatch.setenv(at.CPU_CAP_ENV, "0.9")
+    assert at._cpu_thread_budget() == 8
+
+
+def test_gpu_copies_share_the_total_lane_budget(monkeypatch):
+    _force_cuda(monkeypatch)
+    monkeypatch.setattr("os.cpu_count", lambda: 4)
+    monkeypatch.delenv(at.CPU_CAP_ENV, raising=False)
+    monkeypatch.setenv(at.GPU_COPIES_ENV, "8")
+    monkeypatch.setenv(at.WORKERS_ENV, "8")
+    monkeypatch.delattr(at._multi_tls, "plan", raising=False)
+    monkeypatch.delattr(at._multi_tls, "asr_threads", raising=False)
+    plan = at._worker_plan()
+    assert plan == [("cuda", "int8")]
+    assert len(plan) * at._parakeet_threads() <= at._cpu_thread_budget() == 1
+
+
+def test_shared_cpu_limiter_serializes_offpool_stages(monkeypatch):
+    monkeypatch.setattr("os.cpu_count", lambda: 4)
+    monkeypatch.delenv(at.CPU_CAP_ENV, raising=False)
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def run_stage():
+        nonlocal active, peak
+        with at.transcription_cpu_limiter(1):
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.02)
+            with lock:
+                active -= 1
+
+    threads = [threading.Thread(target=run_stage) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert peak == 1
+    assert at._cpu_limiter_active == 0
 
 # --- _worker_plan shapes ----------------------------------------------------
 
@@ -126,6 +171,24 @@ def test_plan_ram_clamp_binds_cpu_slots(monkeypatch):
     # usable 3.2 GiB // 1.5 GiB per CPU worker -> 2 slots (not 8); the GPU
     # copy (default 1, no VRAM probe) passes through untouched.
     assert at._worker_plan() == [("cuda", "int8"), ("cpu", "int8"), ("cpu", "int8")]
+
+
+def test_pool_initializer_keeps_one_stable_thread_plan(monkeypatch):
+    monkeypatch.setattr("os.cpu_count", lambda: 20)
+    monkeypatch.delenv(at.CPU_CAP_ENV, raising=False)
+    monkeypatch.delattr(at._multi_tls, "plan", raising=False)
+    monkeypatch.delattr(at._multi_tls, "asr_threads", raising=False)
+    plan = [("cuda", "int8")] * 8  # max_workers override, cap budget is 8
+    at._worker_thread_init(plan)
+    try:
+        monkeypatch.setattr(
+            at, "_worker_plan", lambda: (_ for _ in ()).throw(AssertionError("replanned"))
+        )
+        assert at._parakeet_threads() == 1
+    finally:
+        at._multi_tls.plan = None
+        at._multi_tls.asr_threads = None
+        at._multi_tls.pin = None
 
 
 # --- per-thread pin ---------------------------------------------------------

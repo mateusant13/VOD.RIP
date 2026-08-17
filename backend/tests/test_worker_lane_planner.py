@@ -213,9 +213,9 @@ def test_run_worker_swaps_pool_when_gpu_frees():
     """plan-watch turns a CPU-only worker GPU-on without restart.
 
     _pool_plan returns CPU-only first (GPU held), then hybrid once the GPU
-    frees — run_worker must create a SECOND pool pinned to the CUDA plan
-    and drain the old one, instead of keeping the static CPU plan for the
-    life of the process."""
+    frees — run_worker must create a SECOND pool pinned to the CUDA plan,
+    fully drain and close the old executor before creating the replacement,
+    and close the replacement on exit."""
     import threading
     import time as _time
 
@@ -224,6 +224,7 @@ def test_run_worker_swaps_pool_when_gpu_frees():
     mp = pytest.MonkeyPatch()
     state = {"i": 0}
     calls = []
+    lifecycle = []
 
     def _fake_plan(_mw):
         if state["i"] < 2:  # initial plan + one watch pass: CPU-only
@@ -237,6 +238,10 @@ def test_run_worker_swaps_pool_when_gpu_frees():
         def __init__(self, *a, **kw):
             calls.append((kw.get("max_workers"), kw.get("initargs")))
             super().__init__(*a, **kw)
+
+        def shutdown(self, wait=True, *, cancel_futures=False):
+            lifecycle.append((id(self), wait))
+            return super().shutdown(wait=wait, cancel_futures=cancel_futures)
 
     mp.setattr(at, "_pool_plan", _fake_plan)
     mp.setattr(at, "ThreadPoolExecutor", RecordingTPE)
@@ -267,6 +272,10 @@ def test_run_worker_swaps_pool_when_gpu_frees():
     assert budget0 == 2 and initargs0[0] == [
         ("cpu", "int8"), ("cpu", "int8"),
     ], calls[0]
+
+    assert len(lifecycle) == 2, lifecycle
+    assert lifecycle[0][1] is True and lifecycle[1][1] is True, lifecycle
+    assert lifecycle[0][0] != lifecycle[1][0], lifecycle
     budget1, initargs1 = calls[1]
     assert budget1 == 2 and initargs1[0] == [
         ("cuda", "int8"), ("cpu", "int8"),

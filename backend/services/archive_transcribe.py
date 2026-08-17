@@ -64,6 +64,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
+
 from functools import lru_cache
 from itertools import count
 from pathlib import Path
@@ -95,15 +97,15 @@ except (ValueError, OverflowError):
     _CPU_CAP_FRAC = 0.4  # bad env value must not crash the import
 if not math.isfinite(_CPU_CAP_FRAC):
     _CPU_CAP_FRAC = 0.4  # inf/nan would blow the budget to the whole box
+_CPU_CAP_FRAC = max(0.0, min(0.4, _CPU_CAP_FRAC))
 
 
 def _cpu_thread_budget() -> int:
-    """Hard ceiling of ASR CPU threads: 40% of logical threads (default), any machine.
+    """Hard ceiling of ASR CPU threads: never above 40% of logical threads.
 
-    _CPU_CAP_FRAC (the import-time parse) is the unset-env fallback; a live
-    env value is re-parsed per call so VODRIP_TRANSCRIBE_CPU_CAP changes
-    apply without a reload. Bad values (unparsable, inf, NaN) fall back to
-    the 0.4 default."""
+    The env value is live-reparsed so a running worker can re-plan, but values
+    above the documented 0.4 ceiling are clamped.  ``max(1, ...)`` is the
+    minimum-progress exception for tiny hosts."""
     frac = _CPU_CAP_FRAC
     raw = os.environ.get(CPU_CAP_ENV, "").strip()
     if raw:
@@ -113,7 +115,38 @@ def _cpu_thread_budget() -> int:
             frac = 0.4
         if not math.isfinite(frac):
             frac = 0.4
+    frac = max(0.0, min(0.4, frac))
     return max(1, int(frac * (os.cpu_count() or 4)))
+
+
+_cpu_limiter_condition = threading.Condition()
+_cpu_limiter_active = 0
+
+
+@contextmanager
+def transcription_cpu_limiter(weight: int = 1) -> Iterator[None]:
+    """Bound CPU-heavy transcription stages across pool and off-pool callers.
+
+    ``weight`` is the stage's own thread budget (ASR/VAD) or one for ffmpeg
+    and live-caption work.  The limiter is process-wide and re-reads the
+    clamped cap while waiting, so a plan change cannot multiply active work.
+    """
+    global _cpu_limiter_active
+    requested = max(1, int(weight))
+    with _cpu_limiter_condition:
+        while True:
+            limit = _cpu_thread_budget()
+            units = min(requested, limit)  # minimum-progress floor on tiny hosts
+            if _cpu_limiter_active + units <= limit:
+                _cpu_limiter_active += units
+                break
+            _cpu_limiter_condition.wait()
+    try:
+        yield
+    finally:
+        with _cpu_limiter_condition:
+            _cpu_limiter_active -= units
+            _cpu_limiter_condition.notify_all()
 # Music/no-speech verdict for captionless YouTube ASR: below this fraction
 # of speech (speech_sec / total_sec) the audio is treated as instrumental
 # music — the video is marked transcript_kind='music' (job done, no ASR
@@ -857,11 +890,10 @@ def _worker_plan() -> list[tuple[str, str]]:
         if _cpu_load_high() or caption_session_active():
             slots = min(slots, 1)  # contended box / live captions — at most one quiet thread
         return [("cpu", "int8")] * slots
-    gpu_slots = _gpu_copies()
+    gpu_slots = min(_gpu_copies(), _cpu_thread_budget())
     cpu_slots = _ram_worker_clamp(_cpu_worker_ceiling(), _CPU_WORKER_RSS_EST)
-    # len(plan) <= budget: GPU recognizers spawn num_threads too, so the CPU
-    # side must shrink below the budget by the GPU slot count (each slot
-    # uses >= 1 thread; the floor-1 product then never exceeds the cap).
+    # GPU recognizers also consume host decode threads.  Count every slot
+    # against one total budget before adding the CPU side.
     cpu_slots = min(cpu_slots, max(0, _cpu_thread_budget() - gpu_slots))
     if _cpu_load_high() or caption_session_active():
         cpu_slots = min(cpu_slots, 1)
@@ -1077,14 +1109,14 @@ def _thread_pin() -> Optional[tuple[str, str]]:
 
 
 def _worker_thread_init(plan: list[tuple[str, str]], lane_model: Optional[str] = None) -> None:
-    """ThreadPoolExecutor initializer — pin this pool thread to its slot.
+    """Pin a pool thread and retain the executor's immutable plan snapshot.
 
-    Threads are created one at a time in submission order, so thread i gets
-    plan[i % len(plan)] (the modulo guards a second pool in the same
-    process, whose threads keep counting past the first pool's). GPU-slot
-    threads also pin the ladder model (e.g. 'medium' on entry cards); CPU
-    slots keep the user's active model."""
-    _multi_tls.pin = plan[next(_pool_thread_seq) % len(plan)]
+    The snapshot is consumed by every lazy recognizer/VAD load on this thread;
+    a live planner recheck cannot silently change its thread count mid-pool."""
+    plan_snapshot = tuple(plan) or (("cpu", "int8"),)
+    _multi_tls.plan = plan_snapshot
+    _multi_tls.asr_threads = _plan_thread_count(plan_snapshot)
+    _multi_tls.pin = plan_snapshot[next(_pool_thread_seq) % len(plan_snapshot)]
     _multi_tls.lane_model = (
         lane_model if _multi_tls.pin and _multi_tls.pin[0] == "cuda" else None
     )
@@ -1454,18 +1486,26 @@ def _parakeet_langs() -> frozenset[str]:
     return PARAKEET_LANG_CANDIDATES
 
 
-def _parakeet_threads() -> int:
-    """sherpa-onnx decode threads per recognizer: the FULL pool slot count
-    (GPU + CPU — every recognizer spawns num_threads, so the 40% cap must
-    count all lanes), the box's cores divided by that, capped at the
-    A/B-measured 8-thread sweet spot AND the hard thread budget. Called from
-    _load_parakeet under _model_lock; _worker_plan() takes only leaf locks
-    (_vram_lock/_cpu_load_lock — never _model_lock), so no lock cycle.
-    Machine-aware: a 20-thread box with a 4-slot plan (1 GPU + 3 CPU) gets
-    2 -> 8 ASR threads total = 40% (was 6 CPU-only -> 18/20, 90%)."""
-    lanes = len(_worker_plan())  # every slot's recognizer spawns num_threads threads
+def _plan_thread_count(plan: Any) -> int:
+    """Return one recognizer's threads for an immutable lane plan."""
+    lanes = max(1, len(plan))
     cores = os.cpu_count() or 4
     return max(1, min(_PARAAKEET_MAX_THREADS, cores // lanes, _cpu_thread_budget() // lanes))
+
+
+def _parakeet_threads(plan: Optional[Any] = None) -> int:
+    """Threads per recognizer from this pool thread's stable plan snapshot.
+
+    Direct callers keep the legacy API: without an executor snapshot, take one
+    plan for this load and use it consistently until the recognizer is built."""
+    if plan is None:
+        cached = getattr(_multi_tls, "asr_threads", None)
+        if cached is not None and getattr(_multi_tls, "plan", None) is not None:
+            return cached
+        plan = getattr(_multi_tls, "plan", None)
+        if plan is None:
+            plan = tuple(_worker_plan())
+    return _plan_thread_count(plan)
 
 
 class _AsrRoutingError(Exception):
@@ -1609,12 +1649,13 @@ def _load_parakeet(provider: str = "cpu") -> Any:
 
     d = _parakeet_model_dir()
     t0 = time.monotonic()
+    threads = _parakeet_threads()
     kwargs = dict(
         encoder=str(d / "encoder.int8.onnx"),
         decoder=str(d / "decoder.int8.onnx"),
         joiner=str(d / "joiner.int8.onnx"),
         tokens=str(d / "tokens.txt"),
-        num_threads=_parakeet_threads(),
+        num_threads=threads,
         sample_rate=SAMPLE_RATE,
         feature_dim=_PARAAKEET_FEATURE_DIM,
         model_type="nemo_transducer",
@@ -1623,7 +1664,8 @@ def _load_parakeet(provider: str = "cpu") -> Any:
         _ensure_cuda_libs()  # onnxruntime_providers_cuda.dll needs the cu12 DLLs on PATH
         kwargs["provider"] = provider
     try:
-        rec = sherpa_onnx.OfflineRecognizer.from_transducer(**kwargs)
+        with transcription_cpu_limiter(threads):
+            rec = sherpa_onnx.OfflineRecognizer.from_transducer(**kwargs)
         if provider != "cpu":
             with _cuda_resident_lock:
                 _cuda_recognizers_resident += 1
@@ -1637,11 +1679,12 @@ def _load_parakeet(provider: str = "cpu") -> Any:
             "parakeet CUDA recognizer failed to load (%s) — falling back to CPU "
             "(GPU slots stay CPU for the rest of this process)", exc,
         )
-        rec = sherpa_onnx.OfflineRecognizer.from_transducer(**kwargs)
+        with transcription_cpu_limiter(threads):
+            rec = sherpa_onnx.OfflineRecognizer.from_transducer(**kwargs)
         provider = "cpu"
     logger.info(
         "Parakeet recognizer loaded in %.1fs (provider=%s threads=%d, cache=%s)",
-        time.monotonic() - t0, provider, _parakeet_threads(), _parakeet_cache_dir(),
+        time.monotonic() - t0, provider, threads, _parakeet_cache_dir(),
     )
     return rec
 
@@ -1811,7 +1854,8 @@ def _transcribe_batch_parakeet(
                 stream.accept_waveform(SAMPLE_RATE, audio[s0:s1])
                 streams.append(stream)
             try:
-                rec.decode_streams(streams)
+                with transcription_cpu_limiter(_parakeet_threads()):
+                    rec.decode_streams(streams)
                 items = []
                 for j, (cs, ce) in enumerate(sub):
                     base = 0.0 if clip_offsets is None else clip_offsets[offset + j]
@@ -1840,7 +1884,8 @@ def _transcribe_batch_parakeet(
         clip = audio[s0:s1]
         stream = rec.create_stream()
         stream.accept_waveform(SAMPLE_RATE, clip)
-        rec.decode_stream(stream)
+        with transcription_cpu_limiter(_parakeet_threads()):
+            rec.decode_stream(stream)
         out.append((_clip_items(stream, cs, ce, base), language))
     return out
 
@@ -1857,10 +1902,12 @@ def decode_audio(path: str, ffmpeg_bin: Optional[str] = None) -> "Any":
     if ffmpeg_bin is None:
         ffmpeg_bin = _resolve_ffmpeg_exe()
     cmd = [
-        ffmpeg_bin, "-nostdin", "-v", "error", "-i", str(path),
+        ffmpeg_bin, "-nostdin", "-v", "error", "-threads", "1",
+        "-i", str(path), "-threads", "1",
         "-f", "f32le", "-ac", "1", "-ar", str(SAMPLE_RATE), "-",
     ]
-    proc = sp.run(cmd, capture_output=True, timeout=3600, creationflags=_NO_WINDOW)
+    with transcription_cpu_limiter(1):
+        proc = sp.run(cmd, capture_output=True, timeout=3600, creationflags=_NO_WINDOW)
     if proc.returncode != 0:
         stderr = (proc.stderr or b"").decode("utf-8", "replace")[-300:]
         raise RuntimeError(f"ffmpeg decode failed for {path}: {stderr}")
@@ -2003,10 +2050,13 @@ def _decode_to_shards(
     tmpdir = Path(out_dir) if out_dir else Path(tempfile.mkdtemp(prefix="vodrip-shards-"))
     shard_bytes = int(shard_sec * SAMPLE_RATE) * np.dtype(np.int16).itemsize
     cmd = [
-        ffmpeg_bin, "-nostdin", "-v", "error", "-i", str(path),
+        ffmpeg_bin, "-nostdin", "-v", "error", "-threads", "1",
+        "-i", str(path), "-threads", "1",
         "-f", "s16le", "-ac", "1", "-ar", str(SAMPLE_RATE), "-",
     ]
     proc: Optional[sp.Popen] = None
+    _ffmpeg_guard = transcription_cpu_limiter(1)
+    _ffmpeg_guard.__enter__()
     try:
         proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE, creationflags=_NO_WINDOW)
         idx = 0
@@ -2041,6 +2091,7 @@ def _decode_to_shards(
                 proc.wait()
         if own_dir:
             shutil.rmtree(tmpdir, ignore_errors=True)
+        _ffmpeg_guard.__exit__(None, None, None)
 
 
 def _merge_speech_regions(
@@ -2145,22 +2196,22 @@ _VAD_MIN_SILENCE_MS = 200
 _VAD_PAD_MS = 30
 
 
+def _vad_thread_count() -> int:
+    """VAD's torch/ONNX CPU weight from the same stable lane plan."""
+    return min(_VAD_TORCH_THREADS, _parakeet_threads())
+
+
 def _load_vad() -> Any:
     """Build one Silero VAD model (torch .jit by default, ONNX opt-in).
 
-    Multi-lane workers pin torch intra-op threads to _VAD_TORCH_THREADS so
-    N lanes don't each grab all the box's cores (torch.set_num_threads is a
-    process-global knob — pinning it from the first loading lane covers the
-    others). Single-lane callers keep the torch default.
-    """
+    Torch intra-op threads are bounded by the recognizer's stable plan even
+    for off-pool live-caption callers; ONNX sessions already use one thread."""
     if os.environ.get("VODRIP_VAD_ONNX", "").strip() == "1":
         return _load_onnx_vad()
     from silero_vad import load_silero_vad
 
-    if _in_multi_mode():
-        import torch
-
-        torch.set_num_threads(_VAD_TORCH_THREADS)
+    import torch
+    torch.set_num_threads(_vad_thread_count())
     return load_silero_vad(onnx=False)
 
 
@@ -2450,17 +2501,18 @@ def vad_speech_seconds(audio: "Any") -> list[tuple[float, float]]:
     # per-thread instance (_get_vad) so VAD runs in parallel — no lock on
     # the lane path. Only the off-pool callers that share the global
     # instance (live captions, direct calls) re-serialize here.
-    if _in_multi_mode():
-        if isinstance(vad, _OnnxVad):
-            probs = _vad_probs_onnx(audio, vad)
-        else:
-            probs = _vad_probs_torch(audio, vad)
-    else:
-        with _vad_lock:
+    with transcription_cpu_limiter(_vad_thread_count()):
+        if _in_multi_mode():
             if isinstance(vad, _OnnxVad):
                 probs = _vad_probs_onnx(audio, vad)
             else:
                 probs = _vad_probs_torch(audio, vad)
+        else:
+            with _vad_lock:
+                if isinstance(vad, _OnnxVad):
+                    probs = _vad_probs_onnx(audio, vad)
+                else:
+                    probs = _vad_probs_torch(audio, vad)
     return _vad_regions(probs, len(audio))
 
 
@@ -2804,10 +2856,10 @@ def _fetch_remote_audio_wav(platform: str, video_id: str, channel: str, out_wav:
             raise RuntimeError(f"Kick VOD {video_id} has no HLS source")
         audio_url = info.m3u8_url
         headers = {"referer": url, "origin": _BASE}
-    cmd = [ffmpeg, "-y", "-v", "error"]
+    cmd = [ffmpeg, "-y", "-v", "error", "-threads", "1"]
     for key, value in (headers or {}).items():
         cmd += ["-headers", f"{key}: {value}"]
-    cmd += ["-i", audio_url, "-vn", "-ac", "1", "-ar", "16000",
+    cmd += ["-i", audio_url, "-threads", "1", "-vn", "-ac", "1", "-ar", "16000",
             "-f", "wav", str(out_wav)]
     # P1-2: sp.run is ONE blocking call with no progress signal — a slow/
     # throttled CDN would let the job's heartbeat go stale (the fetch
@@ -2834,7 +2886,8 @@ def _fetch_remote_audio_wav(platform: str, video_id: str, channel: str, out_wav:
     )
     watchdog.start()
     try:
-        proc = sp.run(cmd, capture_output=True, timeout=_REMOTE_AUDIO_FETCH_TIMEOUT_S)
+        with transcription_cpu_limiter(1):
+            proc = sp.run(cmd, capture_output=True, timeout=_REMOTE_AUDIO_FETCH_TIMEOUT_S)
     except sp.TimeoutExpired as exc:
         raise TimeoutError(
             f"{platform} VOD audio fetch exceeded "
@@ -4042,11 +4095,10 @@ def run_worker(
 
     DYNAMIC PLAN (natural plan only, max_workers=None): the pool plan is
     re-evaluated every _PLAN_RECHECK_S by a daemon plan-watch thread. When
-    the GPU frees up (another app closed) or gets grabbed, the watch
-    proposes the new plan and the main loop swaps the executor: in-flight
-    jobs run out on the old pool (shutdown(wait=False)), fresh claims go to
-    the new one — a GPU that becomes free turns the worker GPU-on without a
-    max_workers plans are static (tests/launchers pin them).
+    the GPU frees up (another app closed) or gets grabbed, the watch proposes
+    a new plan; the current executor drains fully before the replacement is
+    created, so old/new inference never overlaps. max_workers plans are static
+    (tests/launchers pin them).
     """
     global _pool_thread_seq
     _reap_stale_shard_dirs()  # one cleanup pass per boot; orphaned shards only
@@ -4057,9 +4109,9 @@ def run_worker(
     logger.info("archive transcribe worker: plan=[%s] workers=%d",
                 ", ".join(f"{d}/{ct}" for d, ct in plan), budget)
     # Dynamic plan re-evaluation: a GPU that frees up (or gets grabbed) is
-    # noticed within ~_PLAN_RECHECK_S and the pool is swapped. In-flight
-    # jobs finish on the OLD executor (shutdown(wait=False) lets them run
-    # out); the new executor only takes fresh claims, so no job is lost.
+    # noticed within ~_PLAN_RECHECK_S.  A proposed replacement waits for the
+    # current executor to drain before creation, so old/new inference never
+    # overlaps and every executor can be closed deterministically.
     # The watch runs in a daemon thread because a recheck can block ~60 s on
     # the VRAM median after a held->free transition — the main loop never
     # waits for that, it only consumes the cheap proposal.
@@ -4088,67 +4140,82 @@ def run_worker(
     _pool_thread_seq = count()  # realign: new pool pins thread 0 -> plan[0]
     pool = _make_pool(plan, budget)
     try:
-        with pool:
-            # Per-slot claim loop: each finished future frees a slot and a
-            # refill claims the next job immediately. The old await-all
-            # barrier idled every worker behind the slowest job of the batch
-            # (a 10-min clip sat ~1h behind a 13.5h VOD).
-            pending: dict = {}  # Future -> claimed job
+        # Per-slot claim loop: each finished future frees a slot and a
+        # refill claims the next job immediately. The old await-all
+        # barrier idled every worker behind the slowest job of the batch
+        # (a 10-min clip sat ~1h behind a 13.5h VOD).
+        pending: dict = {}  # Future -> claimed job
 
-            def _refill() -> None:
-                while len(pending) < budget:
-                    job = _claim_next_job()
-                    if job is None:
-                        return
-                    pending[pool.submit(_process_job, job, multi=multi)] = job
+        def _refill() -> None:
+            while len(pending) < budget:
+                job = _claim_next_job()
+                if job is None:
+                    return
+                pending[pool.submit(_process_job, job, multi=multi)] = job
 
-            _refill()
-            while not _WORKER_STOP.is_set():
-                _maybe_close_idle_model()
-                archive_db.worker_heartbeat("transcribe")
-                with _proposal_lock:
-                    proposed = tuple(plan_proposal)
-                    if proposed:
-                        plan_proposal.clear()
+        _refill()
+        while not _WORKER_STOP.is_set():
+            _maybe_close_idle_model()
+            archive_db.worker_heartbeat("transcribe")
+            with _proposal_lock:
+                proposed = tuple(plan_proposal)
                 if proposed:
-                    (new_plan,) = proposed
+                    plan_proposal.clear()
+            if proposed:
+                (new_plan,) = proposed
+                if new_plan != plan:
                     old_pool = pool
-                    old_pool.shutdown(wait=False)  # in-flight run out there
+                    # Correctness over instantaneous reconfiguration:
+                    # drain every old inference before resetting pin state.
+                    while pending:
+                        done, _ = wait(pending)
+                        for fut in done:
+                            pending.pop(fut, None)
+                            try:
+                                fut.result()
+                            except Exception:
+                                logger.exception("worker future crashed while draining")
+                    old_pool.shutdown(wait=True)
+                    # Thread IDs can be reused by the replacement pool;
+                    # drop their recognizers before resetting the slot seq.
+                    close_model()
                     plan, budget, multi = new_plan, len(new_plan), len(new_plan) > 1
                     _pool_thread_seq = count()  # realign pins to the new plan
                     pool = _make_pool(plan, budget)
                     logger.info(
                         "archive transcribe worker: plan changed -> [%s] "
-                        "workers=%d (old pool draining)",
+                        "workers=%d (old pool drained)",
                         ", ".join(f"{d}/{ct}" for d, ct in plan), budget,
                     )
-                if not pending:
-                    if once:
-                        break
-                    time.sleep(poll_interval)
                     _refill()
-                    continue
-                done, _ = wait(pending, timeout=poll_interval)
-                for fut in done:
-                    pending.pop(fut, None)
-                    try:
-                        result = fut.result()
-                    except Exception:
-                        logger.exception("worker future crashed")  # belt & braces
-                        result = None
-                    _refill()
-                    # --once must not spin on a requeued job: the YouTube
-                    # bot-gate cooldown requeues the same row until the
-                    # freeze lifts, so the queue is NOT drained. Exit 0 and
-                    # let the next invocation retry later.
-                    if once and isinstance(result, dict) and result.get("requeued"):
-                        return
-                if once and not pending:
+            if not pending:
+                if once:
                     break
+                time.sleep(poll_interval)
+                _refill()
+                continue
+            done, _ = wait(pending, timeout=poll_interval)
+            for fut in done:
+                pending.pop(fut, None)
+                try:
+                    result = fut.result()
+                except Exception:
+                    logger.exception("worker future crashed")  # belt & braces
+                    result = None
+                _refill()
+                # --once must not spin on a requeued job: the YouTube
+                # bot-gate cooldown requeues the same row until the
+                # freeze lifts, so the queue is NOT drained. Exit 0 and
+                # let the next invocation retry later.
+                if once and isinstance(result, dict) and result.get("requeued"):
+                    return
+            if once and not pending:
+                break
     finally:
         if max_workers is None:
             watch_stop.set()
             watch.join(timeout=2.0)
+        pool.shutdown(wait=True)
         close_model()
 
 
@@ -4683,8 +4750,8 @@ def _run_module_selfcheck() -> None:
         _saved_cap_env = os.environ.get(CPU_CAP_ENV)
         try:
             os.environ[CPU_CAP_ENV] = "0.5"
-            assert _cpu_thread_budget() == max(1, int(0.5 * (os.cpu_count() or 4))), (
-                "the CPU cap env must scale the thread budget"
+            assert _cpu_thread_budget() == max(1, int(0.4 * (os.cpu_count() or 4))), (
+                "a CPU cap above 0.4 must stay clamped at the hard ceiling"
             )
             os.environ[CPU_CAP_ENV] = "banana"
             assert _cpu_thread_budget() == max(1, int(0.4 * (os.cpu_count() or 4))), (

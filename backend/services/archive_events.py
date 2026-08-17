@@ -242,6 +242,12 @@ def _sed_model() -> Any:
         from panns_inference import SoundEventDetection
 
         ckpt = _ensure_checkpoint()
+        try:
+            import torch
+            from services.archive_transcribe import _parakeet_threads
+            torch.set_num_threads(_parakeet_threads())
+        except Exception:
+            pass
         t0 = time.monotonic()
         _sed = SoundEventDetection(checkpoint_path=ckpt, device=want)
         _sed_device = want
@@ -357,6 +363,7 @@ def detect_events(
     keep the same absolute offsets either way."""
     import numpy as np
     import librosa
+    from services.archive_transcribe import _parakeet_threads, transcription_cpu_limiter
 
     if classes is None:
         classes = event_classes(_labels_of(_sed_model()))
@@ -380,7 +387,8 @@ def detect_events(
             chunk = seg[ws : ws + win_samples]
             if len(chunk) < win_samples:  # pad the tail window with zeros
                 chunk = np.pad(chunk, (0, win_samples - len(chunk)))
-            frame = sed.inference(chunk[None, :])  # (1, n_frames, 527)
+            with transcription_cpu_limiter(_parakeet_threads()):
+                frame = sed.inference(chunk[None, :])  # (1, n_frames, 527)
             frame = np.asarray(frame[0])[:, cls_idx]
             events.extend(extract_events(
                 frame, classes, threshold=threshold, min_sec=min_sec,

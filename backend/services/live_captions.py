@@ -210,14 +210,15 @@ def _decode_audio_bytes(data: bytes) -> "Any":
     temp files, one subprocess per segment (~100ms).
     """
     import numpy as np
-
-    from services.ytdlp_ffmpeg import _resolve_ffmpeg_exe
+    from services import archive_transcribe as at
 
     cmd = [
-        _resolve_ffmpeg_exe(), "-v", "error", "-i", "pipe:0",
+        _resolve_ffmpeg_exe(), "-v", "error", "-threads", "1",
+        "-i", "pipe:0", "-threads", "1",
         "-f", "f32le", "-ac", "1", "-ar", "16000", "-",
     ]
-    proc = sp.run(cmd, input=data, capture_output=True, timeout=60)
+    with at.transcription_cpu_limiter(1):
+        proc = sp.run(cmd, input=data, capture_output=True, timeout=60)
     if proc.returncode != 0:
         stderr = (proc.stderr or b"").decode("utf-8", "replace")[-300:]
         raise RuntimeError(f"ffmpeg segment decode failed: {stderr}")
