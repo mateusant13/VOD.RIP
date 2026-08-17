@@ -163,14 +163,14 @@ def test_legacy_single_model_invariant(monkeypatch):
 
 
 def test_plan_ram_clamp_binds_cpu_slots(monkeypatch):
-    """CPU slots share the host-RAM budget (conservative by design)."""
+    """CPU slots account for the GPU copy's shared host-RAM estimate."""
     _force_cuda(monkeypatch)
     monkeypatch.setenv(at.WORKERS_ENV, "8")
     monkeypatch.delenv(at.GPU_COPIES_ENV, raising=False)
     monkeypatch.setattr(at, "_free_system_ram_bytes", lambda: 4 * GIB)
-    # usable 3.2 GiB // 1.5 GiB per CPU worker -> 2 slots (not 8); the GPU
-    # copy (default 1, no VRAM probe) passes through untouched.
-    assert at._worker_plan() == [("cuda", "int8"), ("cpu", "int8"), ("cpu", "int8")]
+    # usable 3.2 GiB - 1 GiB GPU host estimate leaves 2.2 GiB: one
+    # 1.5 GiB CPU lane, not the unsafe two-lane plan.
+    assert at._worker_plan() == [("cuda", "int8"), ("cpu", "int8")]
 
 
 def test_pool_initializer_keeps_one_stable_thread_plan(monkeypatch):

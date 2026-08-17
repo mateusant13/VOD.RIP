@@ -619,21 +619,27 @@ def _free_system_ram_bytes() -> int:
     return free
 
 
-def _ram_worker_clamp(configured: int, per_worker_est: int) -> int:
-    """min(configured, max(1, usable_free_ram // per_worker_est)).
+def _ram_worker_clamp(
+    configured: int,
+    per_worker_est: int,
+    *,
+    reserved_bytes: int = 0,
+) -> int:
+    """Clamp slots to usable free RAM after ``reserved_bytes`` is reserved.
 
-    usable = free * (1 - _RAM_HEADROOM) — the headroom fraction of free RAM
-    is never committed to the worker budget. Returns `configured` unchanged
-    when free RAM is unknown (0), mirroring the VRAM probe-failure path.
-    Never drops below 1; a configured 1 passes through untouched so the
-    legacy single-model path is exact regardless of RAM."""
-    if configured <= 1:
-        return configured
+    GPU and CPU lane estimates share host RAM.  A zero result is allowed only
+    when a preceding GPU reservation consumes the available budget; CPU-only
+    plans retain the one-slot minimum-progress floor."""
+    if configured <= 0:
+        return 0
     free = _free_system_ram_bytes()
     if free <= 0:
         return configured
-    usable = int(free * (1.0 - _RAM_HEADROOM))
-    return max(1, min(configured, usable // per_worker_est))
+    usable = max(0, int(free * (1.0 - _RAM_HEADROOM)) - max(0, reserved_bytes))
+    slots = usable // per_worker_est
+    if reserved_bytes:
+        return min(configured, slots)
+    return max(1, min(configured, slots))
 
 
 # GPU lane VRAM floor (parakeet-only): the GPU lane exists whenever the
@@ -891,7 +897,11 @@ def _worker_plan() -> list[tuple[str, str]]:
             slots = min(slots, 1)  # contended box / live captions — at most one quiet thread
         return [("cpu", "int8")] * slots
     gpu_slots = min(_gpu_copies(), _cpu_thread_budget())
-    cpu_slots = _ram_worker_clamp(_cpu_worker_ceiling(), _CPU_WORKER_RSS_EST)
+    cpu_slots = _ram_worker_clamp(
+        _cpu_worker_ceiling(),
+        _CPU_WORKER_RSS_EST,
+        reserved_bytes=gpu_slots * _GPU_COPY_RSS_EST,
+    )
     # GPU recognizers also consume host decode threads.  Count every slot
     # against one total budget before adding the CPU side.
     cpu_slots = min(cpu_slots, max(0, _cpu_thread_budget() - gpu_slots))
