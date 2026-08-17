@@ -482,7 +482,15 @@ class LiveCaptioner:
         # (event, data) tuples — consumed by the SSE generator. Bounded so a
         # slow subscriber drops blocks instead of stalling the worker.
         self.events: asyncio.Queue = asyncio.Queue(maxsize=_QUEUE_MAX)
-        self._low_latency = (os.environ.get(LOW_LATENCY_ENV, "0") or "0").strip() == "1"
+        # Read from settings first, fall back to env var for backward compat.
+        try:
+            from deps import settings_mgr
+            _low_lat = settings_mgr.get().caption_low_latency
+        except Exception:
+            _low_lat = False
+        if not _low_lat:
+            _low_lat = (os.environ.get(LOW_LATENCY_ENV, "0") or "0").strip() == "1"
+        self._low_latency = bool(_low_lat)
         _default_window = WINDOW_SEC_REDUCED if self._low_latency else WINDOW_SEC
         self.window_sec = window_sec if window_sec is not None else _env_float(WINDOW_SEC_ENV, _default_window)
         self.poll_sec = poll_sec if poll_sec is not None else _env_float(POLL_SEC_ENV, POLL_SEC)

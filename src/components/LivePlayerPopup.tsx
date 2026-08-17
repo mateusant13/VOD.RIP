@@ -1129,7 +1129,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       // (duration = buffered end) instead of Infinity, so setting currentTime
       // can seek back into the retained back-buffer above.
       liveDurationInfinity: false,
-      maxLiveSyncPlaybackRate: 1.5,
+      maxLiveSyncPlaybackRate: 1.2,
       startPosition: -1,
       autoStartLoad: !replay,
     });
