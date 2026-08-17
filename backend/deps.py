@@ -77,9 +77,9 @@ CHANNEL_DAYS_DEFAULT = 14
 CHANNEL_LIMIT_MAX = 250
 CHANNEL_CLIP_LIMIT = 25
 CHANNEL_CLIP_MAX_DURATION_SEC = 60
-CLIP_FETCH_TIMEOUT_SEC = 35
-CHANNEL_VOD_FETCH_TIMEOUT_SEC = 45
-YOUTUBE_CHANNEL_FETCH_TIMEOUT_SEC = 90  # ponytail: yt-dlp cold bootstrap + enrich can exceed 45s
+CLIP_FETCH_TIMEOUT_SEC = 20
+CHANNEL_VOD_FETCH_TIMEOUT_SEC = 20
+YOUTUBE_CHANNEL_FETCH_TIMEOUT_SEC = 30  # ponytail: yt-dlp cold bootstrap + enrich; was90s but health watchdog triggers at 45s
 # Delta refresh: after the disk index is warm, refreshes fetch only the
 # newest N items per platform and merge — never the full list again.
 CHANNEL_DELTA_LIMIT = 25

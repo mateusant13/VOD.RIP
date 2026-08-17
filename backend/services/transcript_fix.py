@@ -92,7 +92,7 @@ CACHE_TTL_S = 7 * 24 * 3600
 # overrides both as a single number.
 _DEFAULT_CONF = {"parakeet": 0.5}
 # Engines eligible for the weak path (captions never are — "captions").
-_WEAK_ENGINES = frozenset({"parakeet"})
+_WEAK_ENGINES = frozenset({"parakeet", "whisper"})
 
 # Source-side token maps (exact token match, applied to window tokens; the
 # numeral map also applies to single-token cores where it is vacuous — iv/4
