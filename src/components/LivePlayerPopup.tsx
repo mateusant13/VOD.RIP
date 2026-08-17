@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Captions, ExternalLink, Languages, Loader2, Maximize2, Minimize2, MessageSquare, Pause, Play, Search, Volume2, VolumeX, RefreshCw, X } from 'lucide-react';
+import { Captions, ExternalLink, Languages, Loader2, Maximize2, Minimize2, MessageSquare, Pause, Play, Search, Settings, Volume2, VolumeX, RefreshCw, X } from 'lucide-react';
 import { apiDelete, apiPost } from '../hooks/useApiClient';
 import { archiveVideoIdFromUrl } from '../archiveScope';
 import { buildVodUrl } from '../channelUtils';
@@ -167,9 +167,6 @@ const CAPTION_MAX_PDT_ANCHORS = 16;
  *  clamp; the choice persists under the same key the buttons used. */
 const CAPTION_FONT_MIN_PX = 14;
 const CAPTION_FONT_MAX_PX = 48;
-/** Drag distance (px) per 1px of font growth — 2px of drag ≈ one old A−/A+
- *  step, so the resize feel is unchanged. */
-const CAPTION_FONT_DRAG_DIVISOR = 2;
 const CAPTION_FONT_STORAGE_KEY = 'vodrip.live.captionFontSize';
 /** Per-session caption translate-target override — the in-player selector
  *  (pt-BR / English / Español) sends ?lang= on the caption SSE so the
@@ -405,6 +402,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   // Buffering UX (mirrors the mini preview player's waiting→spinner debounce)
   const [buffering, setBuffering] = useState(false);
   const bufferingTimerRef = useRef<number | null>(null);
+  /** True once the video has started playing at least once (playing/canplay
+   *  fired). The buffering overlay is suppressed during the initial load
+   *  spinner and only shows after playback has started then stalled. */
+  const hasPlayedOnceRef = useRef(false);
   const pendingReplaySeekRef = useRef<number | null>(null);
   // True when the user paused (togglePlay) — unexpected pauses (e.g. the
   // play() promise aborting on a live-sync seek) auto-resume instead.
@@ -537,6 +538,17 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     }
   }, [captionLang]);
   const [captionLangMenuOpen, setCaptionLangMenuOpen] = useState(false);
+  const [captionFontSizeMenuOpen, setCaptionFontSizeMenuOpen] = useState(false);
+  /** True once at least one caption was received via SSE — controls the
+   *  overlay visibility independently of captionsAvailable (the /available
+   *  probe result). Show captions as soon as text arrives, even while the
+   *  probe is still resolving. */
+  const [captionsHeard, setCaptionsHeard] = useState(false);
+  // Delay SSE creation by one render cycle to avoid React 19 StrictMode
+  // double-mount creating two EventSource instances. The probe runs in
+  // parallel; the SSE opens before the probe resolves (~50-200ms fetch).
+  const [sseReady, setSseReady] = useState(false);
+  useEffect(() => { setSseReady(true); }, []);
   const [caption, setCaption] = useState<CaptionBlock | null>(null);
   // Caption clock anchor state — refs (mutated by hls events + SSE, read by
   // the timeupdate sync; no re-render needed for the map itself):
@@ -549,36 +561,12 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   const captionRetryRef = useRef<{ attempt: number; timer: number | null }>({ attempt: 0, timer: null });
   // Bumping re-opens the caption EventSource (see the SSE effect).
   const [captionSseTick, setCaptionSseTick] = useState(0);
-  // Caption-box drag-resize grip state (mouse-drag only — no A−/A+ buttons).
-  const captionResizeRef = useRef<{ startY: number; startPx: number } | null>(null);
-  /** Start a caption-box resize drag from the overlay's corner grip. */
-  const startCaptionResize = (e: React.PointerEvent<HTMLButtonElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    captionResizeRef.current = { startY: e.clientY, startPx: captionFontSize };
-    try {
-      e.currentTarget.setPointerCapture(e.pointerId);
-    } catch {
-      /* jsdom lacks pointer capture — the drag still works via synthetic moves */
-    }
-  };
-  /** Resize while dragging — drag DOWN = grow (the grip hangs off the box's
-   *  bottom-right corner); 2px of drag per 1px of font (the old A−/A+ feel),
-   *  clamped to the persisted floor/ceiling. */
-  const moveCaptionResize = (e: React.PointerEvent<HTMLButtonElement>) => {
-    const st = captionResizeRef.current;
-    if (!st) return;
-    const next = st.startPx + Math.round((e.clientY - st.startY) / CAPTION_FONT_DRAG_DIVISOR);
-    setCaptionFontSize(Math.min(CAPTION_FONT_MAX_PX, Math.max(CAPTION_FONT_MIN_PX, next)));
-  };
-  const endCaptionResize = (e: React.PointerEvent<HTMLButtonElement>) => {
-    captionResizeRef.current = null;
-    try {
-      e.currentTarget.releasePointerCapture(e.pointerId);
-    } catch {
-      /* not captured */
-    }
-  };
+  // Cold-start fallback:
+  // inside the video area (not the OS desktop). Offset in pixels from the
+  // default bottom-center position; resets on stream change.
+  const captionOverlayDragRef = useRef<{ offsetX: number; offsetY: number }>({ offsetX: 0, offsetY: 0 });
+  const [captionOverlayOffset, setCaptionOverlayOffset] = useState({ x: 0, y: 0 });
+  const captionOverlayDragStartRef = useRef<{ pointerX: number; pointerY: number; offsetX: number; offsetY: number } | null>(null);
   // Cold-start fallback: the newest block dropped by the stale-head shift
   // when EVERY queued block is stale (first anchor landed after the pending
   // windows passed) — re-shown while nothing fresh is due so the overlay
@@ -677,6 +665,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   useEffect(() => {
     setCaption(null); // a new stream starts with a clean overlay
     setCaptionsAvailable(false); // …and a clean availability (per-stream)
+    setCaptionsHeard(false); // …and a clean heard-state (per-stream)
     const st = captionRetryRef.current;
     if (st.timer != null) window.clearTimeout(st.timer);
     captionRetryRef.current = { attempt: 0, timer: null }; // fresh stream — fresh retry budget
@@ -721,7 +710,13 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   }, [captionSource]);
 
   useEffect(() => {
-    if (!captionSource || !captionsAvailable || !captionsEnabled) return;
+    // Open SSE as soon as the caption source exists and captions are enabled.
+    // Don't wait for the /available probe — captions arrive immediately via
+    // SSE while the probe is still resolving (fixes "captions not activating
+    // on open"). Probe in parallel to hide CC if models are truly missing.
+    // sseReady delays creation by one render cycle to avoid StrictMode
+    // double-mount creating two EventSource instances.
+    if (!captionSource || !captionsEnabled || !sseReady) return;
     // jsdom has no EventSource — the chat panel degrades the same way; the
     // tests stub it and drive the handlers directly.
     if (typeof EventSource === 'undefined') return;
@@ -758,6 +753,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     };
     es.addEventListener('caption', (ev) => {
       heardCaption = true;
+      setCaptionsHeard(true);
       captionRetryRef.current.attempt = 0; // healthy frame — reset the retry budget
       try {
         const data = JSON.parse((ev as MessageEvent).data) as CaptionBlock;
@@ -822,10 +818,14 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       // reconnects (a cleanup-per-tick reset would make retries unbounded).
       // It resets on a healthy caption or a stream change (probe effect).
       // A new stream / toggle must not inherit the previous timeline's queue.
+      if (!captionsEnabled) setCaption(null);
       pendingCaptionsRef.current = [];
       staleFallbackRef.current = null;
+      // Reset drag offset — a new stream's overlay starts at default position.
+      captionOverlayDragRef.current = { offsetX: 0, offsetY: 0 };
+      setCaptionOverlayOffset({ x: 0, y: 0 });
     };
-  }, [captionSource, captionsAvailable, captionsEnabled, captionEpochOf, captionClockSync, captionLang, captionSseTick]);
+  }, [captionSource, captionsEnabled, sseReady, captionEpochOf, captionClockSync, captionLang, captionSseTick]);
 
   // Handle level selection (original hls.levels indices)
   const handleQualitySelect = useCallback((index: number) => {
@@ -903,19 +903,21 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   // other player buttons included — closes it. Re-registers as the open state
   // flips so the closure sees the current menu set.
   useEffect(() => {
-    if (!qualityMenuOpen && !volumeMenuOpen && !captionLangMenuOpen) return;
+    if (!qualityMenuOpen && !volumeMenuOpen && !captionLangMenuOpen && !captionFontSizeMenuOpen) return;
     const handler = (e: MouseEvent) => {
       const target = e.target as HTMLElement;
       if (volumeMenuOpen && target.closest('[data-volume-menu]')) return;
       if (qualityMenuOpen && target.closest('[data-quality-menu]')) return;
       if (captionLangMenuOpen && target.closest('[data-caption-lang-menu]')) return;
+      if (captionFontSizeMenuOpen && target.closest('[data-caption-font-size-menu]')) return;
       setQualityMenuOpen(false);
       setVolumeMenuOpen(false);
       setCaptionLangMenuOpen(false);
+      setCaptionFontSizeMenuOpen(false);
     };
     window.addEventListener('mousedown', handler);
     return () => window.removeEventListener('mousedown', handler);
-  }, [qualityMenuOpen, volumeMenuOpen, captionLangMenuOpen]);
+  }, [qualityMenuOpen, volumeMenuOpen, captionLangMenuOpen, captionFontSizeMenuOpen]);
 
   // --- Auto-hide: bump + hide-block rules ---
   // This build has no clip-seconds POPOVER (the seconds field is inline in
@@ -929,7 +931,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       && (el as HTMLInputElement).type === 'text';
   };
   const hideBlocked = paused || loading || error !== null
-    || volumeMenuOpen || qualityMenuOpen || captionLangMenuOpen || isTransportTextFocused();
+    || qualityMenuOpen || captionLangMenuOpen || captionFontSizeMenuOpen || isTransportTextFocused();
   const hideBlockedRef = useRef(hideBlocked);
   hideBlockedRef.current = hideBlocked;
   const controlsHidden = !controlsVisible && !hideBlocked;
@@ -1003,17 +1005,18 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   }, []);
 
   // Debounced waiting→overlay (mirrors attachPreviewBufferingListeners).
-  /** Debounced waiting→overlay. 400ms threshold suppresses transient stalls
-   *  (proxy jitter, segment decode hiccup) that resolve in <1s — only shows
-   *  the spinner when the stall is sustained enough to actually interrupt the
-   *  viewing experience. Live proxy adds ~50-200ms per segment fetch; shorter
-   *  debounces cause false-positive flicker. */
+  /** Debounced waiting→overlay. 1200ms threshold suppresses transient stalls
+   *  (proxy jitter, segment decode hiccup) and the initial-load waiting
+   *  events — only shows the spinner AFTER playback has started once
+   *  (hasPlayedOnceRef) and then stalled. Suppresses the initial spinner
+   *  flicker when the live stream is buffering for the first time. */
   const showBuffering = useCallback(() => {
+    if (!hasPlayedOnceRef.current) return; // initial load — the spinner covers it
     if (bufferingTimerRef.current != null) return;
     bufferingTimerRef.current = window.setTimeout(() => {
       bufferingTimerRef.current = null;
       setBuffering(true);
-    }, 400);
+    }, 1200);
   }, []);
   const clearBuffering = useCallback(() => {
     if (bufferingTimerRef.current != null) {
@@ -1086,17 +1089,9 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       ...twitchAdBlockHlsConfig({ live: true, onAdRotation }),
       enableWorker: true,
       startLevel: 0,
-      lowLatencyMode: true,
-      // Live latency target: TWO segments behind the live edge. count 1
-      // (~2s at non-LL) is too aggressive through a proxy — one slow segment
-      // fetch drains the thin buffer and triggers rebuffering. count 2
-      // (~4s) gives ~2s extra cushion for proxy latency while staying well
-      // under the 12s force-resync ceiling. hls.js count knobs are the
-      // popup's only live-sync geometry — computeLiveEdgeSec mirrors this
-      // (count × targetduration) to keep the edge math exact. count 2 is
-      // the standard for proxy-mediated live playback per hls.js docs.
-      maxBufferLength: 20,
-      maxMaxBufferLength: 40,
+      lowLatencyMode: false, // proxy + LL-HLS stalls — disabled for stable playback
+      maxBufferLength: 30,
+      maxMaxBufferLength: 60,
       // Retained back-buffer = the arrow-seek window: LIVE without a DVR
       // archive still lets ArrowLeft/Right rewind ~30s into the stream (the
       // rail stays disabled — see the keydown listener below).
@@ -1124,14 +1119,12 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         },
       },
       testBandwidth: false,
-      // liveSyncDurationCount 2 = ~4s behind edge at 2s segments. count 1
-      // is too aggressive through a proxy — one slow segment fetch drains
-      // the thin buffer and triggers rebuffering. 2 gives ~2s extra cushion
-      // for proxy latency while staying <5s behind the live edge.
-      liveSyncDurationCount: 2,
+      // 3 segments behind the edge — more cushion than count 2 for
+      // proxy-mediated playback; ~6s at 2s segments.
+      liveSyncDurationCount: 3,
       // hls.js REQUIRES liveMaxLatencyDurationCount > liveSyncDurationCount
-      // (config validation throws otherwise) — 6 ≈ 12s at 2s segments.
-      liveMaxLatencyDurationCount: 6,
+      // — 8 ≈ 16s at 2s segments.
+      liveMaxLatencyDurationCount: 8,
       // twitchAdBlockHlsConfig injects the DURATION variants (liveSyncDuration
       // 3 / liveMaxLatencyDuration 10) for the mini preview; hls.js throws on
       // mixing count + duration variants, so null them — the count knobs
@@ -1522,6 +1515,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       firstFrameLoggedRef.current = true;
       console.info('[live] first-frame', Math.round(performance.now() - firstFrameStartRef.current));
     };
+    const onPlayingMarkPlayed = () => { hasPlayedOnceRef.current = true; };
     video.addEventListener('play', onPlay);
     video.addEventListener('pause', onPause);
     video.addEventListener('volumechange', onVolumeChange);
@@ -1529,8 +1523,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     video.addEventListener('durationchange', onDuration);
     video.addEventListener('waiting', showBuffering);
     video.addEventListener('playing', clearBuffering);
+    video.addEventListener('playing', onPlayingMarkPlayed);
     video.addEventListener('playing', onFirstFrame);
     video.addEventListener('timeupdate', onFirstFrame);
+    video.addEventListener('canplay', onPlayingMarkPlayed);
     video.addEventListener('canplay', clearBuffering);
     return () => {
       video.removeEventListener('play', onPlay);
@@ -1540,8 +1536,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       video.removeEventListener('durationchange', onDuration);
       video.removeEventListener('waiting', showBuffering);
       video.removeEventListener('playing', clearBuffering);
+      video.removeEventListener('playing', onPlayingMarkPlayed);
       video.removeEventListener('playing', onFirstFrame);
       video.removeEventListener('timeupdate', onFirstFrame);
+      video.removeEventListener('canplay', onPlayingMarkPlayed);
       video.removeEventListener('canplay', clearBuffering);
     };
   }, [showBuffering, clearBuffering, captionClockSync]);
@@ -1922,36 +1920,69 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
 
   const handleFastClip = useCallback(() => {
     const platform = (activeEntry.platform || '').toLowerCase();
-    const slug = liveChatSlugFromUrl(activeEntry.url, platform) ?? channelSlug ?? '';
+    // Twitch path: slug from the playing entry's URL or channel.
+    // Kick/YouTube path: the channel's twitchSlug resolves the twin VOD.
+    const twitchSlug = channel?.twitchSlug;
+    const slug = platform === 'twitch'
+      ? (liveChatSlugFromUrl(activeEntry.url, platform) ?? channelSlug ?? '')
+      : (twitchSlug ?? '');
     if (!slug) {
       showClipNotice(t('Channel login missing — cannot open the Twitch editor'));
       return;
     }
-    const url = vodUrl ?? activeEntry.url;
-    const vodId = archiveVideoIdFromUrl(url);
-    if (!vodId) {
-      showClipNotice(t('Not a Twitch VOD URL'));
+    // Twitch platform: use vodUrl (existing behavior).
+    if (platform === 'twitch') {
+      const url = vodUrl ?? activeEntry.url;
+      const vodId = archiveVideoIdFromUrl(url);
+      if (!vodId) {
+        showClipNotice(t('Not a Twitch VOD URL'));
+        return;
+      }
+      if (vodUrl && !isVodForCurrentSession(url)) {
+        showClipNotice(t('Not a Twitch VOD URL'));
+        return;
+      }
+      try { videoRef.current?.pause(); } catch { /* ignore */ }
+      pauseOtherPreviews();
+      setClipPopup({
+        url,
+        broadcasterLogin: slug,
+        vodId,
+        playheadSec: currentSec,
+        vodDurationSec: archiveDuration,
+        reuseSession: sessionIdRef.current
+          ? { sessionId: sessionIdRef.current, trimTimeline: false }
+          : null,
+      });
       return;
     }
-    // A cached VOD URL must belong to the CURRENT broadcast — a previous
-    // broadcast's timeline would mis-map the live playhead (P1-1).
-    if (vodUrl && !isVodForCurrentSession(url)) {
-      showClipNotice(t('Not a Twitch VOD URL'));
+    // Kick/YouTube path: find a matching twitch VOD for the current session.
+    if (!twitchSlug) {
+      showClipNotice(t('No Twitch VOD for this session'));
       return;
     }
+    const twitchVod = (channel?.vodVideos ?? []).find((v) => {
+      const plat = (v.platform ?? '').toLowerCase();
+      return plat === 'twitch' && v.url && isVodForCurrentSession(buildVodUrl(v));
+    });
+    if (!twitchVod) {
+      showClipNotice(t('No Twitch VOD for this session'));
+      return;
+    }
+    const twitchUrl = buildVodUrl(twitchVod);
     try { videoRef.current?.pause(); } catch { /* ignore */ }
     pauseOtherPreviews();
     setClipPopup({
-      url,
-      broadcasterLogin: slug,
-      vodId,
+      url: twitchUrl,
+      broadcasterLogin: twitchSlug,
+      vodId: twitchVod.id,
       playheadSec: currentSec,
       vodDurationSec: archiveDuration,
       reuseSession: sessionIdRef.current
         ? { sessionId: sessionIdRef.current, trimTimeline: false }
         : null,
     });
-  }, [activeEntry.url, activeEntry.platform, channelSlug, vodUrl, currentSec, archiveDuration, showClipNotice, t, isVodForCurrentSession]);
+  }, [activeEntry.url, activeEntry.platform, channelSlug, channel, vodUrl, currentSec, archiveDuration, showClipNotice, t, isVodForCurrentSession]);
 
   // Zoomed rail window — zoom=1 → the full 0..railMax (pixel-identical to
   // the unzoomed rail); otherwise the window anchored at railAnchorFrac.
@@ -2313,30 +2344,23 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                 {paused ? <Play size={15} /> : <Pause size={15} />}
               </button>
 
-              <div className="relative" data-player-menu data-volume-menu>
+              <div
+                className="relative"
+                data-player-menu
+                data-volume-menu
+                onMouseEnter={() => setVolumeMenuOpen(true)}
+                onMouseLeave={() => setVolumeMenuOpen(false)}
+              >
                 <button
                   type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setVolumeMenuOpen((o) => !o);
-                  }}
+                  onClick={(e) => { e.stopPropagation(); toggleMute(); }}
                   title="Volume"
                   className={transportBtn}
                 >
-                  {muted || volume === 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}                </button>
+                  {muted || volume === 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}
+                </button>
                 {volumeMenuOpen && (
                   <div className="absolute bottom-full left-0 z-30 mb-1.5 flex items-center gap-2 border-2 border-zinc-600 bg-zinc-950 px-2.5 py-2 shadow-lg">
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        toggleMute();
-                      }}
-                      title={muted ? t('Unmute') : t('Mute')}
-                      className={transportBtn}
-                    >
-                      {muted || volume === 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}
-                    </button>
                     <input
                       type="range"
                       min={0}
@@ -2353,11 +2377,11 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
 
               {/* Twitch clip — opens the in-app mini-preview at the live
                   playhead (120s window, user trims 5..60s, then the Twitch
-                  editor), identical to the preview clip buttons. Kick gets
-                  no clip button (same gate as the explore player). Sits
-                  BESIDE the volume button and shares its transportBtn class
-                  so both render the SAME height docked and fullscreen. */}
-              {ctrlPlatform === 'twitch' && (
+                  editor), identical to the preview clip buttons. Shows for
+                  Twitch platform OR when the channel has a twitchSlug (Kick/
+                  YouTube lives with a twin Twitch stream). Sits BESIDE the
+                  volume button and shares its transportBtn class. */}
+              {(ctrlPlatform === 'twitch' || !!channel?.twitchSlug) && (
                 <button
                   type="button"
                   onClick={handleFastClip}
@@ -2424,6 +2448,43 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                       </div>
                     )}
                   </div>
+                  {/* Caption size gear menu — A−/A+ buttons ±2px clamp,
+                      persisted via the same localStorage key. Outside-click
+                      handled by the shared mousedown listener. */}
+                  <div className="relative" data-caption-font-size-menu>
+                    <button
+                      type="button"
+                      onClick={() => setCaptionFontSizeMenuOpen((o) => !o)}
+                      aria-haspopup="menu"
+                      aria-expanded={captionFontSizeMenuOpen}
+                      aria-label={t('Caption size')}
+                      title={t('Caption size')}
+                      className={`${transportBtn} px-1`}
+                    >
+                      <Settings size={15} aria-hidden />
+                    </button>
+                    {captionFontSizeMenuOpen && (
+                      <div className="absolute bottom-full right-0 z-30 mb-1.5 flex items-center gap-1 border-2 border-zinc-600 bg-zinc-950 px-2 py-1.5 shadow-lg">
+                        <button
+                          type="button"
+                          onClick={() => setCaptionFontSize((n) => Math.max(CAPTION_FONT_MIN_PX, n - 2))}
+                          title={t('Smaller captions')}
+                          className="text-[10px] font-bold text-zinc-300 hover:text-white px-1 py-0.5"
+                        >
+                          A−
+                        </button>
+                        <span className="font-mono text-[9px] text-zinc-400">{captionFontSize}px</span>
+                        <button
+                          type="button"
+                          onClick={() => setCaptionFontSize((n) => Math.min(CAPTION_FONT_MAX_PX, n + 2))}
+                          title={t('Larger captions')}
+                          className="text-[10px] font-bold text-zinc-300 hover:text-white px-1 py-0.5"
+                        >
+                          A+
+                        </button>
+                      </div>
+                    )}
+                  </div>
                 </>
               )}
 
@@ -2473,51 +2534,69 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
           </div>
         )}
 
-        {/* Live captions overlay — the latest caption block sits above the
-            transport and NEVER intercepts pointer events (video/controls
-            stay fully clickable); only the resize grip itself is interactive. */}
-        {captionsAvailable && captionsEnabled && caption && !loading && !error && (
+        {/* Live captions overlay — draggable inside the video area. The
+            entire overlay is pointer-events-auto for drag; the text
+            stopPropagation prevents stealing video click-to-pause. */}
+        {captionsHeard && captionsEnabled && caption && !loading && !error && (
           <div
             data-live-captions-overlay
-            className="pointer-events-none absolute inset-x-0 bottom-16 z-[5] flex justify-center px-4"
+            className="pointer-events-auto absolute inset-x-0 bottom-16 z-[5] flex justify-center px-4 select-none"
+            style={{
+              transform: captionOverlayOffset.x !== 0 || captionOverlayOffset.y !== 0
+                ? `translate(${captionOverlayOffset.x}px, ${captionOverlayOffset.y}px)`
+                : undefined,
+            }}
+            onPointerDown={(e) => {
+              e.stopPropagation();
+              captionOverlayDragStartRef.current = {
+                pointerX: e.clientX,
+                pointerY: e.clientY,
+                offsetX: captionOverlayDragRef.current.offsetX,
+                offsetY: captionOverlayDragRef.current.offsetY,
+              };
+              const onMove = (ev: PointerEvent) => {
+                const st = captionOverlayDragStartRef.current;
+                if (!st) return;
+                const dx = ev.clientX - st.pointerX;
+                const dy = ev.clientY - st.pointerY;
+                const nx = Math.max(-200, Math.min(200, st.offsetX + dx));
+                const ny = Math.max(-100, Math.min(100, st.offsetY + dy));
+                captionOverlayDragRef.current = { offsetX: nx, offsetY: ny };
+                setCaptionOverlayOffset({ x: nx, y: ny });
+              };
+              const onUp = () => {
+                captionOverlayDragStartRef.current = null;
+                window.removeEventListener('pointermove', onMove);
+                window.removeEventListener('pointerup', onUp);
+              };
+              window.addEventListener('pointermove', onMove);
+              window.addEventListener('pointerup', onUp);
+            }}
           >
-            <div className="relative max-w-[95%]">
-              <p
-                className={`${captionFontSize >= 34 ? 'line-clamp-4' : captionFontSize >= 24 ? 'line-clamp-3' : 'line-clamp-2'} rounded bg-black/60 px-3 py-1.5 text-center font-semibold leading-snug text-zinc-100 [text-shadow:0_1px_2px_rgba(0,0,0,0.9)] backdrop-blur-[2px]`}
-                style={{ fontSize: captionFontSize }}
-              >
-                {caption.text}
-              </p>
-              {/* Mouse-drag resize grip — the ONLY caption-size control (the
-                  A−/A+ buttons are gone): pulling the corner down grows the
-                  box within the clamp; the choice persists via the font-size
-                  effect above. pointer-events-auto: the only clickable part
-                  of the overlay. */}
-              <button
-                type="button"
-                data-caption-resize-grip
-                aria-label={t('Resize captions (drag)')}
-                title={t('Resize captions (drag)')}
-                onPointerDown={startCaptionResize}
-                onPointerMove={moveCaptionResize}
-                onPointerUp={endCaptionResize}
-                onPointerCancel={endCaptionResize}
-                className="pointer-events-auto absolute -bottom-2.5 -right-2.5 cursor-nwse-resize rounded-sm bg-black/70 p-1 text-zinc-300 hover:text-white"
-              >
-                <span className="block h-2 w-2 border-b-2 border-r-2 border-current" />
-              </button>
-            </div>
+            <p
+              className={`${captionFontSize >= 34 ? 'line-clamp-4' : captionFontSize >= 24 ? 'line-clamp-3' : 'line-clamp-2'} max-w-[95%] rounded bg-black/60 px-3 py-1.5 text-center font-semibold leading-snug text-zinc-100 [text-shadow:0_1px_2px_rgba(0,0,0,0.9)] backdrop-blur-[2px] cursor-grab active:cursor-grabbing`}
+              style={{ fontSize: captionFontSize }}
+              onPointerDown={(e) => e.stopPropagation()}
+            >
+              {caption.text}
+            </p>
           </div>
         )}
       </div>
-      {/* Docked live chat — same side-dock rule as the archive search panel:
-          hidden while this popup is fullscreen. Multi-stream channels merge
-          one stream per live platform (filter chips appear in the panel). */}
-      {chatOpen && !isFullscreen && chatSources.length > 0 && (
-        <LiveChatPanel
-          sources={chatSources}
-          onClose={toggleChat}
-        />
+      {/* Docked live chat — always mounted when chat sources exist (preloads
+          EventSource + /api/chat/history on live open); visually hidden
+          when chatOpen is false so the EventSource starts immediately. */}
+      {!isFullscreen && chatSources.length > 0 && (
+        <div
+          className={chatOpen ? '' : 'hidden w-0 overflow-hidden'}
+          style={chatOpen ? undefined : { position: 'absolute', height: 0, width: 0, overflow: 'hidden' }}
+          aria-hidden={!chatOpen}
+        >
+          <LiveChatPanel
+            sources={chatSources}
+            onClose={toggleChat}
+          />
+        </div>
       )}
       </div>
       {clipPopup && (

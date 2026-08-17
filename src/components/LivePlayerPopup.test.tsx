@@ -472,11 +472,12 @@ describe('LivePlayerPopup fast clip', () => {
     openSpy.mockRestore();
   });
 
-  it('KICK: no clip button at all (same platform gate as the explore player)', async () => {
+  it('KICK without twitchSlug: no clip button', async () => {
     mockFetch();
     renderPopup();
     await screen.findByTitle('Fullscreen');
 
+    // Kick entry without a twitchSlug → no clip button (no twin Twitch VOD).
     expect(screen.queryByTitle('Open the Twitch clip mini-preview at the playhead')).toBeNull();
   });
 
@@ -497,23 +498,28 @@ describe('LivePlayerPopup fast clip', () => {
 });
 
 describe('LivePlayerPopup live chat', () => {
-  it('keeps the chat panel closed by default and guards a missing EventSource (jsdom)', async () => {
+  it('preloads chat EventSources on live open; panel hidden until toggle', async () => {
     mockFetch();
     renderPopup();
     await screen.findByTitle('Fullscreen');
 
-    // Live preview chat is CLOSED by default.
-    expect(document.querySelector('[data-live-chat-panel]')).toBeNull();
+    // Chat panel is ALWAYS mounted (for preloading EventSources on live open)
+    // but visually hidden when chatOpen is false.
+    const panel = document.querySelector('[data-live-chat-panel]');
+    expect(panel).toBeTruthy();
+    expect(panel?.closest('[aria-hidden="true"]')).toBeTruthy();
 
-    // The header toggle opens the panel…
+    // The header toggle shows the panel.
     fireEvent.click(screen.getByTitle('Live chat'));
-    expect(document.querySelector('[data-live-chat-panel]')).toBeTruthy();
+    expect(panel?.closest('[aria-hidden="true"]')).toBeNull();
     // jsdom has no EventSource — the panel must degrade, not crash.
     expect(screen.getByText('Live chat unavailable')).toBeTruthy();
 
-    // …and closes it again (first match — the panel's own X shares the title).
+    // Closing hides it again.
     fireEvent.click(screen.getAllByTitle('Close live chat')[0]);
-    await waitFor(() => expect(document.querySelector('[data-live-chat-panel]')).toBeNull());
+    await waitFor(() => {
+      expect(document.querySelector('[data-live-chat-panel]')?.closest('[aria-hidden="true"]')).toBeTruthy();
+    });
   });
 });
 
@@ -733,6 +739,10 @@ describe('LivePlayerPopup live captions', () => {
     vi.stubGlobal('EventSource', FakeEventSource);
     FakeEventSource.instances = [];
   });
+  /** Filter EventSource instances to only caption SSE (not chat streams). */
+  function captionEsInstances() {
+    return FakeEventSource.instances.filter((es) => es.url.includes('/api/live/captions'));
+  }
 
   it('renders the latest caption block over the video when available (PLAYING entry URL)', async () => {
     mockFetch();
@@ -741,8 +751,8 @@ describe('LivePlayerPopup live captions', () => {
     // Captions default ON: the CC button and the caption EventSource appear
     // once the availability probe resolves.
     await screen.findByTitle('Hide captions');
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
-    const es = FakeEventSource.instances[0];
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(1));
+    const es = captionEsInstances()[0];
     // The stream URL resolves the playing entry's platform + slug (kick).
     expect(es.url).toContain('/api/live/captions?platform=kick');
     expect(es.url).toContain('channel=srdoglol');
@@ -767,8 +777,8 @@ describe('LivePlayerPopup live captions', () => {
     mockFetch();
     renderPopup();
     await screen.findByTitle('Hide captions');
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
-    const es = FakeEventSource.instances[0];
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(1));
+    const es = captionEsInstances()[0];
     act(() => { es.fire('caption', JSON.stringify({ text: 'legenda visível', start: 0, end: 3 })); });
     expect(screen.getByText('legenda visível')).toBeTruthy();
 
@@ -788,12 +798,12 @@ describe('LivePlayerPopup live captions', () => {
     expect(dimBtn.className).not.toContain('text-[#53fc18]');
 
     fireEvent.click(dimBtn);
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(2));
-    expect(FakeEventSource.instances[1].closed).toBe(false);
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(2));
+    expect(captionEsInstances()[1].closed).toBe(false);
     const relitBtn = screen.getByTitle('Hide captions');
     expect(relitBtn.className).toContain('text-[#53fc18]');
     expect(relitBtn.className).not.toContain('opacity-40');
-    act(() => { FakeEventSource.instances[1].fire('caption', JSON.stringify({ text: 'legenda de novo', start: 3, end: 6 })); });
+    act(() => { captionEsInstances()[1].fire('caption', JSON.stringify({ text: 'legenda de novo', start: 3, end: 6 })); });
     // Anchored to the video clock: window [3,6] needs the clock at the due
     // point (t=3 → epoch 5.75) before it renders.
     expect(screen.queryByText('legenda de novo')).toBeNull();
@@ -806,17 +816,17 @@ describe('LivePlayerPopup live captions', () => {
     mockFetch();
     const view = renderPopup();
     await screen.findByTitle('Hide captions');
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(1));
     view.unmount();
-    expect(FakeEventSource.instances[0].closed).toBe(true);
+    expect(captionEsInstances()[0].closed).toBe(true);
   });
 
   it('reconnects after an offline event (bounded backoff) and recovers captions without user action', async () => {
     mockFetch();
     renderPopup();
     await screen.findByTitle('Hide captions');
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
-    const es = FakeEventSource.instances[0];
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(1));
+    const es = captionEsInstances()[0];
     act(() => { es.fire('caption', JSON.stringify({ text: 'última fala', start: 0, end: 3 })); });
     expect(screen.getByText('última fala')).toBeTruthy();
 
@@ -829,8 +839,8 @@ describe('LivePlayerPopup live captions', () => {
 
     // ~1.5s later the retry re-probes /available (mockFetch: true) and opens
     // a fresh EventSource — a fresh connection restarts the backend captioner.
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(2), { timeout: 4000 });
-    const es2 = FakeEventSource.instances[1];
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(2), { timeout: 4000 });
+    const es2 = captionEsInstances()[1];
     expect(es2.closed).toBe(false);
     act(() => { es2.fire('caption', JSON.stringify({ text: 'recuperada', start: 4, end: 7 })); });
     // Anchored to the video clock: window [4,7] is due at t=4 (origin 2.75).
@@ -848,36 +858,40 @@ describe('LivePlayerPopup live captions', () => {
       renderPopup();
       // Flush the session + availability microtask chain (fetch mock →
       // session resolve → probe → captionsAvailable → SSE).
-      for (let i = 0; i < 30 && FakeEventSource.instances.length === 0; i++) {
+      for (let i = 0; i < 30 && captionEsInstances().length === 0; i++) {
         await act(async () => {});
       }
-      expect(FakeEventSource.instances).toHaveLength(1);
+      // Wait for the probe to resolve and the CC button to appear.
+      for (let i = 0; i < 30 && !screen.queryByTitle('Hide captions'); i++) {
+        await act(async () => {});
+      }
+      expect(captionEsInstances()).toHaveLength(1);
       expect(screen.queryByTitle('Hide captions')).toBeTruthy();
 
-      const fail = (i: number) => act(() => { FakeEventSource.instances[i].fire('offline', '{}'); });
+      const fail = (i: number) => act(() => { captionEsInstances()[i].fire('offline', '{}'); });
       const advance = (ms: number) => act(async () => { vi.advanceTimersByTime(ms); await Promise.resolve(); });
 
       // Attempt 1 → 1.5s → probe true → reconnect.
       fail(0);
       await advance(1500);
       await act(async () => {});
-      expect(FakeEventSource.instances).toHaveLength(2);
+      expect(captionEsInstances()).toHaveLength(2);
       // Attempt 2 → 3s → reconnect.
       fail(1);
       await advance(3000);
       await act(async () => {});
-      expect(FakeEventSource.instances).toHaveLength(3);
+      expect(captionEsInstances()).toHaveLength(3);
       // Attempt 3 → 6s → reconnect.
       fail(2);
       await advance(6000);
       await act(async () => {});
-      expect(FakeEventSource.instances).toHaveLength(4);
+      expect(captionEsInstances()).toHaveLength(4);
       // Attempt 4 exceeds the budget → give up: the CC cluster hides and no
       // further EventSource is created (no endless reconnect storm).
       fail(3);
       await act(async () => {});
       expect(screen.queryByTitle('Hide captions')).toBeNull();
-      expect(FakeEventSource.instances).toHaveLength(4);
+      expect(captionEsInstances()).toHaveLength(4);
     } finally {
       vi.useRealTimers();
     }
@@ -907,7 +921,7 @@ describe('LivePlayerPopup live captions', () => {
     // …but the bounded re-probe succeeds → the cluster appears WITHOUT any
     // user interaction (captions "not activating until manual interaction").
     await waitFor(() => expect(screen.queryByTitle('Hide captions')).toBeTruthy(), { timeout: 4000 });
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(1));
   });
 
   it('sends ?lang= on the caption SSE from the in-player selector and persists the choice', async () => {
@@ -915,24 +929,24 @@ describe('LivePlayerPopup live captions', () => {
     mockFetch();
     const view = renderPopup();
     await screen.findByTitle('Hide captions');
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(1));
     // Default: no lang param — the backend follows the app language.
-    expect(FakeEventSource.instances[0].url).not.toContain('lang=');
+    expect(captionEsInstances()[0].url).not.toContain('lang=');
 
     // The selector lives in the player, next to the CC toggle (same cluster).
     fireEvent.click(screen.getByTitle('Caption language'));
     fireEvent.click(screen.getByText('Español'));
     // The choice reconnects the caption stream with ?lang=es.
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(2));
-    expect(FakeEventSource.instances[1].url).toContain('lang=es');
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(2));
+    expect(captionEsInstances()[1].url).toContain('lang=es');
     expect(localStorage.getItem('vodrip.live.captionLang')).toBe('es');
 
     // Persists across popup reopen.
     view.unmount();
     renderPopup();
     await screen.findByTitle('Hide captions');
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(3));
-    expect(FakeEventSource.instances[2].url).toContain('lang=es');
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(3));
+    expect(captionEsInstances()[2].url).toContain('lang=es');
     // Icon-only button: no text label (the old "ES"/"AUTO" text is gone),
     // the icon carries the accessible name via title/aria-label.
     const langBtn = screen.getByTitle('Caption language');
@@ -940,7 +954,7 @@ describe('LivePlayerPopup live captions', () => {
     expect(langBtn.querySelector('svg')).toBeTruthy();
   });
 
-  it('shows no CC button or overlay when the parakeet gate reports unavailable', async () => {
+  it('CC button hidden when parakeet gate reports unavailable — SSE still opens for caption delivery', async () => {
     const fn = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes('/api/preview/live')) {
@@ -954,7 +968,9 @@ describe('LivePlayerPopup live captions', () => {
     vi.stubGlobal('fetch', fn);
     renderPopup();
     await screen.findByTitle('Fullscreen');
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(0));
+    // SSE opens immediately (no probe guard) — but CC button stays hidden
+    // because the probe reports unavailable.
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(1));
     expect(screen.queryByTitle('Hide captions')).toBeNull();
     expect(screen.queryByTitle('Live captions')).toBeNull();
     expect(document.querySelector('[data-live-captions-overlay]')).toBeNull();
@@ -967,8 +983,8 @@ describe('LivePlayerPopup live captions', () => {
     const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
     await act(async () => { hls.trigger(FakeHls.Events.MANIFEST_PARSED); }); // clears loading → transport renders
     await screen.findByTitle('Hide captions');
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
-    const es = FakeEventSource.instances[0];
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(1));
+    const es = captionEsInstances()[0];
 
     // Frag anchor: timeline position 0 ↔ wall epoch 1000 (frag PDT in ms).
     act(() => { hls.trigger('fragBuffered', { frag: { start: 0, programDateTime: 1_000_000 } }); });
@@ -998,8 +1014,8 @@ describe('LivePlayerPopup live captions', () => {
     const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
     await act(async () => { hls.trigger(FakeHls.Events.MANIFEST_PARSED); });
     await screen.findByTitle('Hide captions');
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
-    const es = FakeEventSource.instances[0];
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(1));
+    const es = captionEsInstances()[0];
 
     act(() => { hls.trigger('fragBuffered', { frag: { start: 0, programDateTime: 1_000_000 } }); });
     const video = document.querySelector('video') as HTMLVideoElement;
@@ -1021,8 +1037,8 @@ describe('LivePlayerPopup live captions', () => {
     renderPopup();
     await screen.findByTitle('Fullscreen');
     await screen.findByTitle('Hide captions');
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
-    const es = FakeEventSource.instances[0];
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(1));
+    const es = captionEsInstances()[0];
     const video = document.querySelector('video') as HTMLVideoElement;
 
     // No frag anchors: the first block calibrates the origin to its due
@@ -1051,8 +1067,8 @@ describe('LivePlayerPopup live captions', () => {
     const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
     await act(async () => { hls.trigger(FakeHls.Events.MANIFEST_PARSED); });
     await screen.findByTitle('Hide captions');
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
-    const es = FakeEventSource.instances[0];
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(1));
+    const es = captionEsInstances()[0];
 
     act(() => { hls.trigger('fragBuffered', { frag: { start: 0, programDateTime: 1_000_000 } }); });
     const video = document.querySelector('video') as HTMLVideoElement;
@@ -1083,8 +1099,8 @@ describe('LivePlayerPopup live captions', () => {
     const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
     await act(async () => { hls.trigger(FakeHls.Events.MANIFEST_PARSED); });
     await screen.findByTitle('Hide captions');
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
-    const es = FakeEventSource.instances[0];
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(1));
+    const es = captionEsInstances()[0];
 
     // hls.js computes programDateTime via Date.parse — LOCAL zone for a
     // naive tag. The component must read the raw tag with a UTC default,
@@ -1108,76 +1124,65 @@ describe('LivePlayerPopup live captions', () => {
     expect(screen.getByText('utc')).toBeTruthy();
   });
 
-  it('drag grip resizes the caption overlay text, clamped at the 14px floor (no A−/A+ buttons)', async () => {
+  it('gear menu A−/A+ resizes caption overlay text, clamped at the 14px floor', async () => {
     localStorage.removeItem('vodrip.live.captionFontSize');
     mockFetch();
     renderPopup();
     await screen.findByTitle('Hide captions');
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
-    const es = FakeEventSource.instances[0];
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(1));
+    const es = captionEsInstances()[0];
     act(() => { es.fire('caption', JSON.stringify({ text: 'redimensionável', start: 0, end: 3 })); });
 
     const overlayText = () => document.querySelector('[data-live-captions-overlay] p') as HTMLElement;
-    // The A−/A+ buttons are GONE — resize is mouse-drag only (the grip).
-    expect(screen.queryByTitle('Smaller captions')).toBeNull();
-    expect(screen.queryByTitle('Larger captions')).toBeNull();
-    const grip = document.querySelector('[data-caption-resize-grip]') as HTMLButtonElement;
-    // Default matches the previous fixed `text-sm` (14px).
+    // Default 14px, no grip button, gear menu exists.
     expect(overlayText().style.fontSize).toBe('14px');
+    expect(document.querySelector('[data-caption-resize-grip]')).toBeNull();
 
-    // Dragging UP past the floor clamps at 14px (2px of drag per 1px of font).
-    fireEvent.pointerDown(grip, { clientY: 100 });
-    fireEvent.pointerMove(grip, { clientY: 80 });
-    expect(overlayText().style.fontSize).toBe('14px');
-
-    // Dragging DOWN grows in the old 2px-step feel: 4px drag → 16px…
-    fireEvent.pointerMove(grip, { clientY: 104 });
+    // Open gear menu → A+ increases by 2px.
+    fireEvent.click(screen.getByTitle('Caption size'));
+    fireEvent.click(screen.getByTitle('Larger captions'));
     expect(overlayText().style.fontSize).toBe('16px');
-    // …8px drag → 18px…
-    fireEvent.pointerMove(grip, { clientY: 108 });
+    fireEvent.click(screen.getByTitle('Larger captions'));
     expect(overlayText().style.fontSize).toBe('18px');
-    // …dragging back up shrinks…
-    fireEvent.pointerMove(grip, { clientY: 104 });
+
+    // A− decreases by 2px.
+    fireEvent.click(screen.getByTitle('Smaller captions'));
     expect(overlayText().style.fontSize).toBe('16px');
-    fireEvent.pointerMove(grip, { clientY: 100 });
+    fireEvent.click(screen.getByTitle('Smaller captions'));
     expect(overlayText().style.fontSize).toBe('14px');
-    // …and clamps: further drag stays at the floor.
-    fireEvent.pointerMove(grip, { clientY: 90 });
+
+    // Floor clamp: further A− stays at 14px.
+    fireEvent.click(screen.getByTitle('Smaller captions'));
     expect(overlayText().style.fontSize).toBe('14px');
-    fireEvent.pointerUp(grip, { clientY: 90 });
   });
 
-  it('caption clamp scales with the font size (line-clamp-2 → -3 → -4)', async () => {
+  it('caption clamp scales with the font size (line-clamp-2 → -3 → -4) via gear menu', async () => {
     localStorage.removeItem('vodrip.live.captionFontSize');
     mockFetch();
     renderPopup();
     await screen.findByTitle('Hide captions');
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
-    const es = FakeEventSource.instances[0];
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(1));
+    const es = captionEsInstances()[0];
     act(() => { es.fire('caption', JSON.stringify({ text: 'redimensionável', start: 0, end: 3 })); });
 
     const overlayText = () => document.querySelector('[data-live-captions-overlay] p') as HTMLElement;
-    const grip = document.querySelector('[data-caption-resize-grip]') as HTMLButtonElement;
-    // Each drag starts FROM the current size; 2px of drag per 1px of font.
-    const dragTo = (from: number, to: number) => {
-      fireEvent.pointerDown(grip, { clientY: from });
-      fireEvent.pointerMove(grip, { clientY: to });
-      fireEvent.pointerUp(grip, { clientY: to });
-    };
-    // 14px (default) → 2 lines; ≥24px → 3; ≥34px → 4 — a fixed 2-line clamp
-    // at 48px would truncate captions to a few words.
+    // Open the gear menu.
+    fireEvent.click(screen.getByTitle('Caption size'));
+    // 14px (default) → line-clamp-2
     expect(overlayText().className).toContain('line-clamp-2');
-    dragTo(0, 20); // 14 + 10 = 24px
+    // 14 → 16 → 18 → 20 → 22 → 24 (6 clicks) → line-clamp-3
+    for (let i = 0; i < 5; i++) fireEvent.click(screen.getByTitle('Larger captions'));
     expect(overlayText().style.fontSize).toBe('24px');
     expect(overlayText().className).toContain('line-clamp-3');
-    dragTo(20, 60); // 24 + 20 = 44px
-    expect(overlayText().style.fontSize).toBe('44px');
+    // 24 → 26 → ... → 34 (5 more clicks) → line-clamp-4
+    for (let i = 0; i < 5; i++) fireEvent.click(screen.getByTitle('Larger captions'));
+    expect(overlayText().style.fontSize).toBe('34px');
     expect(overlayText().className).toContain('line-clamp-4');
     // Shrinking back restores the smaller clamps.
-    dragTo(60, 20); // 44 − 10 = 24px
+    for (let i = 0; i < 5; i++) fireEvent.click(screen.getByTitle('Smaller captions'));
     expect(overlayText().style.fontSize).toBe('24px');
     expect(overlayText().className).toContain('line-clamp-3');
-    dragTo(20, 0); // 24 − 10 = 14px
+    for (let i = 0; i < 5; i++) fireEvent.click(screen.getByTitle('Smaller captions'));
     expect(overlayText().style.fontSize).toBe('14px');
     expect(overlayText().className).toContain('line-clamp-2');
   });
@@ -1186,7 +1191,7 @@ describe('LivePlayerPopup live captions', () => {
     mockFetch();
     renderPopup();
     await screen.findByTitle('Hide captions');
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(1));
 
     // ON → "Hide captions" as the accessible name (matches the title).
     expect(screen.getByRole('button', { name: 'Hide captions' })).toBeTruthy();
@@ -1202,8 +1207,8 @@ describe('LivePlayerPopup live captions', () => {
     const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
     await act(async () => { hls.trigger(FakeHls.Events.MANIFEST_PARSED); });
     await screen.findByTitle('Hide captions');
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
-    const es = FakeEventSource.instances[0];
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(1));
+    const es = captionEsInstances()[0];
     const video = document.querySelector('video') as HTMLVideoElement;
     const at = (t: number) => act(() => { video.currentTime = t; fireEvent(video, new Event('timeupdate')); });
 
@@ -1235,27 +1240,25 @@ describe('LivePlayerPopup live captions', () => {
     expect(screen.queryByText('bloco-3')).toBeNull();
   });
 
-  it('drag clamps at the 48px ceiling and persists the choice', async () => {
+  it('gear menu A+ clamps at the 48px ceiling and persists the choice', async () => {
     localStorage.removeItem('vodrip.live.captionFontSize');
     mockFetch();
     renderPopup();
     await screen.findByTitle('Hide captions');
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
-    const es = FakeEventSource.instances[0];
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(1));
+    const es = captionEsInstances()[0];
     act(() => { es.fire('caption', JSON.stringify({ text: 'gigante', start: 0, end: 3 })); });
 
     const overlayText = () => document.querySelector('[data-live-captions-overlay] p') as HTMLElement;
-    const grip = document.querySelector('[data-caption-resize-grip]') as HTMLButtonElement;
-    // 14 + 68/2 = 48px — a huge drag clamps at the ceiling (the old 17 × A+).
-    fireEvent.pointerDown(grip, { clientY: 0 });
-    fireEvent.pointerMove(grip, { clientY: 200 });
+    // 14 → 48 = 17 × A+ (each +2px).
+    fireEvent.click(screen.getByTitle('Caption size'));
+    for (let i = 0; i < 17; i++) fireEvent.click(screen.getByTitle('Larger captions'));
     expect(overlayText().style.fontSize).toBe('48px');
-    // Further drag is a no-op at the ceiling.
-    fireEvent.pointerMove(grip, { clientY: 400 });
+    // Further clicks are a no-op at the ceiling.
+    fireEvent.click(screen.getByTitle('Larger captions'));
     expect(overlayText().style.fontSize).toBe('48px');
-    fireEvent.pointerUp(grip, { clientY: 400 });
 
-    // Persisted to localStorage (the save effect writes every change).
+    // Persisted to localStorage.
     expect(localStorage.getItem('vodrip.live.captionFontSize')).toBe('48');
   });
 
@@ -1264,8 +1267,8 @@ describe('LivePlayerPopup live captions', () => {
     mockFetch();
     const view = renderPopup();
     await screen.findByTitle('Hide captions');
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
-    const es = FakeEventSource.instances[0];
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(1));
+    const es = captionEsInstances()[0];
     act(() => { es.fire('caption', JSON.stringify({ text: 'persistida', start: 0, end: 3 })); });
     expect((document.querySelector('[data-live-captions-overlay] p') as HTMLElement).style.fontSize).toBe('30px');
 
@@ -1273,8 +1276,8 @@ describe('LivePlayerPopup live captions', () => {
     view.unmount();
     renderPopup();
     await screen.findByTitle('Hide captions');
-    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(2));
-    act(() => { FakeEventSource.instances[1].fire('caption', JSON.stringify({ text: 'persistida de novo', start: 0, end: 3 })); });
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(2));
+    act(() => { captionEsInstances()[1].fire('caption', JSON.stringify({ text: 'persistida de novo', start: 0, end: 3 })); });
     expect((document.querySelector('[data-live-captions-overlay] p') as HTMLElement).style.fontSize).toBe('30px');
   });
 });
@@ -1332,50 +1335,51 @@ describe('LivePlayerPopup z-order', () => {
   });
 });
 
-describe('LivePlayerPopup volume menu outside-click', () => {
-  it('closes on a mousedown on any other player button', async () => {
+describe('LivePlayerPopup volume hover-only', () => {
+  it('hover shows volume slider, mousedown elsewhere hides it', async () => {
     renderPopup();
     await screen.findByTitle('Fullscreen');
 
-    // Open the volume menu.
-    fireEvent.click(screen.getByTitle('Volume'));
+    // Hover opens the volume slider.
+    const wrapper = document.querySelector('[data-volume-menu]')!;
+    fireEvent.mouseEnter(wrapper);
     expect(screen.getByLabelText('Volume')).toBeTruthy();
 
-    // A mousedown on ANOTHER transport button (fullscreen) closes the menu —
-    // the click lands outside the volume menu's own layout.
-    fireEvent.mouseDown(screen.getByTitle('Fullscreen'));
+    // A mousedown on the popup root (outside the volume menu) closes it.
+    const popup = document.querySelector('[data-live-popup]')!;
+    fireEvent.mouseDown(popup);
+    await waitFor(() => expect(screen.queryByLabelText('Volume')).toBeNull());
+  });
+
+  it('leaving the wrapper hides the slider', async () => {
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+
+    const wrapper = document.querySelector('[data-volume-menu]')!;
+    fireEvent.mouseEnter(wrapper);
+    expect(screen.getByLabelText('Volume')).toBeTruthy();
+
+    fireEvent.mouseLeave(wrapper);
     expect(screen.queryByLabelText('Volume')).toBeNull();
   });
 
-  it('keeps the menu open for clicks inside it and the slider drag still works', async () => {
+  it('clicking the speaker toggles mute; hover shows slider independently', async () => {
     renderPopup();
     await screen.findByTitle('Fullscreen');
 
+    // Click toggles mute (not the slider).
     fireEvent.click(screen.getByTitle('Volume'));
+    expect(screen.queryByLabelText('Volume')).toBeNull();
+
+    // Hover shows the slider.
+    const wrapper = document.querySelector('[data-volume-menu]')!;
+    fireEvent.mouseEnter(wrapper);
     const slider = screen.getByLabelText('Volume') as HTMLInputElement;
     expect(slider).toBeTruthy();
 
-    // mousedown on the slider (inside the menu layout) must NOT close it…
-    fireEvent.mouseDown(slider);
-    expect(screen.getByLabelText('Volume')).toBeTruthy();
-
-    // …and dragging still adjusts the volume while the menu stays open.
+    // Dragging still adjusts the volume.
     fireEvent.change(slider, { target: { value: '0.5' } });
-    expect((screen.getByLabelText('Volume') as HTMLInputElement).value).toBe('0.5');
-    expect(screen.getByLabelText('Volume')).toBeTruthy();
-  });
-
-  it('the toggle still opens and closes the menu', async () => {
-    renderPopup();
-    await screen.findByTitle('Fullscreen');
-
-    const toggle = screen.getByTitle('Volume');
-    fireEvent.click(toggle);
-    expect(screen.getByLabelText('Volume')).toBeTruthy();
-    fireEvent.click(toggle);
-    expect(screen.queryByLabelText('Volume')).toBeNull();
-    fireEvent.click(toggle);
-    expect(screen.getByLabelText('Volume')).toBeTruthy();
+    expect(slider.value).toBe('0.5');
   });
 });
 
@@ -1538,8 +1542,8 @@ describe('LivePlayerPopup replay rail (wheel zoom + arrow seek)', () => {
     const rail = screen.getByRole('slider', { name: 'Seek back into the broadcast (replay)' }) as HTMLInputElement;
     expect(rail.disabled).toBe(true);
 
-    // Live edge = liveSyncPosition(100) + two-segment lag (2 × 2s) = 104;
-    // the back-buffer window is [104−30, 104−0.75] = [74, 103.25].
+    // Live edge = liveSyncPosition(100) + three-segment lag (3 × 2s) = 106;
+    // the back-buffer window is [106−30, 106−0.75] = [76, 105.25].
     hls.liveSyncPosition = 100;
     const video = document.querySelector('video') as HTMLVideoElement;
     video.currentTime = 95;
@@ -1550,18 +1554,18 @@ describe('LivePlayerPopup replay rail (wheel zoom + arrow seek)', () => {
     fireEvent.keyDown(window, { key: 'ArrowRight' });
     expect(video.currentTime).toBe(95); // 90 + 5
 
-    // Clamped to the buffer's leading edge: 5 − 5 → −0 → 74.
+    // Clamped to the buffer's leading edge: 5 − 5 → −0 → 76.
     video.currentTime = 5;
     fireEvent.keyDown(window, { key: 'ArrowLeft' });
-    expect(video.currentTime).toBe(74);
+    expect(video.currentTime).toBe(76);
 
-    // Clamped just below the live edge (0.75s safety): 108 + 5 → 113 → 103.25.
-    video.currentTime = 108;
+    // Clamped just below the live edge (0.75s safety): 110 + 5 → 115 → 105.25.
+    video.currentTime = 110;
     fireEvent.keyDown(window, { key: 'ArrowRight' });
-    expect(video.currentTime).toBe(103.25);
+    expect(video.currentTime).toBe(105.25);
 
-    // Never below 0: early stream (edge 14 → window [0, 13.25]).
-    hls.liveSyncPosition = 12; // edge 16 (two-segment lag)
+    // Never below 0: early stream (edge 18 → window [0, 17.25]).
+    hls.liveSyncPosition = 12; // edge 18 (three-segment lag)
     video.currentTime = 0;
     fireEvent.keyDown(window, { key: 'ArrowLeft' });
     expect(video.currentTime).toBe(0);
@@ -1621,30 +1625,23 @@ describe('LivePlayerPopup live latency config', () => {
     await waitFor(() => expect((window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls).toBeTruthy());
     const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
 
-    // Count-based live-sync geometry — TWO segments behind the edge: count 1
-    // was too aggressive through a proxy — one slow segment fetch drained
-    // the thin buffer and triggered rebuffering. count 2 (~4s at 2s segments)
-    // gives ~2s extra cushion for proxy latency while staying <5s behind the
-    // live edge. hls.js validates count 2 (liveMaxLatencyDurationCount 6 > 2)
-    // and THROWS when count and duration variants are mixed, so the duration
-    // knobs the adblock config injects are nulled out.
-    expect(hls.config.liveSyncDurationCount).toBe(2);
+    // 3 segments behind the edge — deep cushion for proxy-mediated playback.
+    expect(hls.config.liveSyncDurationCount).toBe(3);
     expect(hls.config.liveSyncDuration).toBeUndefined();
-    expect(hls.config.liveMaxLatencyDurationCount).toBe(6);
+    expect(hls.config.liveMaxLatencyDurationCount).toBe(8);
     expect(hls.config.liveMaxLatencyDuration).toBeUndefined();
 
-    // LL-HLS part handling on (backend prefers Twitch LL masters; non-LL
-    // playlists play identically) + gentle 1.1× catch-up when behind.
-    expect(hls.config.lowLatencyMode).toBe(true);
+    // LL-HLS disabled — proxy + LL-HLS stalls cause buffering.
+    expect(hls.config.lowLatencyMode).toBe(false);
     expect(hls.config.maxLiveSyncPlaybackRate).toBe(1.1);
 
-    // Buffering-fix geometry retained: deep forward buffer, 30s retained
-    // back-buffer for the arrow seek, finite live timeline (seekable).
-    expect(hls.config.maxBufferLength).toBe(20);
+    // Deep forward buffer to absorb proxy jitter; 30s retained back-buffer.
+    expect(hls.config.maxBufferLength).toBe(30);
+    expect(hls.config.maxMaxBufferLength).toBe(60);
     expect(hls.config.backBufferLength).toBe(30);
     expect(hls.config.liveDurationInfinity).toBe(false);
 
-    // Live mode auto-starts; the replay guard still owns replay mode.
+    // Live mode auto-starts.
     expect(hls.config.autoStartLoad).toBe(true);
   });
 });
@@ -1713,13 +1710,12 @@ describe('LivePlayerPopup auto-hide controls', () => {
     expect(transport.className).toContain('opacity-100');
   });
 
-  it('stays visible while paused and while the volume menu is open', async () => {
+  it('stays visible while paused and resumes hiding after unpause', async () => {
     vi.useFakeTimers();
     renderPopup();
     await flushSession();
 
     const transport = document.querySelector('[data-live-transport]')!;
-    const popup = document.querySelector('[data-live-popup]')!;
     const video = document.querySelector('video') as HTMLVideoElement;
 
     // Pause → the countdown is cancelled, controls stay up indefinitely.
@@ -1733,13 +1729,6 @@ describe('LivePlayerPopup auto-hide controls', () => {
     expect(transport.className).toContain('opacity-100');
     act(() => { vi.advanceTimersByTime(1000); });
     expect(transport.className).toContain('opacity-0');
-
-    // Menu open (bump first so the controls are visible) → never hides.
-    fireEvent.mouseMove(popup);
-    fireEvent.click(screen.getByTitle('Volume'));
-    expect(screen.getByLabelText('Volume')).toBeTruthy();
-    act(() => { vi.advanceTimersByTime(6000); });
-    expect(transport.className).toContain('opacity-100');
   });
 
   it('keeps the header visible while the session is still loading', async () => {
