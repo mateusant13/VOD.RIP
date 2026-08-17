@@ -41,6 +41,7 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Deque, Optional
+from services.ytdlp_ffmpeg import _resolve_ffmpeg_exe
 from urllib.parse import urljoin
 
 logger = logging.getLogger(__name__)
@@ -81,6 +82,7 @@ _FLUSH_FAIL_LIMIT_LOW_LATENCY = 5  # smaller windows = more empty/short transcri
 _MASTER_TTL_SEC = 300.0  # re-resolve the live master (fresh usher tokens)
 _MASTER_403_TTL_SEC = 60.0  # ...or sooner after a 403 (expired token)
 _OFFLINE_STRIKES = 3  # consecutive offline resolutions -> offline event + stop
+_TRANSIENT_STRIKE_LIMIT = 6  # consecutive generic errors (404, network) -> offline + stop
 _BACKOFF_INITIAL_SEC = 1.0
 _BACKOFF_MAX_SEC = 15.0
 _QUEUE_MAX = 8  # bounded subscriber queue — slow consumers drop blocks
@@ -197,7 +199,10 @@ def _fetch(url: str, headers: dict) -> bytes:
     from urllib.parse import urlparse
 
     host = (urlparse(url).hostname or "").lower()
-    if host == "ttvnw.net" or host.endswith(".ttvnw.net"):
+    # Twitch edge CDNs (*.ttvnw.net) 403 an EMPTY body for any request
+    # carrying an Origin header — but the Usher API (usher.ttvnw.net)
+    # REQUIRES Origin.  Strip Origin only for CDN hosts, keep it for usher.
+    if (host == "ttvnw.net" or host.endswith(".ttvnw.net")) and host != "usher.ttvnw.net":
         hdrs = {k: v for k, v in hdrs.items() if k.lower() != "origin"}
     hdrs.setdefault("User-Agent", _SEGMENT_UA)
     resp = requests.get(url, headers=hdrs, timeout=_HTTP_TIMEOUT)
@@ -518,6 +523,7 @@ class LiveCaptioner:
         self._master_at = 0.0
         self._media_url: Optional[str] = None
         self._offline_strikes = 0
+        self._transient_strikes = 0
         # Translation state (worker-owned): channel-language evidence resolved
         # once at start; SLID detections for the last 5 speech windows feed
         # the majority gate when evidence is unknown (caption_translate).
@@ -563,6 +569,7 @@ class LiveCaptioner:
                 self._master_at = 0.0
                 self._media_url = None
                 self._offline_strikes = 0
+                self._transient_strikes = 0
                 self._evidence_family = None
                 self._lang_votes = deque(maxlen=5)
                 self._target_family = lang  # fresh session: explicit selection or app-language default
@@ -624,15 +631,30 @@ class LiveCaptioner:
             except Exception as exc:
                 # Transient: playlist fetch error / expired token / decode —
                 # back off and retry, keeping the loop (and the SSE) alive.
+                # After _TRANSIENT_STRIKE_LIMIT consecutive failures the
+                # channel is treated as unreachable (token revoked, CDN
+                # broken, channel genuinely down) — emit offline so the
+                # frontend hides the CC cluster instead of showing keepalives
+                # forever.
+                self._transient_strikes += 1
                 logger.debug(
-                    "live captions %s/%s transient error: %s",
-                    self.platform, self.channel, exc,
+                    "live captions %s/%s transient error (%d/%d): %s",
+                    self.platform, self.channel,
+                    self._transient_strikes, _TRANSIENT_STRIKE_LIMIT, exc,
                 )
+                if self._transient_strikes >= _TRANSIENT_STRIKE_LIMIT:
+                    logger.info(
+                        "live captions %s/%s offline (transient limit reached)",
+                        self.platform, self.channel,
+                    )
+                    self._emit("offline", {})
+                    return
                 backoff = min(backoff * 2, _BACKOFF_MAX_SEC)
                 self._stop.wait(backoff)
                 continue
             backoff = _BACKOFF_INITIAL_SEC
             self._offline_strikes = 0
+            self._transient_strikes = 0
             segments = self._trim_stale_head(segments)
             for seg in segments:
                 if self._stop.is_set():
@@ -663,8 +685,9 @@ class LiveCaptioner:
         try:
             master_text = _fetch(master["url"], master["headers"]).decode("utf-8", "replace")
         except Exception as exc:
-            if _is_http_403(exc):
-                # Expired usher token — re-resolve sooner than the TTL.
+            if _is_http_token_error(exc):
+                # Expired usher token or offline channel (403/404) —
+                # re-resolve sooner than the TTL.
                 self._master = None
                 self._master_at = 0.0
             raise
@@ -676,7 +699,7 @@ class LiveCaptioner:
         try:
             playlist = _fetch(self._media_url, master["headers"]).decode("utf-8", "replace")
         except Exception as exc:
-            if _is_http_403(exc):
+            if _is_http_token_error(exc):
                 self._master = None
                 self._master_at = 0.0
             raise
@@ -854,6 +877,13 @@ class LiveCaptioner:
 def _is_http_403(exc: BaseException) -> bool:
     resp = getattr(exc, "response", None)
     return resp is not None and getattr(resp, "status_code", None) == 403
+
+
+def _is_http_token_error(exc: BaseException) -> bool:
+    """Usher token errors: 403 (nauth_token_invalid) or 404 (offline channel)."""
+    resp = getattr(exc, "response", None)
+    code = getattr(resp, "status_code", None) if resp is not None else None
+    return code in (403, 404)
 
 
 def _env_float(name: str, default: float) -> float:

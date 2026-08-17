@@ -108,7 +108,7 @@ async def _run() -> None:
         # e2e drives the LOOP, not the engine — never load the real model.
         live_captions._warm_asr = lambda: None
         # nor the real translator/SLID/archive-DB reads (own e2e exists)
-        live_captions._warm_translate = lambda evidence: None
+        live_captions._warm_translate = lambda evidence, target=None: None
         live_captions._resolve_evidence = lambda platform, channel: None
         live_captions._maybe_translate = lambda captioner, text, audio: (text, False)
         live_captions._resolve_live_master = lambda platform, channel: {
