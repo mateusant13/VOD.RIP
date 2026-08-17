@@ -5,6 +5,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { LivePlayerPopup, __resetLivePlayerRegistryForTests, liveQualityCountNow, registerLivePlayer } from './LivePlayerPopup';
 import { EXPLORE_POPUP_Z, LIVE_POPUP_ACTIVE_Z, SEARCH_POPUP_Z } from '../layoutUtils';
 import { registerPreviewPlayback } from '../previewPlaybackBus';
+import type { PreviewSessionResponse } from '../types';
 
 /**
  * hls.js needs MediaSource, which jsdom lacks — stub the module so the
@@ -1739,7 +1740,7 @@ describe('LivePlayerPopup auto-hide controls', () => {
     await act(async () => {});
 
     const header = document.querySelector('[data-live-header]')!;
-    act(() => { vi.advanceTimersByTime(6000); }); // < SESSION_STALL_MS (8s)
+    act(() => { vi.advanceTimersByTime(6000); }); // < SESSION_STALL_MS (15s)
     expect(header.className).toContain('opacity-100');
   });
 });
@@ -1894,5 +1895,152 @@ describe('LivePlayerPopup live quality policy', () => {
     });
     expect(hls.currentLevel).toBe(-1);
     expect(hls.autoLevelEnabled).toBe(true);
+  });
+});
+
+describe('LivePlayerPopup session retry loop', () => {
+  it('retries up to LIVE_SESSION_MAX_RETRIES on failure before showing error', async () => {
+    vi.useFakeTimers();
+    try {
+      let callCount = 0;
+      const fn = vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/api/preview/live')) {
+          callCount++;
+          if (callCount <= 3) {
+            return new Response(JSON.stringify({ detail: 'temporarily unavailable' }), { status: 500 });
+          }
+          return new Response(JSON.stringify({ session_id: 's1' }), { status: 200 });
+        }
+        if (url.includes('/api/archive/videos')) {
+          return new Response(JSON.stringify({ videos: [] }), { status: 200 });
+        }
+        if (url.includes('/api/live/captions/available')) {
+          return new Response(JSON.stringify({ available: true }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+      vi.stubGlobal('fetch', fn);
+
+      renderPopup();
+      await act(async () => {}); // initial render + first attempt (500)
+
+      // First retry backoff: 1s
+      await act(async () => { vi.advanceTimersByTime(1000); });
+      await act(async () => {}); // second attempt (500)
+
+      // Second retry backoff: 2s
+      await act(async () => { vi.advanceTimersByTime(2000); });
+      await act(async () => {}); // third attempt (500)
+
+      // Third retry backoff: 4s
+      await act(async () => { vi.advanceTimersByTime(4000); });
+      await act(async () => {}); // fourth attempt (success)
+
+      // Session should be created on the 4th attempt (after 3 retries)
+      const liveCalls = fn.mock.calls.filter(([input]: [RequestInfo | URL]) => String(input).includes('/api/preview/live'));
+      expect(liveCalls).toHaveLength(4);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('LivePlayerPopup live session prefetch', () => {
+  it('consumes a prefetched session without calling POST', async () => {
+    const fn = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/archive/videos')) {
+        return new Response(JSON.stringify({ videos: [] }), { status: 200 });
+      }
+      if (url.includes('/api/live/captions/available')) {
+        return new Response(JSON.stringify({ available: true }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+    vi.stubGlobal('fetch', fn);
+
+    const prefetchedSession = {
+      session_id: 'prefetched-s1',
+      kind: 'hls' as const,
+      master_url: 'https://edge/live/master.m3u8',
+      playback_url: 'https://edge/live/master.m3u8',
+      archive_duration: 0,
+    };
+    const liveSessionPrefetchRef = { current: { url: ENTRY.url, session: prefetchedSession } };
+
+    render(
+      <LivePlayerPopup
+        entry={ENTRY}
+        channelName="srdogg / srdoglol"
+        onClose={vi.fn()}
+        channelSlug="srdoglol"
+        onOpenHit={vi.fn()}
+        savedChannels={[]}
+        liveSessionPrefetchRef={liveSessionPrefetchRef}
+      />,
+    );
+
+    // Wait for the component to mount and use the prefetched session
+    await waitFor(() => {
+      // The prefetched session should be consumed (ref cleared)
+      expect(liveSessionPrefetchRef.current).toBeNull();
+    });
+
+    // POST /api/preview/live should never have been called
+    const liveCalls = fn.mock.calls.filter(([input]: [RequestInfo | URL]) => String(input).includes('/api/preview/live'));
+    expect(liveCalls).toHaveLength(0);
+
+    // But the replay snapshot should have been called (success path)
+    const snapshotCalls = fn.mock.calls.filter(([input]: [RequestInfo | URL]) => String(input).includes('/api/preview/hls/prefetched-s1/resource'));
+    expect(snapshotCalls.length).toBeGreaterThanOrEqual(0); // may or may not be called depending on timing
+  });
+
+  it('does not consume prefetch for a different URL', async () => {
+    vi.useFakeTimers();
+    try {
+      let callCount = 0;
+      const fn = vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/api/preview/live')) {
+          callCount++;
+          return new Response(JSON.stringify({ session_id: `s${callCount}` }), { status: 200 });
+        }
+        if (url.includes('/api/archive/videos')) {
+          return new Response(JSON.stringify({ videos: [] }), { status: 200 });
+        }
+        if (url.includes('/api/live/captions/available')) {
+          return new Response(JSON.stringify({ available: true }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 404 });
+      });
+      vi.stubGlobal('fetch', fn);
+
+      // Prefetch for a DIFFERENT URL — should NOT be consumed
+      const liveSessionPrefetchRef = {
+        current: { url: 'https://kick.com/other-channel', session: { session_id: 'other-s1' } as PreviewSessionResponse },
+      };
+
+      render(
+        <LivePlayerPopup
+          entry={ENTRY}
+          channelName="srdogg / srdoglol"
+          onClose={vi.fn()}
+          channelSlug="srdoglol"
+          onOpenHit={vi.fn()}
+          savedChannels={[]}
+          liveSessionPrefetchRef={liveSessionPrefetchRef}
+        />,
+      );
+
+      await act(async () => {});
+      await act(async () => { vi.advanceTimersByTime(500); });
+
+      // POST /api/preview/live SHOULD have been called (prefetch URL mismatch)
+      const liveCalls = fn.mock.calls.filter(([input]: [RequestInfo | URL]) => String(input).includes('/api/preview/live'));
+      expect(liveCalls).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

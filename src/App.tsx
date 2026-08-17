@@ -251,6 +251,8 @@ interface ChannelRowProps {
   setSavedChannels: Dispatch<SetStateAction<SavedChannel[]>>;
   setChannelDragId: Dispatch<SetStateAction<string | null>>;
   setChannelDropInsertIndex: Dispatch<SetStateAction<number | null>>;
+  /** Pre-warm a live session on hover — fired from the LiveBadge. */
+  onPrefetchLive?: (entry: ChannelLiveStatus['live'][number]) => void;
 }
 
 const ChannelRow = memo(function ChannelRow({
@@ -262,6 +264,7 @@ const ChannelRow = memo(function ChannelRow({
   startEditChannelLinks,
   removePlatformFromChannel, channelContentFilter,
   setSavedChannels, setChannelDragId, setChannelDropInsertIndex,
+  onPrefetchLive,
 }: ChannelRowProps) {
   const { t } = useI18n();
   const dropAbove = dragId != null && dropInsertIndex === index;
@@ -324,6 +327,7 @@ const ChannelRow = memo(function ChannelRow({
           e.stopPropagation();
           void openLivePreview(liveEntries[0], liveEntries, ch.displayName, ch);
         } : undefined}
+        onMouseEnter={liveEntries.length ? () => onPrefetchLive?.(liveEntries[0]) : undefined}
         ariaLabel={t('Live {name}', { name: ch.displayName })}
       />
       <button
@@ -546,6 +550,11 @@ export default function App() {
   const previewSessionIdRef = useRef<string | null>(null);
   /** YouTube Extract Info — session created in parallel so Watch Preview attaches instantly. */
   const previewSessionPrefetchRef = useRef<{
+    url: string;
+    session: PreviewSessionResponse;
+  } | null>(null);
+  /** Live session pre-warm — created on channel hover, consumed by LivePlayerPopup on mount. */
+  const liveSessionPrefetchRef = useRef<{
     url: string;
     session: PreviewSessionResponse;
   } | null>(null);
@@ -5534,6 +5543,25 @@ export default function App() {
   // and those extractors can't resolve them. Trim/download still work because
   // the session is a regular PreviewSession (kind=hls) proxied via the same
   // /api/preview/hls/{sid}/master.m3u8 endpoint.
+
+  /** Pre-warm a live session on channel hover — the popup consumes it on mount. */
+  const prefetchLiveSession = useCallback(async (entry: ChannelLiveStatus['live'][number]) => {
+    if (!entry?.url) return;
+    // Don't re-prefetch if already cached for this URL
+    if (liveSessionPrefetchRef.current?.url === entry.url) return;
+    liveSessionPrefetchRef.current = null;
+    try {
+      const body: { url: string; is_live: boolean; platform?: string } = { url: entry.url, is_live: true };
+      if (entry.platform) body.platform = entry.platform;
+      const res = await apiPost<PreviewSessionResponse>('/api/preview/live', body);
+      if (res?.session_id) {
+        liveSessionPrefetchRef.current = { url: entry.url, session: res };
+      }
+    } catch {
+      // Best effort — don't break the UI
+    }
+  }, []);
+
   const openLivePreview = useCallback(async (entry: ChannelLiveStatus['live'][number], entries: ChannelLiveStatus['live'], channelName?: string, channel?: SavedChannel | null): Promise<void> => {
     if (!entry?.url) return;
     const name = channelName || entry.platform || 'Live';
@@ -6328,7 +6356,7 @@ export default function App() {
         </button>
         {hovered && (
           <div
-            className={`absolute bottom-full left-0 mb-1.5 z-30 flex items-center gap-2 px-2.5 py-2 shadow-lg ${popoverClass}`}
+            className={`absolute left-full bottom-0 ml-1.5 z-30 flex items-center gap-2 px-2.5 py-2 shadow-lg ${popoverClass}`}
             onClick={(e) => e.stopPropagation()}
           >
             <input
@@ -7210,6 +7238,7 @@ export default function App() {
                     setChannelDropInsertIndex={setChannelDropInsertIndex}
                     openLivePreview={openLivePreview}
                     onOpenChannelSearch={openChannelSearch}
+                    onPrefetchLive={prefetchLiveSession}
                   />
                   {selectedChannelId === ch.id && (
                     <div className="flex flex-col gap-2 ml-1 pl-2 border-l-2 border-zinc-700 py-1 min-w-0">
@@ -7411,6 +7440,7 @@ export default function App() {
                               tabIndex={0}
                               onClick={() => void openLivePreview(selectedChannelFirstLiveEntry, selectedChannelLiveEntries, selectedChannel?.displayName, selectedChannel)}
                               onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); void openLivePreview(selectedChannelFirstLiveEntry, selectedChannelLiveEntries); } }}
+                              onMouseEnter={() => void prefetchLiveSession(selectedChannelFirstLiveEntry)}
                               className="flex items-center gap-1.5 px-1.5 py-1 rounded border border-red-800/40 bg-zinc-800/20 hover:bg-zinc-800/50 cursor-pointer"
                             >
                               <span className="h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse shrink-0" />
@@ -7466,6 +7496,7 @@ export default function App() {
                               tabIndex={0}
                               onClick={() => void openLivePreview(selectedChannelFirstLiveEntry, selectedChannelLiveEntries, selectedChannel?.displayName, selectedChannel)}
                               onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); void openLivePreview(selectedChannelFirstLiveEntry, selectedChannelLiveEntries); } }}
+                              onMouseEnter={() => void prefetchLiveSession(selectedChannelFirstLiveEntry)}
                               className="flex items-center gap-1.5 px-1.5 py-1 rounded border border-red-800/40 bg-zinc-800/20 hover:bg-zinc-800/50 cursor-pointer"
                             >
                               <span className="h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse shrink-0" />
@@ -7788,6 +7819,7 @@ export default function App() {
             onClose={() => closeLivePopup(popup.id)}
             onOpenHit={openArchiveHit}
             savedChannels={savedChannels}
+            liveSessionPrefetchRef={liveSessionPrefetchRef}
           />
         );
       })}

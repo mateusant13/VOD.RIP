@@ -12,12 +12,14 @@ export function LiveBadge({
   invisible,
   onClick,
   ariaLabel,
+  onMouseEnter,
 }: {
   entries: LiveEntry[];
   invisible?: boolean;
   /** When provided the badge itself is the clickable live control (opens the live player). */
   onClick?: (e: React.MouseEvent) => void;
   ariaLabel?: string;
+  onMouseEnter?: () => void;
 }) {
   if (entries.length === 0 && !invisible) return null;
   const title = entries.map((e) => `${e.platform}: ${e.title}`).join('\n');
@@ -36,6 +38,7 @@ export function LiveBadge({
         title={title}
         aria-label={ariaLabel}
         onClick={onClick}
+        onMouseEnter={onMouseEnter}
         className={`${baseClass} cursor-pointer hover:bg-red-800/70 active:bg-red-800`}
         style={invisible ? { visibility: 'hidden' } : undefined}
       >
@@ -47,6 +50,7 @@ export function LiveBadge({
     <span
       title={title}
       className={baseClass}
+      onMouseEnter={onMouseEnter}
       style={invisible ? { visibility: 'hidden' } : undefined}
     >
       {inner}

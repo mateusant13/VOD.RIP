@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { Captions, ExternalLink, Languages, Loader2, Maximize2, Minimize2, MessageSquare, Pause, Play, Search, Settings, Volume2, VolumeX, RefreshCw, X } from 'lucide-react';
 import { apiDelete, apiPost } from '../hooks/useApiClient';
@@ -90,6 +90,8 @@ interface LivePlayerPopupProps {
   zIndex?: number;
   /** App raises this popup's ladder rank on pointer-down (drag to front). */
   onBringToFront?: () => void;
+  /** Pre-warmed live session from channel hover — consumed on mount to skip the POST. */
+  liveSessionPrefetchRef?: MutableRefObject<{ url: string; session: PreviewSessionResponse } | null>;
 }
 
 type DragState = {
@@ -126,9 +128,12 @@ interface CaptionBlock {
 }
 /** Re-snapshot the archive playlist while parked in REPLAY (grows while live). */
 const REPLAY_RESNAPSHOT_MS = 30_000;
-/** Live session POST stall budget — after this the popup advances to the next
- *  live entry (or surfaces the error) instead of pinning the spinner. */
-const SESSION_STALL_MS = 8_000;
+/** Live session POST stall budget per attempt — after this the attempt is
+ *  aborted and the next retry (or fallback entry) takes over. 15s covers
+ *  cold-backend wake + transcode ramp without pinning the spinner. */
+const SESSION_STALL_MS = 15_000;
+/** Maximum retries for the session creation POST before giving up. */
+const LIVE_SESSION_MAX_RETRIES = 3;
 /** Inactivity fade for the transport + header ('rapido' per the user) — the
  *  App fullscreen pattern is 200ms; the live popup watches at 2500ms so a
  *  paused read of the rail/menus never flickers. */
@@ -257,7 +262,7 @@ export function __resetLivePlayerRegistryForTests(): void {
   liveQualityCount = 0;
 }
 
-export function LivePlayerPopup({ entry, entries, channelName, onClose, channelSlug, channel, vodUrl, onOpenHit, savedChannels, cascadeIndex = 0, zIndex, onBringToFront }: LivePlayerPopupProps) {
+export function LivePlayerPopup({ entry, entries, channelName, onClose, channelSlug, channel, vodUrl, onOpenHit, savedChannels, cascadeIndex = 0, zIndex, onBringToFront, liveSessionPrefetchRef }: LivePlayerPopupProps) {
   const { t } = useI18n();
   const videoRef = useRef<HTMLVideoElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
@@ -1352,6 +1357,9 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   // Create preview session on mount — one run per entry: advancing a fallback
   // changes activeEntry.url, which re-runs this effect; cleanup aborts the
   // in-flight POST and destroys the hls instance, so the switch never leaks.
+  // Retries up to LIVE_SESSION_MAX_RETRIES with exponential backoff on any
+  // error (not just AbortError), and consumes a pre-warmed session from
+  // liveSessionPrefetchRef when available.
   useEffect(() => {
     let cancelled = false;
     // Start the hls.js chunk load in parallel with the session POST — the
@@ -1360,96 +1368,75 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     // any other open path and makes the two fetches overlap instead of
     // chaining).
     void import('hls.js').catch(() => {});
-    // Stall guard: abort the session POST after 8s — a hung backend must not
-    // pin the spinner (apiPost's own budget is 60s x 3 retries). The abort
-    // rejects as AbortError; the catch advances to the next entry if one
-    // exists, else surfaces the error (with the retry button) as today.
-    const controller = new AbortController();
-    const stallTimer = window.setTimeout(() => controller.abort(), SESSION_STALL_MS);
 
     (async () => {
-      try {
-        if (invisibleRecreateRef.current) {
-          // Invisible retry: keep the current frame under the buffering
-          // overlay — no loading swap for the one automatic recreate.
-          invisibleRecreateRef.current = false;
-        } else {
-          setLoading(true);
-        }
-        setError(null);
-        const body: {
-          url: string;
-          is_live: boolean;
-          headers?: Record<string, string>;
-          platform?: string;
-          vod_url?: string;
-        } = { url: activeEntry.url, is_live: true };
-        if (activeEntry.headers) body.headers = activeEntry.headers;
-        if (activeEntry.platform) body.platform = activeEntry.platform;
-        if (vodUrl) body.vod_url = vodUrl;
+      // Pre-loop setup: invisible recreate / loading state, body construction
+      if (invisibleRecreateRef.current) {
+        invisibleRecreateRef.current = false;
+      } else {
+        setLoading(true);
+      }
+      setError(null);
+      const body: {
+        url: string;
+        is_live: boolean;
+        headers?: Record<string, string>;
+        platform?: string;
+        vod_url?: string;
+      } = { url: activeEntry.url, is_live: true };
+      if (activeEntry.headers) body.headers = activeEntry.headers;
+      if (activeEntry.platform) body.platform = activeEntry.platform;
+      if (vodUrl) body.vod_url = vodUrl;
 
-        const res = await apiPost<PreviewSessionResponse>('/api/preview/live', body, { signal: controller.signal });
-        if (cancelled) {
-          // StrictMode double-mount (dev) / entry switch: this mount is gone
-          // but the POST completed — delete the orphan session instead of
-          // leaking it for its 30min TTL.
-          if (res?.session_id) apiDelete(`/api/preview/session/${res.session_id}`).catch(() => {});
-          return;
-        }
-        window.clearTimeout(stallTimer);
-        if (!res) {
-          if (tryAdvanceEntry()) return;
-          setError(t('No response from server'));
-          setLoading(false);
-          markPreviewError();
-          return;
-        }
+      // Consume a pre-warmed session (from channel hover) if the URL matches.
+      // ponytail: skip the entire retry loop — the session is ready.
+      const prefetched =
+        liveSessionPrefetchRef?.current?.url === activeEntry.url
+          ? liveSessionPrefetchRef.current.session
+          : null;
+      if (prefetched) {
+        liveSessionPrefetchRef.current = null;
+        if (cancelled) return;
+        // Fall through to the shared success path below with res = prefetched.
+        await handleLiveSessionSuccess(prefetched, cancelled);
+        return;
+      }
 
-        sessionIdRef.current = res.session_id;
-        sessionRef.current = res;
-        sessionPlatformRef.current = (activeEntry.platform || '').toLowerCase();
-        setArchiveDuration(res.archive_duration ?? 0);
-
-        // Warm the LIVE rail: the backend resolves the DVR archive lazily on
-        // this snapshot request (off the playback critical path), so fetch it
-        // unconditionally and sum its EXTINF durations — the rail then spans
-        // the whole broadcast from the start instead of sitting at 1s until
-        // the first REPLAY switch. No archive → the request 404s and the rail
-        // stays off (same as a live stream with no DVR).
-        fetch(replaySnapshotUrl(res.session_id))
-          .then((r) => (r.ok ? r.text() : ''))
-          .then((text) => {
-            if (cancelled) return;
-            const total = parsePlaylistTotalSec(text);
-            if (total > 0) {
-              setArchiveDuration(total);
-              archiveReadyRef.current = true;
-              setArchiveReady(true);
+      // Normal flow: POST /api/preview/live with per-attempt stall guard
+      // and exponential backoff on failure.
+      for (let attempt = 0; attempt <= LIVE_SESSION_MAX_RETRIES; attempt++) {
+        if (cancelled) return;
+        const controller = new AbortController();
+        const stallTimer = window.setTimeout(() => controller.abort(), SESSION_STALL_MS);
+        try {
+          const res = await apiPost<PreviewSessionResponse>('/api/preview/live', body, { signal: controller.signal });
+          window.clearTimeout(stallTimer);
+          if (cancelled) {
+            if (res?.session_id) apiDelete(`/api/preview/session/${res.session_id}`).catch(() => {});
+            return;
+          }
+          if (!res) {
+            if (tryAdvanceEntry()) return;
+            setError(t('No response from server'));
+            setLoading(false);
+            markPreviewError();
+            return;
+          }
+          await handleLiveSessionSuccess(res, cancelled);
+          return; // success — exit the loop
+        } catch (err) {
+          window.clearTimeout(stallTimer);
+          if (cancelled) return;
+          if (attempt < LIVE_SESSION_MAX_RETRIES) {
+            // Delete stale session if one was created
+            if (sessionIdRef.current) {
+              void apiDelete(`/api/preview/session/${sessionIdRef.current}`).catch(() => {});
+              sessionIdRef.current = null;
             }
-          })
-          .catch(() => {});
-
-        // Attach player to video element
-        const video = videoRef.current;
-        if (!video) { setLoading(false); return; }
-
-        const src = res.master_url || res.playback_url;
-        // Live sessions return playback_url == master_url (both .m3u8) — decide by kind, not presence.
-        const isHls = res.kind === 'hls' || !!src && src.includes('.m3u8');
-        if (src && !isHls) {
-          // Progressive stream
-          video.src = src;
-          video.addEventListener('loadedmetadata', () => { setLoading(false); clearRetry(); }, { once: true });
-          video.play().catch(() => {});
-        } else if (src) {
-          await createHlsPlayer(src, -1);
-        } else {
-          setLoading(false);
-        }
-
-        video.play().catch(() => {});
-      } catch (err: unknown) {
-        if (!cancelled) {
+            await new Promise((r) => setTimeout(r, Math.pow(2, attempt) * 1000));
+            continue;
+          }
+          // All retries exhausted
           if (tryAdvanceEntry()) return;
           const stalled = err instanceof DOMException && err.name === 'AbortError';
           setError(stalled
@@ -1457,17 +1444,82 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
             : (err instanceof Error ? err.message : t('Failed to start live stream')));
           setLoading(false);
           markPreviewError();
+          return;
         }
       }
     })();
 
+    /** Shared success path: set session state, warm rail, attach player. */
+    async function handleLiveSessionSuccess(
+      res: PreviewSessionResponse,
+      isCancelled: boolean,
+    ): Promise<void> {
+      if (isCancelled) {
+        if (res?.session_id) apiDelete(`/api/preview/session/${res.session_id}`).catch(() => {});
+        return;
+      }
+      if (!res) {
+        if (tryAdvanceEntry()) return;
+        setError(t('No response from server'));
+        setLoading(false);
+        markPreviewError();
+        return;
+      }
+
+      sessionIdRef.current = res.session_id;
+      sessionRef.current = res;
+      sessionPlatformRef.current = (activeEntry.platform || '').toLowerCase();
+      setArchiveDuration(res.archive_duration ?? 0);
+
+      // Warm the LIVE rail: the backend resolves the DVR archive lazily on
+      // this snapshot request (off the playback critical path), so fetch it
+      // unconditionally and sum its EXTINF durations — the rail then spans
+      // the whole broadcast from the start instead of sitting at 1s until
+      // the first REPLAY switch. No archive → the request 404s and the rail
+      // stays off (same as a live stream with no DVR).
+      fetch(replaySnapshotUrl(res.session_id))
+        .then((r) => (r.ok ? r.text() : ''))
+        .then((text) => {
+          if (isCancelled) return;
+          const total = parsePlaylistTotalSec(text);
+          if (total > 0) {
+            setArchiveDuration(total);
+            archiveReadyRef.current = true;
+            setArchiveReady(true);
+          }
+        })
+        .catch(() => {});
+
+      // Attach player to video element
+      const video = videoRef.current;
+      if (!video) { setLoading(false); return; }
+
+      const src = res.master_url || res.playback_url;
+      // Live sessions return playback_url == master_url (both .m3u8) — decide by kind, not presence.
+      const isHls = res.kind === 'hls' || !!src && src.includes('.m3u8');
+      if (src && !isHls) {
+        // Progressive stream
+        video.src = src;
+        video.addEventListener('loadedmetadata', () => { setLoading(false); clearRetry(); }, { once: true });
+        video.play().catch(() => {});
+      } else if (src) {
+        await createHlsPlayer(src, -1);
+      } else {
+        setLoading(false);
+      }
+
+      video.play().catch(() => {});
+    }
+
     return () => {
       cancelled = true;
-      window.clearTimeout(stallTimer);
-      controller.abort();
+      // Clear prefetch for this URL if it wasn't consumed
+      if (liveSessionPrefetchRef?.current?.url === activeEntry.url) {
+        liveSessionPrefetchRef.current = null;
+      }
       destroyHls();
     };
-  }, [activeEntry.url, activeEntry.headers, activeEntry.platform, vodUrl, abortRef, createHlsPlayer, destroyHls, retryTick, markPreviewError, clearRetry, tryAdvanceEntry]);
+  }, [activeEntry.url, activeEntry.headers, activeEntry.platform, vodUrl, abortRef, createHlsPlayer, destroyHls, retryTick, markPreviewError, clearRetry, tryAdvanceEntry, liveSessionPrefetchRef]);
 
   // Sync transport state from the video element
   useEffect(() => {
@@ -2360,7 +2412,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                   {muted || volume === 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}
                 </button>
                 {volumeMenuOpen && (
-                  <div className="absolute bottom-full left-0 z-30 mb-1.5 flex items-center gap-2 border-2 border-zinc-600 bg-zinc-950 px-2.5 py-2 shadow-lg">
+                  <div className="absolute left-full bottom-0 z-30 ml-1.5 flex items-center gap-2 border-2 border-zinc-600 bg-zinc-950 px-2.5 py-2 shadow-lg">
                     <input
                       type="range"
                       min={0}

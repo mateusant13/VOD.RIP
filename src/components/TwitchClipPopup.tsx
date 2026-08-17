@@ -1128,7 +1128,7 @@ export default function TwitchClipPopup({
             </button>
             {volumeHovered && (
               <div
-                className="absolute bottom-full left-0 mb-1.5 z-30 flex items-center gap-2 px-2.5 py-2 shadow-lg border-2 border-zinc-600 bg-zinc-950"
+                className="absolute left-full bottom-0 ml-1.5 z-30 flex items-center gap-2 px-2.5 py-2 shadow-lg border-2 border-zinc-600 bg-zinc-950"
                 onClick={(e) => e.stopPropagation()}
               >
                 <input
