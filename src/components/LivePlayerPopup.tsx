@@ -2324,10 +2324,11 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       {/* Video area + docked live chat — the chat panel takes its own column
           right of the video (same side-dock pattern as the archive preview's
           chat panel), never over the video while fullscreen. */}
-      <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
+      <div className="flex flex-1 min-h-0 overflow-hidden" style={{ minHeight: 0 }}>
       <div
         style={{
           flex: 1,
+          minWidth: 0,
           position: 'relative',
           background: '#000',
           overflow: 'hidden',
@@ -2713,8 +2714,8 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
           when chatOpen is false so the EventSource starts immediately. */}
       {!isFullscreen && chatSources.length > 0 && (
         <div
-          className={chatOpen ? '' : 'hidden w-0 overflow-hidden'}
-          style={chatOpen ? undefined : { position: 'absolute', height: 0, width: 0, overflow: 'hidden' }}
+          className={chatOpen ? 'flex min-h-0 overflow-hidden shrink-0' : 'hidden w-0 overflow-hidden'}
+          style={chatOpen ? { width: LIVE_CHAT_PANEL_W, minHeight: 0, overflow: 'hidden' } : { position: 'absolute', height: 0, width: 0, overflow: 'hidden' }}
           aria-hidden={!chatOpen}
         >
           <LiveChatPanel
