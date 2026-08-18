@@ -109,7 +109,10 @@ import { useDirectMSEPlayer } from './hooks/useDirectMSEPlayer';
 import { youtubeIframeCommand, youtubeIframeListen } from './youtubeEmbed';
 import { previewRetryAfterError, previewRetryMode, type PreviewRetryStage, type PreviewRetryState } from './previewRetry';
 import { PreviewStartTimeout } from './previewStartTimeout';
-
+import FrameToggle from './components/FrameToggle';
+import FrameOverlay from './components/FrameOverlay';
+import PanelResizer from './components/PanelResizer';
+import './styles/frame.css';
 // ─── TYPES (migrated to src/types.ts) ───────────────
 
 interface ChannelLiveStatus {
@@ -744,6 +747,11 @@ export default function App() {
   const explorePauseMapRef = useRef(new Map<string, () => void>());
   const popupZCounterRef = useRef(0);
   const [initialPanelLayout] = useState(loadPanelLayout);
+  // Frame mode: bottom-right fixed checkbox, persists to localStorage vodrip.ui.frameMode
+  const [frameMode, setFrameMode] = useState<boolean>(() => {
+    try { const v = localStorage.getItem('vodrip.ui.frameMode'); return v === '1' || v === 'true'; } catch { return false; }
+  });
+  useEffect(() => { try { localStorage.setItem('vodrip.ui.frameMode', frameMode ? '1' : '0'); } catch {} }, [frameMode]);
   const [previewPanelWidth, setPreviewPanelWidth] = useState(initialPanelLayout.previewPanelWidth);
   const [previewVideoAspect, setPreviewVideoAspect] = useState(PREVIEW_VIDEO_ASPECT_DEFAULT);
   const [urlAsidePanelSize, setUrlAsidePanelSize] = useState(initialPanelLayout.urlAside);
@@ -7032,6 +7040,9 @@ export default function App() {
           )}
         </div>
       )}
+      {previewOpen && (showUrlInSidebar || showUrlInPreviewMiddle) && (
+        <PanelResizer leftRef={previewPanelRef} rightRef={urlAsidePanelRef} persistKey="previewCol" minLeft={280} minRight={240} />
+      )}
       {(showUrlInSidebar || showUrlInPreviewMiddle) && (
         <div
           ref={urlAsidePanelRef}
@@ -7070,6 +7081,7 @@ export default function App() {
           <PanelResizeHandles onPointerDown={onUrlAsidePanelResize} />
         </div>
       )}
+      <PanelResizer leftRef={urlAsidePanelRef} rightRef={mainPanelRef} persistKey="main" minLeft={240} minRight={260} />
       <div
         ref={mainPanelRef}
         style={{ width: effectiveLayout.main.w, height: effectiveLayout.main.h }}
@@ -7949,6 +7961,22 @@ export default function App() {
         onConfirm={() => void executeStartDownload()}
         onCancel={() => setDownloadConfirmOpen(false)}
       />
+      <FrameToggle frameMode={frameMode} setFrameMode={setFrameMode} />
+      {frameMode && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            pointerEvents: 'none',
+            zIndex: 5,
+          }}
+        >
+            <FrameOverlay
+              active={frameMode}
+              onDropCell={() => {}}
+            />
+        </div>
+      )}
     </main>
   );
 }

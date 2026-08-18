@@ -1,0 +1,29 @@
+/* frame.css — Frame snap layout + panel resize gutters */
+
+.frame-overlay {
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(2, 1fr);
+}
+
+@media (max-width: 1100px) {
+  .frame-overlay {
+    grid-template-columns: repeat(2, 1fr);
+    grid-template-rows: repeat(3, 1fr);
+  }
+}
+
+/* Responsive stack below 900px — no layout thrash: flex-wrap owns it */
+@media (max-width: 900px) {
+  .vod-app-shell .vod-layout-row {
+    flex-wrap: wrap;
+  }
+  .panel-resizer-gutter {
+    display: none;
+  }
+}
+
+.panel-resizer-gutter {
+  touch-action: none;
+}
+
+/* Dotted cell hover is inline in FrameOverlay for zero extra specificity */
