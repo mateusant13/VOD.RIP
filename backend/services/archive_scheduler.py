@@ -574,7 +574,7 @@ def _requeue_failed_transcribe_job(
         "SELECT attempts, max_attempts FROM archive_jobs WHERE id = ?", (job_id,)
     )
     if row and int(row[0]["attempts"] or 0) >= int(row[0]["max_attempts"] or 3):
-        logger.info(
+        logger.debug(
             "scheduler skipped failed transcribe job %s — attempts exhausted",
             job_id,
         )
@@ -616,15 +616,20 @@ def _enqueue_transcriptions() -> None:
     # Pass 1 — stale-failed requeue (window-independent). Jobs whose
     # attempts are exhausted are skipped by _requeue_failed_transcribe_job
     # (P1-1 zombie guard) — a permanently-failing VOD never cycles here.
+    # Exhaust-quiet: LIMIT 100 + single per-pass debug summary (no per-job
+    # INFO spam when the DB holds a large historical failure backlog).
+    _pass1_exhausted = 0
+    _pass1_non_candidate = 0
     for r in archive_db.query(
         """SELECT id, platform, video_id FROM archive_jobs
            WHERE kind='transcribe' AND status='failed' AND updated_at < ?
-           ORDER BY updated_at ASC""",
+           ORDER BY updated_at ASC LIMIT 100""",
         (fresh_cutoff.isoformat(timespec="seconds"),),
     ):
         if enqueued >= pass1_cap:
             break
         if not _transcribe_video_candidate(r["platform"], r["video_id"]):
+            _pass1_non_candidate += 1
             continue  # transcribed meanwhile / terminal verdict — leave failed
         if _requeue_failed_transcribe_job(r["id"], now_iso):
             enqueued += 1
@@ -632,6 +637,13 @@ def _enqueue_transcriptions() -> None:
                 "scheduler requeued stale failed transcribe job %s (%s/%s)",
                 r["id"], r["platform"], r["video_id"],
             )
+        else:
+            _pass1_exhausted += 1
+    if _pass1_exhausted or _pass1_non_candidate:
+        logger.debug(
+            "scheduler transcribe pass-1 skipped %d exhausted, %d non-candidate (cap %d, enqueued %d)",
+            _pass1_exhausted, _pass1_non_candidate, pass1_cap, enqueued,
+        )
 
     if enqueued >= budget:
         return
