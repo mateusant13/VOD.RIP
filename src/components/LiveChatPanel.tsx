@@ -301,7 +301,7 @@ export default function LiveChatPanel({ sources, onClose }: LiveChatPanelProps) 
   return (
     <div
       data-live-chat-panel
-      className="flex flex-col bg-zinc-950 border-l-2 border-zinc-800 shrink-0"
+      className="flex flex-col bg-zinc-950 border-l-2 border-zinc-800 shrink-0 h-full min-h-0 overflow-hidden"
       style={{ width: LIVE_CHAT_PANEL_W }}
     >
       <div className="flex items-center justify-between gap-1 px-2 py-1 bg-zinc-900 border-b border-zinc-800 shrink-0">
