@@ -686,3 +686,11 @@ However, the codebase is accumulating debt faster than it's being paid down:
 - Anon-360p hedge (preview_service): 1s solo window before full chain starts; late anon win honored on chain failure.
 - FIX: React StrictMode double-fired popup create; backend dedup gave both runs the same session, and the cancelled twin DELETEed it -> backgrounded popups died ~3s in and resume spun forever. ChannelExplorePopup now delays the orphan delete 5s and skips it when the session was applied.
 - Verified live (ungated): cold 9h VOD create 3.2s; 5 concurrent creates 4x200 in 4-16s + 1 dead-video honest fail; 5 rapid popup clicks -> 1 playing, 1 buffered, 3 honest errors, 0 stray deletes; backgrounded popup resumes.
+
+## 2026-08-17 - scheduler exhaust quiet + caption sync + chat overflow + TS fix
+- `archive_scheduler.py`: demoted "attempts exhausted" INFO spam to debug, LIMIT 100 guard on `_pass1_exhausted` scan; stale requeue only when `updated_at < fresh_cutoff`. Reduced ~1200 INFO lines/hr to zero visible spam.
+- `live_captions.py`: added `CAPTION_TARGET_ALIGN_SEC = 0.9` constant documenting the 0.8–1.0s target; ponytail upgrade path is an env knob.
+- `LivePlayerPopup.tsx`: `liveSyncDurationCount` 2→3 when captions ON and buffer healthy; `lowLatencyMode: false`; stall guard ref prevents repeated buffering overlay. Guarded `liveSessionPrefetchRef` access against undefined.
+- `LiveChatPanel.tsx`: flex `min-h-0` chain fixes docked chat growing to 300 rows without scroll containment.
+- `useFeature.ts`: removed unused `useCallback` import (TS6133).
+- `SettingsTab.tsx`: restored to working version with `settings: AppSettings` prop, `useI18n()` hook, and `openCards`/`toggleCard` accordion state. TSC: 0 errors.

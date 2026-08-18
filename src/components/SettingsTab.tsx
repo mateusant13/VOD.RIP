@@ -17,8 +17,9 @@ import type { AppSettings, UpdateInfo } from '../types';
 import { previewDownloadTree, type DownloadLayout } from '../downloadLayout';
 import { FEATURE_MANIFEST } from '../lib/featureManifest';
 import { getEnabledFeatures } from '../lib/featureFlags';
-import { notifyFeatureChange, useEnabledFeatures } from '../hooks/useFeature';
+import { notifyFeatureChange } from '../hooks/useFeature';
 type Props = {
+  settings: AppSettings;
   setSettings: Dispatch<SetStateAction<AppSettings>>;
   appVersion: string | null;
   updateInfo: UpdateInfo | null;
@@ -116,8 +117,15 @@ export default function SettingsTab({
   onApplyUpdate,
   onFlushPanelLayout,
 }: Props) {
-  const enabledMap = useEnabledFeatures();
   const [savedSig, setSavedSig] = useState(() => settingsSignature(settings));
+  const dirty = settingsSignature(settings) !== savedSig;
+  const { lang, setLang, t } = useI18n();
+
+  /** Accordion: every card starts collapsed; expanding one never closes the
+   *  others (independent chevron toggles, state keyed by card id). */
+  const [openCards, setOpenCards] = useState<Record<string, boolean>>({});
+  const toggleCard = (id: string) =>
+    setOpenCards((m) => ({ ...m, [id]: !m[id] }));
 
   /** Machine-aware resource suggestions (threads + cache MB) served by
    *  GET /api/settings/recommended — filled via the "Recommended" button in
@@ -490,20 +498,19 @@ export default function SettingsTab({
 
       <SettingsCard
         icon={Sparkles}
-        title={t('Features')}
+        title="Features"
         open={!!openCards.features}
         onToggle={() => toggleCard('features')}
       >
-        <p className="text-[11px] font-mono text-zinc-500">{t('Choose which tools you want. Tools that use more power start off — turn them on whenever you need them.')}</p>
+        <p className="text-[11px] font-mono text-zinc-500">Toggle heavy features (OFF by default). Changes persist to Settings and reload preserves them.</p>
         <div className="flex flex-col gap-2 mt-2">
           {FEATURE_MANIFEST.map(f => {
-            const enabled = !!enabledMap[f.id];
-            const label = f.id === 'core-download' ? t('Downloads') : f.id === 'transcribe-vod' ? t('Transcripts for saved videos') : f.id === 'live-captions' ? t('Live subtitles') : f.id === 'live-preview' ? t('Live previews') : f.id === 'chat-live' ? t('Live chat') : f.id;
+            const enabled = !!(getEnabledFeatures()[f.id]);
             return (
               <Toggle
                 key={f.id}
-                label={`${label} — ${t(f.description)}`}
-                info={t(f.cost === 'heavy' ? 'Uses more power' : 'Light')}
+                label={`${f.id} — ${f.description}`}
+                info={f.cost === 'heavy' ? 'HEAVY — GPU/model/threads' : 'LIGHT'}
                 checked={enabled}
                 onChange={c => {
                   const cur = getEnabledFeatures(); cur[f.id]=c;

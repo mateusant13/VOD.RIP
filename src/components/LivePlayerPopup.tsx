@@ -1468,7 +1468,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
           ? liveSessionPrefetchRef.current.session
           : null;
       if (prefetched) {
-        liveSessionPrefetchRef.current = null;
+        if (liveSessionPrefetchRef) liveSessionPrefetchRef.current = null;
         if (cancelled) return;
         // Fall through to the shared success path below with res = prefetched.
         await handleLiveSessionSuccess(prefetched, cancelled);

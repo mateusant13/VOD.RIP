@@ -1,4 +1,4 @@
-import { useSyncExternalStore, useCallback } from 'react';
+import { useSyncExternalStore } from 'react';
 import { getEnabledFeatures } from '../lib/featureFlags';
 
 let version = 0;
