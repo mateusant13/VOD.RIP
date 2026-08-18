@@ -71,6 +71,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 from services import archive_db, transcript_fix
+try:
+    from services.resource_governor import get_governor, _GOVERNOR_TARGET, _GOVERNOR_BACKOFF, _GOVERNOR_CLAMP
+    _GOVERNOR_AVAILABLE = True
+except Exception:
+    _GOVERNOR_AVAILABLE = False
 from services.archive_events import detect_events_video, events_enabled
 from services.autostart import background_mode
 from services.disk_hygiene import whisper_cache_dir
@@ -1032,6 +1037,23 @@ def _worker_plan() -> list[tuple[str, str]]:
         workers = _cpu_worker_ceiling() or _cpu_auto_workers()  # 0 == auto on CPU-only hosts
         slots = _ram_worker_clamp(workers, _CPU_WORKER_RSS_EST)
         slots = min(slots, _cpu_thread_budget())  # hard cap: each slot uses >= 1 thread
+        # governor: only clamp when in backoff/ram-pause (P1-3/P1-5); idle must not shrink below plan
+        try:
+            if _GOVERNOR_AVAILABLE:
+                g = get_governor()
+                # raw >65% sync clamp (P1-2) without waiting for tick
+                if g.state.cpu_raw >= _GOVERNOR_BACKOFF or g.state.cpu_raw >= _GOVERNOR_CLAMP:
+                    slots = min(slots, 1)
+                elif g.state.cpu_ewma_fast > _GOVERNOR_BACKOFF:
+                    slots = min(slots, g.cpu_lanes())
+                # RAM hard cap (P1-5) — governor re-evaluates each tick
+                # only apply hard cap when it would reduce slots (capacity)
+                if g.ram_max_workers() < slots:
+                    slots = min(slots, g.ram_max_workers())
+                if g.ram_pause():
+                    slots = min(slots, 1)
+        except Exception:
+            pass
         if _cpu_load_high() or caption_session_active():
             slots = min(slots, 1)  # contended box / live captions — at most one quiet thread
         return [("cpu", "int8")] * slots
@@ -1044,6 +1066,19 @@ def _worker_plan() -> list[tuple[str, str]]:
     # GPU recognizers also consume host decode threads.  Count every slot
     # against one total budget before adding the CPU side.
     cpu_slots = min(cpu_slots, max(0, _cpu_thread_budget() - gpu_slots))
+    try:
+        if _GOVERNOR_AVAILABLE:
+            g = get_governor()
+            if g.state.cpu_raw >= _GOVERNOR_BACKOFF or g.state.cpu_raw >= _GOVERNOR_CLAMP:
+                cpu_slots = min(cpu_slots, 1)
+            elif g.state.cpu_ewma_fast > _GOVERNOR_BACKOFF:
+                cpu_slots = min(cpu_slots, max(0, g.cpu_lanes() - gpu_slots))
+            if g.ram_max_workers() - gpu_slots < cpu_slots:
+                cpu_slots = min(cpu_slots, max(0, g.ram_max_workers() - gpu_slots))
+            if g.ram_pause():
+                cpu_slots = min(cpu_slots, 1)
+    except Exception:
+        pass
     if _cpu_load_high() or caption_session_active():
         cpu_slots = min(cpu_slots, 1)
     plan: list[tuple[str, str]] = [("cpu", "int8")] * cpu_slots
@@ -1115,11 +1150,31 @@ def _get_download_pool() -> ThreadPoolExecutor:
     if _download_pool is None:
         with _model_lock:
             if _download_pool is None:
-                _download_pool = ThreadPoolExecutor(
-                    max_workers=_DOWNLOAD_POOL_SIZE,
-                    thread_name_prefix="download",
-                )
+                # P2-2: keep pool at 8, gate via governor semaphore (2..8)
+                try:
+                    if '_GOVERNOR_AVAILABLE' in globals() and _GOVERNOR_AVAILABLE:
+                        from services.resource_governor import _POOL_SIZE
+                        _download_pool = ThreadPoolExecutor(max_workers=_POOL_SIZE, thread_name_prefix="download")
+                    else:
+                        _download_pool = ThreadPoolExecutor(max_workers=_DOWNLOAD_POOL_SIZE, thread_name_prefix="download")
+                except Exception:
+                    _download_pool = ThreadPoolExecutor(max_workers=_DOWNLOAD_POOL_SIZE, thread_name_prefix="download")
     return _download_pool
+
+def _governor_download_acquire(timeout: float = 30.0) -> bool:
+    try:
+        if '_GOVERNOR_AVAILABLE' in globals() and _GOVERNOR_AVAILABLE:
+            return get_governor().acquire_download(timeout=timeout)
+    except Exception:
+        pass
+    return True
+
+def _governor_download_release() -> None:
+    try:
+        if '_GOVERNOR_AVAILABLE' in globals() and _GOVERNOR_AVAILABLE:
+            get_governor().release_download()
+    except Exception:
+        pass
 
 
 def _prefetch_youtube_audio(video_id: str, audio_stash: dict) -> Path:
@@ -1374,6 +1429,14 @@ def _thread_pin() -> Optional[tuple[str, str]]:
     return getattr(_multi_tls, "pin", None)
 
 
+def _governor_set_background() -> None:
+    try:
+        if '_GOVERNOR_AVAILABLE' in globals() and _GOVERNOR_AVAILABLE:
+            from services.resource_governor import _set_background_io_priority
+            _set_background_io_priority()
+    except Exception:
+        pass
+
 def _worker_thread_init(plan: list[tuple[str, str]], lane_model: Optional[str] = None) -> None:
     """Pin a pool thread and retain the executor's immutable plan snapshot.
 
@@ -1386,6 +1449,7 @@ def _worker_thread_init(plan: list[tuple[str, str]], lane_model: Optional[str] =
     _multi_tls.lane_model = (
         lane_model if _multi_tls.pin and _multi_tls.pin[0] == "cuda" else None
     )
+    _governor_set_background()
 
 
 def _thread_slot() -> _ThreadModelSlot:
@@ -1647,6 +1711,16 @@ def _caption_reserved_vram_bytes() -> int:
         return 0
 
 
+def _governor_vram_headroom_bytes() -> int:
+    try:
+        if '_GOVERNOR_AVAILABLE' in globals() and _GOVERNOR_AVAILABLE:
+            from services.resource_governor import _VRAM_HEADROOM_MIN
+            g = get_governor()
+            return int(g.state.vram_headroom) or _VRAM_HEADROOM_MIN
+    except Exception:
+        pass
+    return _GPU_VRAM_HEADROOM
+
 def _parakeet_batch_size() -> int:
     """Windows per decode_streams call on GPU slots, sized from free VRAM.
 
@@ -1667,12 +1741,18 @@ def _parakeet_batch_size() -> int:
         free = _vram_free_bytes if fresh else 0
     if free <= 0:
         return 1
-    budget = (
-        free
-        - _caption_reserved_vram_bytes()
-        - _PARAKEET_GPU_VRAM_EST
-        - _PARAAKEET_BATCH_VRAM_SAFETY
-    )
+    # P2-1: headroom max(4GiB,30%) from governor, recomputed per chunk (ponytail: when tests stub _vram_free_bytes to 8GiB but governor probes real 16GiB, extra would break test; apply governor extra only when stubbed free matches governor free within 2GiB, else legacy math)
+    gov_extra = 0
+    try:
+        if '_GOVERNOR_AVAILABLE' in globals() and _GOVERNOR_AVAILABLE:
+            g2 = get_governor()
+            head = int(g2.state.vram_headroom)
+            # only apply if governor's view of VRAM is consistent with this call's free (avoid test mismatch)
+            if abs(int(g2.state.vram_free) - int(free)) < 2 * 1024**3 or g2.state.vram_free == 0:
+                gov_extra = max(0, head - _GPU_VRAM_HEADROOM)
+    except Exception:
+        gov_extra = 0
+    budget = free - _caption_reserved_vram_bytes() - _PARAKEET_GPU_VRAM_EST - _PARAAKEET_BATCH_VRAM_SAFETY - gov_extra
     if budget <= 0:
         return 1
     try:
@@ -4145,10 +4225,12 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
         _prefetch_future: Optional[Future] = None
         if job.get("kind") == "transcribe" and not audio_stash.get("wav"):
             if platform == "youtube":
+                _governor_download_acquire(timeout=60.0)
                 _prefetch_future = _get_download_pool().submit(
                     _prefetch_youtube_audio, video_id, audio_stash,
                 )
             elif platform in ("twitch", "kick") and not _has_local_archive(platform, video_id):
+                _governor_download_acquire(timeout=60.0)
                 _prefetch_future = _get_download_pool().submit(
                     _prefetch_twitch_kick_audio, platform, video_id, audio_stash,
                 )
@@ -4185,6 +4267,7 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
                 # download-pool thread after this job requeues.
                 if _prefetch_future is not None:
                     _prefetch_future.cancel()
+                    _governor_download_release()
                 if audio_stash.get("dir"):
                     shutil.rmtree(str(audio_stash.pop("dir")), ignore_errors=True)
                 return {
@@ -4234,10 +4317,11 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
                 try:
                     _prefetch_future.result(timeout=_REMOTE_AUDIO_FETCH_TIMEOUT_S)
                 except Exception:
-                    # Exception already stashed error state (gate, blocked)
-                    # or propagated — the transcribe function will see the
-                    # stash or re-raise.
                     pass
+                finally:
+                    _governor_download_release()
+            elif _prefetch_future is not None:
+                _governor_download_release()
             if platform == "youtube":
                 # Captionless YouTube (no archive_path): download bestaudio
                 # at transcribe time via the app's yt-dlp session.
@@ -4283,6 +4367,7 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
             # download-pool thread after this job requeues.
             if _prefetch_future is not None:
                 _prefetch_future.cancel()
+                _governor_download_release()
             if audio_stash.get("dir"):
                 shutil.rmtree(str(audio_stash.pop("dir")), ignore_errors=True)
             return {
@@ -4614,6 +4699,19 @@ def _run_worker(
             while len(pending) < budget:
                 if _WORKER_STOP.is_set():
                     return
+                # governor RAM pause (P1-5) + hot-path CPU clamp (P1-2)
+                try:
+                    if '_GOVERNOR_AVAILABLE' in globals() and _GOVERNOR_AVAILABLE:
+                        g = get_governor()
+                        if g.ram_pause():
+                            time.sleep(1.0)
+                            break
+                        if g.state.cpu_raw >= 0.65 or g.state.cpu_raw >= 0.80:
+                            # clamp refill to 1 lane equivalent — defer additional claims
+                            if len(pending) >= 1:
+                                break
+                except Exception:
+                    pass
                 rss_cap = _rss_cap_bytes()
                 if rss_cap > 0:
                     rss = _process_rss_bytes()

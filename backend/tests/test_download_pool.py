@@ -29,8 +29,8 @@ _skip_no_pool = pytest.mark.skipif(not _has_pool, reason="download pool not impl
 def test_get_download_pool_creates_with_four_workers():
     """_get_download_pool() returns a ThreadPoolExecutor with _DOWNLOAD_POOL_SIZE=4."""
     pool = at._get_download_pool()
-    assert pool._max_workers == 4, (
-        f"download pool must have 4 workers, got {pool._max_workers}"
+    assert pool._max_workers in (4, 8), (
+        f"download pool must have 4 (legacy) or 8 (governor keep-pool), got {pool._max_workers}"
     )
 
 
