@@ -177,18 +177,46 @@ _REAL_GPU_PROBE_TIMEOUT_S = 5.0
 _smi_gpu_index = 0  # nvidia-smi index of the discrete compute GPU we picked
 
 
+def _torch_cuda_vram() -> Optional[tuple[int, int]]:
+    """(total, free) VRAM bytes from torch.cuda — last-resort fallback.
+
+    Covers machines with CUDA in PATH but non-standard nvcuda.dll layout
+    (RTX 5080 / Blackwell, CUDA 12+).  Returns None when torch is not
+    installed, has no CUDA build, or reports no devices."""
+    try:
+        import torch
+
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            free_b, total_b = torch.cuda.mem_get_info()
+            return int(total_b), int(free_b)
+    except Exception:
+        pass
+    return None
+
+
 def _parse_smi_vram_rows(stdout: str) -> list[tuple[int, int, int]]:
-    """[(index, total_bytes, free_bytes), ...] from csv noheader total,free lines."""
+    """[(index, total_bytes, free_bytes), ...] from csv noheader total,free lines.
+
+    Handles both comma-separated (csv,noheader,nounits) and space-separated
+    output.  Accepts integer and float VRAM values (Blackwell nvidia-smi may
+    emit decimals).  Robust against leading/trailing whitespace."""
     rows: list[tuple[int, int, int]] = []
     for i, line in enumerate((stdout or "").strip().splitlines()):
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) != 2:
+        line = line.strip()
+        if not line:
             continue
-        try:
-            total_mib, free_mib = int(parts[0]), int(parts[1])
-        except ValueError:
+        # Split on comma or any whitespace, then take the last two tokens
+        tokens = re.split(r"[,\s]+", line)
+        nums = []
+        for tok in tokens:
+            try:
+                nums.append(float(tok))
+            except ValueError:
+                continue
+        if len(nums) < 2:
             continue
-        rows.append((i, total_mib * 1024 ** 2, free_mib * 1024 ** 2))
+        total_mib, free_mib = nums[-2], nums[-1]
+        rows.append((i, int(total_mib * 1024 ** 2), int(free_mib * 1024 ** 2)))
     return rows
 
 
@@ -226,29 +254,47 @@ def _cuda_runtime_vram() -> Optional[tuple[int, int]]:
     compute-init test. A fake adapter (no CUDA device) fails
     cudaGetDeviceCount==0 or the context init, so this returns None and
     callers see no GPU. Windows-only; POSIX returns None (nvidia-smi
-    covers it there)."""
+    covers it there).
+
+    Tries multiple DLL locations: system default, CUDA_PATH/bin, and
+    CUDA_PATH/lib/x64 (covers CUDA 12+ and non-standard installs)."""
     if os.name != "nt":
         return None
-    try:
-        import ctypes
+    # ponytail: try system nvcuda.dll first, then CUDA_PATH locations
+    # Upgrade path: use ctypes.util.find_library("cuda") when it stops
+    # returning the stub DLL on Windows.
+    dll_paths: list[str] = ["nvcuda.dll"]
+    cuda_path = os.environ.get("CUDA_PATH") or os.environ.get("CUDA_PATH_V12_8")
+    if cuda_path:
+        cuda_path = os.path.normpath(cuda_path)
+        for sub in ("bin", os.path.join("lib", "x64")):
+            candidate = os.path.join(cuda_path, sub, "nvcuda.dll")
+            if os.path.isfile(candidate):
+                dll_paths.append(candidate)
+                break  # prefer bin, fall back to lib/x64
+    import ctypes
 
-        nv = ctypes.WinDLL("nvcuda.dll")
-        count = ctypes.c_int(0)
-        if nv.cudaGetDeviceCount(ctypes.byref(count)) != 0 or count.value <= 0:
-            return None
-        best: Optional[tuple[int, int]] = None
-        for i in range(count.value):
-            if nv.cudaSetDevice(i) != 0:
+    for dll_path in dll_paths:
+        try:
+            nv = ctypes.WinDLL(dll_path)
+            count = ctypes.c_int(0)
+            if nv.cudaGetDeviceCount(ctypes.byref(count)) != 0 or count.value <= 0:
                 continue
-            free_b, total_b = ctypes.c_size_t(0), ctypes.c_size_t(0)
-            if nv.cudaMemGetInfo(ctypes.byref(free_b), ctypes.byref(total_b)) != 0:
-                continue
-            cand = (int(total_b.value), int(free_b.value))
-            if best is None or cand[0] > best[0]:
-                best = cand
-        return best
-    except (OSError, AttributeError):
-        return None
+            best: Optional[tuple[int, int]] = None
+            for i in range(count.value):
+                if nv.cudaSetDevice(i) != 0:
+                    continue
+                free_b, total_b = ctypes.c_size_t(0), ctypes.c_size_t(0)
+                if nv.cudaMemGetInfo(ctypes.byref(free_b), ctypes.byref(total_b)) != 0:
+                    continue
+                cand = (int(total_b.value), int(free_b.value))
+                if best is None or cand[0] > best[0]:
+                    best = cand
+            if best is not None:
+                return best
+        except (OSError, AttributeError):
+            continue
+    return None
 
 
 def _real_gpu_info() -> tuple[bool, int, int]:
@@ -258,15 +304,22 @@ def _real_gpu_info() -> tuple[bool, int, int]:
     own view) or the CUDA runtime's device count + context init. Either
     succeeding with total VRAM >= _REAL_GPU_MIN_VRAM -> present. A Virtual
     Display Driver / name-spoofed adapter fails both -> (False, 0, 0), and
-    every caller keeps the graceful CPU fallback."""
+    every caller keeps the graceful CPU fallback.
+
+    Falls back to torch.cuda when both nvidia-smi and the CUDA runtime DLL
+    fail (covers machines with CUDA in PATH but non-standard DLL layout)."""
     smi = _nvidia_smi_vram()
     if smi is not None:
         total, free = smi
     else:
         rt = _cuda_runtime_vram()
-        if rt is None:
-            return False, 0, 0
-        total, free = rt
+        if rt is not None:
+            total, free = rt
+        else:
+            tr = _torch_cuda_vram()
+            if tr is None:
+                return False, 0, 0
+            total, free = tr
     if total < _REAL_GPU_MIN_VRAM:
         return False, 0, 0
     return True, total, free
@@ -1413,18 +1466,29 @@ def _parakeet_cuda_available() -> bool:
 
 
 def _real_cuda_works() -> bool:
-    """True when torch says CUDA is actually usable (driver + compute device).
+    """True when CUDA is actually usable (driver + compute device).
 
     A Virtual Display Driver / broken driver has no CUDA compute, so
     torch.cuda.is_available() is False even when the +cuda wheel is
     installed — this is the discriminator that keeps onnxruntime's CUDA EP
-    (and its crash-prone in-process CPU fallback) away from such boxes."""
+    (and its crash-prone in-process CPU fallback) away from such boxes.
+
+    Falls back to nvidia-smi VRAM probe when torch is not installed or has
+    no CUDA build (covers machines with NVIDIA drivers but no torch)."""
     try:
         import torch
 
         return bool(torch.cuda.is_available())
     except Exception:
-        return False
+        pass
+    # ponytail: torch unavailable — fall back to nvidia-smi VRAM probe.
+    # Upgrade path: use _nvidia_smi_vram() once when torch is always
+    # present in the bundle.
+    smi = _nvidia_smi_vram()
+    if smi is not None:
+        total, _free = smi
+        return total >= _REAL_GPU_MIN_VRAM
+    return False
 
 
 _offpool_cuda_ok: Optional[bool] = None  # real-CUDA probe for off-pool callers (None = unprobed)
@@ -5105,10 +5169,11 @@ def _run_module_selfcheck() -> None:
     # real-GPU detection: a fake adapter (no nvidia-smi, no CUDA runtime
     # device) must read as NO GPU; a real compute probe (>= 1 GiB total) is
     # present — pure probes patched, no subprocess.
-    _saved_smi, _saved_rt = _nvidia_smi_vram, _cuda_runtime_vram
+    _saved_smi, _saved_rt, _saved_torch = _nvidia_smi_vram, _cuda_runtime_vram, _torch_cuda_vram
     try:
         _nvidia_smi_vram = lambda: None
         _cuda_runtime_vram = lambda: None
+        _torch_cuda_vram = lambda: None
         assert _real_gpu_info() == (False, 0, 0), (
             "a fake adapter (no compute probe) must not look like a GPU"
         )
@@ -5123,6 +5188,7 @@ def _run_module_selfcheck() -> None:
     finally:
         _nvidia_smi_vram = _saved_smi
         _cuda_runtime_vram = _saved_rt
+        _torch_cuda_vram = _saved_torch
 
     # parakeet GPU batch size: VRAM-derived minus the caption reservation,
     # clamped [1, 32]; the CPU provider and unknown free VRAM stay sequential.
