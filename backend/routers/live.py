@@ -98,13 +98,11 @@ async def live_captions_stream(
     except HTTPException:
         raise
     except Exception:
-        pass
+        raise HTTPException(status_code=503, detail="live-captions feature is disabled")
     from services.live_captions import captions_available, get_captioner
-
     ok, reason = await asyncio.to_thread(captions_available, plat)
     if not ok:
         raise HTTPException(status_code=503, detail=reason)
-
     captioner = get_captioner(plat, chan, asyncio.get_running_loop())
     captioner.acquire(lang)
     try:
@@ -135,7 +133,7 @@ async def live_captions_available(
         if not _feat_enabled("live-captions"):
             return {"available": False, "reason": "live-captions feature is disabled", "low_latency": False}
     except Exception:
-        pass
+        return {"available": False, "reason": "live-captions feature is disabled", "low_latency": False}
     import os
     from services.live_captions import captions_available, LOW_LATENCY_ENV
 
@@ -887,19 +885,27 @@ class FastClipRequest(BaseModel):
 
 @router.post("/live/clip")
 def fast_live_clip(req: FastClipRequest) -> dict:
-    """Fast-clip capability report — HONEST, never fakes a clip.
+    """Fast live-clip: Kick/YouTube cut via ffmpeg, Twitch via browser editor.
 
-    There is NO server-side live clip path in this build (audited):
-    - Twitch: the app routes live clips to Twitch's own browser editor
-      (twitch.tv/<channel> → player Clip button) driven by the VOD.RIP cookie
-      extension with the session cookie — no Helix token/scopes, no server
-      mutation. The frontend never calls this endpoint for Twitch anymore.
-    - Kick: has no public clip-creation API.
-    - YouTube: has no public live-clip API.
-    So the payload always reports ``available: false`` with the exact
-    requirement the UI surfaces (never a fabricated clip id).
+    Kick/YouTube resolve the live HLS master, ffmpeg -c copy to a temp file
+    and return available:true only if the file exists and is >1 KiB. Twitch
+    still routes to the browser clip editor (cookie flow) and always returns
+    available:false with the needed cookie hint.
+    Runs synchronously (blocks worker up to ~90s); callers should rate-limit.
+    Temp files in VOD.RIP-live-clips are not auto-reaped in this build.
     """
     plat = (req.platform or "").lower()
+    slug = (req.slug or "").strip()
+    if not slug:
+        raise HTTPException(status_code=400, detail="channel is required")
+    # whitelist slug charset — prevents path-injection via slug "a/b"
+    import re as _re
+    if plat in ("twitch", "kick"):
+        if not _re.fullmatch(r"[A-Za-z0-9_\-]{1,40}", slug):
+            raise HTTPException(status_code=400, detail="invalid channel slug")
+    elif plat == "youtube":
+        if not _re.fullmatch(r"@?[A-Za-z0-9_\.\-]{1,64}", slug):
+            raise HTTPException(status_code=400, detail="invalid channel slug")
     if plat not in ("twitch", "kick", "youtube"):
         raise HTTPException(status_code=400, detail="platform must be one of twitch/kick/youtube")
     if plat == "twitch":
@@ -916,14 +922,14 @@ def fast_live_clip(req: FastClipRequest) -> dict:
         from services.ytdlp_ffmpeg import _resolve_ffmpeg_exe
         import subprocess, tempfile
         from pathlib import Path as _P
-        info = (kick_live_info if plat == "kick" else youtube_live_info)(req.slug)
+        info = (kick_live_info if plat == "kick" else youtube_live_info)(slug)
         if not info or not info.get("url"):
             reason = (info or {}).get("reason") or f"{plat} channel offline or no live master"
             return {"available": False, "reason": reason, "needed": [reason]}
         ffmpeg = _resolve_ffmpeg_exe()
         out_dir = _P(tempfile.gettempdir()) / "VOD.RIP-live-clips"
         out_dir.mkdir(parents=True, exist_ok=True)
-        safe = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in req.slug)[:40]
+        safe = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in slug)[:40]
         out = out_dir / f"{plat}_{safe}_{req.duration_sec}s.mp4"
         cmd = [ffmpeg, "-y", "-i", info["url"], "-t", str(req.duration_sec), "-c", "copy", str(out)]
         hdrs = info.get("headers") or {}

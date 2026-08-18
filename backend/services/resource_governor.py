@@ -488,8 +488,9 @@ class ResourceGovernor:
             eff = self.effective_target()
             if self._ram_total>0:
                 self._ram_max = max(1, int(self._ram_total * eff // _RAM_PER_WORKER))
+            # RAM pause is a capacity guard (80% physical), not a budget guard:
+            # background 40% caps CPU lanes/VRAM but does not imply 40% RAM pause.
             self._ram_pause = self._ram_used >= _GOVERNOR_TARGET
-            # VRAM headroom
             head = _VRAM_HEADROOM_MIN
             if self._vram_total>0:
                 head = max(_VRAM_HEADROOM_MIN, int(self._vram_total*0.30))

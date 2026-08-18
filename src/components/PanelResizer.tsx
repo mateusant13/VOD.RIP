@@ -136,10 +136,6 @@ export default function PanelResizer({
       document.body.style.userSelect = '';
       document.body.style.cursor = '';
       if (leftEl) leftEl.style.willChange = '';
-      if (persistKey) {
-        const finalW = leftEl.offsetWidth;
-        writePersisted(persistKey, finalW);
-      }
       window.removeEventListener('pointermove', handleMove);
       window.removeEventListener('pointerup', handleUp);
       window.removeEventListener('pointercancel', handleUp);
@@ -160,12 +156,20 @@ export default function PanelResizer({
     else return;
     e.preventDefault();
     const minL = minLeft ?? MINIMA[persistKey] ?? 280;
+    const minR = minRight ?? MINIMA[persistKey] ?? 280;
     let nextW = leftEl.offsetWidth + dx;
     nextW = Math.max(minL, nextW);
+    const container = leftEl.parentElement;
+    if (container && rightRef?.current) {
+      const containerW = container.clientWidth;
+      const gap = 12;
+      if (containerW - nextW - gap < minR) nextW = containerW - minR - gap;
+      nextW = Math.max(minL, nextW);
+    }
     leftEl.style.width = `${nextW}px`;
     if (persistKey) writePersisted(persistKey, nextW);
     onResize?.(dx);
-  }, [leftRef, persistKey, minLeft, onResize]);
+  }, [leftRef, rightRef, persistKey, minLeft, minRight, onResize]);
 
   return (
     <div

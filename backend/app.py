@@ -261,7 +261,7 @@ async def _app_lifespan(_app: FastAPI):
             from services.feature_registry import is_enabled as _fe
             return _fe("live-captions") or _fe("transcribe-vod")
         except Exception:
-            return True
+            return False
     if _should_prewarm_parakeet():
         threading.Thread(target=_prewarm_parakeet_bg, daemon=True, name="parakeet-prewarm").start()
     else:
@@ -738,7 +738,7 @@ async def _app_lifespan(_app: FastAPI):
             from services.feature_registry import is_enabled as _fe2
             return _fe2("live-preview")
         except Exception:
-            return True
+            return False
     if _live_warm_allowed():
         threading.Thread(target=_warm_live_guarded, daemon=True, name="live-warm").start()
     else:
@@ -759,7 +759,7 @@ async def _app_lifespan(_app: FastAPI):
             # live-preview drives youtube warm (preview snapshots)
             return _fe3("live-preview")
         except Exception:
-            return True
+            return False
     if _yt_warm_allowed():
         threading.Thread(target=_warm_youtube_guarded, daemon=True, name="yt-warm").start()
     else:
@@ -810,7 +810,7 @@ async def _app_lifespan(_app: FastAPI):
                     if not _fe_emb("transcribe-vod"):
                         return
                 except Exception:
-                    pass
+                    return
                 try:
                     if _warm_shutdown.wait(_BOOT_WARM_GRACE_SEC):
                         return
@@ -821,8 +821,6 @@ async def _app_lifespan(_app: FastAPI):
                         logger.info("semantic embed backfill: %d segments embedded", done)
                 except Exception:
                     logger.debug("semantic embed backfill skipped", exc_info=True)
-
-            threading.Thread(target=_embed_backfill_guarded, daemon=True, name="embed-backfill").start()
     except Exception:
         logger.debug("semantic embed backfill spawn skipped", exc_info=True)
 
@@ -970,7 +968,7 @@ async def _app_lifespan(_app: FastAPI):
             from services.feature_registry import is_enabled as _fe_aw
             return _fe_aw("transcribe-vod")
         except Exception:
-            return True
+            return False
     if _archive_worker_allowed():
         threading.Thread(target=_boot_archive_worker, daemon=True, name="archive-worker-boot").start()
     else:

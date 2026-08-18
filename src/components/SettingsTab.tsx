@@ -17,9 +17,8 @@ import type { AppSettings, UpdateInfo } from '../types';
 import { previewDownloadTree, type DownloadLayout } from '../downloadLayout';
 import { FEATURE_MANIFEST } from '../lib/featureManifest';
 import { getEnabledFeatures } from '../lib/featureFlags';
-import { notifyFeatureChange } from '../hooks/useFeature';
+import { notifyFeatureChange, useEnabledFeatures } from '../hooks/useFeature';
 type Props = {
-  settings: AppSettings;
   setSettings: Dispatch<SetStateAction<AppSettings>>;
   appVersion: string | null;
   updateInfo: UpdateInfo | null;
@@ -117,15 +116,8 @@ export default function SettingsTab({
   onApplyUpdate,
   onFlushPanelLayout,
 }: Props) {
+  const enabledMap = useEnabledFeatures();
   const [savedSig, setSavedSig] = useState(() => settingsSignature(settings));
-  const dirty = settingsSignature(settings) !== savedSig;
-  const { lang, setLang, t } = useI18n();
-
-  /** Accordion: every card starts collapsed; expanding one never closes the
-   *  others (independent chevron toggles, state keyed by card id). */
-  const [openCards, setOpenCards] = useState<Record<string, boolean>>({});
-  const toggleCard = (id: string) =>
-    setOpenCards((m) => ({ ...m, [id]: !m[id] }));
 
   /** Machine-aware resource suggestions (threads + cache MB) served by
    *  GET /api/settings/recommended — filled via the "Recommended" button in
@@ -505,7 +497,7 @@ export default function SettingsTab({
         <p className="text-[11px] font-mono text-zinc-500">Toggle heavy features (OFF by default). Changes persist to Settings and reload preserves them.</p>
         <div className="flex flex-col gap-2 mt-2">
           {FEATURE_MANIFEST.map(f => {
-            const enabled = !!(getEnabledFeatures()[f.id]);
+            const enabled = !!enabledMap[f.id];
             return (
               <Toggle
                 key={f.id}

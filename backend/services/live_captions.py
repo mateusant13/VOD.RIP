@@ -69,6 +69,12 @@ def _record_error(kind: str, message: str, platform: str = "", channel: str = ""
     try:
         pp = _error_log_path()
         pp.parent.mkdir(parents=True, exist_ok=True)
+        # ponytail: 5 MB rotation — cheap bound on disk; upgrade to rotating handler when centralized logging lands.
+        try:
+            if pp.exists() and pp.stat().st_size > 5 * 1024 * 1024:
+                pp.unlink(missing_ok=True)
+        except Exception:
+            pass
         ts = datetime.fromtimestamp(entry["ts"], tz=timezone.utc).isoformat()
         msg = entry["message"]
         line = f"{ts} [{kind}] {platform}/{channel} {msg}\n"
@@ -547,9 +553,7 @@ def captions_available(platform: str) -> tuple[bool, str]:
     asyncio.to_thread."""
     plat = (platform or "").lower()
     if plat not in SUPPORTED_PLATFORMS:
-        if "youtube" in SUPPORTED_PLATFORMS:
-            return False, "captions support twitch, kick and youtube"
-        return False, "captions support twitch and kick only"
+        return False, "captions support twitch, kick and youtube"
     try:
         from services import archive_transcribe as at
     except Exception as exc:  # pragma: no cover - env-specific

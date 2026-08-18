@@ -1,5 +1,4 @@
 import { useCallback, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
 
 /**
  * FrameOverlay — CSS grid of snap targets (dotted outlines, tmux-like).
@@ -51,14 +50,18 @@ export function FrameOverlay({
       try {
         e.dataTransfer.setDragImage(clone, 40, 20);
       } catch {}
-      setTimeout(() => clone.remove(), 0);
+      const cleanup = () => clone.remove();
+      // Esc-cancel or drop both fire before the next tick; cleanup on next frame and on dragend fallback.
+      setTimeout(cleanup, 0);
       const id = ghost.getAttribute('data-frame-card') || '';
       dragDataRef.current = id;
       e.dataTransfer.setData('text/plain', id);
       e.dataTransfer.effectAllowed = 'move';
+      const onEnd = () => { cleanup(); document.removeEventListener('dragend', onEnd); document.removeEventListener('dragcancel', onEnd); };
+      document.addEventListener('dragend', onEnd, { once: true });
+      document.addEventListener('dragcancel', onEnd as any, { once: true } as any);
     }
   }, []);
-
   if (!active) return null;
 
   const grid = (

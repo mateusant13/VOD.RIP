@@ -83,8 +83,6 @@ def get_enabled_map() -> Dict[str, bool]:
     stored = _get_stored_features()
     out: Dict[str, bool] = {}
     for fid, d in _DEFAULTS.items():
-        out[fid] = stored.get(fid, d) if fid in stored or fid not in stored else d
-        # above expression simplifies to stored.get(fid, d)
         out[fid] = stored.get(fid, d)
     return out
 
