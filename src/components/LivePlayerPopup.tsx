@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject } from 'react';
 import { createPortal } from 'react-dom';
-import { Captions, ExternalLink, Languages, Loader2, Maximize2, Minimize2, MessageSquare, Pause, Play, Search, Settings, Volume2, VolumeX, RefreshCw, X } from 'lucide-react';
+import { Captions, ExternalLink, Languages, Loader2, Maximize2, Minimize2, MessageSquare, Pause, Play, Search, Type, Volume2, VolumeX, RefreshCw, X } from 'lucide-react';
 import { apiDelete, apiPost } from '../hooks/useApiClient';
 import { archiveVideoIdFromUrl } from '../archiveScope';
 import { buildVodUrl } from '../channelUtils';
@@ -2427,25 +2427,6 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                 )}
               </div>
 
-              {/* Twitch clip — opens the in-app mini-preview at the live
-                  playhead (120s window, user trims 5..60s, then the Twitch
-                  editor), identical to the preview clip buttons. Shows for
-                  Twitch platform OR when the channel has a twitchSlug (Kick/
-                  YouTube lives with a twin Twitch stream). Sits BESIDE the
-                  volume button and shares its transportBtn class. */}
-              {(ctrlPlatform === 'twitch' || !!channel?.twitchSlug) && (
-                <button
-                  type="button"
-                  onClick={handleFastClip}
-                  title={t('Open the Twitch clip mini-preview at the playhead')}
-                  className={`${transportBtn} flex items-center gap-1.5`}
-                >
-                  <TwitchLogoIcon size={15} className="shrink-0" />
-                  {/* Logo already says Twitch — label stays bare "clip" (user request). */}
-                  <span className="text-[9px] font-bold uppercase tracking-wider whitespace-nowrap leading-none">clip</span>
-                </button>
-              )}
-
               {/* Live captions toggle — CC overlay over the video. Only
                   rendered when the parakeet gate reports available (503 /
                   missing engine → no button, no overlay). */}
@@ -2474,7 +2455,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                       aria-expanded={captionLangMenuOpen}
                       aria-label={t('Caption language')}
                       title={t('Caption language')}
-                      className={`${transportBtn} px-1`}
+                      className={transportBtn}
                     >
                       <Languages size={15} aria-hidden />
                     </button>
@@ -2500,9 +2481,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                       </div>
                     )}
                   </div>
-                  {/* Caption size gear menu — A−/A+ buttons ±2px clamp,
+                  {/* Caption size menu — A−/A+ buttons ±2px clamp,
                       persisted via the same localStorage key. Outside-click
-                      handled by the shared mousedown listener. */}
+                      handled by the shared mousedown listener. Uses the same
+                      Type icon as the quality menu's gear. */}
                   <div className="relative" data-caption-font-size-menu>
                     <button
                       type="button"
@@ -2511,9 +2493,9 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                       aria-expanded={captionFontSizeMenuOpen}
                       aria-label={t('Caption size')}
                       title={t('Caption size')}
-                      className={`${transportBtn} px-1`}
+                      className={transportBtn}
                     >
-                      <Settings size={15} aria-hidden />
+                      <Type size={15} aria-hidden />
                     </button>
                     {captionFontSizeMenuOpen && (
                       <div className="absolute bottom-full right-0 z-30 mb-1.5 flex items-center gap-1 border-2 border-zinc-600 bg-zinc-950 px-2 py-1.5 shadow-lg">
@@ -2538,6 +2520,24 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                     )}
                   </div>
                 </>
+              )}
+
+              {/* Twitch clip — rightmost of the left-side transport
+                  buttons. Opens the in-app mini-preview at the live playhead
+                  (120s window, user trims 5..60s, then the Twitch editor).
+                  Shows for Twitch platform OR when the channel has a
+                  twitchSlug (Kick/YouTube lives with a twin Twitch stream). */}
+              {(ctrlPlatform === 'twitch' || !!channel?.twitchSlug) && (
+                <button
+                  type="button"
+                  onClick={handleFastClip}
+                  title={t('Open the Twitch clip mini-preview at the playhead')}
+                  className={`${transportBtn} flex items-center gap-1.5`}
+                >
+                  <TwitchLogoIcon size={15} className="shrink-0" />
+                  {/* Logo already says Twitch — label stays bare "clip" (user request). */}
+                  <span className="text-[9px] font-bold uppercase tracking-wider whitespace-nowrap leading-none">clip</span>
+                </button>
               )}
 
               {clipNotice && (
