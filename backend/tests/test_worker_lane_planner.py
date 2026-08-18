@@ -12,6 +12,7 @@ ONE int8 model on every tier. The only ladder left is the VRAM floor —
   <  2 GiB -> CPU lane only (1-2 int8 copies by cores/RAM)
 Unknown allowance (probe failure) trusts the env cap like everywhere else.
 """
+import contextlib
 import os
 
 from services import archive_transcribe as at
@@ -242,7 +243,11 @@ def test_run_worker_swaps_pool_when_gpu_frees():
     mp.setattr(at, "_claim_next_job", lambda: None)
     mp.setattr(at, "_maybe_close_idle_model", lambda: None)
     mp.setattr(at, "close_model", lambda: None)
+    mp.setattr(at, "_parakeet_cuda_available", lambda: False)
     mp.setattr(at.archive_db, "worker_heartbeat", lambda *a, **k: None)
+    # Bypass the Windows named mutex (Local\VODRIP.archive-transcribe) that
+    # blocks when another worker process already holds it.
+    mp.setattr(at, "_transcription_worker_owner", contextlib.nullcontext)
     try:
         t = threading.Thread(
             target=at.run_worker,

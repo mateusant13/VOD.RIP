@@ -729,7 +729,7 @@ def _gpu_lane_plan() -> Optional[tuple[Optional[str], str]]:
 
 _RSS_CAP_ENV = "VODRIP_TRANSCRIBE_RSS_CAP_MB"
 _VRAM_CAP_ENV = "VODRIP_TRANSCRIBE_VRAM_CAP_MB"
-_RSS_CHECK_INTERVAL_S = 30.0  # sleep on RSS over-cap before retry
+_RSS_CHECK_INTERVAL_S = 5.0  # was 30 — faster recovery from RAM pressure
 
 
 def _total_system_ram_bytes() -> int:
@@ -911,7 +911,7 @@ def _gpu_compute_type() -> str:
 # the jobs wait in SQLite and drain later. Measured via GetSystemTimes
 # (kernel32, stdlib ctypes — psutil is not a declared dependency); POSIX
 # uses os.getloadavg(). Probe failure/unknown -> False (no clamp).
-_CPU_LOAD_HIGH = 0.85          # busy fraction of ALL cores at/above this
+_CPU_LOAD_HIGH = 0.70          # preemptively reduce before user apps impacted
 _CPU_LOAD_TTL_S = 15.0         # readout cache TTL (sampling sleeps ~0.2 s)
 _cpu_load_high_cache = False
 _cpu_load_at = 0.0
@@ -975,10 +975,11 @@ def _cpu_auto_workers() -> int:
 
     Whisper int8 needs ~1 thread per lane minimum before it becomes
     latency-bound, so the default scales with os.cpu_count(): 2 lanes below
-    16 threads, 3 at 16–31, 4 at 32+. The RAM clamp (and the contention
-    clamp when the box is busy) still caps the actual slots — this only
-    raises the ceiling that used to be a flat 2. Env override
-    (VODRIP_TRANSCRIBE_WORKERS) wins over this in _cpu_worker_ceiling.
+    16 threads, 2 at 16–31 (fewer lanes = more ASR threads per lane),
+    4 at 32+. The RAM clamp (and the contention clamp when the box is busy)
+    still caps the actual slots — this only raises the ceiling that used to
+    be a flat 2. Env override (VODRIP_TRANSCRIBE_WORKERS) wins over this
+    in _cpu_worker_ceiling.
 
     Background (autostart) mode caps at 3 — nobody is at the keyboard, but
     the 3-lane footprint (~3 GB RSS total at the 1.5 GB/lane estimate +
@@ -991,7 +992,7 @@ def _cpu_auto_workers() -> int:
     if threads >= 32:
         return 4
     if threads >= 16:
-        return 3
+        return 2  # fewer lanes = more ASR threads per lane (sweet spot: 8)
     return 2
 
 
@@ -3684,7 +3685,9 @@ def _claim_next_job() -> Optional[dict]:
                   CASE WHEN kind = 'chat' AND platform = 'twitch' THEN ?
                        WHEN kind = 'chat' THEN ?
                        ELSE ? END))
-           ORDER BY priority DESC, created_at ASC
+           ORDER BY priority DESC, COALESCE(
+            (SELECT duration_sec FROM videos WHERE videos.platform = archive_jobs.platform AND videos.video_id = archive_jobs.video_id),
+            99999) ASC, created_at ASC
            LIMIT 8""",
         (now_iso, twitch_chat_cutoff, yt_chat_cutoff, transcribe_cutoff),
     )
