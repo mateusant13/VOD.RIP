@@ -41,9 +41,8 @@ Design decisions:
   * Device: _real_gpu_info() — a COMPUTE-level probe (nvidia-smi memory
     query and/or the CUDA runtime's device count + context init), never
     adapter names — a Virtual Display Driver / name-spoofed adapter has no
-    CUDA device and resolves to cpu. This machine has an NVIDIA RTX 5080
-    (CUDA works via torch), so real runs are cuda; the CPU path exists for
-    GPU-less hosts.
+    CUDA device and resolves to cpu. Real runs use cuda when a real GPU is
+    present; the CPU path exists for GPU-less hosts.
 
 Opt-in by design: app.py does NOT import this module. Start the worker with
 ``python -m services.archive_transcribe`` or ``start_worker()`` from a launcher.
@@ -181,8 +180,8 @@ def _torch_cuda_vram() -> Optional[tuple[int, int]]:
     """(total, free) VRAM bytes from torch.cuda — last-resort fallback.
 
     Covers machines with CUDA in PATH but non-standard nvcuda.dll layout
-    (RTX 5080 / Blackwell, CUDA 12+).  Returns None when torch is not
-    installed, has no CUDA build, or reports no devices."""
+    (CUDA 12+ installs).  Returns None when torch is not installed, has
+    no CUDA build, or reports no devices."""
     try:
         import torch
 
@@ -198,8 +197,8 @@ def _parse_smi_vram_rows(stdout: str) -> list[tuple[int, int, int]]:
     """[(index, total_bytes, free_bytes), ...] from csv noheader total,free lines.
 
     Handles both comma-separated (csv,noheader,nounits) and space-separated
-    output.  Accepts integer and float VRAM values (Blackwell nvidia-smi may
-    emit decimals).  Robust against leading/trailing whitespace."""
+    output.  Accepts integer and float VRAM values.  Robust against
+    leading/trailing whitespace."""
     rows: list[tuple[int, int, int]] = []
     for i, line in enumerate((stdout or "").strip().splitlines()):
         line = line.strip()
@@ -366,9 +365,8 @@ def _cache_dir() -> Path:
 
 # --- parallelism budget ---------------------------------------------------
 
-# GPU lane budget (user hardware: RTX 5080 16 GiB; large-v3-turbo fp16 is
-# ~5-6 GiB, NOT the old 1-2.5 GiB estimate). The card is a SHARED tenant:
-# the desktop + the user's other ML project hold VRAM, so the measured
+# GPU lane budget (large-v3-turbo fp16 is ~5-6 GiB). The card is a SHARED
+# tenant: the desktop + other ML projects hold VRAM, so the measured
 # allowance at claim time decides the lane — never a static count.
 _GPU_VRAM_HEADROOM = int(2 * 1024 ** 3)   # must stay free for the tenants
 _GPU_UTIL_SECOND_COPY = 0.70              # below this, a 2nd copy may add
@@ -1864,8 +1862,7 @@ def _parakeet_provider() -> str:
     CPU fallback access-violates the process (reproduced: the captioner's
     CUDA attempt crashed the whole API listener). The probe keeps the
     real-time captioner on CPU on such boxes while letting it use the card
-    on a real GPU (the RTX 5080 class the pool already targets). Pool
-    threads keep their pinned slot device."""
+    on a real GPU. Pool threads keep their pinned slot device."""
     pin = _thread_pin()
     if pin is None:
         return "cuda" if _offpool_cuda_available() else "cpu"
