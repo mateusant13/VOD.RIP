@@ -686,7 +686,7 @@ async def test_captions_stream_validates_platform(monkeypatch):
         assert res.status_code == 400
         res = await client.get("/api/live/captions", params={"platform": "twitch", "channel": ""})
         assert res.status_code == 400
-        res = await client.get("/api/live/captions/available", params={"platform": "youtube", "channel": "x"})
+        res = await client.get("/api/live/captions/available", params={"platform": "facebook", "channel": "x"})
         assert res.status_code == 400
 
 

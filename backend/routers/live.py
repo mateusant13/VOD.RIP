@@ -56,7 +56,7 @@ class LiveDownloadRequest(BaseModel):
 # the same per-connection queue pattern as the chat SSE). The parakeet gate
 # (sherpa-onnx importable AND model files present) 503s the stream endpoint
 # and the /available probe reports it so the frontend hides the CC toggle.
-_CAPTION_PLATFORMS = ("twitch", "kick")
+_CAPTION_PLATFORMS = ("twitch", "kick", "youtube")
 
 
 _CAPTION_LANGS = ("pt", "en", "es")  # in-player selector (pt-BR / English / Español)
@@ -65,7 +65,7 @@ _CAPTION_LANGS = ("pt", "en", "es")  # in-player selector (pt-BR / English / Esp
 @router.get("/live/captions")
 async def live_captions_stream(
     request: Request,
-    platform: str = Query(..., description="twitch | kick"),
+    platform: str = Query(..., description="twitch | kick | youtube"),
     channel: str = Query(..., description="channel slug / login"),
     lang: Optional[str] = Query(None, description="caption translate-target family override: pt | en | es (default: app language)"),
 ):
@@ -86,7 +86,7 @@ async def live_captions_stream(
     plat = (platform or "").lower()
     chan = (channel or "").strip().lower()
     if plat not in _CAPTION_PLATFORMS or not chan:
-        raise HTTPException(status_code=400, detail="platform must be one of twitch/kick and channel is required")
+        raise HTTPException(status_code=400, detail="platform must be one of twitch/kick/youtube and channel is required")
     if lang is not None:
         lang = lang.strip().lower()
         if lang not in _CAPTION_LANGS:
@@ -120,7 +120,7 @@ async def live_captions_stream(
 
 @router.get("/live/captions/available")
 async def live_captions_available(
-    platform: str = Query(..., description="twitch | kick"),
+    platform: str = Query(..., description="twitch | kick | youtube"),
     channel: str = Query(..., description="channel slug / login"),
 ) -> dict:
     """Parakeet-gate probe: ``{available, reason}`` — the popup renders the
@@ -128,7 +128,7 @@ async def live_captions_available(
     plat = (platform or "").lower()
     chan = (channel or "").strip().lower()
     if plat not in _CAPTION_PLATFORMS or not chan:
-        raise HTTPException(status_code=400, detail="platform must be one of twitch/kick and channel is required")
+        raise HTTPException(status_code=400, detail="platform must be one of twitch/kick/youtube and channel is required")
     # Feature gate: live-captions OFF => unavailable without burning GPU
     try:
         from services.feature_registry import is_enabled as _feat_enabled
@@ -149,6 +149,13 @@ async def live_captions_available(
     if not low_latency:
         low_latency = (os.environ.get(LOW_LATENCY_ENV, "0") or "0").strip() == "1"
     return {"available": ok, "reason": reason or None, "low_latency": low_latency}
+
+
+@router.get("/live/captions/errors")
+def live_captions_errors(limit: int = Query(20, ge=1, le=50)) -> dict:
+    """Recent live-caption errors (HLS/ASR/translate)."""
+    from services.live_captions import get_error_ring
+    return {"errors": get_error_ring(limit)}
 
 
 async def _captions_sse_gen(request: Request, captioner) -> "AsyncGenerator[str, None]":
@@ -893,6 +900,8 @@ def fast_live_clip(req: FastClipRequest) -> dict:
     requirement the UI surfaces (never a fabricated clip id).
     """
     plat = (req.platform or "").lower()
+    if plat not in ("twitch", "kick", "youtube"):
+        raise HTTPException(status_code=400, detail="platform must be one of twitch/kick/youtube")
     if plat == "twitch":
         return {
             "available": False,
@@ -902,16 +911,30 @@ def fast_live_clip(req: FastClipRequest) -> dict:
                 "VOD.RIP cookie extension (clip_assist content script)",
             ],
         }
-    if plat == "kick":
-        return {
-            "available": False,
-            "reason": "Kick has no public clip-creation API.",
-            "needed": ["No public Kick endpoint — a first-party account flow would be required"],
-        }
-    if plat == "youtube":
-        return {
-            "available": False,
-            "reason": "YouTube has no public live-clip API.",
-            "needed": ["No public YouTube endpoint for live clip creation"],
-        }
-    raise HTTPException(status_code=400, detail="platform must be one of twitch/kick/youtube")
+    try:
+        from services.live_capture import kick_live_info, youtube_live_info
+        from services.ytdlp_ffmpeg import _resolve_ffmpeg_exe
+        import subprocess, tempfile
+        from pathlib import Path as _P
+        info = (kick_live_info if plat == "kick" else youtube_live_info)(req.slug)
+        if not info or not info.get("url"):
+            reason = (info or {}).get("reason") or f"{plat} channel offline or no live master"
+            return {"available": False, "reason": reason, "needed": [reason]}
+        ffmpeg = _resolve_ffmpeg_exe()
+        out_dir = _P(tempfile.gettempdir()) / "VOD.RIP-live-clips"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in req.slug)[:40]
+        out = out_dir / f"{plat}_{safe}_{req.duration_sec}s.mp4"
+        cmd = [ffmpeg, "-y", "-i", info["url"], "-t", str(req.duration_sec), "-c", "copy", str(out)]
+        hdrs = info.get("headers") or {}
+        if hdrs:
+            hdr_str = "\r\n".join(f"{k}: {v}" for k, v in hdrs.items()) + "\r\n"
+            idx = cmd.index("-i")
+            cmd[idx:idx] = ["-headers", hdr_str]
+        proc = subprocess.run(cmd, capture_output=True, timeout=30 + req.duration_sec)
+        if proc.returncode == 0 and out.exists() and out.stat().st_size > 1024:
+            return {"available": True, "path": str(out), "reason": "local HLS segment"}
+        err = (proc.stderr or b"").decode("utf-8", "replace")[-400:]
+        return {"available": False, "reason": f"ffmpeg clip failed: {err or proc.returncode}", "needed": ["ffmpeg available and a live stream"]}
+    except Exception as exc:
+        return {"available": False, "reason": str(exc)[:400], "needed": [str(exc)[:80]]}

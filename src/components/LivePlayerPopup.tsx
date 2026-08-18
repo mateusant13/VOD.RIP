@@ -1126,7 +1126,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       testBandwidth: false,
       // 3 segments behind the edge — more cushion than count 2 for
       // proxy-mediated playback; ~6s at 2s segments.
-      liveSyncDurationCount: 3,
+      liveSyncDurationCount: 3, // per-platform audio HLS picker lives in backend (_parse_master_audio_url + _resolve_live_master)
       // hls.js REQUIRES liveMaxLatencyDurationCount > liveSyncDurationCount
       // — 8 ≈ 16s at 2s segments.
       liveMaxLatencyDurationCount: 8,

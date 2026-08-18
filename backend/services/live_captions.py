@@ -32,6 +32,7 @@ generator.
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import os
 import re
@@ -40,13 +41,50 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Deque, Optional
 from services.ytdlp_ffmpeg import _resolve_ffmpeg_exe
 from urllib.parse import urljoin
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_PLATFORMS = ("twitch", "kick")
+SUPPORTED_PLATFORMS = ("twitch", "kick", "youtube")
+
+# --- error ring + file log (Phase D) ----------------------------------------
+_ERROR_RING_MAX = 50
+_ERROR_RING: "collections.deque[dict]" = collections.deque(maxlen=_ERROR_RING_MAX)
+_ERROR_RING_LOCK = threading.Lock()
+
+def _error_log_path() -> Path:
+    try:
+        from services.settings import _get_appdata_dir
+        return _get_appdata_dir() / "logs" / "live-captions.log"
+    except Exception:
+        return Path("logs") / "live-captions.log"
+
+def _record_error(kind: str, message: str, platform: str = "", channel: str = "") -> None:
+    entry = {"ts": time.time(), "kind": kind, "message": str(message)[:500], "platform": platform, "channel": channel}
+    with _ERROR_RING_LOCK:
+        _ERROR_RING.append(entry)
+    try:
+        pp = _error_log_path()
+        pp.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.fromtimestamp(entry["ts"], tz=timezone.utc).isoformat()
+        msg = entry["message"]
+        line = f"{ts} [{kind}] {platform}/{channel} {msg}\n"
+        with pp.open("a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+
+def get_error_ring(limit: int = 50) -> list[dict]:
+    with _ERROR_RING_LOCK:
+        items = list(_ERROR_RING)[-max(1, min(limit, _ERROR_RING_MAX)):]
+    return items
+
+def _clear_error_ring_for_tests() -> None:
+    with _ERROR_RING_LOCK:
+        _ERROR_RING.clear()
 
 # --- env knobs (all optional) ------------------------------------------------
 WINDOW_SEC_ENV = "VODRIP_CAPTION_WINDOW_SEC"
@@ -259,20 +297,38 @@ def _resolve_live_master(platform: str, channel: str) -> Optional[dict]:
     cache) instead of the yt-dlp page extract (3-15s) — the captioner must
     not sit on the popup's open path. Returns ``{url, headers}`` or None
     when the channel is offline / unreachable."""
+    if platform == "youtube":
+        try:
+            from services.yt_gate import youtube_gate_active
+            if youtube_gate_active():
+                logger.debug("live captions youtube/%s gated — skipping resolve", channel)
+                _record_error("hls", "youtube gate active — cooldown", platform, channel)
+                return None
+        except Exception:
+            pass
+        try:
+            from services.live_capture import youtube_live_info
+            info = youtube_live_info(channel)
+            if not info or not info.get("url"):
+                if info and info.get("reason"):
+                    _record_error("hls", info["reason"], platform, channel)
+                return None
+            return {"url": info["url"], "headers": info.get("headers") or {}}
+        except Exception as exc:
+            _record_error("hls", f"youtube resolve failed: {exc}", platform, channel)
+            return None
     from services.live_capture import kick_live_info, probe_twitch_live_master
 
     if platform == "twitch":
         probed = probe_twitch_live_master(channel)
         if probed and probed.get("url"):
             return {"url": probed["url"], "headers": probed.get("headers") or {}}
-        # ponytail: the usher probe failed (GQL token / usher unreachable) —
-        # fall back to the yt-dlp page extract, which routes around it at a
-        # 3-15s cost. Upgrade path: fix the probe path, then drop yt-dlp
-        # from this resolver entirely.
         from services.live_capture import twitch_live_info
 
         info = twitch_live_info(channel)
         if not info or not info.get("url"):
+            if info and info.get("reason"):
+                _record_error("hls", info["reason"], platform, channel)
             return None
         return {"url": info["url"], "headers": info.get("headers") or {}}
 
@@ -491,6 +547,8 @@ def captions_available(platform: str) -> tuple[bool, str]:
     asyncio.to_thread."""
     plat = (platform or "").lower()
     if plat not in SUPPORTED_PLATFORMS:
+        if "youtube" in SUPPORTED_PLATFORMS:
+            return False, "captions support twitch, kick and youtube"
         return False, "captions support twitch and kick only"
     try:
         from services import archive_transcribe as at
@@ -695,6 +753,7 @@ class LiveCaptioner:
             try:
                 text, lang = _transcribe_window(audio, buffer_sec)
             except Exception as exc:
+                _record_error("asr", str(exc), self.platform, self.channel)
                 self._flush_failures += 1
                 logger.warning(
                     "live captions %s/%s ASR flush failed (%d/%d): %s",
@@ -780,6 +839,7 @@ class LiveCaptioner:
                 self._stop.wait(max(self.poll_sec * 3, 0.1))
                 continue
             except Exception as exc:
+                _record_error("hls", str(exc), self.platform, self.channel)
                 # Transient: playlist fetch error / expired token / decode —
                 # back off and retry, keeping the loop (and the SSE) alive.
                 # After _TRANSIENT_STRIKE_LIMIT consecutive failures the
