@@ -61,6 +61,7 @@ export default function PanelResizer({
   const rafRef = useRef<number | null>(null);
   const pendingDxRef = useRef(0);
   const activeElRef = useRef<HTMLElement | null>(null);
+  const cleanupDragRef = useRef<(() => void) | null>(null);
 
   const ensureRestored = useCallback((el: HTMLElement | null) => {
     if (!el || !persistKey) return;
@@ -84,7 +85,7 @@ export default function PanelResizer({
     const dx = pendingDxRef.current;
     const startW = startWRef.current;
     const minL = minLeft ?? MINIMA[persistKey] ?? 280;
-    const minR = minRight ?? 240;
+    const minR = minRight ?? MINIMA[persistKey] ?? 280;
     let nextW = startW + dx;
     nextW = Math.max(minL, nextW);
     const container = el.parentElement;
@@ -124,27 +125,39 @@ export default function PanelResizer({
         rafRef.current = requestAnimationFrame(flush);
       }
     };
-    const handleUp = (ev: PointerEvent) => {
-      if (ev.pointerId !== e.pointerId) return;
+    const cleanup = () => {
       if (rafRef.current != null) {
         cancelAnimationFrame(rafRef.current);
         rafRef.current = null;
       }
-      pendingDxRef.current = ev.clientX - startXRef.current;
-      flush();
-      try { (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId); } catch {}
       document.body.style.userSelect = '';
       document.body.style.cursor = '';
+      const leftEl = leftRef?.current ?? null;
       if (leftEl) leftEl.style.willChange = '';
       window.removeEventListener('pointermove', handleMove);
       window.removeEventListener('pointerup', handleUp);
       window.removeEventListener('pointercancel', handleUp);
+      window.removeEventListener('blur', onBlur);
       activeElRef.current = null;
+      cleanupDragRef.current = null;
     };
+    const handleUp = (ev: PointerEvent) => {
+      if (ev.pointerId !== e.pointerId) return;
+      pendingDxRef.current = ev.clientX - startXRef.current;
+      flush();
+      try { (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId); } catch {}
+      cleanup();
+    };
+    const onBlur = () => { cleanup(); };
+    cleanupDragRef.current = cleanup;
     window.addEventListener('pointermove', handleMove);
     window.addEventListener('pointerup', handleUp);
     window.addEventListener('pointercancel', handleUp);
+    window.addEventListener('blur', onBlur);
   }, [leftRef, orientation, flush, ensureRestored, persistKey]);
+
+  // Cleanup drag state on unmount (safety net for blur/detach races).
+  useEffect(() => () => { cleanupDragRef.current?.(); }, []);
 
   const onKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
     const leftEl = leftRef?.current ?? null;

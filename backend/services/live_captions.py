@@ -500,6 +500,7 @@ def _maybe_translate(
 
 _CAPTIONERS: dict[tuple[str, str], "LiveCaptioner"] = {}
 _REGISTRY_LOCK = threading.Lock()
+_MAX_CONCURRENT_CAPTIONERS = 10  # ponytail: env knob if needed; prevents anon resource exhaustion
 
 # Live-caption session count across ALL captioners. While >= 1 the archive
 # worker's GPU lane is paused (services.archive_transcribe holds the flag;
@@ -540,12 +541,17 @@ def _session_end() -> None:
 
 def get_captioner(
     platform: str, channel: str, loop: asyncio.AbstractEventLoop
-) -> "LiveCaptioner":
-    """The shared captioner for (platform, channel), created on first use."""
+) -> Optional["LiveCaptioner"]:
+    """The shared captioner for (platform, channel), created on first use.
+
+    Returns None when the concurrent-captioner cap is hit (router should
+    return 429 to prevent anon resource exhaustion)."""
     key = (platform, channel)
     with _REGISTRY_LOCK:
         c = _CAPTIONERS.get(key)
         if c is None:
+            if len(_CAPTIONERS) >= _MAX_CONCURRENT_CAPTIONERS:
+                return None
             c = LiveCaptioner(platform, channel, loop)
             _CAPTIONERS[key] = c
         return c
@@ -635,6 +641,7 @@ class LiveCaptioner:
         self._asr_stop = threading.Event()
         self._asr_window_ready = threading.Event()
         self._asr_queue: deque = deque(maxlen=3)  # FIFO, max 2-3 windows, drop oldest
+        self._asr_lock = threading.Lock()  # protects _asr_queue popleft/append
         self._buffer_lock = threading.Lock()
         # Worker-owned state (touched only by the worker thread).
         self._seen: set[str] = set()
@@ -750,8 +757,9 @@ class LiveCaptioner:
         """Block until a window is available or stop is set. Returns
         (audio, buffer_sec) or None on shutdown."""
         while not self._asr_stop.is_set():
-            if self._asr_queue:
-                return self._asr_queue.popleft()
+            with self._asr_lock:
+                if self._asr_queue:
+                    return self._asr_queue.popleft()
             self._asr_window_ready.clear()
             self._asr_window_ready.wait(timeout=0.5)
         return None
@@ -1038,9 +1046,10 @@ class LiveCaptioner:
                 win_start_off = self._stream_sec - buffer_sec
                 origin = self._origin
                 # Bounded FIFO: drop oldest if queue is full (max 3 windows)
-                if len(self._asr_queue) >= 3:
-                    self._asr_queue.popleft()
-                self._asr_queue.append((audio, buffer_sec, win_start_off, origin))
+                with self._asr_lock:
+                    if len(self._asr_queue) >= 3:
+                        self._asr_queue.popleft()
+                    self._asr_queue.append((audio, buffer_sec, win_start_off, origin))
                 self._asr_window_ready.set()
 
     def _emit(self, event: str, data: dict) -> None:

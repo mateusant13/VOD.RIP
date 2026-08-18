@@ -104,6 +104,8 @@ async def live_captions_stream(
     if not ok:
         raise HTTPException(status_code=503, detail=reason)
     captioner = get_captioner(plat, chan, asyncio.get_running_loop())
+    if captioner is None:
+        raise HTTPException(status_code=429, detail="too many active caption streams — try again later")
     captioner.acquire(lang)
     try:
         return StreamingResponse(

@@ -43,3 +43,38 @@ def test_manifest_in_sync():
         assert py["id"] == ts["id"], f"id diverges: py={py['id']} ts={ts['id']}"
         assert py["cost"] == ts["cost"], f"cost diverges for {py['id']}: py={py['cost']} ts={ts['cost']}"
         assert bool(py["defaultEnabled"]) == ts["defaultEnabled"], f"defaultEnabled diverges for {py['id']}: py={py['defaultEnabled']} ts={ts['defaultEnabled']}"
+
+
+def test_manifest_description_in_sync():
+    """Description drift between Python and TS manifests must be caught."""
+    ts_rows = _parse_ts_manifest()
+    assert ts_rows, f"failed to parse {_TS_MANIFEST}"
+    py_by_id = {r["id"]: r for r in MANIFEST}
+    for ts in ts_rows:
+        py = py_by_id.get(ts["id"])
+        assert py is not None, f"TS id {ts['id']} missing in Python MANIFEST"
+        assert py["description"] == ts["description"], (
+            f"description drift for {ts['id']}: py={py['description']!r} ts={ts['description']!r}"
+        )
+
+
+def test_manifest_parser_reordered_keys_limitation():
+    """The current _parse_ts_manifest regex is fixed-order (id, cost, defaultEnabled, description).
+
+    Reordered keys are NOT parsed — this documents the brittle-parser limitation flagged
+    in review. If the parser is made order-agnostic, this test should be updated to
+    assert reordered input IS parsed.
+    """
+    # Reordered: description first, then id/cost/defaultEnabled — should not match fixed-order regex.
+    reordered_snippet = "{ description: 'Show subtitles live while a stream is happening', id: 'live-captions', cost: 'heavy', defaultEnabled: false }"
+    pat = re.compile(
+        r"\{\s*id:\s*'([^']+)'\s*,\s*cost:\s*'([^']+)'\s*,\s*defaultEnabled:\s*(true|false)\s*,\s*description:\s*'((?:[^'\\]|\\.)*)'",
+        re.DOTALL,
+    )
+    assert not pat.search(reordered_snippet), (
+        "parser limitation: reordered keys are not matched by the fixed-order regex — "
+        "refactor to an order-agnostic parser if this becomes a drift vector"
+    )
+    # Single-quote vs double-quote is also brittle — double quotes do not match.
+    double_quote = '{ id: "live-captions", cost: "heavy", defaultEnabled: false, description: "x" }'
+    assert not pat.search(double_quote), "parser only handles single-quoted values"

@@ -204,7 +204,6 @@ const QUALITY_PIN_SAFETY_MS = 15_000;
 // (hls.js throws on count+duration mix), lowLatencyMode stays false.
 const CAPTION_LIVE_SYNC_COUNT_CAPTIONED = 2;
 const CAPTION_LIVE_SYNC_COUNT_BASELINE = 3;
-const CAPTION_LIVE_SYNC_MIN_BUFFER_SEC = 4;
 /** Tolerance matching the cached VOD's created_at to the current session
  *  start (fast-clip guard): the CURRENT broadcast's VOD row is created at
  *  stream start; a PREVIOUS broadcast is hours older. ±5 min absorbs clock
@@ -904,6 +903,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   // Caption-aware live sync: when captions are visible (text heard + enabled)
   // ride 0.6-1.0s closer to the edge (count 2 vs 3) only if buffer > 4s.
   // One knob, count-only — never touches liveSyncDuration (mix throws).
+  // Hysteresis: downshift at >4.5s, upshift at <3.5s — prevents
+  // oscillation when forward buffer hovers near the 4s threshold.
+  const CAPTION_SYNC_DOWNSHIFT_SEC = 4.5;
+  const CAPTION_SYNC_UPSHIFT_SEC = 3.5;
   const maybeTuneCaptionLiveSync = useCallback(() => {
     const hls: any = hlsRef.current;
     const video = videoRef.current;
@@ -916,9 +919,19 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         return b.end(b.length - 1) - video.currentTime;
       } catch { return 0; }
     })();
-    const want = captionOn && buffered > CAPTION_LIVE_SYNC_MIN_BUFFER_SEC
-      ? CAPTION_LIVE_SYNC_COUNT_CAPTIONED
-      : CAPTION_LIVE_SYNC_COUNT_BASELINE;
+    const currentCount = hls.config.liveSyncDurationCount;
+    let want: number;
+    if (captionOn && currentCount === CAPTION_LIVE_SYNC_COUNT_CAPTIONED) {
+      // Currently at count 2 — only shift back to 3 if buffer drops below 3.5s.
+      want = buffered < CAPTION_SYNC_UPSHIFT_SEC
+        ? CAPTION_LIVE_SYNC_COUNT_BASELINE
+        : CAPTION_LIVE_SYNC_COUNT_CAPTIONED;
+    } else if (captionOn && buffered > CAPTION_SYNC_DOWNSHIFT_SEC) {
+      // Currently at count 3 (or baseline) — shift to 2 only when buffer is healthy.
+      want = CAPTION_LIVE_SYNC_COUNT_CAPTIONED;
+    } else {
+      want = CAPTION_LIVE_SYNC_COUNT_BASELINE;
+    }
     if (hls.config.liveSyncDurationCount !== want) {
       hls.config.liveSyncDurationCount = want;
       // Catch-up nudge only when tightening (3→2) and already stable.
@@ -1054,6 +1067,9 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       qualityPinTimerRef.current = null;
     }
     qualityPinArmedRef.current = false;
+    // Reset stall guard across sessions so a previous channel's state
+    // doesn't cause the next channel to hop to fallback on first jitter.
+    stallGuardRef.current = { at: 0, count: 0 };
   }, []);
 
   // Debounced waiting→overlay (mirrors attachPreviewBufferingListeners).

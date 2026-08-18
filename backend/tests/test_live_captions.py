@@ -1012,3 +1012,308 @@ async def test_parallel_warm_vs_hls_poll(monkeypatch):
         th = captioner._thread
         if th is not None:
             th.join(timeout=3.0)
+
+# ---------------------------------------------------------------------------
+# P2-1: fast_live_clip slug validation + subprocess
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_fast_live_clip_twitch_valid_path_returns_available_false(monkeypatch):
+    """Twitch always returns available:false (browser clip editor), even with valid slug."""
+    from httpx import ASGITransport, AsyncClient
+    from app import app as _app
+
+    async with AsyncClient(transport=ASGITransport(app=_app), base_url="http://test") as client:
+        res = await client.post("/api/live/clip", json={"platform": "twitch", "slug": "srdogg", "duration_sec": 30})
+        assert res.status_code == 200
+        body = res.json()
+        assert body["available"] is False
+        assert "browser" in body["reason"].lower() or "cookie" in body["reason"].lower() or "Twitch" in body["reason"]
+
+
+@pytest.mark.anyio
+async def test_fast_live_clip_kick_valid_slug_returns_available_true(monkeypatch):
+    """Kick with valid slug + mocked live info + mocked ffmpeg success returns available:true."""
+    import pathlib
+    import subprocess as _sp
+    from httpx import ASGITransport, AsyncClient
+    from app import app as _app
+
+    def _fake_kick_live_info(slug):
+        return {"url": "https://kick.live/hls/master.m3u8", "headers": {}, "title": "live"}
+
+    monkeypatch.setattr("services.live_capture.kick_live_info", _fake_kick_live_info)
+    monkeypatch.setattr("services.ytdlp_ffmpeg._resolve_ffmpeg_exe", lambda *a, **kw: "ffmpeg")
+
+    def _fake_run(cmd, capture_output=None, timeout=None, **kw):
+        # Simulate ffmpeg creating the expected output file (>1 KiB).
+        out = pathlib.Path(cmd[-1])
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"x" * 2048)
+        return _sp.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+
+    async with AsyncClient(transport=ASGITransport(app=_app), base_url="http://test") as client:
+        res = await client.post("/api/live/clip", json={"platform": "kick", "slug": "srdoglol", "duration_sec": 10})
+        assert res.status_code == 200
+        body = res.json()
+        assert body["available"] is True
+        assert "path" in body
+
+
+@pytest.mark.anyio
+async def test_fast_live_clip_path_injection_returns_400(monkeypatch):
+    """Slug containing ../ or slash is rejected with 400."""
+    from httpx import ASGITransport, AsyncClient
+    from app import app as _app
+
+    async with AsyncClient(transport=ASGITransport(app=_app), base_url="http://test") as client:
+        for bad_slug in ["../etc/passwd", "a/b", "x/../y", "a b"]:
+            res = await client.post("/api/live/clip", json={"platform": "twitch", "slug": bad_slug, "duration_sec": 10})
+            assert res.status_code == 400, f"slug {bad_slug!r} should be 400, got {res.status_code}"
+            assert "invalid" in res.json()["detail"].lower() or "channel" in res.json()["detail"].lower()
+
+
+@pytest.mark.anyio
+async def test_fast_live_clip_invalid_platform_returns_400(monkeypatch):
+    from httpx import ASGITransport, AsyncClient
+    from app import app as _app
+
+    async with AsyncClient(transport=ASGITransport(app=_app), base_url="http://test") as client:
+        res = await client.post("/api/live/clip", json={"platform": "facebook", "slug": "srdogg", "duration_sec": 10})
+        assert res.status_code == 400
+        assert "platform" in res.json()["detail"].lower()
+
+
+@pytest.mark.anyio
+async def test_fast_live_clip_ffmpeg_failure_returns_available_false(monkeypatch):
+    """When ffmpeg exits non-zero, fast_live_clip returns available:false (not 500)."""
+    import subprocess as _sp
+    from httpx import ASGITransport, AsyncClient
+    from app import app as _app
+
+    def _fake_kick_live_info(slug):
+        return {"url": "https://kick.live/hls/master.m3u8", "headers": {}}
+
+    monkeypatch.setattr("services.live_capture.kick_live_info", _fake_kick_live_info)
+    monkeypatch.setattr("services.ytdlp_ffmpeg._resolve_ffmpeg_exe", lambda *a, **kw: "ffmpeg")
+
+    def _fake_run_fail(cmd, capture_output=None, timeout=None, **kw):
+        return _sp.CompletedProcess(cmd, 1, stdout=b"", stderr=b"ffmpeg: connection timeout")
+
+    monkeypatch.setattr("subprocess.run", _fake_run_fail)
+
+    async with AsyncClient(transport=ASGITransport(app=_app), base_url="http://test") as client:
+        res = await client.post("/api/live/clip", json={"platform": "kick", "slug": "srdoglol", "duration_sec": 10})
+        assert res.status_code == 200
+        body = res.json()
+        assert body["available"] is False
+        # Reason mentions ffmpeg failure or timeout
+        assert "ffmpeg" in body["reason"].lower() or "timeout" in body["reason"].lower() or "failed" in body["reason"].lower()
+
+
+# ---------------------------------------------------------------------------
+# P2-3: live-caption gate fail-closed path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_captions_stream_503_when_feature_gate_off(monkeypatch):
+    """When feature_registry.is_enabled('live-captions') is False, SSE returns 503 fail-closed."""
+    from httpx import ASGITransport, AsyncClient
+    from app import app as _app
+
+    monkeypatch.setattr("services.feature_registry.is_enabled", lambda fid: False)
+
+    async with AsyncClient(transport=ASGITransport(app=_app), base_url="http://test") as client:
+        res = await client.get("/api/live/captions", params={"platform": "twitch", "channel": "srdogg"})
+        assert res.status_code == 503
+
+
+@pytest.mark.anyio
+async def test_captions_stream_503_when_feature_gate_raises(monkeypatch):
+    """When feature_registry.is_enabled raises, SSE returns 503 fail-closed."""
+    from httpx import ASGITransport, AsyncClient
+    from app import app as _app
+
+    def _boom(fid):
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr("services.feature_registry.is_enabled", _boom)
+
+    async with AsyncClient(transport=ASGITransport(app=_app), base_url="http://test") as client:
+        res = await client.get("/api/live/captions", params={"platform": "twitch", "channel": "srdogg"})
+        assert res.status_code == 503
+
+
+@pytest.mark.anyio
+async def test_captions_available_returns_false_when_gate_off(monkeypatch):
+    """When the live-captions feature is off, /available returns available:false (not 503)."""
+    from httpx import ASGITransport, AsyncClient
+    from app import app as _app
+
+    monkeypatch.setattr("services.feature_registry.is_enabled", lambda fid: False)
+
+    async with AsyncClient(transport=ASGITransport(app=_app), base_url="http://test") as client:
+        res = await client.get("/api/live/captions/available", params={"platform": "twitch", "channel": "srdogg"})
+        assert res.status_code == 200
+        body = res.json()
+        assert body["available"] is False
+        assert "disabled" in (body["reason"] or "").lower() or "feature" in (body["reason"] or "").lower()
+
+
+@pytest.mark.anyio
+async def test_captions_available_returns_false_when_gate_raises(monkeypatch):
+    """When feature_registry.is_enabled raises, /available returns available:false fail-closed."""
+    from httpx import ASGITransport, AsyncClient
+    from app import app as _app
+
+    def _boom(fid):
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr("services.feature_registry.is_enabled", _boom)
+
+    async with AsyncClient(transport=ASGITransport(app=_app), base_url="http://test") as client:
+        res = await client.get("/api/live/captions/available", params={"platform": "twitch", "channel": "srdogg"})
+        assert res.status_code == 200
+        body = res.json()
+        assert body["available"] is False
+
+
+# ---------------------------------------------------------------------------
+# P2-4: YouTube caption platform
+# ---------------------------------------------------------------------------
+
+
+def test_captions_available_youtube_true_when_model_present(monkeypatch):
+    """captions_available('youtube') returns (True, '') when model dir is present."""
+    from pathlib import Path
+    from services import live_captions as lc
+    from services.feature_registry import is_enabled as _orig_enabled  # noqa: F401 — keep import shape
+    import services.archive_transcribe as at
+
+    monkeypatch.setattr(at, "_parakeet_resolve_dir", lambda: Path("/fake/parakeet"))
+    ok, reason = lc.captions_available("youtube")
+    assert ok is True
+    assert reason == ""
+
+
+def test_captions_available_youtube_false_when_model_missing(monkeypatch):
+    """captions_available('youtube') returns (False, ...) when model dir is None."""
+    from services import live_captions as lc
+    import services.archive_transcribe as at
+
+    monkeypatch.setattr(at, "_parakeet_resolve_dir", lambda: None)
+    ok, reason = lc.captions_available("youtube")
+    assert ok is False
+    assert "parakeet" in reason.lower() or "model" in reason.lower()
+
+
+@pytest.mark.anyio
+async def test_captions_stream_accepts_youtube_platform(monkeypatch):
+    """platform=youtube is not rejected 400 on /api/live/captions (feature + parakeet gated only)."""
+    from services import live_captions
+    from services.feature_registry import is_enabled as _orig_enabled
+    monkeypatch.setattr("services.feature_registry.is_enabled", lambda fid: True if fid == "live-captions" else _orig_enabled(fid))
+    monkeypatch.setattr(live_captions, "captions_available", lambda plat: (True, ""))
+
+    class _StubCaptioner:
+        events = None
+        def acquire(self, lang=None):
+            pass
+        def release(self):
+            pass
+
+    monkeypatch.setattr(live_captions, "get_captioner", lambda p, c, loop: _StubCaptioner())
+    from routers import live as live_router
+
+    async def _fake_gen(request, captioner):
+        return
+        yield
+
+    monkeypatch.setattr(live_router, "_captions_sse_gen", _fake_gen)
+    from httpx import ASGITransport, AsyncClient
+    from app import app as _app
+
+    async with AsyncClient(transport=ASGITransport(app=_app), base_url="http://test") as client:
+        res = await client.get("/api/live/captions", params={"platform": "youtube", "channel": "@srdogg"})
+        # Should NOT be 400 platform error — either 200 (SSE) or 429 or 503 parakeet, but not 400
+        assert res.status_code != 400, f"youtube platform should not be 400, got {res.status_code}: {res.text}"
+
+
+# ---------------------------------------------------------------------------
+# P2-5: scheduler SQL starvation filter — exhausted jobs never starve retryable
+# ---------------------------------------------------------------------------
+
+
+def test_scheduler_requeue_skips_exhausted_attempts(monkeypatch, tmp_path):
+    """_requeue_failed_transcribe_job returns False when attempts >= max_attempts (zombie guard)."""
+    import os as _os
+    _os.environ["VODRIP_ARCHIVE_DB"] = str(tmp_path / "archive.db")
+    from services import archive_db as _adb
+    from services import archive_scheduler as _sched
+
+    _adb._conn = None
+    _adb._schema_ready = False
+    try:
+        _adb.enqueue_job("transcribe-twitch-vid-ex", "transcribe", "twitch", "vid-ex", priority=0)
+        _adb.execute(
+            "UPDATE archive_jobs SET status='failed', attempts=3, max_attempts=3, updated_at='2020-01-01T00:00:00Z' WHERE id=?",
+            ("transcribe-twitch-vid-ex",),
+        )
+        _adb.enqueue_job("transcribe-twitch-vid-ok", "transcribe", "twitch", "vid-ok", priority=0)
+        _adb.execute(
+            "UPDATE archive_jobs SET status='failed', attempts=1, max_attempts=3, updated_at='2020-01-01T00:00:00Z' WHERE id=?",
+            ("transcribe-twitch-vid-ok",),
+        )
+        # Exhausted must not requeue
+        assert _sched._requeue_failed_transcribe_job("transcribe-twitch-vid-ex", "2026-08-18T00:00:00Z") is False
+        row = _adb.query("SELECT status FROM archive_jobs WHERE id='transcribe-twitch-vid-ex'")[0]
+        assert row["status"] == "failed"
+        # Under-cap job CAN requeue
+        assert _sched._requeue_failed_transcribe_job("transcribe-twitch-vid-ok", "2026-08-18T00:00:00Z") is True
+        row2 = _adb.query("SELECT status FROM archive_jobs WHERE id='transcribe-twitch-vid-ok'")[0]
+        assert row2["status"] == "queued"
+        # SQL starvation filter: attempts < max_attempts predicate excludes exhausted rows
+        rows = _adb.query(
+            "SELECT id FROM archive_jobs WHERE kind='transcribe' AND status='failed' AND attempts < max_attempts"
+        )
+        ids = {r["id"] for r in rows}
+        assert "transcribe-twitch-vid-ex" not in ids
+    finally:
+        _adb._conn = None
+        _adb._schema_ready = False
+
+
+def test_scheduler_pass1_sql_predicate_skips_exhausted(monkeypatch, tmp_path):
+    """The pass-1 SQL WHERE attempts < max_attempts skips exhausted jobs at the query level."""
+    import os as _os
+    _os.environ["VODRIP_ARCHIVE_DB"] = str(tmp_path / "archive.db")
+    from services import archive_db as _adb
+
+    _adb._conn = None
+    _adb._schema_ready = False
+    try:
+        for vid, attempts, max_a in [("mix-ex1", 3, 3), ("mix-ex2", 5, 3), ("mix-ok1", 1, 3), ("mix-ok2", 2, 5)]:
+            _adb.enqueue_job(f"transcribe-twitch-{vid}", "transcribe", "twitch", vid, priority=0)
+            _adb.execute(
+                "UPDATE archive_jobs SET status='failed', attempts=?, max_attempts=?, updated_at='2020-01-01T00:00:00Z' WHERE id=?",
+                (attempts, max_a, f"transcribe-twitch-{vid}"),
+            )
+        rows = list(
+            _adb.query(
+                "SELECT id, attempts, max_attempts FROM archive_jobs "
+                "WHERE kind='transcribe' AND status='failed' AND attempts < max_attempts ORDER BY updated_at ASC LIMIT 100"
+            )
+        )
+        ids = {r["id"] for r in rows}
+        assert "transcribe-twitch-mix-ok1" in ids
+        assert "transcribe-twitch-mix-ok2" in ids
+        assert "transcribe-twitch-mix-ex1" not in ids
+        assert "transcribe-twitch-mix-ex2" not in ids
+        assert len(rows) == 2
+    finally:
+        _adb._conn = None
+        _adb._schema_ready = False
