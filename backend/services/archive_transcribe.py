@@ -61,7 +61,7 @@ import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 
@@ -1100,6 +1100,72 @@ def _make_pool(plan: list[tuple[str, str]], budget: int) -> ThreadPoolExecutor:
         initializer=_worker_thread_init,
         initargs=(plan,),
     )
+
+
+# --- download I/O pool (audio prefetch) -----------------------------------
+# Dedicated I/O pool for audio downloads — decouples I/O wait from
+# transcription threads.  When a single GPU lane runs jobs sequentially,
+# overlapping downloads via the pool halves wall-clock (download A +
+# download B in parallel, then transcribe A + transcribe B).  ponytail:
+# 4 threads covers the typical hybrid budget (2 GPU + 2 CPU); raising
+# above 4 only helps when >4 transcription lanes run concurrently.
+_download_pool: Optional[ThreadPoolExecutor] = None
+_DOWNLOAD_POOL_SIZE = 4  # concurrent ffmpeg/yt-dlp downloads
+
+
+def _get_download_pool() -> ThreadPoolExecutor:
+    global _download_pool
+    if _download_pool is None:
+        _download_pool = ThreadPoolExecutor(
+            max_workers=_DOWNLOAD_POOL_SIZE,
+            thread_name_prefix="download",
+        )
+    return _download_pool
+
+
+def _prefetch_youtube_audio(video_id: str, audio_stash: dict) -> str:
+    """Download YouTube audio in the I/O pool.  Returns path string,
+    stashes result into *audio_stash* for the transcribe function."""
+    from services.archive_ytdlp import (
+        _is_gate_error,
+        _is_permanent_download_error,
+        download_bestaudio,
+    )
+    outdir = Path(tempfile.mkdtemp(prefix=f"vodrip-transcribe-youtube-{video_id}-"))
+    try:
+        path = download_bestaudio(video_id, outdir)
+        audio_stash["wav"] = path
+        audio_stash["dir"] = outdir
+        return path
+    except Exception as exc:
+        if _is_permanent_download_error(exc):
+            archive_db.mark_video_transcript_kind("youtube", video_id, "blocked")
+        if _is_gate_error(exc):
+            raise _YoutubeGateRequeue(str(exc)[:400]) from exc
+        raise
+
+
+def _prefetch_twitch_kick_audio(
+    platform: str, video_id: str, audio_stash: dict,
+) -> Path:
+    """Download Twitch/Kick audio in the I/O pool.  Returns wav Path,
+    stashes result into *audio_stash* for the transcribe function."""
+    rows = archive_db.query(
+        "SELECT channel FROM videos WHERE platform = ? AND video_id = ?",
+        (platform, video_id),
+    )
+    channel = rows[0]["channel"] or "" if rows else ""
+    outdir = Path(tempfile.mkdtemp(prefix=f"vodrip-transcribe-{platform}-{video_id}-"))
+    wav = outdir / "audio.wav"
+    try:
+        _fetch_remote_audio_wav(platform, video_id, channel, wav)
+        audio_stash["wav"] = wav
+        audio_stash["dir"] = outdir
+        return wav
+    except Exception as exc:
+        if _is_remote_permanent_error(exc):
+            archive_db.mark_video_transcript_kind(platform, video_id, "blocked")
+        raise
 
 
 # --- model cache ----------------------------------------------------------
@@ -2730,7 +2796,7 @@ def vad_speech_seconds(audio: "Any") -> list[tuple[float, float]]:
     return _vad_regions(probs, len(audio))
 
 
-_MAX_CHUNK_SEC = 30.0  # chunking contract — resume granularity + batch window
+_MAX_CHUNK_SEC = 60.0  # chunking contract — halves chunk overhead for parakeet TDT v3
 
 
 def _plan_chunks(
@@ -2740,10 +2806,8 @@ def _plan_chunks(
 ) -> list[tuple[float, float]]:
     """Merge nearby speech regions into transcribe chunks; drop sub-minimum ones.
 
-    Chunks are capped at _MAX_CHUNK_SEC (30 s): it was faster-whisper's mel
-    window (an uncapped run silently transcribed only the first 30 s), and
-    it is kept as the chunking contract — GPU batches decode 30 s windows
-    and resume granularity stays fine.
+    Chunks are capped at _MAX_CHUNK_SEC (60 s): halves chunk overhead vs
+    the old 30 s window for parakeet TDT v3; resume granularity stays fine.
 
     Deterministic — resume relies on identical chunks across runs.
     """
@@ -3420,6 +3484,9 @@ def _transcribe_audio_source(
     ci = 0
     n_chunks = len(chunks)
     twin_won = False  # higher-priority twin transcribed mid-run — abort
+    _transcript_batch: list[dict] = []
+    _transcript_batch_lang: Optional[str] = None  # lang for the current batch
+    _BATCH_INSERT_SIZE = 16
     # Per-call decode batch: parakeet on GPU slots sizes decode_streams
     # from free VRAM (one run == one batched call); CPU slots keep batch 1
     # (the sequential decode_stream loop inside _transcribe_batch_parakeet,
@@ -3457,8 +3524,8 @@ def _transcribe_audio_source(
             if detected_lang is None and detected:
                 detected_lang = detected  # first batch's language wins
             lang = language or detected_lang  # explicit wins; else echoed; else None
-            # Batch insert: one insert_transcript() call per chunk (it accepts
-            # a list); a crash loses at most the in-flight chunk.
+            if _transcript_batch_lang is None:
+                _transcript_batch_lang = lang
             first_idx = seg_idx
             batch_rows = []
             for seg in chunk_segs:
@@ -3493,7 +3560,13 @@ def _transcribe_audio_source(
                     )
                     twin_won = True
                     break
-                archive_db.insert_transcript(platform, video_id, batch_rows, lang=lang)
+                _transcript_batch.extend(batch_rows)
+                if len(_transcript_batch) >= _BATCH_INSERT_SIZE:
+                    archive_db.insert_transcript(
+                        platform, video_id, _transcript_batch, lang=_transcript_batch_lang,
+                    )
+                    _transcript_batch.clear()
+                    _transcript_batch_lang = None
             segments += len(batch_rows)
             _append_manifest_entry(manifest, ci2, first_idx, len(chunk_segs))
             speech_done += chunks[ci2][1] - chunks[ci2][0]
@@ -3501,6 +3574,13 @@ def _transcribe_audio_source(
                 progress_cb(speech_done, speech_sec, ci2 + 1, n_chunks)
         if twin_won:
             break
+
+    # Flush remaining batched transcript rows.
+    if _transcript_batch:
+        archive_db.insert_transcript(
+            platform, video_id, _transcript_batch, lang=_transcript_batch_lang,
+        )
+        _transcript_batch.clear()
 
     # Disk hygiene: the job finished — the crash-resume manifest has served
     # its purpose. Best-effort: a failed unlink just leaves it for the next
@@ -4044,6 +4124,20 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
                 "skipped": "dedupe-transcribed",
             }
 
+        # Audio prefetch: submit download to the I/O pool so it overlaps
+        # with other jobs' downloads (single GPU lane benefits most —
+        # sequential downloads become parallel).
+        _prefetch_future: Optional[Future] = None
+        if job.get("kind") == "transcribe" and not audio_stash.get("wav"):
+            if platform == "youtube":
+                _prefetch_future = _get_download_pool().submit(
+                    _prefetch_youtube_audio, video_id, audio_stash,
+                )
+            elif platform in ("twitch", "kick") and not _has_local_archive(platform, video_id):
+                _prefetch_future = _get_download_pool().submit(
+                    _prefetch_twitch_kick_audio, platform, video_id, audio_stash,
+                )
+
         # GPU sequential gate: one video at a time on the GPU. A GPU-pinned
         # thread finding another video active (or a live-caption session
         # holding the GPU) releases its claim — requeue with a short backoff
@@ -4112,6 +4206,17 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
         # releases whatever is left.
 
         def _run_transcribe() -> dict:
+            # Resolve prefetch: wait for the I/O pool download if pending.
+            # The stashed wav path is picked up by the transcribe functions
+            # (audio_stash check) so they skip their own download.
+            if _prefetch_future is not None and not audio_stash.get("wav"):
+                try:
+                    _prefetch_future.result(timeout=_REMOTE_AUDIO_FETCH_TIMEOUT_S)
+                except Exception:
+                    # Exception already stashed error state (gate, blocked)
+                    # or propagated — the transcribe function will see the
+                    # stash or re-raise.
+                    pass
             if platform == "youtube":
                 # Captionless YouTube (no archive_path): download bestaudio
                 # at transcribe time via the app's yt-dlp session.
