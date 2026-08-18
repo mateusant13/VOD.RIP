@@ -8,12 +8,11 @@ export interface FeatureDef {
 }
 
 export const FEATURE_MANIFEST: FeatureDef[] = [
-  { id: 'core-download', cost: 'light', defaultEnabled: true, description: 'Core VOD / clip downloads (yt-dlp + ffmpeg)' },
-  { id: 'transcribe-vod', cost: 'heavy', defaultEnabled: false, description: 'VOD transcription (parakeet ASR, GPU/VRAM)' },
-  { id: 'live-captions', cost: 'heavy', defaultEnabled: false, description: 'Live captions — real-time ASR for live streams' },
-  { id: 'live-preview', cost: 'heavy', defaultEnabled: false, description: 'Live preview sessions & channel live-status warm' },
-  { id: 'clipping', cost: 'light', defaultEnabled: true, description: 'Clipping & trim tools (timeline, clip editor)' },
-  { id: 'chat-live', cost: 'light', defaultEnabled: true, description: 'Live chat capture & overlay for previews' },
+  { id: 'core-download', cost: 'light', defaultEnabled: true, description: 'Download videos and clips from Kick, Twitch and YouTube' },
+  { id: 'transcribe-vod', cost: 'heavy', defaultEnabled: false, description: 'Automatically write out what was said in your saved videos so you can search them' },
+  { id: 'live-captions', cost: 'heavy', defaultEnabled: false, description: 'Show subtitles live while a stream is happening' },
+  { id: 'live-preview', cost: 'heavy', defaultEnabled: false, description: 'See at a glance who is live and open a preview instantly' },
+  { id: 'chat-live', cost: 'light', defaultEnabled: true, description: 'Show live chat next to the video and save it with your download' },
 ];
 
 export const FEATURE_IDS = FEATURE_MANIFEST.map(f => f.id) as string[];

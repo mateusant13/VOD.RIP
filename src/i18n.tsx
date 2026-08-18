@@ -601,7 +601,25 @@ const ptBR: Record<string, string> = {
     'Clipes ao vivo do Twitch são criados no editor de clipes do navegador (fluxo da extensão de cookies).',
   'Kick has no public clip-creation API.': 'O Kick não tem API pública de criação de clipes.',
   'YouTube has no public live-clip API.': 'O YouTube não tem API pública de clipes ao vivo.',
-  // ── Experimental AI ask-about-channel ──────────────────────
+  // ── Feature setup (FirstRunWizard + Settings → Features) ──
+  'Welcome to VOD.RIP — choose your setup': 'Bem-vindo ao VOD.RIP — escolha como começar',
+  'Some extra tools use more power and are off at first. You can turn them on anytime in Settings → Features.': 'Alguns recursos extras consomem mais energia e começam desligados. Você pode ativá-los quando quiser em Configurações → Recursos.',
+  'Just the basics': 'Só o essencial',
+  'Everything': 'Tudo',
+  'Save & continue': 'Salvar e continuar',
+  'Uses more power': 'Consome mais energia',
+  'Light': 'Leve',
+  'Features': 'Recursos',
+  'Choose which tools you want. Tools that use more power start off — turn them on whenever you need them.': 'Escolha quais ferramentas você quer. As que consomem mais energia começam desligadas — ligue quando precisar.',
+  'Downloads': 'Downloads',
+  'Transcripts for saved videos': 'Transcrever vídeos salvos',
+  'Live subtitles': 'Legendas ao vivo',
+  'Live previews': 'Prévia ao vivo',
+  'Download videos and clips from Kick, Twitch and YouTube': 'Baixe vídeos e clipes do Kick, Twitch e YouTube',
+  'Automatically write out what was said in your saved videos so you can search them': 'Escreve automaticamente o que foi dito nos seus vídeos salvos para você poder pesquisar',
+  'Show subtitles live while a stream is happening': 'Mostra legendas ao vivo enquanto a transmissão acontece',
+  'See at a glance who is live and open a preview instantly': 'Veja de relance quem está ao vivo e abra a prévia na hora',
+  'Show live chat next to the video and save it with your download': 'Mostra o chat ao vivo ao lado do vídeo e salva junto com o download',
   'Experimental': 'Experimental',
   'Experimental: AI search & answers': 'Experimental: busca e respostas com IA',
   'Ask questions about archived channels. Answers come only from the local archive (chat + transcripts) using your own OpenAI-compatible API key.':
@@ -1195,6 +1213,25 @@ const es: Record<string, string> = {
     'Los clips en vivo de Twitch se crean en el editor de clips del navegador (flujo de la extensión de cookies).',
   'Kick has no public clip-creation API.': 'Kick no tiene una API pública de creación de clips.',
   'YouTube has no public live-clip API.': 'YouTube no tiene una API pública de clips en vivo.',
+  // ── Feature setup (FirstRunWizard + Settings → Features) ──
+  'Welcome to VOD.RIP — choose your setup': 'Bienvenido a VOD.RIP — elige tu configuración',
+  'Some extra tools use more power and are off at first. You can turn them on anytime in Settings → Features.': 'Algunas herramientas extra consumen más energía y empiezan apagadas. Puedes activarlas cuando quieras en Ajustes → Funciones.',
+  'Just the basics': 'Solo lo esencial',
+  'Everything': 'Todo',
+  'Save & continue': 'Guardar y continuar',
+  'Uses more power': 'Consume más energía',
+  'Light': 'Ligero',
+  'Features': 'Funciones',
+  'Choose which tools you want. Tools that use more power start off — turn them on whenever you need them.': 'Elige qué herramientas quieres. Las que consumen más energía empiezan apagadas — actívalas cuando las necesites.',
+  'Downloads': 'Descargas',
+  'Transcripts for saved videos': 'Transcribir vídeos guardados',
+  'Live subtitles': 'Subtítulos en vivo',
+  'Live previews': 'Vistas previas en vivo',
+  'Download videos and clips from Kick, Twitch and YouTube': 'Descarga vídeos y clips de Kick, Twitch y YouTube',
+  'Automatically write out what was said in your saved videos so you can search them': 'Escribe automáticamente lo que se dijo en tus vídeos guardados para que puedas buscarlo',
+  'Show subtitles live while a stream is happening': 'Muestra subtítulos en vivo mientras la transmisión ocurre',
+  'See at a glance who is live and open a preview instantly': 'Ve de un vistazo quién está en vivo y abre la vista previa al instante',
+  'Show live chat next to the video and save it with your download': 'Muestra el chat en vivo junto al vídeo y lo guarda con tu descarga',
   // ── Experimental AI ask-about-channel ──────────────────────
   'Experimental': 'Experimental',
   'Experimental: AI search & answers': 'Experimental: búsqueda y respuestas con IA',
@@ -1212,7 +1249,6 @@ const es: Record<string, string> = {
   'Days (blank = entire history)': 'Días (vacío = historial completo)',
   'Sources': 'Fuentes',
 }
-
 // botGate.* and progress.* keys are namespaced (not English sentences), so
 // they need explicit English entries — every other key falls back to the key itself.
 

@@ -490,19 +490,20 @@ export default function SettingsTab({
 
       <SettingsCard
         icon={Sparkles}
-        title="Features"
+        title={t('Features')}
         open={!!openCards.features}
         onToggle={() => toggleCard('features')}
       >
-        <p className="text-[11px] font-mono text-zinc-500">Toggle heavy features (OFF by default). Changes persist to Settings and reload preserves them.</p>
+        <p className="text-[11px] font-mono text-zinc-500">{t('Choose which tools you want. Tools that use more power start off — turn them on whenever you need them.')}</p>
         <div className="flex flex-col gap-2 mt-2">
           {FEATURE_MANIFEST.map(f => {
             const enabled = !!enabledMap[f.id];
+            const label = f.id === 'core-download' ? t('Downloads') : f.id === 'transcribe-vod' ? t('Transcripts for saved videos') : f.id === 'live-captions' ? t('Live subtitles') : f.id === 'live-preview' ? t('Live previews') : f.id === 'chat-live' ? t('Live chat') : f.id;
             return (
               <Toggle
                 key={f.id}
-                label={`${f.id} — ${f.description}`}
-                info={f.cost === 'heavy' ? 'HEAVY — GPU/model/threads' : 'LIGHT'}
+                label={`${label} — ${t(f.description)}`}
+                info={t(f.cost === 'heavy' ? 'Uses more power' : 'Light')}
                 checked={enabled}
                 onChange={c => {
                   const cur = getEnabledFeatures(); cur[f.id]=c;

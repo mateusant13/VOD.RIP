@@ -8,46 +8,38 @@ from __future__ import annotations
 
 from typing import Dict, List
 
-# Cost taxonomy: heavy = GPU/model/thread-pool heavy; light = cheap network/UI.
 MANIFEST: List[Dict] = [
     {
         "id": "core-download",
         "cost": "light",
         "defaultEnabled": True,
-        "description": "Core VOD / clip downloads (yt-dlp + ffmpeg)",
+        "description": "Download videos and clips from Kick, Twitch and YouTube",
     },
     {
         "id": "transcribe-vod",
         "cost": "heavy",
         "defaultEnabled": False,
-        "description": "VOD transcription (parakeet ASR, GPU/VRAM)",
+        "description": "Automatically write out what was said in your saved videos so you can search them",
     },
     {
         "id": "live-captions",
         "cost": "heavy",
         "defaultEnabled": False,
-        "description": "Live captions — real-time ASR for live streams",
+        "description": "Show subtitles live while a stream is happening",
     },
     {
         "id": "live-preview",
         "cost": "heavy",
         "defaultEnabled": False,
-        "description": "Live preview sessions & channel live-status warm",
-    },
-    {
-        "id": "clipping",
-        "cost": "light",
-        "defaultEnabled": True,
-        "description": "Clipping & trim tools (timeline, clip editor)",
+        "description": "See at a glance who is live and open a preview instantly",
     },
     {
         "id": "chat-live",
         "cost": "light",
         "defaultEnabled": True,
-        "description": "Live chat capture & overlay for previews",
+        "description": "Show live chat next to the video and save it with your download",
     },
 ]
-
 # Fast lookup of defaults
 _DEFAULTS: Dict[str, bool] = {f["id"]: bool(f["defaultEnabled"]) for f in MANIFEST}
 _HEAVY_IDS = {f["id"] for f in MANIFEST if f["cost"] == "heavy"}
