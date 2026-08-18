@@ -693,9 +693,10 @@ async def test_captions_stream_validates_platform(monkeypatch):
 @pytest.mark.anyio
 async def test_captions_stream_503_when_parakeet_gated(monkeypatch):
     """VODRIP_PARAAKEET=0 / missing sherpa -> 503 with the reason; the
-    frontend never opens the stream then."""
+    feature gate is patched to enabled so this tests the parakeet gate."""
     from services import live_captions
-
+    from services.feature_registry import is_enabled as _orig_enabled
+    monkeypatch.setattr("services.feature_registry.is_enabled", lambda fid: True if fid == "live-captions" else _orig_enabled(fid))
     monkeypatch.setattr(live_captions, "captions_available", lambda plat: (False, "parakeet engine unavailable"))
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         res = await client.get("/api/live/captions", params={"platform": "twitch", "channel": "srdogg"})
@@ -706,6 +707,8 @@ async def test_captions_stream_503_when_parakeet_gated(monkeypatch):
 @pytest.mark.anyio
 async def test_available_endpoint_shape(monkeypatch):
     from services import live_captions
+    from services.feature_registry import is_enabled as _orig_enabled
+    monkeypatch.setattr("services.feature_registry.is_enabled", lambda fid: True if fid == "live-captions" else _orig_enabled(fid))
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         monkeypatch.setattr(live_captions, "captions_available", lambda plat: (True, ""))
@@ -731,7 +734,8 @@ async def test_captions_stream_lang_param_reaches_captioner(monkeypatch):
     (app-language default); a bad lang is rejected 400 before any stream."""
     from routers import live as live_router
     from services import live_captions
-
+    from services.feature_registry import is_enabled as _orig_enabled
+    monkeypatch.setattr("services.feature_registry.is_enabled", lambda fid: True if fid == "live-captions" else _orig_enabled(fid))
     monkeypatch.setattr(live_captions, "captions_available", lambda plat: (True, ""))
     acquired: list = []
 
@@ -762,7 +766,6 @@ async def test_captions_stream_lang_param_reaches_captioner(monkeypatch):
         res = await client.get("/api/live/captions", params={"platform": "twitch", "channel": "srdogg", "lang": "de"})
         assert res.status_code == 400
         assert "lang" in res.json()["detail"]
-
 
 @pytest.mark.anyio
 async def test_captioner_acquire_lang_sets_target_family(monkeypatch):
