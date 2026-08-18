@@ -69,10 +69,14 @@ def _record_error(kind: str, message: str, platform: str = "", channel: str = ""
     try:
         pp = _error_log_path()
         pp.parent.mkdir(parents=True, exist_ok=True)
-        # ponytail: 5 MB rotation — cheap bound on disk; upgrade to rotating handler when centralized logging lands.
         try:
             if pp.exists() and pp.stat().st_size > 5 * 1024 * 1024:
-                pp.unlink(missing_ok=True)
+                bak = pp.with_suffix(".1.log")
+                try:
+                    bak.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                pp.rename(bak)
         except Exception:
             pass
         ts = datetime.fromtimestamp(entry["ts"], tz=timezone.utc).isoformat()
@@ -82,7 +86,6 @@ def _record_error(kind: str, message: str, platform: str = "", channel: str = ""
             f.write(line)
     except Exception:
         pass
-
 def get_error_ring(limit: int = 50) -> list[dict]:
     with _ERROR_RING_LOCK:
         items = list(_ERROR_RING)[-max(1, min(limit, _ERROR_RING_MAX)):]

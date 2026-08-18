@@ -192,11 +192,13 @@ async def presence(body: dict):
 
 @router.get("/api/features")
 async def list_features():
+    """Canonical feature list — manifest + current enabled map."""
     from services.feature_registry import get_manifest, get_enabled_map
     return {"manifest": get_manifest(), "features": get_enabled_map()}
 
 
 @router.get("/api/info/features")
 async def info_features():
+    """Deprecated alias for /api/features — kept for backward compat."""
     from services.feature_registry import get_manifest, get_enabled_map
     return {"manifest": get_manifest(), "features": get_enabled_map()}

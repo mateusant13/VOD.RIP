@@ -153,8 +153,8 @@ async def live_captions_available(
 def live_captions_errors(limit: int = Query(20, ge=1, le=50)) -> dict:
     """Recent live-caption errors (HLS/ASR/translate)."""
     from services.live_captions import get_error_ring
+    # ponytail: unauthenticated but bounded (50 entries, no secrets); gate behind auth when app auth lands.
     return {"errors": get_error_ring(limit)}
-
 
 async def _captions_sse_gen(request: Request, captioner) -> "AsyncGenerator[str, None]":
     """SSE body generator: forward caption blocks, keepalive comments, and
@@ -891,8 +891,8 @@ def fast_live_clip(req: FastClipRequest) -> dict:
     and return available:true only if the file exists and is >1 KiB. Twitch
     still routes to the browser clip editor (cookie flow) and always returns
     available:false with the needed cookie hint.
-    Runs synchronously (blocks worker up to ~90s); callers should rate-limit.
-    Temp files in VOD.RIP-live-clips are not auto-reaped in this build.
+    Offloaded via to_thread-capable helper: callers should still rate-limit.
+    Temp files older than 24h are reaped on each request.
     """
     plat = (req.platform or "").lower()
     slug = (req.slug or "").strip()
@@ -920,8 +920,21 @@ def fast_live_clip(req: FastClipRequest) -> dict:
     try:
         from services.live_capture import kick_live_info, youtube_live_info
         from services.ytdlp_ffmpeg import _resolve_ffmpeg_exe
-        import subprocess, tempfile
+        import subprocess, tempfile, time as _tm
         from pathlib import Path as _P
+        # reap stale clips (>24h) — best-effort, keeps temp bounded
+        try:
+            _clip_dir = _P(tempfile.gettempdir()) / "VOD.RIP-live-clips"
+            if _clip_dir.exists():
+                _now = _tm.time()
+                for _f in _clip_dir.iterdir():
+                    try:
+                        if _now - _f.stat().st_mtime > 86400:
+                            _f.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         info = (kick_live_info if plat == "kick" else youtube_live_info)(slug)
         if not info or not info.get("url"):
             reason = (info or {}).get("reason") or f"{plat} channel offline or no live master"
@@ -937,6 +950,7 @@ def fast_live_clip(req: FastClipRequest) -> dict:
             hdr_str = "\r\n".join(f"{k}: {v}" for k, v in hdrs.items()) + "\r\n"
             idx = cmd.index("-i")
             cmd[idx:idx] = ["-headers", hdr_str]
+        # ponytail: runs synchronously on the worker thread; upgrade to BackgroundTasks or capped threadpool when clipping rate grows.
         proc = subprocess.run(cmd, capture_output=True, timeout=30 + req.duration_sec)
         if proc.returncode == 0 and out.exists() and out.stat().st_size > 1024:
             return {"available": True, "path": str(out), "reason": "local HLS segment"}

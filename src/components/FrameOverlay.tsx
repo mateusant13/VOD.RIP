@@ -104,32 +104,20 @@ export function FrameOverlay({
     </div>
   );
 
-  // reparent via portal: when children are supplied (dragged preview cards), portal them into the overlay
+  // App wraps FrameOverlay in a fixed inset-0 container so grid/content render
+  // inline here — no portal needed (avoids clipping by vod-app-shell overflow).
   if (children) {
     const content = (
       <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}>
         <div style={{ pointerEvents: 'auto' }}>{children}</div>
       </div>
     );
-    // grid + portaled children; if document.body exists, portal the whole thing to avoid clipping by parent overflow:hidden
-    const combined = (
+    return (
       <>
         {grid}
         {content}
       </>
     );
-    // Use portal for the overlay itself when possible so blank-area grid is not clipped by vod-app-shell overflow
-    if (typeof document !== 'undefined' && document.body) {
-      // Render grid inline here; children portaled. Keep grid inline to preserve App flow; children via portal if needed.
-      // Simpler: return grid + content inline (App already wraps in fixed portal container).
-      return (
-        <>
-          {grid}
-          {content}
-        </>
-      );
-    }
-    return combined;
   }
 
   return grid;

@@ -76,11 +76,15 @@ export async function syncFromBackend(): Promise<void> {
     if (!r.ok) return;
     const j = await r.json() as { features?: Record<string, boolean> };
     if (j.features && typeof j.features === 'object') {
+      const before = JSON.stringify(getEnabledFeatures());
       const cur = getEnabledFeatures();
       for (const id of FEATURE_IDS) if (id in j.features) cur[id] = !!j.features[id];
-      try { localStorage.setItem(LS_FEATURES, JSON.stringify(cur)); } catch { /* ignore */ }
+      const after = JSON.stringify(cur);
+      if (after !== before) {
+        try { localStorage.setItem(LS_FEATURES, after); } catch { /* ignore */ }
+        try { const { notifyFeatureChange } = await import('../hooks/useFeature'); notifyFeatureChange(); } catch { /* ignore */ }
+      }
     }
-    // if backend already has onboarding flag, mirror it (optional)
     const b = j as unknown as { onboardingDone?: boolean };
     if (b.onboardingDone) markOnboardingDone();
   } catch { /* ignore */ }
