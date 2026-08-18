@@ -69,6 +69,7 @@ def test_real_gpu_detection_rejects_fake_adapter(monkeypatch):
     read as NO GPU — compute probes are the truth, never adapter names."""
     monkeypatch.setattr(at, "_nvidia_smi_vram", lambda: None)
     monkeypatch.setattr(at, "_cuda_runtime_vram", lambda: None)
+    monkeypatch.setattr(at, "_torch_cuda_vram", lambda: None)
     assert at._real_gpu_info() == (False, 0, 0), (
         "a fake adapter with no compute probe must not look like a GPU"
     )
@@ -106,6 +107,7 @@ def test_parakeet_cuda_wheel_requires_real_gpu(monkeypatch):
     monkeypatch.setattr(at, "_parakeet_cuda_ok", None)
     monkeypatch.setattr(at, "_nvidia_smi_vram", lambda: None)
     monkeypatch.setattr(at, "_cuda_runtime_vram", lambda: None)
+    monkeypatch.setattr(at, "_torch_cuda_vram", lambda: None)
     assert at._parakeet_cuda_available() is False, (
         "a CUDA wheel on a fake adapter must not enable the GPU lane"
     )
