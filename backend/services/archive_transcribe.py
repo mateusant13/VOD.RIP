@@ -1113,15 +1113,17 @@ _DOWNLOAD_POOL_SIZE = 4  # concurrent ffmpeg/yt-dlp downloads
 def _get_download_pool() -> ThreadPoolExecutor:
     global _download_pool
     if _download_pool is None:
-        _download_pool = ThreadPoolExecutor(
-            max_workers=_DOWNLOAD_POOL_SIZE,
-            thread_name_prefix="download",
-        )
+        with _model_lock:
+            if _download_pool is None:
+                _download_pool = ThreadPoolExecutor(
+                    max_workers=_DOWNLOAD_POOL_SIZE,
+                    thread_name_prefix="download",
+                )
     return _download_pool
 
 
-def _prefetch_youtube_audio(video_id: str, audio_stash: dict) -> str:
-    """Download YouTube audio in the I/O pool.  Returns path string,
+def _prefetch_youtube_audio(video_id: str, audio_stash: dict) -> Path:
+    """Download YouTube audio in the I/O pool.  Returns wav Path,
     stashes result into *audio_stash* for the transcribe function."""
     from services.archive_ytdlp import (
         _is_gate_error,
@@ -1130,7 +1132,7 @@ def _prefetch_youtube_audio(video_id: str, audio_stash: dict) -> str:
     )
     outdir = Path(tempfile.mkdtemp(prefix=f"vodrip-transcribe-youtube-{video_id}-"))
     try:
-        path = download_bestaudio(video_id, outdir)
+        path = Path(download_bestaudio(video_id, outdir))
         audio_stash["wav"] = path
         audio_stash["dir"] = outdir
         return path
@@ -1223,7 +1225,7 @@ def close_model() -> None:
     When _parakeet_resident is set (live captions active), the process-global
     recognizer and VAD are kept loaded — only thread slots are cleared. This
     avoids a cold CUDA EP reload on the next caption session."""
-    global _vad, _parakeet_global, _cuda_recognizers_resident
+    global _vad, _parakeet_global, _cuda_recognizers_resident, _download_pool
     closed_any = False
     with _model_lock:
         for slot in _thread_slots.values():
@@ -1253,6 +1255,11 @@ def close_model() -> None:
                 logger.info("Unloading VAD model")
                 del vad
                 closed_any = True
+    # Release the download I/O pool so its threads join on shutdown.
+    dp = _download_pool
+    if dp is not None:
+        _download_pool = None
+        dp.shutdown(wait=False)
     if closed_any:
         gc.collect()
 
@@ -1977,7 +1984,8 @@ def _parakeet_model() -> Any:
                     _shared_models[device] = _load_parakeet(
                         provider=device if device != "cpu" else "cpu"
                     )
-        return _shared_models[device]
+        with _shared_models_lock:
+            return _shared_models[device]
     with _model_lock:
         if _parakeet_global is None:
             _parakeet_global = _load_parakeet(provider=_parakeet_provider())
@@ -3564,6 +3572,16 @@ def _transcribe_audio_source(
                     )
                     _transcript_batch.clear()
                     _transcript_batch_lang = None
+            # Flush remaining batched rows BEFORE writing the manifest entry
+            # so a crash cannot mark a chunk done while its rows are still
+            # staged — crash-resume would then skip re-transcription and
+            # silently lose the data.
+            if _transcript_batch:
+                archive_db.insert_transcript(
+                    platform, video_id, _transcript_batch, lang=_transcript_batch_lang,
+                )
+                _transcript_batch.clear()
+                _transcript_batch_lang = None
             segments += len(batch_rows)
             _append_manifest_entry(manifest, ci2, first_idx, len(chunk_segs))
             speech_done += chunks[ci2][1] - chunks[ci2][0]
@@ -4163,6 +4181,12 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
                     "transcribe job %s (%s/%s) requeued: GPU sequential gate",
                     job_id, platform, video_id,
                 )
+                # Cancel the in-flight prefetch so it does not hold a
+                # download-pool thread after this job requeues.
+                if _prefetch_future is not None:
+                    _prefetch_future.cancel()
+                if audio_stash.get("dir"):
+                    shutil.rmtree(str(audio_stash.pop("dir")), ignore_errors=True)
                 return {
                     "job_id": job_id,
                     "platform": platform,
@@ -4255,6 +4279,12 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
                 "youtube job %s requeued: bot-gate during audio download",
                 job_id,
             )
+            # Cancel the in-flight prefetch so it does not hold a
+            # download-pool thread after this job requeues.
+            if _prefetch_future is not None:
+                _prefetch_future.cancel()
+            if audio_stash.get("dir"):
+                shutil.rmtree(str(audio_stash.pop("dir")), ignore_errors=True)
             return {
                 "job_id": job_id, "platform": platform, "video_id": video_id,
                 "requeued": "youtube-gate",
@@ -4582,6 +4612,8 @@ def _run_worker(
 
         def _refill() -> None:
             while len(pending) < budget:
+                if _WORKER_STOP.is_set():
+                    return
                 rss_cap = _rss_cap_bytes()
                 if rss_cap > 0:
                     rss = _process_rss_bytes()
