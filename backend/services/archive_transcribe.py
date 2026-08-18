@@ -973,27 +973,24 @@ def _cpu_load_high() -> bool:
 def _cpu_auto_workers() -> int:
     """Dynamic default CPU-lane count, sized to the box's threads.
 
-    Whisper int8 needs ~1 thread per lane minimum before it becomes
-    latency-bound, so the default scales with os.cpu_count(): 2 lanes below
-    16 threads, 2 at 16–31 (fewer lanes = more ASR threads per lane),
-    4 at 32+. The RAM clamp (and the contention clamp when the box is busy)
-    still caps the actual slots — this only raises the ceiling that used to
-    be a flat 2. Env override (VODRIP_TRANSCRIBE_WORKERS) wins over this
-    in _cpu_worker_ceiling.
+    Parakeet TDT v3 int8 sweet spot is ~8 ASR threads per lane.  This
+    function picks lane count so that ``threads // lanes ≈ 8``:
 
-    Background (autostart) mode caps at 3 — nobody is at the keyboard, but
-    the 3-lane footprint (~3 GB RSS total at the 1.5 GB/lane estimate +
-    headroom) still fits the 22.5 GB-free reference box while draining the
-    queue faster than 2; VODRIP_TRANSCRIBE_WORKERS raises or lowers it and
-    the RAM/contention clamps still cap the actual slots."""
+      *  4 threads → 1 lane × 4 threads  (below sweet spot, unavoidable)
+      *  8 threads → 1 lane × 8 threads  (sweet spot)
+      * 16 threads → 2 lanes × 8 threads (sweet spot)
+      * 32 threads → 4 lanes × 8 threads (sweet spot)
+      * 64 threads → 8 lanes × 8 threads (sweet spot)
+
+    The RAM clamp (and the contention clamp when the box is busy) still
+    caps the actual slots — this only raises the ceiling.  Env override
+    (VODRIP_TRANSCRIBE_WORKERS) wins over this in _cpu_worker_ceiling.
+
+    Background (autostart) mode caps at 3 — nobody is at the keyboard."""
     if background_mode():
         return 3
     threads = os.cpu_count() or 4
-    if threads >= 32:
-        return 4
-    if threads >= 16:
-        return 2  # fewer lanes = more ASR threads per lane (sweet spot: 8)
-    return 2
+    return max(1, min(8, threads // 8))
 
 
 def _cpu_worker_ceiling() -> int:
