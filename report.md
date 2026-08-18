@@ -688,8 +688,8 @@ However, the codebase is accumulating debt faster than it's being paid down:
 - Verified live (ungated): cold 9h VOD create 3.2s; 5 concurrent creates 4x200 in 4-16s + 1 dead-video honest fail; 5 rapid popup clicks -> 1 playing, 1 buffered, 3 honest errors, 0 stray deletes; backgrounded popup resumes.
 
 ## 2026-08-17 - scheduler exhaust quiet + caption sync + chat overflow + TS fix
-- `archive_scheduler.py`: demoted "attempts exhausted" INFO spam to debug, LIMIT 100 guard on `_pass1_exhausted` scan; stale requeue only when `updated_at < fresh_cutoff`. Reduced ~1200 INFO lines/hr to zero visible spam.
-- `live_captions.py`: added `CAPTION_TARGET_ALIGN_SEC = 0.9` constant documenting the 0.8–1.0s target; ponytail upgrade path is an env knob.
+- `archive_scheduler.py`: demoted per-job "attempts exhausted" to debug; per-pass summary at INFO; LIMIT 100 with `attempts < max_attempts` SQL filter to prevent starvation of retryable jobs behind exhausted backlog. Stale requeue only when `updated_at < fresh_cutoff`. Reduced ~1200 INFO lines/hr to one per-pass summary.
+- `live_captions.py`: added `CAPTION_TARGET_ALIGN_SEC = 0.9` documenting ASR pipeline internal latency; docstring corrected to show end-to-end (HLS edge count 2 ≈ 4s + parakeet 0.3–1s ≈ 4.3–5s total). Ponytail upgrade path is an env knob.
 - `LivePlayerPopup.tsx`: `liveSyncDurationCount` 2→3 when captions ON and buffer healthy; `lowLatencyMode: false`; stall guard ref prevents repeated buffering overlay. Guarded `liveSessionPrefetchRef` access against undefined.
 - `LiveChatPanel.tsx`: flex `min-h-0` chain fixes docked chat growing to 300 rows without scroll containment.
 - `useFeature.ts`: removed unused `useCallback` import (TS6133).
