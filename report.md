@@ -694,3 +694,15 @@ However, the codebase is accumulating debt faster than it's being paid down:
 - `LiveChatPanel.tsx`: flex `min-h-0` chain fixes docked chat growing to 300 rows without scroll containment.
 - `useFeature.ts`: removed unused `useCallback` import (TS6133).
 - `SettingsTab.tsx`: restored to working version with `settings: AppSettings` prop, `useI18n()` hook, and `openCards`/`toggleCard` accordion state. TSC: 0 errors.
+- Review fixes (`d936853`): (1) restored missing `threading.Thread(target=_embed_backfill_guarded).start()` — embed backfill was dead code since `b715799`, new transcripts never embedded; (2) added `keep_parakeet_resident(False)` in `_session_end()` — parakeet was pinned in VRAM forever after first live caption session.
+
+### Remaining P2 findings (tracked, not yet fixed)
+- **ASR queue race**: `_asr_queue` deque accessed from ingest + ASR threads without lock (`live_captions.py:636-755`)
+- **Unauthenticated caption endpoints**: no rate limit/cap on distinct channel keys (`routers/live.py:56-155`)
+- **PanelResizer drag stick**: window blur mid-drag leaves cursor/userSelect stuck (`PanelResizer.tsx:122-162`)
+- **Stall guard cross-session**: `stallGuardRef` not reset between channel switches (`LivePlayerPopup.tsx:569-575`)
+- **Manifest sync test brittle**: regex requires single-quoted fixed-order fields (`test_feature_manifest_sync.py:21-45`)
+- **Live-caption gate fail-closed untested**: monkeypatch bypasses gate in all endpoint tests (`test_live_captions.py:694-734`)
+- **YouTube caption platform untested**: new platform added to SUPPORTED_PLATFORMS but no valid-path test (`test_live_captions.py:683-692`)
+- **Fast live-clip lacks tests**: slug validation, ffmpeg path, header injection untested (`routers/live.py:887-958`)
+- **Scheduler SQL starvation filter untested**: LIMIT 100 + attempts < max_attempts not exercised (`archive_scheduler.py:620-642`)
