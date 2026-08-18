@@ -948,16 +948,6 @@ class PreviewManager:
                 # resolved entry_url — only the two master fetches overlap.
                 session.entry_url = _resolve_and_warm_master(pool, url)
                 session.allowed_hosts.update(_hosts_for_url(session.entry_url))
-                if "low_latency=" in url and not _media_playlist_is_ll(session):
-                    logger.info(
-                        "live session %s: LL master has no PART-INF - falling back to non-LL",
-                        session_id[:8],
-                    )
-                    non_ll = _strip_low_latency_param(url)
-                    if non_ll and non_ll != url:
-                        session.master_url = non_ll
-                        session.entry_url = _resolve_and_warm_master(pool, non_ll)
-                        session.allowed_hosts.update(_hosts_for_url(session.entry_url))
         except Exception as exc:
             logger.debug("live session %s media resolve failed: %s", session_id[:8], exc)
         # DVR archive resolution is deferred to the first replay-playlist

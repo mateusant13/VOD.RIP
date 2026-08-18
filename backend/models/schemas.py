@@ -170,7 +170,7 @@ class AppSettings(BaseModel):
     # Live-caption low-latency mode: 1s windows instead of 2s, raising the
     # flush-fail tolerance to compensate for shorter/emptier frames. Drops
     # total caption lag from ~1-2s to ~0.5-1s behind the live edge.
-    caption_low_latency: bool = False
+    caption_low_latency: bool = True
     # Window-active runtime policy: controls behavior when window is
     # minimized or closed (hidden to tray). Keys: 'when_minimized',
     # 'when_closed'. Values: 'normal' (default), 'reduced', 'off'.

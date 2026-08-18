@@ -208,6 +208,11 @@ def _install_pipeline(monkeypatch, pipeline: _FakePipeline, **kw):
     # Mock the ASR thread prewarm so it doesn't load real models
     from services import archive_transcribe as _at
     monkeypatch.setattr(_at, "prewarm_parakeet", lambda: True)
+    # Pin caption_low_latency=False so tests use _FLUSH_FAIL_LIMIT=3
+    from models.schemas import AppSettings as _AppSettings
+    _fake_settings = _AppSettings(caption_low_latency=False)
+    import deps as _deps
+    monkeypatch.setattr(_deps, "settings_mgr", type("M", (), {"get": staticmethod(lambda: _fake_settings)})())
     return live_captions
 
 
