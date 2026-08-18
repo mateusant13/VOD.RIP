@@ -815,14 +815,68 @@ def _vram_cap_bytes() -> int:
 
 
 def _process_rss_bytes() -> int:
-    """Current process RSS in bytes (0 = unknown). Uses psutil when
-    available; falls back to 0 so callers never crash."""
+    """Current process RSS in bytes (0 = unknown).
+
+    Prefers ``psutil`` when installed (dev / full installs). Frozen bundle +
+    minimal installs have no ``psutil`` dep — fall back to a stdlib probe
+    (``psapi.GetProcessMemoryInfo`` on Windows, POSIX ``/proc`` / ``resource``).
+    Never raises.
+    """
     try:
-        import psutil
+        import psutil  # type: ignore[import-not-found]
+
         return psutil.Process().memory_info().rss
     except Exception:
-        return 0
+        pass
+    # stdlib fallback: no extra dependency, works in the frozen exe.
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
 
+            class _PMC(ctypes.Structure):  # PROCESS_MEMORY_COUNTERS_EX (has PrivateUsage)
+                _fields_ = [  # noqa: RUF012
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                    ("PrivateUsage", ctypes.c_size_t),
+                ]
+
+            h = ctypes.windll.kernel32.GetCurrentProcess()
+            pmc = _PMC()
+            pmc.cb = ctypes.sizeof(_PMC)
+            # argtypes must be set once — psapi variant is the stable one on Win10/11.
+            fn = ctypes.windll.psapi.GetProcessMemoryInfo
+            fn.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+            fn.restype = wintypes.BOOL
+            if fn(h, ctypes.byref(pmc), pmc.cb):
+                # PrivateUsage is the committed private bytes — closer to RSS than
+                # WorkingSet (which is trimmed under pressure). Use the larger of
+                # the two so the cap never silently under-reports.
+                return int(max(pmc.WorkingSetSize, pmc.PrivateUsage))
+        else:
+            # POSIX: /proc/self/statm page 1 is VmRSS in pages; resource fallback.
+            try:
+                with open("/proc/self/statm", encoding="utf-8") as f:
+                    rss_pages = int(f.read().split()[1])
+                return rss_pages * os.sysconf("SC_PAGE_SIZE")
+            except Exception:
+                import resource
+
+                # ru_maxrss is kilobytes on Linux, bytes on macOS — normalize.
+                rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+                # Heuristic: absurdly small value (< 64 MiB) on a big process is likely KiB.
+                return rss * 1024 if rss < 64 * 1024 else rss
+    except Exception:
+        pass
+    return 0
 
 def _check_resource_caps() -> bool:
     """True when the process is within its RSS and VRAM caps.

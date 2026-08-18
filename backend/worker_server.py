@@ -132,19 +132,56 @@ def _rss_cap_bytes() -> int:
 
 def _process_rss_bytes(pid: int) -> int:
     """RSS of an arbitrary process by PID (bytes, 0 = unknown).
-    Windows: tasklist CSV. POSIX: /proc/[pid]/statm."""
+
+    Windows: ``psapi.GetProcessMemoryInfo`` on an opened handle (accurate,
+    fixed cost, locale-independent). Falls back to ``tasklist`` only if the
+    handle open / probe fails (e.g. elevated child). POSIX: ``/proc/[pid]/statm``.
+    """
     try:
         if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            PROCESS_QUERY_LIMITED = 0x1000
+            h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED, False, int(pid))
+            if h:
+                try:
+                    class _PMC(ctypes.Structure):  # PROCESS_MEMORY_COUNTERS_EX
+                        _fields_ = [  # noqa: RUF012
+                            ("cb", wintypes.DWORD),
+                            ("PageFaultCount", wintypes.DWORD),
+                            ("PeakWorkingSetSize", ctypes.c_size_t),
+                            ("WorkingSetSize", ctypes.c_size_t),
+                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                            ("PagefileUsage", ctypes.c_size_t),
+                            ("PeakPagefileUsage", ctypes.c_size_t),
+                            ("PrivateUsage", ctypes.c_size_t),
+                        ]
+
+                    pmc = _PMC()
+                    pmc.cb = ctypes.sizeof(_PMC)
+                    fn = ctypes.windll.psapi.GetProcessMemoryInfo
+                    fn.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+                    fn.restype = wintypes.BOOL
+                    if fn(h, ctypes.byref(pmc), pmc.cb):
+                        return int(max(pmc.WorkingSetSize, pmc.PrivateUsage))
+                finally:
+                    ctypes.windll.kernel32.CloseHandle(h)
             import subprocess as _sp
+
             out = _sp.check_output(
                 ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                text=True, timeout=5, stderr=_sp.DEVNULL,
+                text=True,
+                timeout=5,
+                stderr=_sp.DEVNULL,
             )
             for line in out.strip().splitlines():
                 parts = line.split(",")
                 if len(parts) >= 5:
                     mem_str = parts[4].strip().strip('"')
-                    # tasklist uses locale thousands separator (e.g. "17.800 K")
                     num_str = mem_str[:-1].replace(".", "").replace(",", "")
                     if mem_str.endswith("K"):
                         return int(num_str) * 1024
@@ -159,7 +196,6 @@ def _process_rss_bytes(pid: int) -> int:
     except Exception:
         pass
     return 0
-
 
 def _resource_watchdog(
     logf, proc: subprocess.Popen, stop_event: threading.Event
