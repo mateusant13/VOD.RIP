@@ -706,3 +706,11 @@ However, the codebase is accumulating debt faster than it's being paid down:
 - **YouTube caption platform untested**: new platform added to SUPPORTED_PLATFORMS but no valid-path test (`test_live_captions.py:683-692`)
 - **Fast live-clip lacks tests**: slug validation, ffmpeg path, header injection untested (`routers/live.py:887-958`)
 - **Scheduler SQL starvation filter untested**: LIMIT 100 + attempts < max_attempts not exercised (`archive_scheduler.py:620-642`)
+
+All P2s fixed in `6d87461`:
+- **ASR queue thread safety**: `_asr_lock` protects deque popleft/append across ingest/ASR threads
+- **Caption endpoint rate limit**: `_MAX_CONCURRENT_CAPTIONERS=10` cap, returns 429 when exceeded
+- **PanelResizer drag-stick**: blur handler + unmount cleanup prevent stuck cursor/userSelect
+- **Stall guard cross-session**: reset in `destroyHls` so previous channel state doesn't cause false fallback
+- **Caption sync hysteresis**: downshift >4.5s, upshift <3.5s prevents oscillation at 4s threshold
+- **16 new tests** covering: fast live-clip slug validation/path injection, manifest description drift, gate fail-closed 503, YouTube caption platform, scheduler exhaustion filter
