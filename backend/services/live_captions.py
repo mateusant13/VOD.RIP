@@ -100,6 +100,15 @@ WINDOW_SEC_ENV = "VODRIP_CAPTION_WINDOW_SEC"
 POLL_SEC_ENV = "VODRIP_CAPTION_POLL_SEC"
 MAX_BACKLOG_SEC_ENV = "VODRIP_CAPTION_MAX_BACKLOG_SEC"
 LOW_LATENCY_ENV = "VODRIP_CAPTION_LOW_LATENCY"
+# Target AV alignment when a captions session is active: keep video
+# ~0.8-1.0s behind the live edge so the transcript's parakeet trail
+# (~0.3-1s on a 2s window) lands ≤1.0s behind speech. The predictor is
+# comment-only (no new config): the frontend honors it by riding
+# liveSyncDurationCount 2 (≈4s) vs 3 (≈6s) only while captions are ON
+# and the buffer is healthy (>4s), and the backend honors it by
+# flushing captions as soon as the VAD window completes with no extra
+# queue delay (call_soon_threadsafe put_nowait in _emit — see _asr_worker).
+CAPTION_TARGET_ALIGN_SEC = 0.9  # ponytail: comment constant documenting the 0.8-1.0s target; upgrade path is an env knob if per-site tuning is needed
 # ~2s of speech is a usable caption block (~2-4 words per second of speech);
 # a 1s window would yield 2-3 words — too short to read.
 #
@@ -107,13 +116,14 @@ LOW_LATENCY_ENV = "VODRIP_CAPTION_LOW_LATENCY"
 # caption for window [t0, t1] is emitted right after t1 plus the transcribe
 # latency — never before the window's audio is complete. Parakeet (CPU
 # int8) on a 2s window transcribes in ~0.3-1s, so the caption text lands
-# ~0.5s after the words it transcribes; the player's own sub-second
-# behind-live (liveSyncDurationCount 0) then puts it ~1-2s behind the live
-# edge. The 2s window (was 3s) makes each 2s Twitch segment flush alone —
-# the old 3s window waited for a second segment to fill, adding a full
-# segment of pipeline latency. The frontend anchors every block to the
-# VIDEO clock (frag PDT), so the visible lag is just this transcribe trail,
-# self-adaptive per machine (stalls pause the overlay automatically).
+# ~0.5s after the words it transcribes; the player's own 0.8-1.0s
+# behind-live nudge (liveSyncDurationCount 2 when captions ON) then
+# puts it ~1.0s behind the live edge. The 2s window (was 3s) makes each
+# 2s Twitch segment flush alone — the old 3s window waited for a second
+# segment to fill, adding a full segment of pipeline latency. The
+# frontend anchors every block to the VIDEO clock (frag PDT), so the
+# visible lag is just this transcribe trail, self-adaptive per machine
+# (stalls pause the overlay automatically).
 WINDOW_SEC = 2.0
 WINDOW_SEC_REDUCED = 1.0  # low-latency mode: flush every ~1s instead of ~2s
 POLL_SEC = 1.0  # media-playlist poll cadence (~1 segment ahead of the player)

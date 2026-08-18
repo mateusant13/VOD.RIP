@@ -196,11 +196,21 @@ const QUALITY_PIN_BUFFER_SEC = 8;
 /** Safety timer — pin the policy level even if the buffer never crosses the
  *  cushion (slow network) so the multi-player cap still lands. */
 const QUALITY_PIN_SAFETY_MS = 15_000;
+// Caption/live AV alignment: backend's CAPTION_TARGET_ALIGN_SEC (~0.9s) is the
+// comment-constant wall target; the player honors it by riding 2 segments
+// behind the edge (~4s at 2s segments) vs the 3-segment baseline (~6s) ONLY
+// while captions are visible (text actually heard) and the stream is stable
+// (forward buffer > 4s). Bounded 2-3, never touches liveSyncDuration
+// (hls.js throws on count+duration mix), lowLatencyMode stays false.
+const CAPTION_LIVE_SYNC_COUNT_CAPTIONED = 2;
+const CAPTION_LIVE_SYNC_COUNT_BASELINE = 3;
+const CAPTION_LIVE_SYNC_MIN_BUFFER_SEC = 4;
 /** Tolerance matching the cached VOD's created_at to the current session
  *  start (fast-clip guard): the CURRENT broadcast's VOD row is created at
  *  stream start; a PREVIOUS broadcast is hours older. ±5 min absorbs clock
  *  skew / cache-probe latency without ever matching an older broadcast. */
 const LIVE_VOD_SESSION_MATCH_SEC = 5 * 60;
+
 
 /** Wall epoch seconds of a frag's PROGRAM-DATE-TIME, with the backend's
  *  _parse_iso_epoch semantics: an explicit zone offset is honored, a NAIVE
@@ -556,10 +566,13 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   useEffect(() => { setSseReady(true); }, []);
   const [caption, setCaption] = useState<CaptionBlock | null>(null);
   // Caption clock anchor state — refs (mutated by hls events + SSE, read by
-  // the timeupdate sync; no re-render needed for the map itself):
   const pdtAnchorsRef = useRef<{ pos: number; pdt: number }[]>([]);
   const captionOriginRef = useRef<number | null>(null);
   const pendingCaptionsRef = useRef<CaptionBlock[]>([]);
+  // Stall guard: first fatal BUFFER_STALLED_ERROR nudges to liveSyncPosition;
+  // only a second fatal within the window or a stall persisting >2s advances
+  // to the next fallback entry (prevents hopping channel on transient jitter).
+  const stallGuardRef = useRef<{ at: number; count: number }>({ at: 0, count: 0 });
   // Caption SSE reconnect budget — survives effect cleanups so the bounded
   // backoff spans reconnects (a cleanup-per-tick reset would unbounded the
   // retries); resets on a healthy caption or a stream change.
@@ -888,6 +901,40 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   // no-ops until its manifest parses), unregister on unmount (reverts the
   // remaining players to their policy for the lower count).
   useEffect(() => registerLivePlayer(() => { applyQualityPolicy(); }), [applyQualityPolicy]);
+  // Caption-aware live sync: when captions are visible (text heard + enabled)
+  // ride 0.6-1.0s closer to the edge (count 2 vs 3) only if buffer > 4s.
+  // One knob, count-only — never touches liveSyncDuration (mix throws).
+  const maybeTuneCaptionLiveSync = useCallback(() => {
+    const hls: any = hlsRef.current;
+    const video = videoRef.current;
+    if (!hls || modeRef.current !== 'live' || !video) return;
+    const captionOn = captionsEnabled && captionsHeard;
+    const buffered = (() => {
+      try {
+        const b = video.buffered;
+        if (!b || b.length === 0) return 0;
+        return b.end(b.length - 1) - video.currentTime;
+      } catch { return 0; }
+    })();
+    const want = captionOn && buffered > CAPTION_LIVE_SYNC_MIN_BUFFER_SEC
+      ? CAPTION_LIVE_SYNC_COUNT_CAPTIONED
+      : CAPTION_LIVE_SYNC_COUNT_BASELINE;
+    if (hls.config.liveSyncDurationCount !== want) {
+      hls.config.liveSyncDurationCount = want;
+      // Catch-up nudge only when tightening (3→2) and already stable.
+      if (want === CAPTION_LIVE_SYNC_COUNT_CAPTIONED) {
+        const pos = hls.liveSyncPosition;
+        if (typeof pos === 'number' && Number.isFinite(pos)) {
+          // One-time small nudge — capped so it never seeks backward or jumps far.
+          const delta = pos - video.currentTime;
+          if (delta > 0.5 && delta < 6) video.currentTime = pos;
+        }
+      }
+    }
+  }, [captionsEnabled, captionsHeard]);
+  // Re-evaluate on caption state flips and once per FRAG_BUFFERED / timeupdate.
+  useEffect(() => { maybeTuneCaptionLiveSync(); }, [maybeTuneCaptionLiveSync]);
+
 
   // vaft midroll rotation: after repeated stitched segments the backend swaps
   // this session's usher master to the next player type in place — reloading
@@ -1244,7 +1291,11 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         frag.rawProgramDateTime,
         typeof frag.programDateTime === 'number' ? frag.programDateTime : null,
       );
-      if (typeof pos !== 'number' || !Number.isFinite(pos) || !Number.isFinite(pdt)) return;
+      if (typeof pos !== 'number' || !Number.isFinite(pos) || !Number.isFinite(pdt)) {
+        // No PDT anchor — still re-evaluate caption live-sync on buffer depth.
+        maybeTuneCaptionLiveSync();
+        return;
+      }
       const anchors = pdtAnchorsRef.current;
       const existing = anchors.findIndex((a) => a.pos === pos);
       if (existing >= 0) anchors[existing] = { pos, pdt };
@@ -1252,6 +1303,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       if (anchors.length > CAPTION_MAX_PDT_ANCHORS) {
         anchors.splice(0, anchors.length - CAPTION_MAX_PDT_ANCHORS);
       }
+      maybeTuneCaptionLiveSync();
     });
 
     hls.on(Hls.Events.ERROR, (_e, data) => {
@@ -1260,15 +1312,36 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       // nudges and retries first), then fatal if the nudges fail. A
       // transient <1s jitter must NOT advance to the next entry (that
       // deletes the session, kills the player, and restarts a different
-      // channel at its live edge — the 'stream keeps loading / is
-      // inconsistent after play' symptom). Only a FATAL stall (nudges
-      // exhausted = genuinely dead) or a fatal network error advances.
-      const liveStall = modeRef.current === 'live' && data?.fatal === true && (
-        data?.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR ||
-        data?.type === Hls.ErrorTypes.NETWORK_ERROR
-      );
-      if (liveStall && tryAdvanceEntry()) return;
-      if (!data?.fatal) return;
+      // channel at its live edge). First fatal stalls nudge to
+      // liveSyncPosition; only a second fatal within 2s advances.
+      if (modeRef.current === 'live' && data?.fatal === true
+        && data?.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR) {
+        const now = Date.now();
+        const g = stallGuardRef.current;
+        const withinWindow = now - g.at < 2000;
+        if (withinWindow && g.count >= 1) {
+          if (tryAdvanceEntry()) return;
+        } else {
+          // Nudge to liveSyncPosition instead of hopping channel.
+          const v = videoRef.current;
+          const pos: any = (hls as any).liveSyncPosition;
+          if (v && typeof pos === 'number' && Number.isFinite(pos)) {
+            v.currentTime = pos;
+            stallGuardRef.current = { at: now, count: g.count + (withinWindow ? 1 : 0) + 1 };
+            return;
+          }
+          if (withinWindow) {
+            stallGuardRef.current = { at: now, count: g.count + 1 };
+            if (tryAdvanceEntry()) return;
+          } else {
+            stallGuardRef.current = { at: now, count: 1 };
+            return;
+          }
+        }
+      }
+      const liveStallNetwork = modeRef.current === 'live' && data?.fatal === true
+        && data?.type === Hls.ErrorTypes.NETWORK_ERROR;
+      if (liveStallNetwork && tryAdvanceEntry()) return;
       // Same retry wiring as the mini preview player: bounded network retries
       // (resume near the current position), media error recovery, then error.
       switch (data.type) {
@@ -1307,7 +1380,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     if (startPos >= 0 && modeRef.current !== 'replay') hls.startLoad(startPos);
     else if (modeRef.current !== 'replay') hls.startLoad();
     return hls;
-  }, [destroyHls, onAdRotation, clearRetry, markPreviewError, tryAdvanceEntry, recreateSessionInvisible, armQualityPin]);
+  }, [destroyHls, onAdRotation, clearRetry, markPreviewError, tryAdvanceEntry, recreateSessionInvisible, armQualityPin, maybeTuneCaptionLiveSync]);
 
   // Cleanup player on unmount
   const cleanup = useCallback(() => {
