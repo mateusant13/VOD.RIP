@@ -209,11 +209,12 @@ def test_thread_budget_bounded():
 
 def test_cpu_auto_workers_ladder(monkeypatch):
     """The default CPU-lane count scales with the box: 2 below 16 threads,
-    3 at 16-31, 4 at 32+ — and the env override always wins."""
+    2 at 16-31 (fewer lanes = more ASR threads per lane), 4 at 32+ — and
+    the env override always wins."""
     # test_parakeet_e2e_real.py sets WORKERS_ENV at module level; clear it so
     # this ladder test is order-independent.
     monkeypatch.delenv(at.WORKERS_ENV, raising=False)
-    for threads, expected in ((4, 2), (8, 2), (15, 2), (16, 3), (20, 3), (31, 3), (32, 4), (64, 4)):
+    for threads, expected in ((4, 2), (8, 2), (15, 2), (16, 2), (20, 2), (31, 2), (32, 4), (64, 4)):
         monkeypatch.setattr("os.cpu_count", lambda: threads)
         assert at._cpu_auto_workers() == expected, threads
         assert at._cpu_worker_ceiling() == expected, f"no-env ceiling @ {threads}"
