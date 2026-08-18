@@ -623,6 +623,7 @@ def _enqueue_transcriptions() -> None:
     for r in archive_db.query(
         """SELECT id, platform, video_id FROM archive_jobs
            WHERE kind='transcribe' AND status='failed' AND updated_at < ?
+             AND attempts < max_attempts
            ORDER BY updated_at ASC LIMIT 100""",
         (fresh_cutoff.isoformat(timespec="seconds"),),
     ):
@@ -640,7 +641,7 @@ def _enqueue_transcriptions() -> None:
         else:
             _pass1_exhausted += 1
     if _pass1_exhausted or _pass1_non_candidate:
-        logger.debug(
+        logger.info(
             "scheduler transcribe pass-1 skipped %d exhausted, %d non-candidate (cap %d, enqueued %d)",
             _pass1_exhausted, _pass1_non_candidate, pass1_cap, enqueued,
         )

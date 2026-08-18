@@ -108,7 +108,13 @@ LOW_LATENCY_ENV = "VODRIP_CAPTION_LOW_LATENCY"
 # and the buffer is healthy (>4s), and the backend honors it by
 # flushing captions as soon as the VAD window completes with no extra
 # queue delay (call_soon_threadsafe put_nowait in _emit — see _asr_worker).
-CAPTION_TARGET_ALIGN_SEC = 0.9  # ponytail: comment constant documenting the 0.8-1.0s target; upgrade path is an env knob if per-site tuning is needed
+CAPTION_TARGET_ALIGN_SEC = 0.9  # ponytail: comment constant; upgrade path is env knob if per-site tuning needed
+# NOTE: this value documents the *ASR pipeline* internal latency target
+# (audio-in → caption-out). The *end-to-end* behind-speech latency is
+# higher: HLS live edge count 2 ≈ 4s + parakeet 0.3–1s ≈ 4.3–5s total.
+# count 3 ≈ 6s + parakeet ≈ 6.3–7s. Adjust liveSyncDurationCount
+# (frontend) to trade latency for stability; this constant tracks only
+# the backend pipeline target.
 # ~2s of speech is a usable caption block (~2-4 words per second of speech);
 # a 1s window would yield 2-3 words — too short to read.
 #
