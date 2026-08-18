@@ -21,7 +21,7 @@ Design decisions:
     mode (budget > 1 — CPU workers or opt-in VODRIP_TRANSCRIBE_GPU_COPIES)
     gives each pool thread its own recognizer so inference runs in parallel.
   * Hybrid pool (CUDA hosts): the worker runs the GPU copy AND CPU threads
-    at the same time — VODRIP_TRANSCRIBE_GPU_COPIES GPU slots (default 1)
+    at the same time — VODRIP_TRANSCRIBE_GPU_COPIES GPU slots (default 2)
     plus VODRIP_TRANSCRIBE_WORKERS CPU slots (default 2 on <16-thread boxes,
     3 on 16–31, 4 on 32+; 0 disables the CPU side and restores the
     exclusive-GPU worker). Each pool thread is pinned to its slot's device
@@ -368,7 +368,7 @@ def _cache_dir() -> Path:
 # GPU lane budget (large-v3-turbo fp16 is ~5-6 GiB). The card is a SHARED
 # tenant: the desktop + other ML projects hold VRAM, so the measured
 # allowance at claim time decides the lane — never a static count.
-_GPU_VRAM_HEADROOM = int(2 * 1024 ** 3)   # must stay free for the tenants
+_GPU_VRAM_HEADROOM = int(1 * 1024 ** 3)   # must stay free for the tenants
 _GPU_UTIL_SECOND_COPY = 0.70              # below this, a 2nd copy may add
 # Thermal ceiling: sustained 100% util for hours heats the card and can
 # destabilize the Windows driver (TDR resets, black screens). The decode
@@ -888,7 +888,7 @@ def caption_reserved_vram_bytes() -> int:
 
 
 def _gpu_copies() -> int:
-    """GPU model copies: VODRIP_TRANSCRIBE_GPU_COPIES (default 1) is a CEILING.
+    """GPU model copies: VODRIP_TRANSCRIBE_GPU_COPIES (default 2) is a CEILING.
 
     Measured at claim time (the worker's claim gate) — NEVER static. The
     60 s-median free-VRAM allowance picks the ladder rung (fp16 -> int8 ->
@@ -901,7 +901,7 @@ def _gpu_copies() -> int:
     allowance fits ~2x. Probe failure (no torch / no CUDA / nvidia-smi
     absent) degrades to trusting the env cap. 0/absent -> auto (1 copy)."""
     try:
-        configured = int(os.environ.get(GPU_COPIES_ENV, "1") or "1")
+        configured = int(os.environ.get(GPU_COPIES_ENV, "2") or "2")
     except ValueError:
         return 1
     if configured <= 0:
