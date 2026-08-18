@@ -533,6 +533,7 @@ def _session_end() -> None:
                 from services import archive_transcribe as at
 
                 at.set_caption_session_active(False)
+                at.keep_parakeet_resident(False)
             except Exception:
                 pass
 

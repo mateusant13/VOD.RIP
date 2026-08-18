@@ -821,6 +821,8 @@ async def _app_lifespan(_app: FastAPI):
                         logger.info("semantic embed backfill: %d segments embedded", done)
                 except Exception:
                     logger.debug("semantic embed backfill skipped", exc_info=True)
+
+            threading.Thread(target=_embed_backfill_guarded, daemon=True, name="embed-backfill").start()
     except Exception:
         logger.debug("semantic embed backfill spawn skipped", exc_info=True)
 
