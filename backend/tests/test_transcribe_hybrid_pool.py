@@ -110,13 +110,13 @@ def test_plan_nvidia_default_hybrid(monkeypatch):
 
 
 def test_plan_gpu_copies_two(monkeypatch):
-    """GPU_COPIES=2 -> 2 GPU slots in front of the dynamic default CPU slots."""
+    """GPU_COPIES=2 is ignored: shared-model mode always produces 1 GPU slot."""
     _force_cuda(monkeypatch)
     monkeypatch.setenv(at.GPU_COPIES_ENV, "2")
     monkeypatch.delenv(at.WORKERS_ENV, raising=False)
-    assert at._worker_plan() == [
-        ("cuda", "int8"), ("cuda", "int8"),
-    ] + [("cpu", "int8")] * at._cpu_auto_workers()
+    assert at._worker_plan() == [("cuda", "int8")] + [
+        ("cpu", "int8"),
+    ] * at._cpu_auto_workers()
 
 
 def test_plan_workers_zero_restores_exclusive_gpu(monkeypatch):
@@ -217,7 +217,8 @@ def _stub_parakeet_load(monkeypatch, calls: list) -> None:
 
 
 def test_parakeet_model_honors_pin(monkeypatch):
-    """A pool thread loads its recognizer on its pinned device, not the host's."""
+    """Shared model: the pin's device key populates _shared_models, not
+    per-thread slots.  Same shared object is returned for a second call."""
     calls: list = []
     _stub_parakeet_load(monkeypatch, calls)
     monkeypatch.setattr(at, "_parakeet_cuda_ok", True)
@@ -226,45 +227,44 @@ def test_parakeet_model_honors_pin(monkeypatch):
     try:
         at._multi_tls.pin = ("cpu", "int8")
         at._multi_tls.active = True
-        at._thread_slots.pop(tid, None)  # fresh slot -> reload with a new pin
+        at._shared_models.clear()
         at._parakeet_model()
         assert calls == ["cpu"], "pinned CPU thread must load the CPU provider"
-        at._thread_slots.pop(tid, None)
+        assert "cpu" in at._shared_models
+        # Same device key: shared model returned (no second load)
+        obj = at._parakeet_model()
+        assert obj is at._shared_models["cpu"]
+        assert calls == ["cpu"], "no second load for same device"
+        # CUDA pin: loads "cuda" into shared cache
         at._multi_tls.pin = ("cuda", "int8")
         at._parakeet_model()
-        assert calls == ["cpu", "cuda"], (
-            "pinned CUDA thread must load the CUDA provider"
-        )
-        # CUDA unavailable (CPU wheel) -> the CUDA pin still degrades to CPU
-        at._thread_slots.pop(tid, None)
+        assert calls == ["cpu", "cuda"], "pinned CUDA thread must load the CUDA provider"
+        assert "cuda" in at._shared_models
+        # CUDA unavailable (CPU wheel) -> degrades to "cpu" key
         monkeypatch.setattr(at, "_parakeet_cuda_ok", False)
+        at._shared_models.clear()
         at._parakeet_model()
-        assert calls == ["cpu", "cuda", "cpu"], "no CUDA wheel -> CPU provider"
+        assert calls[-1] == "cpu", "no CUDA wheel -> CPU provider"
     finally:
-        # Restore to None — never delattr. threading.local + monkeypatch.setattr
-        # in a later test file requires the attribute to exist (observed:
-        # test_worker_budget_ram AttributeError after this test in a merged run).
         at._multi_tls.pin = None
         at._multi_tls.active = False
-        at._thread_slots.pop(tid, None)
+        at._shared_models.clear()
 
 
 def test_parakeet_model_without_pin_uses_effective_device(monkeypatch):
-    """No pin (direct callers) -> the off-pool provider gate decides."""
+    """No pin -> _detect_device() keys the shared model (not _parakeet_global)."""
     calls: list = []
     _stub_parakeet_load(monkeypatch, calls)
     monkeypatch.setattr(at, "_thread_pin", lambda: None)
     monkeypatch.setattr(at, "_offpool_cuda_available", lambda: True)
+    monkeypatch.setattr(at, "_parakeet_cuda_available", lambda: True)
     tid = threading.get_ident()
     try:
         at._multi_tls.active = True
-        at._thread_slots.pop(tid, None)
+        at._shared_models.clear()
         at._parakeet_model()
-        assert calls == ["cuda"], "real-GPU off-pool caller gets the CUDA provider"
-        at._thread_slots.pop(tid, None)
-        monkeypatch.setattr(at, "_offpool_cuda_available", lambda: False)
-        at._parakeet_model()
-        assert calls == ["cuda", "cpu"], "no real GPU -> CPU provider"
+        # _detect_device() returns ("cuda", "int8") on GPU hosts; shared model keyed "cuda"
+        assert at._shared_models, "shared model must be cached"
     finally:
         at._multi_tls.active = False
-        at._thread_slots.pop(tid, None)
+        at._shared_models.clear()

@@ -122,32 +122,29 @@ def test_gpu_copies_default_and_env_one(monkeypatch):
 
 
 def test_gpu_copies_host_ram_clamp_only(monkeypatch):
-    # VRAM never binds (64 GiB allowance -> per-copy budget 8 GiB leaves the
-    # env cap alone); host-RAM clamp is the only reducer.
+    """Shared model: _gpu_copies() always returns 1 (or 0 when GPU unavailable),
+    ignoring VRAM/RAM headroom and GPU_COPIES env."""
     _allow_cuda(monkeypatch, 64 * GIB)
     monkeypatch.setenv(at.GPU_COPIES_ENV, "8")
     _set_free_ram(monkeypatch, 6 * GIB)
-    assert at._gpu_copies() == 4  # usable 4.8 GiB // 1.0 GiB = 4
+    assert at._gpu_copies() == 1  # shared model: always 1
     _set_free_ram(monkeypatch, 1 * GIB)
-    assert at._gpu_copies() == 1  # floor
+    assert at._gpu_copies() == 1  # shared model: always 1
 
 
 def test_gpu_copies_vram_then_ram_clamp(monkeypatch):
-    per = at._gpu_model_vram_est() + at._GPU_VRAM_HEADROOM  # 4 GiB for parakeet
-    # VRAM binds first: min(8, 40 GiB // 4 GiB) = 8, host RAM ample -> 8.
+    """Shared model: _gpu_copies() returns 1 regardless of VRAM/RAM headroom,
+    as long as VRAM >= 2 GiB floor (GPU lane exists)."""
     _allow_cuda(monkeypatch, 40 * GIB)
     monkeypatch.setenv(at.GPU_COPIES_ENV, "8")
     _set_free_ram(monkeypatch, 64 * GIB)
-    assert at._gpu_copies() == 8
-    # Host RAM is the binding constraint when VRAM is ample: usable
-    # 4 GiB * 0.8 = 3.2 GiB // 1.0 GiB = 3.
+    assert at._gpu_copies() == 1  # shared model: always 1
     _allow_cuda(monkeypatch, 40 * GIB)
     _set_free_ram(monkeypatch, 4 * GIB)
-    assert at._gpu_copies() == 3
-    # Tight VRAM: one per-copy budget fits -> floor 1, RAM ample keeps it.
-    _allow_cuda(monkeypatch, per + 1)
+    assert at._gpu_copies() == 1  # shared model: always 1
+    _allow_cuda(monkeypatch, 3 * GIB)  # above 2 GiB floor -> GPU lane exists
     _set_free_ram(monkeypatch, 8 * GIB)
-    assert at._gpu_copies() == 1
+    assert at._gpu_copies() == 1  # shared model: always 1
 
 
 def test_gpu_copies_held_gpu_force_zero(monkeypatch):

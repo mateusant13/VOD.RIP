@@ -139,31 +139,23 @@ def test_held_gpu_model_forces_cpu_lane():
 
 
 def test_second_copy_needs_idle_gpu_and_vram():
-    """util >= 70% caps copies at 1; idle + ample VRAM allows 2+ copies.
-
-    Per-copy VRAM budget is the parakeet est (2 GiB) + 2 GiB headroom:
-    16 GiB fits 3 copies, 32 GiB fits the configured 3 as well."""
+    """Shared model: _gpu_copies() always returns 0 or 1, regardless of
+    GPU_COPIES env or VRAM headroom."""
     _, copies, _ = _patched(16, util=0.85, gpu_copies="3")
     assert copies == 1, copies
     _, copies, plan = _patched(16, util=0.3, gpu_copies="3")
-    assert copies == 3, copies
-    assert plan == [
-        ("cuda", "int8"), ("cuda", "int8"), ("cuda", "int8"),
-        ("cpu", "int8"), ("cpu", "int8"),
-    ], plan
+    assert copies == 1, copies
+    assert plan[0] == ("cuda", "int8"), plan
     _, copies, plan = _patched(32, util=0.3, gpu_copies="3")
-    assert copies == 3, copies
-    assert plan == [
-        ("cuda", "int8"), ("cuda", "int8"), ("cuda", "int8"),
-        ("cpu", "int8"), ("cpu", "int8"),
-    ], plan
+    assert copies == 1, copies
+    assert plan[0] == ("cuda", "int8"), plan
 
 
 def test_vram_estimate_fixed_parakeet():
-    """The whisper model ladder is gone: one constant 2 GiB estimate, so a
-    GPU copy's budget (est + headroom) is 4 GiB."""
+    """The whisper model ladder is gone: one constant 2 GiB parakeet VRAM
+    estimate + 1 GiB headroom = 3 GiB per GPU copy."""
     assert at._gpu_model_vram_est() == at._PARAKEET_GPU_VRAM_EST
-    assert at._gpu_model_vram_est() + at._GPU_VRAM_HEADROOM == 4 * 1024 ** 3
+    assert at._gpu_model_vram_est() + at._GPU_VRAM_HEADROOM == 3 * 1024 ** 3
 
 
 def _fake_tasklist(stdout, mine="12345"):

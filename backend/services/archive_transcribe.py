@@ -888,52 +888,16 @@ def caption_reserved_vram_bytes() -> int:
 
 
 def _gpu_copies() -> int:
-    """GPU model copies: VODRIP_TRANSCRIBE_GPU_COPIES (default 2) is a CEILING.
-
-    Measured at claim time (the worker's claim gate) — NEVER static. The
-    60 s-median free-VRAM allowance picks the ladder rung (fp16 -> int8 ->
-    medium int8 -> CPU); below the 2 GiB floor -> 0 copies, the CPU side of
-    the hybrid plan covers the queue. A GPU model held by another process
-    (live backend / the user's other ML project) also forces 0 — never
-    stack; the in-process live captioner's session does the same (it owns
-    the card for real-time ASR while a livestream is watched). A second
-    copy only when the GPU is idle-ish (<70% util) AND the
-    allowance fits ~2x. Probe failure (no torch / no CUDA / nvidia-smi
-    absent) degrades to trusting the env cap. 0/absent -> auto (1 copy)."""
-    try:
-        configured = int(os.environ.get(GPU_COPIES_ENV, "2") or "2")
-    except ValueError:
-        return 1
-    if configured <= 0:
-        configured = 1  # 0 == auto (same as absent)
-    # Cached False (probed at worker boot): no +cuda wheel or no compute GPU
-    # — never advertise CUDA slots that would fail jobs as ASR-unavailable.
-    # None (unprobed, tests) keeps the env/VRAM path so mock plans still work.
+    """GPU lane: 0 (no GPU) or 1 (single shared model per device).
+    ponytail: multi-copy VRAM-counting removed — one shared recognizer is
+    reused by all GPU-pinned threads via create_stream()."""
     if _parakeet_cuda_ok is False:
         return 0
-    # Held check FIRST: when another process holds a GPU model the lane is
-    # forced off, so measuring free VRAM would be pure waste.
     if _gpu_held_by_other() or caption_session_active():
-        return 0  # a foreign process OR the live captioner holds the GPU — don't stack
-    if _gpu_lane_plan() is None:
-        # Measured free VRAM < 2 GiB. When the dip is OUR OWN resident CUDA
-        # recognizer (the ORT CUDA EP arena grows to ~90% of free VRAM at
-        # session create), the model is already loaded and reusable — keep
-        # one GPU copy so the next job waits on the sequential gate instead
-        # of silently degrading to a CPU lane. Only a genuinely foreign VRAM
-        # hog (checked above) or a cold process with no resident model below
-        # the floor falls back to CPU.
-        if _cuda_resident():
-            return 1
-        return 0  # no resident model — measured median free VRAM < 2 GiB, CPU lane only
-    allowance = _gpu_vram_allowance()
-    if configured > 1:
-        util = _gpu_util()
-        if util is not None and util >= _GPU_UTIL_SECOND_COPY:
-            configured = 1  # GPU already busy — one copy is the ceiling
-    if allowance > 0:
-        configured = _clamp_cuda_copies(configured, allowance)
-    return _ram_worker_clamp(configured, _GPU_COPY_RSS_EST)
+        return 0
+    if _gpu_lane_plan() is None and not _cuda_resident():
+        return 0
+    return 1
 
 
 def _gpu_compute_type() -> str:
@@ -1199,17 +1163,17 @@ def close_model() -> None:
     closed_any = False
     with _model_lock:
         for slot in _thread_slots.values():
-            parakeet, slot.parakeet = slot.parakeet, None
-            if parakeet is not None:
-                logger.info("Unloading parakeet thread recognizer")
-                del parakeet
-                closed_any = True
             vad, slot.vad = slot.vad, None
             if vad is not None:
                 logger.info("Unloading VAD thread model")
                 del vad
                 closed_any = True
         _thread_slots.clear()
+        with _shared_models_lock:
+            for dev, rec in list(_shared_models.items()):
+                logger.info("Unloading shared parakeet recognizer (%s)", dev)
+                del _shared_models[dev]
+                closed_any = True
         if not _parakeet_resident:
             parakeet, _parakeet_global = _parakeet_global, None
             if parakeet is not None:
@@ -1230,13 +1194,13 @@ def close_model() -> None:
 
 
 def _maybe_close_idle_model() -> None:
-    """Close the process-global parakeet recognizer after
-    VODRIP_WHISPER_IDLE_CLOSE seconds without use. Thread models die with
-    the pool (close_model on worker shutdown)."""
+    """Close shared + process-global parakeet recognizers after
+    VODRIP_WHISPER_IDLE_CLOSE seconds without use. VAD stays per-thread."""
     if _parakeet_resident:
         return
     idle_sec = _idle_close_seconds()
-    if _parakeet_global is not None and time.monotonic() - _parakeet_last_used > idle_sec:
+    has_models = _parakeet_global is not None or bool(_shared_models)
+    if has_models and time.monotonic() - _parakeet_last_used > idle_sec:
         logger.info("Parakeet recognizer idle for %.0fs — unloading", idle_sec)
         close_model()
 
@@ -1290,16 +1254,23 @@ _multi_tls = threading.local()  # per-thread: .active, .cpu_fallback, .pin
 
 
 class _ThreadModelSlot:
-    """One pool thread's lazy model state (parakeet recognizer + per-thread
-    Silero VAD). The whisper model copy slot was removed with the engine."""
-    __slots__ = ("parakeet", "vad")
+    """Per-thread VAD slot (stateful, not thread-safe).  Parakeet recognizer
+    lives in the shared _shared_models cache — one model per device, shared
+    by all pool threads via concurrent create_stream()."""
+    __slots__ = ("vad",)
 
     def __init__(self) -> None:
-        self.parakeet: Any = None  # sherpa-onnx OfflineRecognizer (provider per slot pin)
         self.vad: Any = None       # per-thread Silero VAD (multi-copy mode only)
 
 
 _thread_slots: dict[int, _ThreadModelSlot] = {}
+
+# --- shared model cache (one parakeet recognizer per device) ---------------
+# sherpa-onnx OfflineRecognizer is thread-safe: concurrent create_stream()
+# + decode_stream() from different threads works without per-thread copies.
+# VAD stays per-thread (stateful LSTM state).
+_shared_models: dict[str, Any] = {}       # "cuda" / "cpu" -> OfflineRecognizer
+_shared_models_lock = threading.Lock()
 
 
 def _in_multi_mode() -> bool:
@@ -1925,19 +1896,24 @@ def _load_parakeet(provider: str = "cpu") -> Any:
 
 
 def _parakeet_model() -> Any:
-    """The ONLY engine's recognizer for the current context: the calling
-    thread's own copy in multi-copy mode, else the process-global one.
-    Creation is serialized by _model_lock (shared model dir + download);
-    inference never takes a lock (each recognizer has one owner)."""
+    """The shared parakeet recognizer for the current device context.
+    ONE model per device (cuda/cpu) in _shared_models; threads share it via
+    concurrent create_stream().  Falls back to _parakeet_global when not in
+    multi-copy mode (tests, single-model callers)."""
     global _parakeet_global, _parakeet_last_used
     _parakeet_last_used = time.monotonic()
     if _in_multi_mode():
-        slot = _thread_slot()
-        if slot.parakeet is None:
+        pin = _thread_pin()
+        device = pin[0] if pin else _detect_device()[0]
+        if device == "cuda" and not _parakeet_cuda_available():
+            device = "cpu"
+        if device not in _shared_models:
             with _model_lock:
-                if slot.parakeet is None:
-                    slot.parakeet = _load_parakeet(provider=_parakeet_provider())
-        return slot.parakeet
+                if device not in _shared_models:
+                    _shared_models[device] = _load_parakeet(
+                        provider=device if device != "cpu" else "cpu"
+                    )
+        return _shared_models[device]
     with _model_lock:
         if _parakeet_global is None:
             _parakeet_global = _load_parakeet(provider=_parakeet_provider())
@@ -4997,9 +4973,9 @@ def _run_module_selfcheck() -> None:
             "busy GPU caps copies at 1"
         )
         _gpu_util = lambda: 0.4
-        assert _worker_plan() == [
-            ("cuda", "int8"), ("cuda", "int8"), ("cuda", "int8"),
-        ] + _cpu_slots, "idle GPU + ample VRAM allows the configured 3 copies"
+        assert _worker_plan() == [("cuda", "int8")] + _cpu_slots, (
+            "shared model: GPU_COPIES ignored, always 1 GPU slot"
+        )
         os.environ.pop(GPU_COPIES_ENV, None)
         # contended box: at most 1 CPU slot
         _gpu_free_vram_bytes = lambda: 64 * 1024 ** 3
