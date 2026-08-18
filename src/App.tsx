@@ -21,6 +21,8 @@ import { archiveVideoIdFromUrl, isNativeArchiveVideoId } from './archiveScope';
 import LocalFilePopup, { type LocalFilePopupItem } from './LocalFilePopup';
 import PreviewQualityMenu from './PreviewQualityMenu';
 import { LivePlayerPopup } from './components/LivePlayerPopup';
+import FirstRunWizard from './components/FirstRunWizard';
+import { syncFromBackend } from './lib/featureFlags';
 import { LiveBadge } from './components/LiveBadge';
 import { liveArchiveContext, appendLivePopup } from './livePlayerLevels';
 import {
@@ -394,6 +396,17 @@ export const PREVIEW_CHAT_DEFAULT_OPEN = false;
 
 export default function App() {
   const viewportTier = useViewportTier();
+  useEffect(() => { void syncFromBackend(); }, []);
+  // presence heartbeat: foreground 80% / background 40%
+  useEffect(() => {
+    let hb: number | null = null;
+    const send = (fg: boolean) => fetch('/api/presence', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ foreground: fg }) }).catch(()=>{});
+    const onVis = () => send(!document.hidden);
+    document.addEventListener('visibilitychange', onVis);
+    send(!document.hidden);
+    hb = window.setInterval(() => send(!document.hidden), 30000);
+    return () => { document.removeEventListener('visibilitychange', onVis); if (hb) clearInterval(hb); };
+  }, []);
   const { t } = useI18n();
   const [tab, setTab] = useState<Tab>('url');
 
@@ -6722,6 +6735,7 @@ export default function App() {
     >
       {/* Any-tab YouTube bot-gate banner (dismissible; polls /cookies/status). */}
       <BotGateBanner onOpenInstructions={() => setTab('settings')} />
+      <FirstRunWizard />
       {/* First-run cookie-extension install offer (once per profile, until
           the tutorial reset re-arms it). */}
       <CookieInstallOffer

@@ -171,6 +171,9 @@ class AppSettings(BaseModel):
     # flush-fail tolerance to compensate for shorter/emptier frames. Drops
     # total caption lag from ~1-2s to ~0.5-1s behind the live edge.
     caption_low_latency: bool = True
+    # Opt-in feature registry — persisted to settings.json (see services/feature_registry.py).
+    # Keys are feature ids from FEATURE_MANIFEST; absent keys fall back to manifest defaults.
+    features: Optional[Dict[str, bool]] = None
     # Window-active runtime policy: controls behavior when window is
     # minimized or closed (hidden to tray). Keys: 'when_minimized',
     # 'when_closed'. Values: 'normal' (default), 'reduced', 'off'.
@@ -178,7 +181,6 @@ class AppSettings(BaseModel):
         "when_minimized": "normal",
         "when_closed": "normal",
     })
-
 
 class SettingsUpdate(BaseModel):
     download_folder: Optional[str] = None
@@ -226,9 +228,8 @@ class SettingsUpdate(BaseModel):
     experimental_ai_enabled: Optional[bool] = None
     ai_api_key: Optional[str] = None
     caption_low_latency: Optional[bool] = None
+    features: Optional[Dict[str, bool]] = None
     window_policy: Optional[Dict[str, str]] = None
-
-
 class OpenFolderRequest(BaseModel):
     path: str
 

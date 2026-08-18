@@ -384,6 +384,9 @@ class ResourceGovernor:
         self._state_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # Presence: foreground (window open) => 80% ceiling, background => 40%
+        # ponytail: presence is last-writer-wins in-process only; upgrade path is shared shm/lock file for cross-process fairness.
+        self._foreground = True
         # publish initial state
         self._publish_state()
 
@@ -398,7 +401,7 @@ class ResourceGovernor:
             vram_free=self._vram_free,
             net_concurrency=self._net_limit,
             battery_limited=self._power_limited,
-            effective_target=0.40 if self._power_limited else _GOVERNOR_TARGET,
+            effective_target=self.effective_target(),
             cpu_ewma_fast=self._cpu_fast if self._cpu_fast is not None else 0.0,
             cpu_ewma_slow=self._cpu_slow if self._cpu_slow is not None else 0.0,
             cpu_raw=self._raw_cpu,
@@ -410,6 +413,20 @@ class ResourceGovernor:
         # atomic swap (GIL) under lock for consistency
         with self._state_lock:
             self._state = st
+
+    def effective_target(self) -> float:
+        if self._power_limited:
+            return 0.40
+        return _GOVERNOR_TARGET if getattr(self, "_foreground", True) else 0.40
+
+    def set_foreground(self, foreground: bool) -> float:
+        self._foreground = bool(foreground)
+        self._publish_state()
+        return self.effective_target()
+
+    @property
+    def foreground(self) -> bool:
+        return bool(getattr(self, "_foreground", True))
 
     @property
     def state(self) -> GovernorState:
@@ -468,7 +485,7 @@ class ResourceGovernor:
                 self._vram_total = vtotal
                 self._vram_free = vfree
             # recompute RAM hard cap
-            eff = 0.40 if self._power_limited else _GOVERNOR_TARGET
+            eff = self.effective_target()
             if self._ram_total>0:
                 self._ram_max = max(1, int(self._ram_total * eff // _RAM_PER_WORKER))
             self._ram_pause = self._ram_used >= _GOVERNOR_TARGET
@@ -480,7 +497,7 @@ class ResourceGovernor:
             self._vram_avail = max(0, self._vram_free - head - _VRAM_MODEL_EST) if self._vram_free>0 else 0
         # CPU AIMD with hysteresis
         threads = os.cpu_count() or 4
-        eff = 0.40 if self._power_limited else _GOVERNOR_TARGET
+        eff = self.effective_target()
         ceiling = _max_cpu_lanes(threads, eff)
         # clamp raw >=0.80 instant
         if raw >= _GOVERNOR_CLAMP:

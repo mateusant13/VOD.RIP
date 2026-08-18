@@ -60,6 +60,12 @@ async def exit_app():
 
 @router.get("/api/info")
 async def server_info():
+    # include features so /api/info reflects opt-in state
+    try:
+        from services.feature_registry import get_enabled_map
+        _feats = get_enabled_map()
+    except Exception:
+        _feats = {}
     try:
         from services._version import __version__ as app_version
     except ImportError:
@@ -71,6 +77,7 @@ async def server_info():
         "engine": "yt-dlp (Python)",
         "description": "Kick & Twitch VOD and clip downloader",
         "python_version": platform.python_version(),
+        "features": _feats,
     }
 
 
@@ -169,3 +176,27 @@ async def window_state():
         "minimized": is_window_minimized(),
         "policy": get_window_policy(),
     }
+
+
+@router.post("/api/presence")
+async def presence(body: dict):
+    """Presence heartbeat: POST {foreground: bool} toggles governor ceiling 40%<->80%."""
+    fg = bool(body.get("foreground", True)) if isinstance(body, dict) else True
+    try:
+        from services.resource_governor import get_governor
+        target = get_governor().set_foreground(fg)
+    except Exception:
+        target = 0.80 if fg else 0.40
+    return {"foreground": fg, "effective_target": target}
+
+
+@router.get("/api/features")
+async def list_features():
+    from services.feature_registry import get_manifest, get_enabled_map
+    return {"manifest": get_manifest(), "features": get_enabled_map()}
+
+
+@router.get("/api/info/features")
+async def info_features():
+    from services.feature_registry import get_manifest, get_enabled_map
+    return {"manifest": get_manifest(), "features": get_enabled_map()}

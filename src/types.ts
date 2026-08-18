@@ -142,6 +142,7 @@ export interface AppSettings {
    * ai_api_key_set (presence flag). */
   experimental_ai_enabled?: boolean;
   ai_api_key_set?: boolean;
+  features?: Record<string, boolean> | null;
 }
 
 export interface AiAskSource {

@@ -15,7 +15,9 @@ import { resetAll as resetFirstTimeFlags } from '../lib/firstTime';
 import { useI18n, type Lang } from '../i18n';
 import type { AppSettings, UpdateInfo } from '../types';
 import { previewDownloadTree, type DownloadLayout } from '../downloadLayout';
-
+import { FEATURE_MANIFEST } from '../lib/featureManifest';
+import { getEnabledFeatures } from '../lib/featureFlags';
+import { notifyFeatureChange } from '../hooks/useFeature';
 type Props = {
   settings: AppSettings;
   setSettings: Dispatch<SetStateAction<AppSettings>>;
@@ -494,9 +496,37 @@ export default function SettingsTab({
         ) : null}
       </SettingsCard>
 
-      {/* ── Danger Zone (user request: directly above Save — exit stays
-          behind an explicit confirm, just no longer buried under the save
-          row) ── */}
+      <SettingsCard
+        icon={Sparkles}
+        title="Features"
+        open={!!openCards.features}
+        onToggle={() => toggleCard('features')}
+      >
+        <p className="text-[11px] font-mono text-zinc-500">Toggle heavy features (OFF by default). Changes persist to Settings and reload preserves them.</p>
+        <div className="flex flex-col gap-2 mt-2">
+          {FEATURE_MANIFEST.map(f => {
+            const enabled = !!(getEnabledFeatures()[f.id]);
+            return (
+              <Toggle
+                key={f.id}
+                label={`${f.id} — ${f.description}`}
+                info={f.cost === 'heavy' ? 'HEAVY — GPU/model/threads' : 'LIGHT'}
+                checked={enabled}
+                onChange={c => {
+                  const cur = getEnabledFeatures(); cur[f.id]=c;
+                  try { localStorage.setItem('vodrip.features', JSON.stringify(cur)); } catch {}
+                  void apiPost('/api/settings/features', { features: cur }).catch(()=>{});
+                  setSettings(s => ({ ...s, features: cur } as AppSettings));
+                  notifyFeatureChange();
+                }}
+                ariaLabel={f.id}
+              />
+            );
+          })}
+        </div>
+      </SettingsCard>
+
+      {/* ── Danger Zone (user request: directly above Save — exit stays */}
       <SettingsCard
         icon={AlertTriangle}
         title={t('Danger Zone')}

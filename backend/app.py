@@ -245,7 +245,7 @@ async def _app_lifespan(_app: FastAPI):
     # onnxruntime — see _preload_sherpa_onnx_ort.
     _preload_sherpa_onnx_ort()
 
-    # Pre-warm parakeet for live captions (never blocks API bind).
+    # Pre-warm parakeet for live captions (never blocks API bind) — gated by live-captions / transcribe-vod.
     def _prewarm_parakeet_bg() -> None:
         try:
             from services.archive_transcribe import prewarm_parakeet
@@ -256,7 +256,16 @@ async def _app_lifespan(_app: FastAPI):
         except Exception:
             logger.debug("Parakeet pre-warm failed", exc_info=True)
 
-    threading.Thread(target=_prewarm_parakeet_bg, daemon=True, name="parakeet-prewarm").start()
+    def _should_prewarm_parakeet() -> bool:
+        try:
+            from services.feature_registry import is_enabled as _fe
+            return _fe("live-captions") or _fe("transcribe-vod")
+        except Exception:
+            return True
+    if _should_prewarm_parakeet():
+        threading.Thread(target=_prewarm_parakeet_bg, daemon=True, name="parakeet-prewarm").start()
+    else:
+        import logging as _lg; _lg.getLogger(__name__).info("Parakeet pre-warm skipped (heavy features disabled)")
 
     # Boot maintenance — disk hygiene (orphaned temp/preview/selfcheck
     # sweeps), archive retention, chat dedupe, FTS optimize, and the
@@ -724,7 +733,16 @@ async def _app_lifespan(_app: FastAPI):
         except Exception:
             logger.debug("Live status warm skipped", exc_info=True)
 
-    threading.Thread(target=_warm_live_guarded, daemon=True, name="live-warm").start()
+    def _live_warm_allowed() -> bool:
+        try:
+            from services.feature_registry import is_enabled as _fe2
+            return _fe2("live-preview")
+        except Exception:
+            return True
+    if _live_warm_allowed():
+        threading.Thread(target=_warm_live_guarded, daemon=True, name="live-warm").start()
+    else:
+        import logging as _lg2; _lg2.getLogger(__name__).info("Live warm skipped (live-preview disabled)")
 
     def _warm_youtube_guarded() -> None:
         """Wrap _warm_youtube so it checks shutdown before submitting to pools."""
@@ -735,7 +753,17 @@ async def _app_lifespan(_app: FastAPI):
         except Exception:
             logger.exception("warm crashed")
 
-    threading.Thread(target=_warm_youtube_guarded, daemon=True, name="yt-warm").start()
+    def _yt_warm_allowed() -> bool:
+        try:
+            from services.feature_registry import is_enabled as _fe3
+            # live-preview drives youtube warm (preview snapshots)
+            return _fe3("live-preview")
+        except Exception:
+            return True
+    if _yt_warm_allowed():
+        threading.Thread(target=_warm_youtube_guarded, daemon=True, name="yt-warm").start()
+    else:
+        import logging as _lg3; _lg3.getLogger(__name__).info("YouTube warm skipped (live-preview disabled)")
 
     # Periodic preview pre-warm: the startup wave runs once per boot and the
     # session snapshots it lands expire after 1h (and any bot-gate pause or
@@ -764,7 +792,8 @@ async def _app_lifespan(_app: FastAPI):
             except Exception:
                 logger.debug("periodic prewarm skipped", exc_info=True)
 
-    threading.Thread(target=_periodic_prewarm, daemon=True, name="yt-prewarm-periodic").start()
+    if _yt_warm_allowed():
+        threading.Thread(target=_periodic_prewarm, daemon=True, name="yt-prewarm-periodic").start()
 
     # Semantic-embedding backfill — embed transcript segments that lack a
     # vector, in the background, so the first SEMANTIC search doesn't pay
@@ -776,6 +805,12 @@ async def _app_lifespan(_app: FastAPI):
         if os.environ.get("VODRIP_EMBED_BACKFILL", "1").strip() not in ("0", "false", "no"):
 
             def _embed_backfill_guarded() -> None:
+                try:
+                    from services.feature_registry import is_enabled as _fe_emb
+                    if not _fe_emb("transcribe-vod"):
+                        return
+                except Exception:
+                    pass
                 try:
                     if _warm_shutdown.wait(_BOOT_WARM_GRACE_SEC):
                         return
@@ -930,7 +965,16 @@ async def _app_lifespan(_app: FastAPI):
         except Exception:
             logger.debug("archive worker boot skipped", exc_info=True)
 
-    threading.Thread(target=_boot_archive_worker, daemon=True, name="archive-worker-boot").start()
+    def _archive_worker_allowed() -> bool:
+        try:
+            from services.feature_registry import is_enabled as _fe_aw
+            return _fe_aw("transcribe-vod")
+        except Exception:
+            return True
+    if _archive_worker_allowed():
+        threading.Thread(target=_boot_archive_worker, daemon=True, name="archive-worker-boot").start()
+    else:
+        import logging as _lg4; _lg4.getLogger(__name__).info("Archive worker boot skipped (transcribe-vod disabled)")
 
     # Entity watcher — scans new transcription segments for saved words /
     # saved channels (auto mode), once at startup then every minute.

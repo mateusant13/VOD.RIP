@@ -91,6 +91,14 @@ async def live_captions_stream(
         lang = lang.strip().lower()
         if lang not in _CAPTION_LANGS:
             raise HTTPException(status_code=400, detail="lang must be one of pt/en/es")
+    try:
+        from services.feature_registry import is_enabled as _feat_enabled2
+        if not _feat_enabled2("live-captions"):
+            raise HTTPException(status_code=503, detail="live-captions feature is disabled")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
     from services.live_captions import captions_available, get_captioner
 
     ok, reason = await asyncio.to_thread(captions_available, plat)
@@ -121,6 +129,13 @@ async def live_captions_available(
     chan = (channel or "").strip().lower()
     if plat not in _CAPTION_PLATFORMS or not chan:
         raise HTTPException(status_code=400, detail="platform must be one of twitch/kick and channel is required")
+    # Feature gate: live-captions OFF => unavailable without burning GPU
+    try:
+        from services.feature_registry import is_enabled as _feat_enabled
+        if not _feat_enabled("live-captions"):
+            return {"available": False, "reason": "live-captions feature is disabled", "low_latency": False}
+    except Exception:
+        pass
     import os
     from services.live_captions import captions_available, LOW_LATENCY_ENV
 

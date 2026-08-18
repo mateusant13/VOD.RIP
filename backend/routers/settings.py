@@ -275,9 +275,36 @@ async def update_settings(update: SettingsUpdate):
             pass
     if update.caption_low_latency is not None:
         current.caption_low_latency = bool(update.caption_low_latency)
+    if update.features is not None:
+        try:
+            from services.feature_registry import _ALL_IDS as _feat_ids
+            cur = dict(current.features or {})
+            for k, v in (update.features or {}).items():
+                if k in _feat_ids:
+                    cur[k] = bool(v)
+            current.features = cur
+        except Exception:
+            current.features = dict(update.features or {})
     settings_mgr.save(current)
     download_mgr.apply_settings(settings_mgr)
     return _redact_ai_key(current)
+
+
+@router.get("/api/settings/features")
+async def get_features():
+    from services.feature_registry import get_enabled_map, get_manifest
+    return {"features": get_enabled_map(), "manifest": get_manifest()}
+
+
+@router.put("/api/settings/features")
+async def put_features(body: dict):
+    from services.feature_registry import set_features_bulk, get_manifest, get_enabled_map
+    feats = body.get("features") if isinstance(body, dict) else None
+    if not isinstance(feats, dict):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="features dict required")
+    updated = set_features_bulk({k: bool(v) for k, v in feats.items()})
+    return {"features": updated, "manifest": get_manifest()}
 
 
 @router.get("/api/settings/recommended")
