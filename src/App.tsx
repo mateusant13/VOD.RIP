@@ -1,3 +1,18 @@
+// ─── TECH DEBT ──────────────────────────────────────────────────────────────
+// ⚠  This file is ~8000 lines — a monolith component with all UI logic
+//    inlined.  It compiles and ships, but every new feature widens the blast
+//    radius of changes and makes navigation painful.
+//
+//    Recommended extraction hooks (prioritised by coupling breadth):
+//      • useLivePopups      — player lifecycle, z-ladder, spawn/close
+//      • useChannelList     — CRUD, reorder drag, platform edits
+//      • usePanelLayout     — sidebar/main preview width, responsive toggle
+//      • useDownloadQueue   — download state, progress, retry
+//      • useUrlInput        — URL parsing, validation, submit flow
+//
+//    Each hook should own its state + effects and return a narrow API;
+//    the App component stays a thin layout shell.
+// ─────────────────────────────────────────────────────────────────────────────
 import { memo, useState, useEffect, useCallback, useLayoutEffect, useMemo, useRef, type Dispatch, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type SetStateAction } from 'react';
 import { createPortal } from 'react-dom';
 import Hls from 'hls.js';

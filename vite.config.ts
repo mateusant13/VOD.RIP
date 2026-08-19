@@ -26,7 +26,7 @@ export default defineConfig({
     include: ["src/**/*.{test,spec}.{ts,tsx}"],
   },
   server: {
-    host: true,
+    host: "localhost",
     port: 5173,
     strictPort: true,
     // No server.warmup here: Vite warms clientFiles SEQUENTIALLY (measured

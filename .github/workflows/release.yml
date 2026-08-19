@@ -2,8 +2,11 @@ name: CI
 
 on:
   push:
+    branches: [main]
     tags:
       - "v*"
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: write
@@ -30,10 +33,15 @@ jobs:
           npm ci
       - name: Type-check frontend
         run: npx tsc --noEmit
+      - name: Frontend unit tests
+        run: npx vitest run
+      - name: Lint Python (ruff)
+        run: |
+          pip install ruff
+          ruff check backend/
       - name: Python syntax check
         run: python -m compileall -q backend
       - name: Run backend tests
         run: |
           cd backend
           python -m pytest tests/ -v --tb=short
-
