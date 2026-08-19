@@ -192,13 +192,14 @@ def test_clips_era_window_scales_depth_and_returns_deep_fetch(monkeypatch) -> No
         )
 
     monkeypatch.setattr(gql, "_gql_persisted", fake_persisted)
-    # 5 pages * 100 = 500 nodes; in-window target = max(100, 301) — crawls
-    # until max_pages (10) caps it. Everything fetched is returned (deep).
+    # in_window_target = max(100, 301) = 301. Each page yields 100
+    # in-window clips, so the target is met at 4 pages (400 clips).
+    # Everything fetched is returned (deep) for era windows.
     clips = gql.list_channel_clips_sync(
         "gaveta", 300, range_label="LAST_MONTH",
         older_than_days=30, newer_than_days=14,
     )
-    assert len(clips) == 1000  # 10 pages of 100, capped by max_pages
-    assert pages_served["n"] == 10
+    assert len(clips) == 400  # 4 pages of 100, in_window_target met
+    assert pages_served["n"] == 4
     assert all(c["id"].startswith("id-e") for c in clips)
     _ = now

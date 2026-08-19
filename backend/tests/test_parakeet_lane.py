@@ -30,9 +30,12 @@ def _clean_env(monkeypatch):
     monkeypatch.delenv("VODRIP_SHERRPA_CACHE", raising=False)
     monkeypatch.setattr(at, "_parakeet_ok", None)
     monkeypatch.setattr(at, "_parakeet_cuda_ok", None)
+    saved_cuda_resident = at._cuda_recognizers_resident
+    at._cuda_recognizers_resident = 0
     yield
     monkeypatch.setattr(at, "_parakeet_ok", None)
     monkeypatch.setattr(at, "_parakeet_cuda_ok", None)
+    at._cuda_recognizers_resident = saved_cuda_resident
 
 
 def _routed(language, *, device="cpu", parakeet_ok=True, cuda_ok=None, vram_free=None):
