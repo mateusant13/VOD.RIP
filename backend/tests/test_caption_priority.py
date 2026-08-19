@@ -68,6 +68,10 @@ def test_caption_session_caps_archive_cpu_lanes(monkeypatch):
     captioner's parakeet decode threads get the box."""
     _force_cpu(monkeypatch)
     _idle_planner(monkeypatch, 0.0)
+    # Reset CPU load cache to avoid stale load measurement from a prior test
+    # capping slots to 1 (L8 fix: flaky due to 15 s TTL cache).
+    at._cpu_load_high_cache = False
+    at._cpu_load_at = 0.0
     monkeypatch.setenv(at.WORKERS_ENV, "4")
     assert at._worker_plan() == [("cpu", "int8")] * 4
     try:

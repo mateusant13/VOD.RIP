@@ -45,3 +45,14 @@ jobs:
         run: |
           cd backend
           python -m pytest tests/ -v --tb=short
+      - name: Verify requirements.lock is up-to-date
+        run: |
+          pip install pip-tools
+          pip-compile --strip-extras backend/requirements.txt -o /tmp/requirements-check.txt 2>/dev/null || true
+          # Diff only the package names+versions (strip comments/whitespace)
+          diff <(grep -E "^[a-zA-Z]" requirements.lock | sort) <(grep -E "^[a-zA-Z]" /tmp/requirements-check.txt | sort) || echo "::warning::requirements.lock may be out of sync with requirements.txt"
+      - name: Playwright e2e smoke test
+        if: always()
+        run: |
+          npx playwright install chromium --with-deps
+          npm run test:e2e 2>&1 || echo "::warning::Playwright e2e had failures (non-blocking)"
