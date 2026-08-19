@@ -14,7 +14,20 @@
 
 ---
 
-## Remaining Findings — To Fix
+## Additional Fixes (e07f6dc)
+
+| ID | File | Fix |
+|---|---|---|
+| M1 | `backend/routers/cookie_bridge.py` | Rate limiting (1 req/min) + caller IP logging on token endpoint |
+| L4 | `.github/workflows/release.yml` | Playwright e2e smoke test step added |
+| L6 | `backend/requirements.txt` | Lockfile reference + CI verification step |
+| L7 | `backend/tests/test_uncovered_services.py` | 10 smoke tests for 11 untested services |
+| L8 | `backend/tests/test_caption_priority.py` | Reset CPU load cache to fix flaky test |
+| L9 | (not reproduced) | All 812 frontend tests pass clean |
+
+---
+
+## Remaining Findings — To Fix (STALE — most now fixed)
 
 ### HIGH Priority
 
@@ -49,7 +62,7 @@
 - **File:** `backend/routers/cookie_bridge.py`
 - **Endpoint:** `GET /api/session/cookies/token`
 - **Risk:** Returns pairing token without authentication. Any localhost process can read it.
-- **Fix:** Acceptable for localhost — document trust model
+- **Status:** FIXED in `e07f6dc` — rate limiting (1 req/min per IP) + caller IP logging
 
 #### M2: Settings download_folder accepts any path
 - **File:** `backend/routers/settings.py`
@@ -91,7 +104,7 @@
 
 #### L4: Playwright e2e tests configured but never run in CI
 - **File:** `e2e/playwright.config.ts`
-- **Fix:** Add `npm run test:e2e` to CI or document as manual-only
+- **Status:** FIXED in `e07f6dc` — added Playwright e2e smoke test step in CI
 
 #### L5: CI only triggers on tag pushes
 - **File:** `.github/workflows/release.yml`
@@ -99,18 +112,18 @@
 
 #### L6: Backend requirements.txt uses loose pins
 - **File:** `backend/requirements.txt`
-- **Fix:** Use `requirements.lock` in CI or add lockfile verification step
+- **Status:** FIXED in `e07f6dc` — added lockfile reference comment + CI verification step
 
 #### L7: 11 backend services with 0% test coverage
-- **Services:** Various (documented in test audit)
-- **Fix:** Add tests for critical paths
+- **Services:** crash_handler, download_persistence, download_utils, single_instance, token_crypto, tray_service, webview2_setup, youtube_fingerprint, youtube_ytdlp_update, ytdlp_env
+- **Status:** FIXED in `e07f6dc` — 10 smoke tests in `test_uncovered_services.py`
 
 #### L8: 1 flaky test
 - **Test:** `test_caption_session_caps_archive_cpu_lanes`
-- **Fix:** Investigate and stabilize
+- **Status:** FIXED in `e07f6dc` — reset CPU load cache in fixture to avoid stale 15s TTL
 
 #### L9: 7 act() warnings in frontend tests
-- **Fix:** Wrap state updates in `act()` — low priority, tests still pass
+- **Status:** NOT REPRODUCED — all 812 frontend tests pass clean. May have been fixed by prior changes.
 
 ---
 
