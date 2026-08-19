@@ -1604,6 +1604,8 @@ export default function ChannelExplorePopup({
             fs ? 'border border-white/20 bg-black/85 backdrop-blur-sm' : 'border-2 border-zinc-600 bg-zinc-950'
           }`}
           onClick={(e) => e.stopPropagation()}
+          onMouseEnter={() => setVolumeHovered(true)}
+          onMouseLeave={() => setVolumeHovered(false)}
         >
           <input
             type="range"

@@ -6379,6 +6379,8 @@ export default function App() {
           <div
             className={`absolute left-full bottom-0 ml-1.5 z-30 flex items-center gap-2 px-2.5 py-2 shadow-lg ${popoverClass}`}
             onClick={(e) => e.stopPropagation()}
+            onMouseEnter={() => setHovered(true)}
+            onMouseLeave={() => setHovered(false)}
           >
             <input
               type="range"
