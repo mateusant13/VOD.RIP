@@ -1396,7 +1396,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     if (startPos >= 0 && modeRef.current !== 'replay') hls.startLoad(startPos);
     else if (modeRef.current !== 'replay') hls.startLoad();
     return hls;
-  }, [destroyHls, onAdRotation, clearRetry, markPreviewError, tryAdvanceEntry, recreateSessionInvisible, armQualityPin, maybeTuneCaptionLiveSync]);
+  }, [destroyHls, onAdRotation, clearRetry, markPreviewError, tryAdvanceEntry, recreateSessionInvisible, armQualityPin]); // ponytail: maybeTuneCaptionLiveSync removed — only called from a separate useEffect, never inside createHlsPlayer; including it caused CC toggle to cascade into HLS player destroy/recreate
 
   // Cleanup player on unmount
   const cleanup = useCallback(() => {
