@@ -1751,6 +1751,12 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
 
   // --- DVR mode switching ---
   const switchToReplay = useCallback((sec: number) => {
+    // ponytail: defensive guard — clear stale timer from a previous switchToReplay
+    // call that didn't reach the interval setup (e.g. early return on !archiveReadyRef).
+    if (replayTimerRef.current != null) {
+      window.clearInterval(replayTimerRef.current);
+      replayTimerRef.current = null;
+    }
     if (pendingReplaySeekRef.current != null) {
       window.clearTimeout(pendingReplaySeekRef.current);
       pendingReplaySeekRef.current = null;

@@ -409,16 +409,18 @@ export default function TwitchClipPopup({
 
     if (playback.kind === 'progressive') {
       attachProgressivePreview(video, playback.url);
-      video.addEventListener('loadedmetadata', () => {
+      const onLoadMetadata = () => {
         // window-muxed MP4 is 0-based (offset set above) — land the click moment.
         const t = timelineOffsetRef.current > 0
           ? Math.max(0, playheadSec - win.start)
           : Math.max(win.start, Math.min(win.end, playheadSec));
         video.currentTime = t;
-      }, { once: true });
+      };
+      video.addEventListener('loadedmetadata', onLoadMetadata, { once: true });
       video.addEventListener('canplay', onCanPlay, { once: true });
       return () => {
         cancelled = true;
+        video.removeEventListener('loadedmetadata', onLoadMetadata);
         video.removeEventListener('timeupdate', clampToWindow);
         video.removeEventListener('canplay', onCanPlay);
         detachProgressivePreview(video);

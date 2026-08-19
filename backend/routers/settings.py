@@ -19,6 +19,15 @@ from utils import (
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["settings"])
 
+# ponytail: reject obviously dangerous system-critical paths as download folder.
+_DANGEROUS_DOWNLOAD_FOLDERS: set[str] = {
+    "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64", "/lost+found",
+    "/media", "/mnt", "/opt", "/proc", "/root", "/run", "/sbin", "/srv", "/sys",
+    "/tmp", "/usr", "/var",
+    "c:\\", "c:\\windows", "c:\\windows\\system32", "c:\\program files",
+    "c:\\program files (x86)", "c:\\users", "c:\\programdata",
+}
+
 
 def _redact_ai_key(settings: AppSettings) -> AppSettings:
     """Never serialize the write-only AI key: GET/POST settings responses
@@ -96,7 +105,11 @@ async def update_settings(update: SettingsUpdate):
     if update.ffmpeg_path is not None:
         current.ffmpeg_path = update.ffmpeg_path
     if update.download_folder is not None:
-        current.download_folder = update.download_folder.strip()
+        folder = update.download_folder.strip()
+        # ponytail: reject obviously dangerous system-critical paths.
+        if folder and folder.lower() in _DANGEROUS_DOWNLOAD_FOLDERS:
+            raise HTTPException(status_code=400, detail=f"Refusing to use system-critical path as download folder: {folder}")
+        current.download_folder = folder
         if current.download_folder:
             current.download_folder_confirmed = True
     if update.download_folder_confirmed is not None:
