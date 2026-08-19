@@ -218,16 +218,19 @@ describe("SettingsTab", () => {
     await screen.findByText(/paired/);
     const sections = [...document.querySelectorAll("section")];
     // Danger Zone renders directly above the Save row (user request);
-    // Cookie Bridge stays among the last cards (Experimental now sits
-    // between Cookie Bridge and Danger Zone).
+    // Cookie Bridge stays among the last cards (Features + Experimental
+    // now sit between Cookie Bridge and Danger Zone).
     const last = sections[sections.length - 1];
     expect(last.textContent).toContain("Danger Zone");
     expect(last.textContent).not.toContain("Cookie Bridge");
     const secondToLast = sections[sections.length - 2];
-    expect(secondToLast.textContent).toContain("Experimental");
+    expect(secondToLast.textContent).toContain("Features");
     expect(secondToLast.textContent).not.toContain("Cookie Bridge");
     const thirdToLast = sections[sections.length - 3];
-    expect(thirdToLast.textContent).toContain("Cookie Bridge");
+    expect(thirdToLast.textContent).toContain("Experimental");
+    expect(thirdToLast.textContent).not.toContain("Cookie Bridge");
+    const fourthToLast = sections[sections.length - 4];
+    expect(fourthToLast.textContent).toContain("Cookie Bridge");
     // The Save button must come AFTER the Danger Zone card in the DOM.
     const saveBtn = screen.getByText("Save Settings");
     expect(last.compareDocumentPosition(saveBtn) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
