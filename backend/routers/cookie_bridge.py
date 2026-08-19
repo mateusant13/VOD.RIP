@@ -591,6 +591,51 @@ def _open_extension_manager() -> dict:
     return {"launched": False, "browser": None, "url": None}
 
 
+def _wake_extension_browser() -> None:
+    """Open a platform page in the background to wake the extension's service
+    worker after install — the SW polls the backend for cookie directives on
+    its 30s alarm and on content-script messages; a page load on a supported
+    platform triggers the content script, which delivers the initial message
+    that wakes the SW.  Fire-and-forget: failures are silently ignored.
+
+    The window is placed off-screen and started minimized to avoid focus
+    steal — the page only needs the renderer alive so the content script
+    can push cookies, not a visible UI.
+    """
+    platform_urls = {
+        "twitch": "https://www.twitch.tv/",
+        "youtube": "https://www.youtube.com/",
+        "kick": "https://kick.com/",
+    }
+    for name, url in platform_urls.items():
+        path = _find_browser(name)
+        if not path:
+            continue
+        try:
+            # ponytail: upgrade path is native CDP wake-up or extension push
+            # notification.  Off-screen + minimized keeps the window invisible
+            # but the renderer alive (the content script needs it).
+            kwargs = {}
+            if os.name == "nt":
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                si.wShowWindow = 7  # SW_SHOWMINNOACTIVE — minimized, no focus steal
+                kwargs["startupinfo"] = si
+            subprocess.Popen(
+                [
+                    str(path),
+                    "--new-window",
+                    "--window-position=-32000,-32000",
+                    url,
+                ],
+                **kwargs,
+            )
+            logger.info("cookie wake-up: opened %s to activate extension SW", name)
+            return
+        except OSError as exc:
+            logger.debug("cookie wake-up %s failed: %s", name, exc)
+
+
 @router.get("/api/extension/status")
 async def extension_status():
     """Version + pending reload directive for the cookie extension's SW.
@@ -743,6 +788,21 @@ def _auto_install_worker(browser: str, extension_dir: Path) -> None:
         _AUTO_INSTALL_STATE["error"] = res.get("error")
         _AUTO_INSTALL_STATE["finished_at"] = time.time()
         logger.info("cookie auto-install finished: %s", _AUTO_INSTALL_STATE["state"])
+    # Success: open a platform page in background to wake the extension's
+    # service worker — the 30s alarm may not fire immediately after fresh
+    # install, so a page load on a supported platform (Twitch/YouTube/Kick)
+    # triggers the content script which delivers the first message that
+    # wakes the SW and pushes cookies to the backend.
+    if res.get("ok"):
+        try:
+            _wake_extension_browser()
+        except Exception:
+            pass
+        # ponytail: upgrade path is native push notification or CDP wake-up.
+        # Reset to idle so the frontend can re-trigger auto-install if
+        # needed (e.g. the user wants a different browser profile).
+        with _AUTO_INSTALL_LOCK:
+            _AUTO_INSTALL_STATE["state"] = "idle"
 
 
 def _start_auto_install(browser: str, extension_dir: Path) -> bool:
@@ -833,6 +893,12 @@ async def session_cookies_enable():
     s = settings_mgr.get()
     s.cookie_bridge_enabled = True
     settings_mgr.save(s)
+    # Wake the extension's service worker by opening a supported-platform page
+    # in the background — the content script on that page delivers the first
+    # message that wakes the SW, which immediately pushes cookies to the
+    # freshly-enabled backend (no 30s alarm wait).  Fire-and-forget: the
+    # browser open is best-effort and never blocks the response.
+    threading.Thread(target=_wake_extension_browser, daemon=True).start()
     return {"enabled": True}
 
 
@@ -887,6 +953,22 @@ async def session_cookies_auto_install():
 @router.get("/api/session/cookies/status")
 async def session_cookies_status():
     gate_sec = gate_remaining_sec()
+    # Watchdog: detect a dead auto-install thread — if state is "running" for
+    # >5 min and no live thread is found, the worker crashed without updating
+    # state.  Reset to error so the frontend shows the stale error instead of
+    # an infinite spinner.
+    with _AUTO_INSTALL_LOCK:
+        if (
+            _AUTO_INSTALL_STATE["state"] == "running"
+            and _AUTO_INSTALL_STATE.get("started_at")
+            and (time.time() - _AUTO_INSTALL_STATE["started_at"]) > 300
+        ):
+            _AUTO_INSTALL_STATE["state"] = "error"
+            _AUTO_INSTALL_STATE["error"] = (
+                "auto-install thread died (no update for >5 min) — retry from Settings"
+            )
+            _AUTO_INSTALL_STATE["finished_at"] = time.time()
+            logger.warning("cookie auto-install watchdog: thread stale, resetting to error")
     with _AUTO_INSTALL_LOCK:
         ai = dict(_AUTO_INSTALL_STATE)
     return {
