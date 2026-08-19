@@ -3209,6 +3209,18 @@ _REMOTE_AUDIO_FETCH_TIMEOUT_S = 30 * 60.0
 _FETCH_HEARTBEAT_INTERVAL_S = 300.0
 
 
+def _is_live_stream_id(video_id: str) -> bool:
+    """True when the video_id is a synthetic watchdog live-capture row, not
+    a real VOD — mirrors routers.channels._is_synthetic_video_id.
+
+    Watchdog rows (<platform>-live-<slug>-<epoch>) have no video behind
+    them; transcribing them would crash (Twitch GQL rejects non-VOD ids,
+    Kick API returns no HLS, yt-dlp yields no bestaudio). The live
+    captioner already handles live streams; the archive worker must skip
+    them."""
+    return video_id.startswith(("twitch-live-", "kick-live-", "youtube-live-"))
+
+
 def _is_remote_permanent_error(exc: Exception) -> bool:
     """True when the VOD is definitively gone/restricted (never retry).
 
@@ -4188,6 +4200,23 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
             return {
                 "job_id": job_id, "platform": platform, "video_id": video_id,
                 "requeued": "youtube-gate",
+            }
+
+        if _is_live_stream_id(video_id):
+            # Live-capture watchdog rows (<platform>-live-<slug>-<ts>) have
+            # no VOD behind them — transcribing would crash (GQL rejects
+            # non-VOD ids, no HLS source). The live captioner already
+            # handles live streams; mark done and move on.
+            logger.info(
+                "transcribe job %s skipped — live stream id (%s/%s)",
+                job_id, platform, video_id,
+            )
+            archive_db.update_job(job_id, status="done", progress=1.0)
+            return {
+                "job_id": job_id,
+                "platform": platform,
+                "video_id": video_id,
+                "skipped": "live-stream",
             }
 
         if platform == "youtube":

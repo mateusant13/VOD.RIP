@@ -1002,6 +1002,8 @@ def _is_permanent_download_error(exc: BaseException) -> bool:
             "drm",
             "protected by drm",
             "sign in to confirm your age",
+            "faça login para confirmar sua idade",  # pt-BR age-gate
+            "confirme sua idade",                    # pt-BR age-gate (broader)
             "age-restricted",
             "age restricted",
             "confirm your age",
