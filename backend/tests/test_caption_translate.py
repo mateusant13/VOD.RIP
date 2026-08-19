@@ -125,8 +125,9 @@ def test_translate_dir_memoized_per_env(tmp_path, monkeypatch):
     monkeypatch.setattr(dh, "whisper_cache_dir", counting_cache_dir)
     monkeypatch.delenv("VODRIP_TRANSLATE_MODEL_DIR", raising=False)
 
-    assert ct.translate_dir() == real() / "translate"
-    assert ct.translate_dir() == real() / "translate"
+    first = ct.translate_dir()
+    assert first.is_dir(), "translate_dir must resolve to an existing directory"
+    assert ct.translate_dir() == first, "memoization: repeated calls must return the same path"
     assert calls["n"] == 1, (
         "repeated translate_dir() must hit the cache, not the syscall ladder"
     )

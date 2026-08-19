@@ -90,7 +90,31 @@ def _resolve_translate_dir(override: str) -> Path:
         return Path(override)
     from services.disk_hygiene import whisper_cache_dir  # lazy: keeps import light
 
-    return whisper_cache_dir() / "translate"
+    primary = whisper_cache_dir() / "translate"
+    # If the primary path already has both model subdirs, use it.
+    if (
+        (primary / NLLB_SUBDIR).is_dir()
+        and (primary / SLID_SUBDIR).is_dir()
+    ):
+        return primary
+    # ponytail: scan common drive letters for a better candidate when the
+    # auto-detected models folder (e.g. H:) doesn't hold translate models
+    # but another drive (G:) does.  Upgrade: a config-driven list or a
+    # manifest file in each models folder.
+    for drive in "CDEFGH":  # covers typical Windows drive letters
+        candidate = Path(f"{drive}:/VOD.RIP-models/translate")
+        if (
+            candidate.is_dir()
+            and (candidate / NLLB_SUBDIR).is_dir()
+            and (candidate / SLID_SUBDIR).is_dir()
+        ):
+            logger.info(
+                "translate models found on %s (primary %s was empty)",
+                candidate,
+                primary,
+            )
+            return candidate
+    return primary
 
 
 def translate_dir() -> Path:
