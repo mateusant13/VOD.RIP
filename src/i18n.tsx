@@ -610,6 +610,10 @@ const ptBR: Record<string, string> = {
   'Uses more power': 'Consome mais energia',
   'Light': 'Leve',
   'Features': 'Recursos',
+  'Toggle heavy features (OFF by default). Changes persist to Settings and reload preserves them.':
+    'Ative recursos pesados (desligados por padrão). As alterações são salvas e persistem após reiniciar.',
+  'HEAVY — GPU/model/threads': 'PESADO — GPU/modelo/threads',
+  'LIGHT': 'LEVE',
   'Choose which tools you want. Tools that use more power start off — turn them on whenever you need them.': 'Escolha quais ferramentas você quer. As que consomem mais energia começam desligadas — ligue quando precisar.',
   'Downloads': 'Downloads',
   'Transcripts for saved videos': 'Transcrever vídeos salvos',
@@ -1222,6 +1226,10 @@ const es: Record<string, string> = {
   'Uses more power': 'Consume más energía',
   'Light': 'Ligero',
   'Features': 'Funciones',
+  'Toggle heavy features (OFF by default). Changes persist to Settings and reload preserves them.':
+    'Activa funciones pesadas (apagadas por defecto). Los cambios se guardan y persisten tras reiniciar.',
+  'HEAVY — GPU/model/threads': 'PESADO — GPU/modelo/hilos',
+  'LIGHT': 'LIGERO',
   'Choose which tools you want. Tools that use more power start off — turn them on whenever you need them.': 'Elige qué herramientas quieres. Las que consumen más energía empiezan apagadas — actívalas cuando las necesites.',
   'Downloads': 'Descargas',
   'Transcripts for saved videos': 'Transcribir vídeos guardados',
