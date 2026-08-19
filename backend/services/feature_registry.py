@@ -24,7 +24,7 @@ MANIFEST: List[Dict] = [
     {
         "id": "live-captions",
         "cost": "heavy",
-        "defaultEnabled": False,
+        "defaultEnabled": True,
         "description": "Show subtitles live while a stream is happening",
     },
     {

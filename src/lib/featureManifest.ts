@@ -10,7 +10,7 @@ export interface FeatureDef {
 export const FEATURE_MANIFEST: FeatureDef[] = [
   { id: 'core-download', cost: 'light', defaultEnabled: true, description: 'Download videos and clips from Kick, Twitch and YouTube' },
   { id: 'transcribe-vod', cost: 'heavy', defaultEnabled: false, description: 'Automatically write out what was said in your saved videos so you can search them' },
-  { id: 'live-captions', cost: 'heavy', defaultEnabled: false, description: 'Show subtitles live while a stream is happening' },
+  { id: 'live-captions', cost: 'heavy', defaultEnabled: true, description: 'Show subtitles live while a stream is happening' },
   { id: 'live-preview', cost: 'heavy', defaultEnabled: false, description: 'See at a glance who is live and open a preview instantly' },
   { id: 'chat-live', cost: 'light', defaultEnabled: true, description: 'Show live chat next to the video and save it with your download' },
 ];
