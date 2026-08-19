@@ -161,3 +161,19 @@ Rules:
 - `vod-rip.spec` skips `cu13`/`*-cu13` nvidia packages (stack pinned to cu12) — keep it; a cu13 tree adds ~850MB to every bundle.
 - Pagefile: `H:\pagefile.sys` 16GB fixed (same NVMe as C: so it mounts at boot).
 
+
+<!-- STEADY-WATCHER -->
+## Steady Watcher (local governor — OMP must read this)
+
+This machine runs **Steady Watcher** (`python -m watcher` in `I:\!watcher`) so VOD.RIP, consultgpt, superharness, BrandOps, and any other heavy work can run **together**, including while the user plays League of Legends or Marvel Rivals.
+
+Live status (always JSON 200): `http://127.0.0.1:47891/status`
+Same payload on disk: `I:\!watcher\status\now.json`
+
+- Heavy jobs are **slow and steady**, not stopped. Treat slowness as the governor, not a hang.
+- If you must wait, `GET http://127.0.0.1:47891/wait?max_ms=250000` (pulses every 4:10, under 4:40) or `python -m watcher wait`.
+- Do not kill/retry GPU or Chromium workers to "unstick" them — that cold-starts CUDA/Playwright.
+- Skill: `.omp/skills/steady-watcher/SKILL.md`
+<!-- /STEADY-WATCHER -->
+
+

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 
 /**
  * FrameOverlay — CSS grid of snap targets (dotted outlines, tmux-like).

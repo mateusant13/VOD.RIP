@@ -1,0 +1,62 @@
+{
+  "app": "Steady Watcher",
+  "ok": true,
+  "ready": true,
+  "mood": "cruise",
+  "run_mode": "auto",
+  "gaming": false,
+  "game": null,
+  "defer_gpu": false,
+  "heavy_job_cap_pct": 90.0,
+  "projects": [
+    {
+      "id": "vodrip",
+      "count": 1,
+      "cpu": 1.45,
+      "rss": 1884241920,
+      "rate": 90.0,
+      "mood": "cruise"
+    }
+  ],
+  "notes": [
+    "47 project processes idle \u2014 they join when they get heavy"
+  ],
+  "advice": "User is idle \u2014 heavy work may use more of the machine.",
+  "pulse_seconds": 250.0,
+  "how_to_wait": "GET http://127.0.0.1:47891/wait?max_ms=250000",
+  "how_to_status": "GET http://127.0.0.1:47891/status",
+  "bus": "http://127.0.0.1:47891",
+  "tick": 264,
+  "updated": "2026-08-19T06:27:50Z",
+  "pulse_n": 4,
+  "admin": true,
+  "paused": false,
+  "sample": {
+    "cpu_pct": 43.2,
+    "ram_total": 51262832640,
+    "ram_available": 23037624320,
+    "ram_pct": 55.1,
+    "disk_read_bps": 167066.10407806476,
+    "disk_write_bps": 2979825.597737207,
+    "idle_seconds": 36.453,
+    "user_idle": true,
+    "foreground": "Discord.exe",
+    "logical_count": 20,
+    "hybrid": true
+  },
+  "procs": [
+    {
+      "pid": 34908,
+      "name": "python.exe",
+      "project_id": "vodrip",
+      "cpu": 1.45,
+      "rss": 1884241920,
+      "policy": "cruise",
+      "in_job": false,
+      "ecoqos": false,
+      "duty": false
+    }
+  ],
+  "daemon": true,
+  "pid": 38236
+}

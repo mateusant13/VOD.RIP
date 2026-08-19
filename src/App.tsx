@@ -110,7 +110,7 @@ import { youtubeIframeCommand, youtubeIframeListen } from './youtubeEmbed';
 import { previewRetryAfterError, previewRetryMode, type PreviewRetryStage, type PreviewRetryState } from './previewRetry';
 import { PreviewStartTimeout } from './previewStartTimeout';
 import FrameToggle from './components/FrameToggle';
-import FrameOverlay, { FrameCard } from './components/FrameOverlay';
+import FrameOverlay from './components/FrameOverlay';
 import PanelResizer from './components/PanelResizer';
 import './styles/frame.css';
 // ─── TYPES (migrated to src/types.ts) ───────────────
@@ -753,7 +753,7 @@ export default function App() {
   });
   useEffect(() => { try { localStorage.setItem('vodrip.ui.frameMode', frameMode ? '1' : '0'); } catch {} }, [frameMode]);
   // Frame cell contents: which card is in each grid cell (null = empty)
-  const [frameCellContents, setFrameCellContents] = useState<(string | null)[]>(Array(6).fill(null));
+  const [_frameCellContents, setFrameCellContents] = useState<(string | null)[]>(Array(6).fill(null));
   const handleDropCell = useCallback((index: number, cardId: string) => {
     setFrameCellContents((prev) => {
       const next = [...prev];
