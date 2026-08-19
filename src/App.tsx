@@ -110,7 +110,7 @@ import { youtubeIframeCommand, youtubeIframeListen } from './youtubeEmbed';
 import { previewRetryAfterError, previewRetryMode, type PreviewRetryStage, type PreviewRetryState } from './previewRetry';
 import { PreviewStartTimeout } from './previewStartTimeout';
 import FrameToggle from './components/FrameToggle';
-import FrameOverlay from './components/FrameOverlay';
+import FrameOverlay, { FrameCard } from './components/FrameOverlay';
 import PanelResizer from './components/PanelResizer';
 import './styles/frame.css';
 // ─── TYPES (migrated to src/types.ts) ───────────────
@@ -752,6 +752,18 @@ export default function App() {
     try { const v = localStorage.getItem('vodrip.ui.frameMode'); return v === '1' || v === 'true'; } catch { return false; }
   });
   useEffect(() => { try { localStorage.setItem('vodrip.ui.frameMode', frameMode ? '1' : '0'); } catch {} }, [frameMode]);
+  // Frame cell contents: which card is in each grid cell (null = empty)
+  const [frameCellContents, setFrameCellContents] = useState<(string | null)[]>(Array(6).fill(null));
+  const handleDropCell = useCallback((index: number, cardId: string) => {
+    setFrameCellContents((prev) => {
+      const next = [...prev];
+      // Remove card from any previous cell it occupied
+      const prevIdx = next.indexOf(cardId);
+      if (prevIdx !== -1) next[prevIdx] = null;
+      next[index] = cardId;
+      return next;
+    });
+  }, []);
   const [previewPanelWidth, setPreviewPanelWidth] = useState(initialPanelLayout.previewPanelWidth);
   const [previewVideoAspect, setPreviewVideoAspect] = useState(PREVIEW_VIDEO_ASPECT_DEFAULT);
   const [urlAsidePanelSize, setUrlAsidePanelSize] = useState(initialPanelLayout.urlAside);
@@ -7603,6 +7615,12 @@ export default function App() {
                                     });
                                   }
                                 }}
+                                data-frame-card={frameMode ? fullUrl : undefined}
+                                draggable={frameMode || undefined}
+                                onDragStart={frameMode ? (e: React.DragEvent) => {
+                                  e.dataTransfer.setData('text/plain', fullUrl);
+                                  e.dataTransfer.effectAllowed = 'move';
+                                } : undefined}
                                 className={`flex items-center gap-1 border bg-zinc-950 px-2 py-1.5 hover:border-zinc-600 hover:text-white ${isSyntheticYt ? 'cursor-not-allowed' : 'cursor-pointer group'} ${
                                   isActiveVod ? `${rowBorder} bg-zinc-900` : 'border-zinc-800'
                                 }`}
@@ -7975,7 +7993,7 @@ export default function App() {
         >
             <FrameOverlay
               active={frameMode}
-              onDropCell={() => {}}
+              onDropCell={handleDropCell}
             />
         </div>
       )}
