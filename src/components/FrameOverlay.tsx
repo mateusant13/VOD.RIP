@@ -1,10 +1,12 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 /**
  * FrameOverlay — CSS grid of snap targets (dotted outlines, tmux-like).
  * - 2x3 / 3x2 adaptive (wide screens 3 cols, narrow 2 cols) — CSS grid auto
  * - Preview cards draggable with custom ghost, onDragOver highlight nearest cell, onDrop reparent via portal
  * - Only rendered when frameMode === true
+ * - Grid is click-through by default; becomes interactive only during an active HTML5 drag
+ *   so the underlying channel list / popups remain fully clickable in frame mode.
  * ponytail: drag uses HTML5 DnD ghost; upgrade to pointer-capture + absolute positioning for smoother cross-panel moves
  */
 
@@ -20,7 +22,20 @@ export function FrameOverlay({
   onDropCell?: (index: number, data: string) => void;
 }) {
   const [hoverCell, setHoverCell] = useState<number | null>(null);
-  const dragDataRef = useRef<string>('');
+  const [dragging, setDragging] = useState(false);
+
+  // Track global HTML5 drag lifecycle — grid only becomes interactive while a drag is active.
+  useEffect(() => {
+    if (!active) return;
+    const onStart = () => setDragging(true);
+    const onEnd = () => setDragging(false);
+    document.addEventListener('dragstart', onStart, true);
+    document.addEventListener('dragend', onEnd, true);
+    return () => {
+      document.removeEventListener('dragstart', onStart, true);
+      document.removeEventListener('dragend', onEnd, true);
+    };
+  }, [active]);
 
   const onDragOver = useCallback((e: React.DragEvent, idx: number) => {
     e.preventDefault();
@@ -32,51 +47,27 @@ export function FrameOverlay({
 
   const onDrop = useCallback((e: React.DragEvent, idx: number) => {
     e.preventDefault();
-    const data = e.dataTransfer.getData('text/plain') || dragDataRef.current || String(idx);
+    e.stopPropagation();
+    const data = e.dataTransfer.getData('text/plain') || String(idx);
     setHoverCell(null);
+    setDragging(false);
     onDropCell?.(idx, data);
   }, [onDropCell]);
 
-  const onDragStartCapture = useCallback((e: React.DragEvent) => {
-    const target = e.target as HTMLElement;
-    const ghost = target.closest('[data-frame-card]') as HTMLElement | null;
-    if (ghost) {
-      const clone = ghost.cloneNode(true) as HTMLElement;
-      clone.style.position = 'absolute';
-      clone.style.top = '-1000px';
-      clone.style.opacity = '0.9';
-      clone.style.transform = 'rotate(1deg)';
-      document.body.appendChild(clone);
-      try {
-        e.dataTransfer.setDragImage(clone, 40, 20);
-      } catch {}
-      const cleanup = () => clone.remove();
-      // Esc-cancel or drop both fire before the next tick; cleanup on next frame and on dragend fallback.
-      setTimeout(cleanup, 0);
-      const id = ghost.getAttribute('data-frame-card') || '';
-      dragDataRef.current = id;
-      e.dataTransfer.setData('text/plain', id);
-      e.dataTransfer.effectAllowed = 'move';
-      const onEnd = () => { cleanup(); document.removeEventListener('dragend', onEnd); document.removeEventListener('dragcancel', onEnd); };
-      document.addEventListener('dragend', onEnd, { once: true });
-      document.addEventListener('dragcancel', onEnd as any, { once: true } as any);
-    }
-  }, []);
   if (!active) return null;
 
   const grid = (
     <div
       className="frame-overlay"
       data-frame-overlay
-      onDragStartCapture={onDragStartCapture}
-      onDragOver={(e) => e.preventDefault()}
       style={{
         position: 'absolute',
         inset: 0,
         display: 'grid',
         gap: 8,
         padding: 8,
-        pointerEvents: 'auto',
+        // ponytail: upgrade to IntersectionObserver-driven visibility for smoother UX
+        pointerEvents: dragging ? 'auto' : 'none',
         zIndex: 1,
       }}
     >
@@ -123,24 +114,34 @@ export function FrameOverlay({
   return grid;
 }
 
-// Helper to make a preview card draggable inside frame mode — portals its content on drop via FrameOverlay
+/**
+ * Wraps a preview card to be draggable in frame mode.
+ * Sets `data-frame-card` for the overlay's ghost/drop identification.
+ * Only makes the card draggable when the `draggable` prop is true (set by the
+ * parent based on `frameMode`).
+ */
 export function FrameCard({
   id,
+  draggable = false,
   children,
   className,
   style,
+  onDragStart,
 }: {
   id: string;
+  draggable?: boolean;
   children: React.ReactNode;
   className?: string;
   style?: React.CSSProperties;
+  onDragStart?: (e: React.DragEvent) => void;
 }) {
   return (
     <div
       data-frame-card={id}
-      draggable
+      draggable={draggable}
       className={className}
-      style={{ ...style, cursor: 'grab' }}
+      style={draggable ? { ...style, cursor: 'grab' } : style}
+      onDragStart={onDragStart}
     >
       {children}
     </div>
