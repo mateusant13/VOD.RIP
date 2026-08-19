@@ -266,7 +266,7 @@ def _http_get_bytes(
         if "googlevideo.com" in url:
             http_version = "v3"
 
-        session = _get_upstream_session()
+        http_pool = _get_upstream_session()
         if http_version:
             # Per-request with explicit http_version (QUIC not poolable)
             try:
@@ -284,8 +284,8 @@ def _http_get_bytes(
                 resp = requests.get(url, headers=headers, stream=True, timeout=timeout)
         else:
             # Pooled connection — avoids TCP+TLS handshake per segment
-            if hasattr(session, 'get'):
-                resp = session.get(url, headers=headers, stream=True, timeout=timeout)
+            if hasattr(http_pool, 'get'):
+                resp = http_pool.get(url, headers=headers, stream=True, timeout=timeout)
             else:
                 import requests
                 resp = requests.get(url, headers=headers, stream=True, timeout=timeout)
