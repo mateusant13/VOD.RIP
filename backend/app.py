@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -1018,7 +1019,38 @@ async def _app_lifespan(_app: FastAPI):
 
 app = FastAPI(title="Kick & Twitch Downloader", version=__version__, lifespan=_app_lifespan)
 
+# CORS: localhost-only for this desktop app (prevents cross-origin abuse).
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 assert_ytdlp_safe()
+
+# --- rate limiter for /api/ai/ask (10 req/min, in-memory per IP) -----------
+_ASK_RATE_LIMIT = 10  # requests
+_ASK_RATE_WINDOW = 60.0  # seconds
+_ask_hits: dict[str, list[float]] = {}
+_ask_rate_lock = threading.Lock()
+
+
+def _ask_rate_ok(client_ip: str) -> bool:
+    """Return True if the client IP is within the rate limit window."""
+    now = time.monotonic()
+    cutoff = now - _ASK_RATE_WINDOW
+    with _ask_rate_lock:
+        hits = _ask_hits.get(client_ip, [])
+        # Prune old entries
+        hits = [t for t in hits if t > cutoff]
+        if len(hits) >= _ASK_RATE_LIMIT:
+            _ask_hits[client_ip] = hits
+            return False
+        hits.append(now)
+        _ask_hits[client_ip] = hits
+    return True
 
 # Two-lane activity signal (user requirement): the app's interactive lane
 # stamps an 'app-activity' heartbeat (throttled, fire-and-forget — never
@@ -1056,6 +1088,20 @@ async def _app_activity_middleware(request: Request, call_next):
     # transient DB lock can never stall the interactive lane.
     if _activity_stamp_due():
         threading.Thread(target=_stamp_app_activity, daemon=True).start()
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def _ask_rate_limit_middleware(request: Request, call_next):
+    """Rate-limit POST /api/ai/ask to prevent abuse of the AI backend."""
+    if request.method == "POST" and request.url.path.rstrip("/") == "/api/ai/ask":
+        client_ip = request.client.host if request.client else "unknown"
+        if not _ask_rate_ok(client_ip):
+            from fastapi.responses import JSONResponse as _JR
+            return _JR(
+                {"detail": "Rate limit exceeded. Try again in a minute."},
+                status_code=429,
+            )
     return await call_next(request)
 
 # Mount static files

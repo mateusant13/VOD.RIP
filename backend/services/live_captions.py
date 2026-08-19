@@ -411,13 +411,26 @@ def _resolve_evidence(platform: str, channel: str) -> Optional[str]:
     """Best-effort channel-language family (platform clue / transcript tally).
 
     None when unknown or the archive DB is unavailable — the per-window SLID
-    gate then decides (see caption_translate). Never raises."""
+    gate then decides (see caption_translate). Never raises.
+
+    Cached for 24 hours per (platform, channel) to avoid repeated DB queries
+    during long-running caption sessions while still refreshing stale data."""
+    _EVIDENCE_TTL_SEC = 24 * 3600  # ponytail: env knob if per-site tuning needed
+    now = time.monotonic()
+    cache_key = (platform, channel)
+    cached = _evidence_cache.get(cache_key)
+    if cached and (now - cached[1]) < _EVIDENCE_TTL_SEC:
+        return cached[0]
     try:
         from services.channel_language import aggregate_channel_language
-
-        return aggregate_channel_language(platform, channel).get("language")
+        result = aggregate_channel_language(platform, channel).get("language")
+        _evidence_cache[cache_key] = (result, now)
+        return result
     except Exception:
         return None
+
+
+_evidence_cache: dict[tuple[str, str], tuple[Optional[str], float]] = {}
 
 
 def _warm_translate(evidence: Optional[str], target_family: Optional[str] = None) -> None:
@@ -1048,7 +1061,12 @@ class LiveCaptioner:
                 # Bounded FIFO: drop oldest if queue is full (max 3 windows)
                 with self._asr_lock:
                     if len(self._asr_queue) >= 3:
-                        self._asr_queue.popleft()
+                        dropped = self._asr_queue.popleft()
+                        logger.warning(
+                            "live captions %s/%s ASR queue full — dropped oldest window (%.1fs)",
+                            self.platform, self.channel,
+                            dropped[1] if dropped else 0,
+                        )
                     self._asr_queue.append((audio, buffer_sec, win_start_off, origin))
                 self._asr_window_ready.set()
 

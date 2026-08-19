@@ -1006,7 +1006,12 @@ def _is_permanent_download_error(exc: BaseException) -> bool:
             "confirme sua idade",                    # pt-BR age-gate (broader)
             "age-restricted",
             "age restricted",
+            "age verification required",             # EN age-gate
+            "age-restricted content",                # EN age-gate
             "confirm your age",
+            "confirma tu edad",                      # ES age-gate
+            "verificación de edad",                  # ES age-gate
+            "contenido restringido por edad",        # ES age-gate (broader)
             "this video is unavailable",
             "video unavailable",
             "this video is private",
