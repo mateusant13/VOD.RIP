@@ -714,7 +714,7 @@ async def test_auto_install_missing_extension_package(client, monkeypatch, tmp_p
 
 
 def test_auto_install_worker_folds_result_into_state(monkeypatch):
-    """Worker maps a successful script result to done + installed."""
+    """Worker maps a successful script result to idle (re-triggerable) + installed."""
     from routers import cookie_bridge as cb
 
     monkeypatch.setattr(
@@ -723,7 +723,7 @@ def test_auto_install_worker_folds_result_into_state(monkeypatch):
     )
     cb._auto_install_worker("chrome", Path("C:/ext"))
     with cb._AUTO_INSTALL_LOCK:
-        assert cb._AUTO_INSTALL_STATE["state"] == "done"
+        assert cb._AUTO_INSTALL_STATE["state"] == "idle"
         assert cb._AUTO_INSTALL_STATE["installed"] is True
         assert cb._AUTO_INSTALL_STATE["extension_id"] == "abc123"
         assert cb._AUTO_INSTALL_STATE["error"] is None

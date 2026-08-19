@@ -308,6 +308,7 @@ def _youtube_preflight_mux(
         return False
     out_dir = _preflight_mux_dir(vid, prefer_height)
     if _preflight_seg0_ready(out_dir):
+        from services.preview.session import resolve_stream_info
         return True
     try:
         _raw, headers, platform, variant_formats, _kind, yt_info = resolve_stream_info(
@@ -759,6 +760,7 @@ def kickoff_youtube_full_mux_warm(
 
                 if not warm_youtube_extract(url, cookies_file=cookies_file):
                     return
+
                 try:
                     _entry, headers, _platform, variant_formats, _kind, yt_info = (
                         resolve_stream_info(url, prefer_height=prefer_height)
@@ -1101,6 +1103,7 @@ def warm_youtube_preview_resolve(
                     (_WARM_DEAD_VID_TTL_SEC // 3600),
                     exc,
                 )
+
         logger.info("YouTube warm resolve skipped for %s: %s", url[:80], exc)
         if reraise:
             raise
@@ -1128,6 +1131,7 @@ def warm_youtube_resolve_only(
     channel_key: str = "",
 ) -> bool:
     """Populate resolved-stream cache + preflight the head so the click can play
+    from services.preview.session import resolve_stream_info
     immediately. Uses the light extract so concurrent warm jobs don't fight for
     yt-dlp locks during a startup storm. The full InnerTube race path runs on
     the user's first preview click.

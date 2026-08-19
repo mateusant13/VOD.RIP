@@ -134,7 +134,12 @@ def export_browser_cookies_to_cache(browser: str) -> Optional[str]:
     from yt_dlp.cookies import extract_cookies_from_browser
 
     name = browser.strip().lower()
-    jar = extract_cookies_from_browser(name, logger=_QuietCookieLogger())
+    try:
+        jar = extract_cookies_from_browser(name, logger=_QuietCookieLogger())
+    except Exception:
+        # Chrome DPAPI decryption fails when Chrome isn't running (yt-dlp #10927)
+        # Edge/Brave same issue. Just skip — POT will be used as fallback.
+        return None
     out = cookie_cache_path(name)
     if not _write_netscape_jar(jar, out):
         return None
