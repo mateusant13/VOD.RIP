@@ -184,7 +184,10 @@ export default function LiveChatPanel({ sources, onClose }: LiveChatPanelProps) 
       };
       es.onerror = () => {
         // EventSource auto-reconnects; surface the flap without killing the panel.
-        setStatus((prev) => (prev === 'live' ? 'reconnecting' : prev === 'connecting' ? 'connecting' : prev));
+        // ponytail: if the status is 'connecting' and the EventSource errors before
+        // it ever opened, nudge to 'reconnecting' so the user sees activity instead
+        // of a frozen "Connecting…" label (EventSource's own retry is invisible).
+        setStatus((prev) => (prev === 'live' || prev === 'connecting' ? 'reconnecting' : prev));
       };
       esList.push(es);
     }

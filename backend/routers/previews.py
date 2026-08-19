@@ -31,7 +31,12 @@ def previews_status() -> dict:
 
 @router.get("/{channel_id}/media")
 def preview_media(channel_id: str, request: Request):
-    mp4 = instant_preview.previews_dir() / f"{channel_id}.mp4"
+    # ponytail: path traversal guard — channel_id is URL-decoded by FastAPI;
+    # reject any value that could escape the previews dir.
+    cid = (channel_id or "").strip()
+    if not cid or ".." in cid or "/" in cid or "\\" in cid:
+        raise HTTPException(status_code=400, detail="Invalid channel_id")
+    mp4 = instant_preview.previews_dir() / f"{cid}.mp4"
     if not mp4.is_file():
         raise HTTPException(status_code=404, detail="Preview not found")
     size = mp4.stat().st_size

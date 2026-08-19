@@ -4392,7 +4392,10 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
         # here; the retry call finds the stash and the job-level finally
         # releases whatever is left.
 
+        _download_governor_released = False  # ponytail: guard against double-release on retry
+
         def _run_transcribe() -> dict:
+            nonlocal _download_governor_released
             # Resolve prefetch: wait for the I/O pool download if pending.
             # The stashed wav path is picked up by the transcribe functions
             # (audio_stash check) so they skip their own download.
@@ -4402,9 +4405,12 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
                 except Exception:
                     pass
                 finally:
-                    _governor_download_release()
-            elif _prefetch_future is not None:
+                    if not _download_governor_released:
+                        _governor_download_release()
+                        _download_governor_released = True
+            elif _prefetch_future is not None and not _download_governor_released:
                 _governor_download_release()
+                _download_governor_released = True
             if platform == "youtube":
                 # Captionless YouTube (no archive_path): download bestaudio
                 # at transcribe time via the app's yt-dlp session.
