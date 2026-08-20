@@ -601,6 +601,33 @@ async def test_pull_rejects_wrong_token(client):
     assert resp.status_code == 403
 
 
+
+async def test_token_requires_bridge_auth(client):
+    await _pair_with_token(client, "tok-1")
+    resp = await client.get("/api/session/cookies/token")
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "invalid or missing bridge token"
+
+
+async def test_token_accepts_header_token(client):
+    await _pair_with_token(client, "tok-1")
+    resp = await client.get(
+        "/api/session/cookies/token",
+        headers={"X-Cookie-Bridge-Token": "tok-1"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["token"] == "tok-1"
+
+
+async def test_token_rejects_wrong_token(client):
+    await _pair_with_token(client, "tok-1")
+    resp = await client.get(
+        "/api/session/cookies/token",
+        params={"token": "wrong"},
+    )
+    assert resp.status_code == 403
+
+
 async def test_pull_blocked_when_disabled(client):
     await _pair_with_token(client, "tok-1")
     resp = await client.post("/api/session/cookies/disable")
@@ -642,14 +669,14 @@ async def test_auto_install_short_circuits_when_paired(client, monkeypatch):
     assert resp.status_code == 200
 
     captured: list = []
-    monkeypatch.setattr("threading.Thread", _capture_thread(captured))
+    monkeypatch.setattr("routers.cookie_bridge.threading.Thread", _capture_thread(captured))
     resp = await client.post("/api/session/cookies/auto-install")
     assert resp.status_code == 200
     body = resp.json()
     assert body["ok"] is True
     assert body["alreadyInstalled"] is True
     assert body["installed"] is True
-    assert captured == [], "no thread may spawn when already paired"
+    assert _auto_install_threads(captured) == [], "no thread may spawn when already paired"
 
     status = (await client.get("/api/session/cookies/status")).json()
     assert status["auto_install"]["installed"] is True
@@ -673,14 +700,14 @@ async def test_auto_install_skips_when_extension_active_but_depaired(client, mon
     assert status["platforms"]["twitch"]["count"] == 1
 
     captured: list = []
-    monkeypatch.setattr("threading.Thread", _capture_thread(captured))
+    monkeypatch.setattr("routers.cookie_bridge.threading.Thread", _capture_thread(captured))
     resp = await client.post("/api/session/cookies/auto-install")
     assert resp.status_code == 200
     body = resp.json()
     assert body["ok"] is True
     assert body["alreadyInstalled"] is True
     assert body["installed"] is True
-    assert captured == [], "no automation thread when the extension is already active"
+    assert _auto_install_threads(captured) == [], "no automation thread when the extension is already active"
 
 
 async def test_auto_install_spawns_when_extension_inactive(client, monkeypatch, tmp_path):
@@ -712,11 +739,11 @@ async def test_auto_install_spawns_when_extension_inactive(client, monkeypatch, 
         )
 
     captured: list = []
-    monkeypatch.setattr("threading.Thread", _capture_thread(captured))
+    monkeypatch.setattr("routers.cookie_bridge.threading.Thread", _capture_thread(captured))
     resp = await client.post("/api/session/cookies/auto-install")
     assert resp.status_code == 200
     assert resp.json()["started"] is True
-    assert len(captured) == 1, "stale push must still run the installer"
+    assert len(_auto_install_threads(captured)) == 1, "stale push must still run the installer"
 
 
 async def test_auto_install_spawns_background_install(client, monkeypatch, tmp_path):
@@ -730,14 +757,15 @@ async def test_auto_install_spawns_background_install(client, monkeypatch, tmp_p
     monkeypatch.setattr(cb, "_find_browser", lambda name: Path("C:/chrome.exe") if name == "chrome" else None)
 
     captured: list = []
-    monkeypatch.setattr("threading.Thread", _capture_thread(captured))
+    monkeypatch.setattr("routers.cookie_bridge.threading.Thread", _capture_thread(captured))
     resp = await client.post("/api/session/cookies/auto-install")
     assert resp.status_code == 200
     body = resp.json()
     assert body["ok"] is True and body["started"] is True
     assert body["state"] == "running"
-    assert len(captured) == 1, "exactly one worker thread must spawn"
-    name, kwargs = captured[0]
+    install_threads = _auto_install_threads(captured)
+    assert len(install_threads) == 1, "exactly one worker thread must spawn"
+    name, kwargs = install_threads[0]
     assert name == "cookie-auto-install"
     assert kwargs["target"] is cb._auto_install_worker
     assert kwargs["args"] == ("chrome", src)
@@ -758,13 +786,13 @@ async def test_auto_install_no_browser_error(client, monkeypatch, tmp_path):
     monkeypatch.setattr(cb, "_find_browser", lambda name: None)
 
     captured: list = []
-    monkeypatch.setattr("threading.Thread", _capture_thread(captured))
+    monkeypatch.setattr("routers.cookie_bridge.threading.Thread", _capture_thread(captured))
     resp = await client.post("/api/session/cookies/auto-install")
     assert resp.status_code == 200
     body = resp.json()
     assert body["ok"] is False
     assert "browser" in (body["error"] or "")
-    assert captured == []
+    assert _auto_install_threads(captured) == []
 
 
 async def test_auto_install_missing_extension_package(client, monkeypatch, tmp_path):
@@ -775,12 +803,12 @@ async def test_auto_install_missing_extension_package(client, monkeypatch, tmp_p
     empty.mkdir()
     monkeypatch.setattr(cb, "_materialize_ext_src", lambda: empty)
     captured: list = []
-    monkeypatch.setattr("threading.Thread", _capture_thread(captured))
+    monkeypatch.setattr("routers.cookie_bridge.threading.Thread", _capture_thread(captured))
     resp = await client.post("/api/session/cookies/auto-install")
     body = resp.json()
     assert body["ok"] is False
     assert "package" in (body["error"] or "")
-    assert captured == []
+    assert _auto_install_threads(captured) == []
 
 
 def test_auto_install_worker_folds_result_into_state(monkeypatch):
@@ -830,17 +858,24 @@ def test_auto_install_worker_survives_crash(monkeypatch):
 
 
 def _capture_thread(captured: list):
-    """threading.Thread stand-in that records (name, kwargs) without running."""
+    """Thread subclass that records spawn args without running (keeps threading.Thread a class)."""
+    import threading as _threading
 
-    def fake_thread(*args, **kwargs):
-        captured.append((kwargs.pop("name", None), kwargs))
-        class _Fake:
-            def start(self):
-                pass
-            daemon = kwargs.get("daemon", False)
-        return _Fake()
+    class _RecordingThread(_threading.Thread):
+        def __init__(self, *args, **kwargs):
+            name = kwargs.pop("name", None)
+            captured.append((name, kwargs))
+            super().__init__(*args, **kwargs)
 
-    return fake_thread
+        def start(self):
+            pass
+
+    return _RecordingThread
+
+
+def _auto_install_threads(captured: list) -> list:
+    """Filter thread captures to cookie-auto-install only (ignore app-activity stamps)."""
+    return [entry for entry in captured if entry[0] == "cookie-auto-install"]
 
 
 async def test_status_shape(client):

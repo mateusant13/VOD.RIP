@@ -56,7 +56,6 @@ from services.yt_gate import gate_remaining_sec
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["cookie-bridge"])
-_TOKEN_RATE_LIMIT: dict[str, float] = {}  # ip -> last access time (monotonic)
 
 
 def _require_platform(platform: str) -> str:
@@ -1048,17 +1047,9 @@ async def session_cookies_pull(request: Request, platform: str, token: Optional[
 
 
 @router.get("/api/session/cookies/token")
-async def session_cookies_token(request: Request):
-    # M1: rate-limit + log access to the pairing token endpoint — any
-    # localhost process could read this; limit to 1 req/min and log the
-    # caller so suspicious access is visible.
-    now = time.monotonic()
-    # simple per-IP rate limit (1 req / 60 s)
+async def session_cookies_token(request: Request, token: Optional[str] = None):
+    """Return the paired bridge token (Settings diagnostics). Same auth as pull."""
+    _require_bridge_auth(request, token)
     ip = request.client.host if request.client else "unknown"
-    last = _TOKEN_RATE_LIMIT.get(ip, 0.0)
-    if now - last < 60:
-        logger.warning("token endpoint rate-limited for %s (last access %.1fs ago)", ip, now - last)
-        raise HTTPException(status_code=429, detail="rate limit: 1 request per minute")
-    _TOKEN_RATE_LIMIT[ip] = now
     logger.info("token endpoint accessed by %s", ip)
     return {"token": _paired_token()}

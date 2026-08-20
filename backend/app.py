@@ -1025,8 +1025,9 @@ app.add_middleware(
     allow_origins=[
         "http://localhost",
         "http://127.0.0.1",
+        "http://[::1]",
     ],
-    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$",
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -1203,4 +1204,5 @@ if __name__ == "__main__":
     print("  Kick & Twitch Downloader v2.0 (Python)")
     print(f"  Open http://localhost:{port} in your browser")
     print("================================================")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    bind_host = (os.environ.get("VODRIP_BIND") or "127.0.0.1").strip() or "127.0.0.1"
+    uvicorn.run(app, host=bind_host, port=port)

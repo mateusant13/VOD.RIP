@@ -111,10 +111,12 @@ def main():
     # first-wins: exit 0 instead of retrying a doomed bind.
     import time as _time
 
+    bind_host = (os.environ.get("VODRIP_BIND") or "127.0.0.1").strip() or "127.0.0.1"
+
     max_bind_attempts = 3
     for attempt in range(1, max_bind_attempts + 1):
         try:
-            uvicorn.run("main:app", host="0.0.0.0", port=port, reload=use_reload)
+            uvicorn.run("main:app", host=bind_host, port=port, reload=use_reload)
             break
         except (OSError, SystemExit) as exc:
             if isinstance(exc, OSError) and exc.errno != 10048:  # WSAEADDRINUSE

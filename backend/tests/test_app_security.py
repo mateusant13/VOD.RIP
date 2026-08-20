@@ -21,7 +21,8 @@ def test_cors_localhost_only_origins():
     assert "*" not in cfg["allow_origins"]
     assert "http://localhost" in cfg["allow_origins"]
     assert "http://127.0.0.1" in cfg["allow_origins"]
-    assert cfg["allow_origin_regex"] == r"^http://(localhost|127\.0\.0\.1)(:\d+)?$"
+    assert "http://[::1]" in cfg["allow_origins"]
+    assert cfg["allow_origin_regex"] == r"^http://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$"
 
 
 @pytest.fixture
@@ -40,6 +41,18 @@ async def test_cors_allows_localhost_origin(client):
         },
     )
     assert resp.headers.get("access-control-allow-origin") == "http://localhost:5173"
+
+
+
+async def test_cors_allows_ipv6_localhost_origin(client):
+    resp = await client.options(
+        "/api/settings",
+        headers={
+            "Origin": "http://[::1]:5173",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+    assert resp.headers.get("access-control-allow-origin") == "http://[::1]:5173"
 
 
 async def test_cors_blocks_untrusted_origin(client):
