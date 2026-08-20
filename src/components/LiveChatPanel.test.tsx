@@ -228,3 +228,17 @@ describe('LiveChatPanel initial scroll position', () => {
     expect(scrollEl.scrollTop).toBe(800);
   });
 });
+
+describe('LiveChatPanel SSE status', () => {
+  it('shows reconnecting when EventSource errors before onopen', async () => {
+    mockPanelFetch({ twitch: { messages: [] } });
+    vi.stubGlobal('EventSource', FakeEventSource);
+    render(
+      <LiveChatPanel sources={[{ platform: 'twitch', slug: 'chan' }]} onClose={() => {}} />,
+    );
+    const es = FakeEventSource.instances.find((e) => e.url.includes('platform=twitch'))!;
+    expect(es).toBeTruthy();
+    es.onerror?.();
+    await waitFor(() => expect(document.body.textContent).toContain('Reconnecting…'));
+  });
+});
