@@ -14,6 +14,7 @@ Run from the backend directory with:
 from __future__ import annotations
 
 from services import archive_transcribe as at
+from transcribe_plan_isolation import isolate_worker_plan, reset_cpu_load_cache
 
 GIB = 1024 ** 3
 
@@ -34,6 +35,7 @@ def _force_cpu(monkeypatch) -> None:
 
 def _idle_planner(monkeypatch, vram_gib: float) -> None:
     """Unheld, idle, RAM-ample planner: only the tested gate can reduce slots."""
+    isolate_worker_plan(monkeypatch)
     monkeypatch.setattr(at, "_gpu_free_vram_bytes", lambda: int(vram_gib * GIB))
     monkeypatch.setattr(at, "_gpu_held_by_other", lambda: False)
     monkeypatch.setattr(at, "_gpu_util", lambda: 0.1)
@@ -68,10 +70,7 @@ def test_caption_session_caps_archive_cpu_lanes(monkeypatch):
     captioner's parakeet decode threads get the box."""
     _force_cpu(monkeypatch)
     _idle_planner(monkeypatch, 0.0)
-    # Reset CPU load cache to avoid stale load measurement from a prior test
-    # capping slots to 1 (L8 fix: flaky due to 15 s TTL cache).
-    at._cpu_load_high_cache = False
-    at._cpu_load_at = 0.0
+    reset_cpu_load_cache()
     monkeypatch.setenv(at.WORKERS_ENV, "4")
     assert at._worker_plan() == [("cpu", "int8")] * 4
     try:

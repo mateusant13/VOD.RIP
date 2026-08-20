@@ -13,12 +13,14 @@ import sys
 import threading
 import time
 from services import archive_transcribe as at
+from transcribe_plan_isolation import isolate_worker_plan
 
 GIB = 1024 ** 3
 
 
 def _force_cuda(monkeypatch) -> None:
     """Idle, unheld GPU with ample VRAM: the plan's GPU lane is usable."""
+    isolate_worker_plan(monkeypatch)
     # raising=False: pin is a per-thread attribute of threading.local and
     # never exists on the pytest thread — default raising=True AttributeErrors.
     monkeypatch.setattr(at._multi_tls, "pin", ("cuda", "int8"), raising=False)
@@ -33,6 +35,7 @@ def _force_cuda(monkeypatch) -> None:
 
 
 def _force_cpu(monkeypatch) -> None:
+    isolate_worker_plan(monkeypatch)
     monkeypatch.setattr(at._multi_tls, "pin", ("cpu", "int8"), raising=False)
     monkeypatch.setattr("os.cpu_count", lambda: 20)
     monkeypatch.setattr(at, "_free_system_ram_bytes", lambda: 64 * GIB)
