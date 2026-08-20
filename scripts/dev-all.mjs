@@ -202,10 +202,13 @@ export function startHealthMonitor({
   healthIntervalMs = 15000,
   maxStrikes = 3,
   healthTimeoutMs = 2500,
+  graceMs = 0,
   onUnhealthy,
 }) {
   let strikes = 0;
+  const startedAt = Date.now();
   const timer = setInterval(async () => {
+    if (Date.now() - startedAt < graceMs) return;
     const ok = await apiHealthy(port, healthTimeoutMs);
     if (ok) {
       strikes = 0;
@@ -734,11 +737,10 @@ async function reloadApi(changedFile) {
     setTimeout(() => void reloadApi(p), 100);
   }
 }
-
-/** Anti-hang watchdog wrapper: paused while a hot reload is in flight so the
- * reload's natural down-time never trips the hung-process detection. */
 function startApiHealthMonitor() {
+  const graceMs = Number(process.env.VODRIP_DEVALL_HEALTH_GRACE_MS || "300000");
   healthMonitorStop = startHealthMonitor({
+    graceMs,
     onUnhealthy: () => {
       if (shuttingDown || reloading || !apiProcess || apiProcess.exitCode !== null) return;
       console.error(
@@ -754,6 +756,11 @@ function startApiHealthMonitor() {
       }
     },
   });
+  if (graceMs > 0) {
+    console.log(
+      `[dev] health monitor armed in ${Math.round(graceMs / 1000)}s (startup warm grace)`,
+    );
+  }
 }
 
 async function main() {
