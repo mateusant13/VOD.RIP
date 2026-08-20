@@ -1069,6 +1069,7 @@ export default function ChannelExplorePopup({
   }, []);
 
   const onPanelResize = useCallback((e: ReactPointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
+    if (frameSnapRect) return;
     startExplorePanelWidthResize(e, edge, panelWidthRef, setPanelWidth, {
       panelEl: containerRef.current,
       aspect: videoAspectRef.current,
@@ -1081,10 +1082,10 @@ export default function ChannelExplorePopup({
       clampWidth: (w) =>
         Math.max(EXPLORE_PANEL_MIN_W, clampExplorePanelWidth(w + chatTotal, chromeHRef.current, videoAspectRef.current) - chatTotal),
     });
-  }, [chatTotal]);
+  }, [chatTotal, frameSnapRect]);
 
   const onPopupDrag = useCallback((e: ReactPointerEvent<HTMLElement>) => {
-    if (fullscreen) return;
+    if (fullscreen || frameSnapRect) return;
     const t = e.target as HTMLElement;
     if (t.tagName === 'VIDEO') return;
     if (t.closest('button, input, select, textarea, a, [role="slider"], [data-player-menu], [data-preview-chat-panel]')) return;
@@ -1233,7 +1234,7 @@ export default function ChannelExplorePopup({
   }, [fullscreen, containerW, videoAspect, stackIndex, frameSnapRect, chatTotal]);
 
   useEffect(() => {
-    if (fullscreen) return;
+    if (fullscreen || frameSnapRect) return;
     const fit = () => {
       // Clamp the total (video + chat) to the viewport budget; the video
       // keeps the remainder (60px floor while the chat is open).
@@ -1252,7 +1253,7 @@ export default function ChannelExplorePopup({
     };
     window.addEventListener('resize', fit);
     return () => window.removeEventListener('resize', fit);
-  }, [fullscreen, stackIndex]);
+  }, [fullscreen, stackIndex, frameSnapRect]);
 
   useEffect(() => {
     if (fullscreen || !containerRef.current || !videoWrapRef.current) return;
@@ -1793,6 +1794,7 @@ export default function ChannelExplorePopup({
           <div
             className="flex items-start justify-between gap-2 shrink-0"
             draggable={frameMode && !fullscreen}
+            onPointerDown={frameMode && !fullscreen ? (e) => e.stopPropagation() : undefined}
             onDragStart={frameMode && !fullscreen ? (e) => {
               e.dataTransfer.setData('text/plain', encodeFrameDragPopupId(id));
               e.dataTransfer.effectAllowed = 'move';
