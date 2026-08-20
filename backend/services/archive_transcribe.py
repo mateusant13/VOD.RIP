@@ -54,6 +54,7 @@ import json
 import logging
 import math
 import os
+import queue
 import re
 import shutil
 import subprocess as sp
@@ -3032,6 +3033,246 @@ def _append_manifest_entry(path: Path, ci: int, first: int, count: int) -> None:
         fh.write(json.dumps({"ci": ci, "first": first, "count": count}) + "\n")
 
 
+# --- intra-VOD hybrid chunk parallelism -----------------------------------
+# When the worker pool has both a GPU lane and CPU lane(s), a single
+# transcribe job fans missing VAD chunks out to pinned chunk-worker threads
+# instead of draining them sequentially on the claiming thread.  A live-
+# caption session forces the CPU-only path (no GPU chunk worker).  Manifest
+# writes, seg_idx allocation and transcript inserts share one lock per job.
+_intra_vod_tls = threading.local()
+
+
+def _in_intra_vod_hybrid() -> bool:
+    return bool(getattr(_intra_vod_tls, "active", False))
+
+
+def _hybrid_chunk_slots() -> list[tuple[str, str]]:
+    """Device pins for intra-VOD chunk workers (empty -> sequential path).
+
+    Requires multi-copy pool mode with at least two usable lanes.  While a
+    live-caption session is active the GPU lane is omitted — only CPU chunk
+    workers run so the captioner's VRAM reservation stays untouched."""
+    if not _in_multi_mode():
+        return []
+    plan = tuple(getattr(_multi_tls, "plan", None) or _worker_plan())
+    cpu_slots = [p for p in plan if p[0] == "cpu"]
+    if caption_session_active():
+        return cpu_slots if len(cpu_slots) >= 2 else []
+    cuda_slots = [p for p in plan if p[0] == "cuda"]
+    if cuda_slots and cpu_slots:
+        return [cuda_slots[0]] + cpu_slots
+    if len(cpu_slots) >= 2:
+        return cpu_slots
+    return []
+
+
+def _chunk_worker_init(plan: tuple[tuple[str, str], ...], pin: tuple[str, str]) -> None:
+    """Pin a dedicated intra-VOD chunk-worker thread (not a pool claim thread)."""
+    _multi_tls.plan = plan
+    _multi_tls.pin = pin
+    _multi_tls.asr_threads = _plan_thread_count(plan)
+    _multi_tls.chunk_worker = True
+
+
+class _ChunkTranscribeState:
+    """Per-job shared state for parallel chunk workers."""
+
+    __slots__ = (
+        "lock", "seg_idx", "existing", "segments", "words", "speech_done",
+        "detected_lang", "twin_won", "transcript_batch", "transcript_batch_lang",
+    )
+
+    def __init__(self, seg_idx: int, existing: set[int]) -> None:
+        self.lock = threading.Lock()
+        self.seg_idx = seg_idx
+        self.existing = existing
+        self.segments = 0
+        self.words = 0
+        self.speech_done = 0.0
+        self.detected_lang: Optional[str] = None
+        self.twin_won = False
+        self.transcript_batch: list[dict] = []
+        self.transcript_batch_lang: Optional[str] = None
+
+
+def _flush_transcript_batch_locked(
+    state: _ChunkTranscribeState,
+    platform: str,
+    video_id: str,
+) -> None:
+    if not state.transcript_batch:
+        return
+    archive_db.insert_transcript(
+        platform, video_id, state.transcript_batch, lang=state.transcript_batch_lang,
+    )
+    state.transcript_batch.clear()
+    state.transcript_batch_lang = None
+
+
+def _commit_chunk_rows(
+    state: _ChunkTranscribeState,
+    *,
+    platform: str,
+    video_id: str,
+    manifest: Path,
+    ci: int,
+    chunk_segs: list[dict],
+    language: Optional[str],
+    detected: Optional[str],
+    engine: str,
+    fix_on: bool,
+    fix_stats: dict,
+    chunk_span: float,
+) -> None:
+    """Thread-safe seg_idx allocation, transcript insert and manifest append."""
+    with state.lock:
+        if state.twin_won:
+            return
+        if detected and state.detected_lang is None:
+            state.detected_lang = detected
+        lang = language or state.detected_lang
+        if state.transcript_batch_lang is None:
+            state.transcript_batch_lang = lang
+        first_idx = state.seg_idx
+        batch_rows: list[dict] = []
+        for seg in chunk_segs:
+            if state.seg_idx in state.existing:
+                state.seg_idx += 1
+                continue
+            if fix_on:
+                transcript_fix.fix_segment(
+                    seg, engine=engine, language=lang, stats=fix_stats,
+                )
+            batch_rows.append({
+                "seg_idx": state.seg_idx,
+                "start_sec": seg["start_sec"],
+                "end_sec": seg["end_sec"],
+                "text": seg["text"],
+                "words": seg["words"],
+            })
+            state.words += len(seg["words"])
+            state.seg_idx += 1
+        if batch_rows:
+            if _twin_transcribed_while_running(platform, video_id):
+                archive_db.delete_transcripts(platform, video_id)
+                state.twin_won = True
+                state.transcript_batch.clear()
+                state.transcript_batch_lang = None
+                return
+            state.transcript_batch.extend(batch_rows)
+            if len(state.transcript_batch) >= 16:
+                _flush_transcript_batch_locked(state, platform, video_id)
+        if state.transcript_batch:
+            _flush_transcript_batch_locked(state, platform, video_id)
+        state.segments += len(batch_rows)
+        _append_manifest_entry(manifest, ci, first_idx, len(chunk_segs))
+        state.speech_done += chunk_span
+
+
+def _transcribe_chunks_hybrid(
+    *,
+    platform: str,
+    video_id: str,
+    chunks: list[tuple[float, float]],
+    missing: list[int],
+    audio: Any,
+    sharded_audio: Any,
+    language: Optional[str],
+    engine: str,
+    model: Any,
+    manifest: Path,
+    existing: set[int],
+    seg_idx: int,
+    progress_cb: Optional[Callable[[float, float, int, int], None]],
+    speech_sec: float,
+    n_chunks: int,
+    fix_on: bool,
+    fix_stats: dict,
+    slots: list[tuple[str, str]],
+) -> _ChunkTranscribeState:
+    """Fan missing chunks to GPU+CPU chunk-worker threads; return shared state."""
+    plan = tuple(getattr(_multi_tls, "plan", None) or _worker_plan())
+    state = _ChunkTranscribeState(seg_idx, existing)
+    work: queue.Queue[Optional[int]] = queue.Queue()
+    for ci in missing:
+        work.put(ci)
+    for _ in slots:
+        work.put(None)  # one sentinel per worker — clean shutdown
+
+    def _worker(pin: tuple[str, str]) -> None:
+        _chunk_worker_init(plan, pin)
+        local_model = _parakeet_model()
+        use_cuda = pin[0] == "cuda"
+        engine_batch = _parakeet_batch_size() if use_cuda else 1
+        engine_kwargs = {"batch_size": engine_batch}
+        while True:
+            ci = work.get()
+            if ci is None:
+                return
+            if state.twin_won:
+                continue
+            cs, ce = chunks[ci]
+            if use_cuda:
+                if not _gpu_gate_try_acquire(platform, video_id):
+                    work.put(ci)
+                    time.sleep(0.25)
+                    continue
+            try:
+                _gpu_thermal_guard()
+                run = [(ci, (cs, ce))]
+                if sharded_audio is not None:
+                    batch_audio, concat_clips, clip_offsets = _clips_to_audio(
+                        sharded_audio, run,
+                    )
+                    batch_out = _transcribe_batch_parakeet(
+                        local_model, batch_audio, concat_clips, language,
+                        clip_offsets=clip_offsets, **engine_kwargs,
+                    )
+                else:
+                    batch_out = _transcribe_batch_parakeet(
+                        local_model, audio, [c for _, c in run], language,
+                        **engine_kwargs,
+                    )
+                (chunk_segs, detected) = batch_out[0]
+                _commit_chunk_rows(
+                    state,
+                    platform=platform,
+                    video_id=video_id,
+                    manifest=manifest,
+                    ci=ci,
+                    chunk_segs=chunk_segs,
+                    language=language,
+                    detected=detected,
+                    engine=engine,
+                    fix_on=fix_on,
+                    fix_stats=fix_stats,
+                    chunk_span=ce - cs,
+                )
+                if progress_cb and not state.twin_won:
+                    with state.lock:
+                        done = state.speech_done
+                    progress_cb(done, speech_sec, ci + 1, n_chunks)
+            finally:
+                if use_cuda:
+                    _gpu_gate_release(platform, video_id)
+
+    _intra_vod_tls.active = True
+    try:
+        with ThreadPoolExecutor(
+            max_workers=len(slots),
+            thread_name_prefix="chunk-hybrid",
+        ) as pool:
+            futs = [pool.submit(_worker, pin) for pin in slots]
+            for fut in futs:
+                fut.result()
+    finally:
+        _intra_vod_tls.active = False
+    with state.lock:
+        _flush_transcript_batch_locked(state, platform, video_id)
+    return state
+
+
+
 def _resume_plan(
     chunks: list[tuple[float, float]],
     header: Optional[dict],
@@ -3638,110 +3879,138 @@ def _transcribe_audio_source(
     _transcript_batch: list[dict] = []
     _transcript_batch_lang: Optional[str] = None  # lang for the current batch
     _BATCH_INSERT_SIZE = 16
-    # Per-call decode batch: parakeet on GPU slots sizes decode_streams
-    # from free VRAM (one run == one batched call); CPU slots keep batch 1
-    # (the sequential decode_stream loop inside _transcribe_batch_parakeet,
-    # byte-identical to pre-batch runs).
-    engine_batch = _parakeet_batch_size()
-    engine_kwargs = {"batch_size": engine_batch}
-    while ci < n_chunks:
-        cs, ce = chunks[ci]
-        if ci not in missing_set:
-            speech_done += ce - cs
-            ci += 1
-            continue
-        # Thermal ceiling: never feed the next batch while the card is
-        # pinned above 90% util (driver/Windows stability, user requirement).
-        _gpu_thermal_guard()
-        # Batch consecutive missing clips into one GPU call; resume gaps only
-        # shrink the run, never break the per-clip insert/manifest contract.
-        run: list[tuple[int, tuple[float, float]]] = []
-        while ci < n_chunks and ci in missing_set and len(run) < engine_batch:
-            run.append((ci, chunks[ci]))
-            ci += 1
-        if sharded_audio is not None:
-            batch_audio, concat_clips, clip_offsets = _clips_to_audio(sharded_audio, run)
-            batch_out = _transcribe_batch_parakeet(
-                model, batch_audio, concat_clips, language, clip_offsets=clip_offsets,
-                **engine_kwargs,
-            )
-        else:
-            batch_out = _transcribe_batch_parakeet(
-                model, audio, [c for _, c in run], language, **engine_kwargs,
-            )
-        for (ci2, _), (chunk_segs, detected) in zip(run, batch_out):
-            # _transcribe_batch_parakeet echoes the requested language back
-            # (parakeet has no detection); first non-None wins.
-            if detected_lang is None and detected:
-                detected_lang = detected  # first batch's language wins
-            lang = language or detected_lang  # explicit wins; else echoed; else None
-            if _transcript_batch_lang is None:
-                _transcript_batch_lang = lang
-            first_idx = seg_idx
-            batch_rows = []
-            for seg in chunk_segs:
-                if seg_idx in existing:
+    hybrid_slots = _hybrid_chunk_slots()
+    if len(hybrid_slots) >= 2 and len(missing) >= 2:
+        hybrid_state = _transcribe_chunks_hybrid(
+            platform=platform,
+            video_id=video_id,
+            chunks=chunks,
+            missing=missing,
+            audio=audio,
+            sharded_audio=sharded_audio,
+            language=language,
+            engine=engine,
+            model=model,
+            manifest=manifest,
+            existing=existing,
+            seg_idx=seg_idx,
+            progress_cb=progress_cb,
+            speech_sec=speech_sec,
+            n_chunks=n_chunks,
+            fix_on=fix_on,
+            fix_stats=fix_stats,
+            slots=hybrid_slots,
+        )
+        segments = hybrid_state.segments
+        words = hybrid_state.words
+        speech_done = hybrid_state.speech_done
+        detected_lang = hybrid_state.detected_lang
+        twin_won = hybrid_state.twin_won
+    else:
+        # Per-call decode batch: parakeet on GPU slots sizes decode_streams
+        # from free VRAM (one run == one batched call); CPU slots keep batch 1
+        # (the sequential decode_stream loop inside _transcribe_batch_parakeet,
+        # byte-identical to pre-batch runs).
+        engine_batch = _parakeet_batch_size()
+        engine_kwargs = {"batch_size": engine_batch}
+        while ci < n_chunks:
+            cs, ce = chunks[ci]
+            if ci not in missing_set:
+                speech_done += ce - cs
+                ci += 1
+                continue
+            # Thermal ceiling: never feed the next batch while the card is
+            # pinned above 90% util (driver/Windows stability, user requirement).
+            _gpu_thermal_guard()
+            # Batch consecutive missing clips into one GPU call; resume gaps only
+            # shrink the run, never break the per-clip insert/manifest contract.
+            run: list[tuple[int, tuple[float, float]]] = []
+            while ci < n_chunks and ci in missing_set and len(run) < engine_batch:
+                run.append((ci, chunks[ci]))
+                ci += 1
+            if sharded_audio is not None:
+                batch_audio, concat_clips, clip_offsets = _clips_to_audio(sharded_audio, run)
+                batch_out = _transcribe_batch_parakeet(
+                    model, batch_audio, concat_clips, language, clip_offsets=clip_offsets,
+                    **engine_kwargs,
+                )
+            else:
+                batch_out = _transcribe_batch_parakeet(
+                    model, audio, [c for _, c in run], language, **engine_kwargs,
+                )
+            for (ci2, _), (chunk_segs, detected) in zip(run, batch_out):
+                # _transcribe_batch_parakeet echoes the requested language back
+                # (parakeet has no detection); first non-None wins.
+                if detected_lang is None and detected:
+                    detected_lang = detected  # first batch's language wins
+                lang = language or detected_lang  # explicit wins; else echoed; else None
+                if _transcript_batch_lang is None:
+                    _transcript_batch_lang = lang
+                first_idx = seg_idx
+                batch_rows = []
+                for seg in chunk_segs:
+                    if seg_idx in existing:
+                        seg_idx += 1
+                        continue
+                    if fix_on:
+                        transcript_fix.fix_segment(
+                            seg, engine=engine, language=lang, stats=fix_stats,
+                        )
+                    batch_rows.append({
+                        "seg_idx": seg_idx,
+                        "start_sec": seg["start_sec"],
+                        "end_sec": seg["end_sec"],
+                        "text": seg["text"],
+                        "words": seg["words"],
+                    })
+                    words += len(seg["words"])
                     seg_idx += 1
-                    continue
-                if fix_on:
-                    transcript_fix.fix_segment(
-                        seg, engine=engine, language=lang, stats=fix_stats,
-                    )
-                batch_rows.append({
-                    "seg_idx": seg_idx,
-                    "start_sec": seg["start_sec"],
-                    "end_sec": seg["end_sec"],
-                    "text": seg["text"],
-                    "words": seg["words"],
-                })
-                words += len(seg["words"])
-                seg_idx += 1
-            if batch_rows:
-                if _twin_transcribed_while_running(platform, video_id):
-                    # The higher-priority twin (youtube > twitch > kick)
-                    # finished mid-run — the guard evaluated at claim time
-                    # missed it. Drop the partial rows (the display
-                    # fallback then serves the twin's transcript instead of
-                    # these) and stop; the job still reports done+skipped.
-                    archive_db.delete_transcripts(platform, video_id)
-                    logger.info(
-                        "twin transcribed on a higher-priority platform while "
-                        "running — aborting %s/%s",
-                        platform, video_id,
-                    )
-                    twin_won = True
-                    break
-                _transcript_batch.extend(batch_rows)
-                if len(_transcript_batch) >= _BATCH_INSERT_SIZE:
+                if batch_rows:
+                    if _twin_transcribed_while_running(platform, video_id):
+                        # The higher-priority twin (youtube > twitch > kick)
+                        # finished mid-run — the guard evaluated at claim time
+                        # missed it. Drop the partial rows (the display
+                        # fallback then serves the twin's transcript instead of
+                        # these) and stop; the job still reports done+skipped.
+                        archive_db.delete_transcripts(platform, video_id)
+                        logger.info(
+                            "twin transcribed on a higher-priority platform while "
+                            "running — aborting %s/%s",
+                            platform, video_id,
+                        )
+                        twin_won = True
+                        break
+                    _transcript_batch.extend(batch_rows)
+                    if len(_transcript_batch) >= _BATCH_INSERT_SIZE:
+                        archive_db.insert_transcript(
+                            platform, video_id, _transcript_batch, lang=_transcript_batch_lang,
+                        )
+                        _transcript_batch.clear()
+                        _transcript_batch_lang = None
+                # Flush remaining batched rows BEFORE writing the manifest entry
+                # so a crash cannot mark a chunk done while its rows are still
+                # staged — crash-resume would then skip re-transcription and
+                # silently lose the data.
+                if _transcript_batch:
                     archive_db.insert_transcript(
                         platform, video_id, _transcript_batch, lang=_transcript_batch_lang,
                     )
                     _transcript_batch.clear()
                     _transcript_batch_lang = None
-            # Flush remaining batched rows BEFORE writing the manifest entry
-            # so a crash cannot mark a chunk done while its rows are still
-            # staged — crash-resume would then skip re-transcription and
-            # silently lose the data.
-            if _transcript_batch:
-                archive_db.insert_transcript(
-                    platform, video_id, _transcript_batch, lang=_transcript_batch_lang,
-                )
-                _transcript_batch.clear()
-                _transcript_batch_lang = None
-            segments += len(batch_rows)
-            _append_manifest_entry(manifest, ci2, first_idx, len(chunk_segs))
-            speech_done += chunks[ci2][1] - chunks[ci2][0]
-            if progress_cb:
-                progress_cb(speech_done, speech_sec, ci2 + 1, n_chunks)
-        if twin_won:
-            break
+                segments += len(batch_rows)
+                _append_manifest_entry(manifest, ci2, first_idx, len(chunk_segs))
+                speech_done += chunks[ci2][1] - chunks[ci2][0]
+                if progress_cb:
+                    progress_cb(speech_done, speech_sec, ci2 + 1, n_chunks)
+            if twin_won:
+                break
 
-    # Flush remaining batched transcript rows.
-    if _transcript_batch:
-        archive_db.insert_transcript(
-            platform, video_id, _transcript_batch, lang=_transcript_batch_lang,
-        )
-        _transcript_batch.clear()
+        # Flush remaining batched transcript rows.
+        if _transcript_batch:
+            archive_db.insert_transcript(
+                platform, video_id, _transcript_batch, lang=_transcript_batch_lang,
+            )
+            _transcript_batch.clear()
 
     # Disk hygiene: the job finished — the crash-resume manifest has served
     # its purpose. Best-effort: a failed unlink just leaves it for the next
@@ -4327,7 +4596,17 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
         # stay ordered priority DESC. CPU-pinned threads and non-transcribe
         # kinds never touch the gate — CPU lanes keep draining in parallel.
         _pin = _thread_pin()
-        if job.get("kind") == "transcribe" and _pin is not None and _pin[0] == "cuda":
+        _defer_gpu_gate = (
+            multi
+            and job.get("kind") == "transcribe"
+            and len(_hybrid_chunk_slots()) >= 2
+        )
+        if (
+            job.get("kind") == "transcribe"
+            and _pin is not None
+            and _pin[0] == "cuda"
+            and not _defer_gpu_gate
+        ):
             if not _gpu_gate_try_acquire(platform, video_id):
                 archive_db.execute(
                     "UPDATE archive_jobs SET status='queued', error=?, progress=0, "
