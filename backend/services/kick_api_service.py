@@ -403,7 +403,7 @@ def get_channel_api(url: str) -> KickChannel:
         username=user.get("username") or slug,
         channel_id=data.get("id"),
         followers=data.get("followers_count") or data.get("followersCount"),
-        is_live=bool(ls),
+        is_live=bool(ls and (ls.get("id") or ls.get("channel_id"))),
         live_title=(ls.get("session_title") if ls else None),
         viewers=(ls.get("viewer_count") if ls else None),
         playback_url=data.get("playback_url"),

@@ -378,32 +378,36 @@ def twitch_live_info(login: str) -> Optional[dict]:
     if status is not None and not status.get("live"):
         return None
 
-    try:
-        probed = probe_twitch_live_master(login, quick=True)
-    except Exception as exc:
-        logger.debug("twitch_live_info(%r): quick probe failed: %s", login, exc)
-        probed = None
+    # Fast path only when GQL explicitly confirmed live. When status is None
+    # (transient GQL failure) fall through to yt-dlp which verifies is_live —
+    # a bare usher URL is never proof the channel is broadcasting.
+    if status is not None and status.get("live"):
+        try:
+            probed = probe_twitch_live_master(login, quick=True)
+        except Exception as exc:
+            logger.debug("twitch_live_info(%r): quick probe failed: %s", login, exc)
+            probed = None
 
-    if probed and probed.get("url"):
-        info = {
-            "url": probed["url"],
-            "headers": dict(probed.get("headers") or {}),
-            "title": (status or {}).get("title") or login,
-            "viewers": (status or {}).get("viewers") or 0,
-            "platform": "Twitch",
-            "started_at": (status or {}).get("started_at"),
-            "player_type": probed.get("player_type"),
-            "ad_free": bool(probed.get("ad_free")),
-        }
-        with _TWITCH_MASTER_LOCK:
-            cached = _TWITCH_MASTER_CACHE.get(login)
-        if not cached or time.time() - cached[0] >= _TWITCH_MASTER_TTL_SEC:
-            threading.Thread(
-                target=lambda ch=login: probe_twitch_live_master(ch, skip_cache=True),
-                daemon=True,
-                name=f"twitch-probe-warm-{login}",
-            ).start()
-        return info
+        if probed and probed.get("url"):
+            info = {
+                "url": probed["url"],
+                "headers": dict(probed.get("headers") or {}),
+                "title": status.get("title") or login,
+                "viewers": status.get("viewers") or 0,
+                "platform": "Twitch",
+                "started_at": status.get("started_at"),
+                "player_type": probed.get("player_type"),
+                "ad_free": bool(probed.get("ad_free")),
+            }
+            with _TWITCH_MASTER_LOCK:
+                cached = _TWITCH_MASTER_CACHE.get(login)
+            if not cached or time.time() - cached[0] >= _TWITCH_MASTER_TTL_SEC:
+                threading.Thread(
+                    target=lambda ch=login: probe_twitch_live_master(ch, skip_cache=True),
+                    daemon=True,
+                    name=f"twitch-probe-warm-{login}",
+                ).start()
+            return info
 
     info = _twitch_live_info_ytdlp_fallback(login)
     if not info:
@@ -428,6 +432,13 @@ def twitch_live_info(login: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 # YouTube
 # ---------------------------------------------------------------------------
+
+def _youtube_info_is_live(info: dict) -> bool:
+    """True only for an actively broadcasting YouTube stream."""
+    if info.get("is_live") is True:
+        return True
+    live_status = info.get("live_status")
+    return live_status in ("live", "is_live")
 
 
 def youtube_live_info(handle: str) -> Optional[dict]:
@@ -481,7 +492,7 @@ def youtube_live_info(handle: str) -> Optional[dict]:
     except Exception as exc:
         logger.debug("youtube_live_info(%r) innertube failed: %s", handle, exc)
         info = None
-    if info:
+    if info and _youtube_info_is_live(info):
         candidates = [
             f for f in (info.get("formats") or [])
             if f.get("protocol") in ("m3u8", "m3u8_native")

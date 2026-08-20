@@ -799,6 +799,15 @@ def _info_from_player_data(
     if created_at and len(created_at) >= 10 and created_at[4] == "-":
         upload_date = created_at[:10].replace("-", "")
 
+    micro = (data.get("microformat") or {}).get("playerMicroformatRenderer") or {}
+    lbd = micro.get("liveBroadcastDetails") or {}
+    is_live = bool(
+        details.get("isLive")
+        or details.get("isLiveContent")
+        or lbd.get("isLiveNow") is True
+    )
+    live_status = "is_live" if is_live else None
+
     return {
         "id": video_id,
         "title": details.get("title"),
@@ -813,6 +822,8 @@ def _info_from_player_data(
         "extractor": "youtube",
         "formats": formats,
         "http_headers": dict(_STREAM_HEADERS),
+        "is_live": is_live,
+        "live_status": live_status,
         # WS-3 platform clue: audio language from the caption track list.
         "language": _language_from_player_data(data),
     }

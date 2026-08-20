@@ -269,6 +269,8 @@ def test_youtube_live_info_returns_video_id(monkeypatch) -> None:
         lambda url, timeout=None: {
             "title": "Test Live",
             "viewer_count": 42,
+            "is_live": True,
+            "live_status": "is_live",
             "http_headers": {"User-Agent": "x"},
             "formats": [{"protocol": "m3u8", "height": 720,
                           "url": "https://cdn.example.com/live.m3u8"}],
@@ -336,6 +338,79 @@ def test_twitch_live_info_uses_gql_quick_path(monkeypatch) -> None:
     assert out["title"] == "Live Title"
     assert out["viewers"] == 1234
     assert "usher.ttvnw.net" in out["url"]
+
+
+def test_twitch_live_info_offline_gql_blocks_quick_probe(monkeypatch) -> None:
+    """Offline channels must not report live via the usher quick probe."""
+    from services.live_capture import twitch_live_info
+
+    monkeypatch.setattr(
+        "services.twitch_gql_service.get_channel_stream_status_sync",
+        lambda login: {"live": False, "started_at": None},
+    )
+
+    def fail_probe(*a, **k):
+        raise AssertionError("quick probe must not run when GQL says offline")
+
+    monkeypatch.setattr("services.live_capture.probe_twitch_live_master", fail_probe)
+    assert twitch_live_info("offlinechan") is None
+
+
+def test_twitch_live_info_gql_failure_falls_back_to_ytdlp(monkeypatch) -> None:
+    """Transient GQL failure must not treat usher URL as live proof."""
+    from services.live_capture import twitch_live_info
+
+    monkeypatch.setattr(
+        "services.twitch_gql_service.get_channel_stream_status_sync",
+        lambda login: None,
+    )
+    monkeypatch.setattr(
+        "services.live_capture.probe_twitch_live_master",
+        lambda login, quick=False, **kw: {
+            "url": f"https://usher.ttvnw.net/hls/{login}?pt=embed",
+            "headers": {},
+            "player_type": "embed",
+            "ad_free": False,
+        },
+    )
+    monkeypatch.setattr(
+        "services.live_capture._twitch_live_info_ytdlp_fallback",
+        lambda login: None,
+    )
+    assert twitch_live_info("maybeoffline") is None
+
+
+def test_youtube_live_info_innertube_vod_not_live(monkeypatch) -> None:
+    """Innertube VOD metadata on the /live page must not paint the LIVE badge."""
+    from services.live_capture import youtube_live_info
+
+    class FakeResp:
+        content = b'"videoId": "AbCdEfGhIjK"'
+
+    monkeypatch.setattr("services.live_capture.requests.get", lambda *a, **k: FakeResp())
+    monkeypatch.setattr(
+        "services.youtube_innertube.innertube_extract_info",
+        lambda url, timeout=None: {
+            "title": "Old Broadcast",
+            "is_live": False,
+            "live_status": None,
+            "formats": [{"protocol": "m3u8", "height": 720, "url": "https://cdn.example.com/vod.m3u8"}],
+        },
+    )
+
+    class _FakeYDL:
+        def __init__(self, opts):
+            self.opts = opts
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def extract_info(self, url, download=False):
+            return {"is_live": False}
+
+    monkeypatch.setattr("yt_dlp.YoutubeDL", _FakeYDL)
+    out = youtube_live_info("@offlinechannel")
+    assert out == {"reason": "Stream is not live"}
 
 
 if __name__ == "__main__":
