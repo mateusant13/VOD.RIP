@@ -27,3 +27,8 @@
 }
 
 /* Dotted cell hover is inline in FrameOverlay for zero extra specificity */
+
+/* During frame DnD, popups must not steal dragover from grid cells */
+body[data-frame-dragging='1'] .explore-frame-popup {
+  pointer-events: none;
+}

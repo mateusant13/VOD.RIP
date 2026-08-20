@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
+import { FRAME_FRAME_GRID_CELLS } from '../frameLayout';
+import { EXPLORE_POPUP_Z } from '../layoutUtils';
 
 /**
  * FrameOverlay — CSS grid of snap targets (dotted outlines, tmux-like).
@@ -9,8 +11,6 @@ import { useCallback, useEffect, useState } from 'react';
  *   so the underlying channel list / popups remain fully clickable in frame mode.
  * ponytail: drag uses HTML5 DnD ghost; upgrade to pointer-capture + absolute positioning for smoother cross-panel moves
  */
-
-const GRID_CELLS = 6;
 
 export function FrameOverlay({
   active,
@@ -27,11 +27,18 @@ export function FrameOverlay({
   // Track global HTML5 drag lifecycle — grid only becomes interactive while a drag is active.
   useEffect(() => {
     if (!active) return;
-    const onStart = () => setDragging(true);
-    const onEnd = () => setDragging(false);
+    const onStart = () => {
+      setDragging(true);
+      document.body.dataset.frameDragging = '1';
+    };
+    const onEnd = () => {
+      setDragging(false);
+      delete document.body.dataset.frameDragging;
+    };
     document.addEventListener('dragstart', onStart, true);
     document.addEventListener('dragend', onEnd, true);
     return () => {
+      onEnd();
       document.removeEventListener('dragstart', onStart, true);
       document.removeEventListener('dragend', onEnd, true);
     };
@@ -68,10 +75,10 @@ export function FrameOverlay({
         padding: 8,
         // ponytail: upgrade to IntersectionObserver-driven visibility for smoother UX
         pointerEvents: dragging ? 'auto' : 'none',
-        zIndex: 1,
+        zIndex: dragging ? EXPLORE_POPUP_Z + 20 : 1,
       }}
     >
-      {Array.from({ length: GRID_CELLS }, (_, i) => (
+      {Array.from({ length: FRAME_GRID_CELLS }, (_, i) => (
         <div
           key={i}
           data-frame-cell={i}

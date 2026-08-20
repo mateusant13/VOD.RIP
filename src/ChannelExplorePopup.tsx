@@ -73,6 +73,8 @@ import {
   type PanelPos,
   type ResizeEdge,
 } from './explorePopupUtils';
+import type { FrameRect } from './frameLayout';
+import { encodeFrameDragPopupId } from './frameLayout';
 import { formatHmsFull } from './utils';
 import { createFullscreenGate, FULLSCREEN_SETTLE_FALLBACK_MS, type FullscreenGate } from './utils/fullscreenGate';
 import type { PreviewSessionResponse, AiAskResponse } from './types';
@@ -136,6 +138,9 @@ interface ChannelExplorePopupProps {
   onBringToFront: () => void;
   /** Open an archive hit in the explore-player flow (App owns the popup stack). */
   onOpenHit: (hit: ArchiveSearchHit, video: ArchiveVideoRow | undefined) => void;
+  /** When set, popup is snapped into a frame grid cell (frame mode). */
+  frameSnapRect?: FrameRect | null;
+  frameMode?: boolean;
 }
 
 
@@ -163,6 +168,8 @@ export default function ChannelExplorePopup({
   onUnregisterPause,
   onBringToFront,
   onOpenHit,
+  frameSnapRect = null,
+  frameMode = false,
 }: ChannelExplorePopupProps) {
   const { t } = useI18n();
   const [playback, setPlayback] = useState<{
@@ -1088,7 +1095,7 @@ export default function ChannelExplorePopup({
       setPos(posRef.current);
     }
     startFloatingPanelDrag(e, posRef, setPos, el);
-  }, [fullscreen, stackIndex]);
+  }, [fullscreen, stackIndex, frameSnapRect]);
 
   const fsGateRef = useRef<FullscreenGate | null>(null);
   if (fsGateRef.current === null) {
@@ -1190,9 +1197,40 @@ export default function ChannelExplorePopup({
       applyExplorePopupFullscreenPosition(el);
       return;
     }
+    if (frameSnapRect) {
+      const innerPad = 6;
+      const maxInnerW = Math.max(0, frameSnapRect.w - innerPad * 2);
+      const maxInnerH = Math.max(0, frameSnapRect.h - innerPad * 2);
+      const chatW = chatTotal;
+      let videoW = Math.max(
+        EXPLORE_PANEL_MIN_W,
+        Math.min(maxInnerW - chatW, maxInnerW * 0.92 - chatW),
+      );
+      let videoH = videoW / videoAspectRef.current;
+      const chrome = chromeHRef.current;
+      let totalH = chrome + videoH;
+      if (totalH > maxInnerH) {
+        videoH = Math.max(72, maxInnerH - chrome);
+        videoW = Math.min(maxInnerW - chatW, videoH * videoAspectRef.current);
+        totalH = chrome + videoW / videoAspectRef.current;
+      }
+      panelWidthRef.current = videoW;
+      setPanelWidth(videoW);
+      const totalW = videoW + chatW;
+      const px = frameSnapRect.x + innerPad + Math.max(0, (maxInnerW - totalW) / 2);
+      const py = frameSnapRect.y + innerPad + Math.max(0, (maxInnerH - totalH) / 2);
+      const snapped: PanelPos = { x: px, y: py };
+      posRef.current = snapped;
+      setPos(snapped);
+      applyExplorePopupWindowPosition(el, snapped);
+      el.style.width = `${totalW}px`;
+      el.style.maxWidth = `${maxInnerW}px`;
+      el.style.maxHeight = `${maxInnerH}px`;
+      return;
+    }
     const p = layoutExplorePopupWindow(el, containerW, posRef, stackIndex);
     setPos((prev) => (prev?.x === p.x && prev?.y === p.y ? prev : p));
-  }, [fullscreen, containerW, videoAspect, stackIndex]);
+  }, [fullscreen, containerW, videoAspect, stackIndex, frameSnapRect, chatTotal]);
 
   useEffect(() => {
     if (fullscreen) return;
@@ -1717,7 +1755,7 @@ export default function ChannelExplorePopup({
       onKeyDown={handleKeyDown}
       onPointerDownCapture={onBringToFront}
       onClick={focusPlayer}
-      className={`group outline-none focus:ring-2 focus:ring-white/25 flex flex-col overflow-visible bg-zinc-950 ${
+      className={`explore-frame-popup group outline-none focus:ring-2 focus:ring-white/25 flex flex-col overflow-visible bg-zinc-950 ${
         fullscreen
           ? 'explore-fs-host min-h-0 p-0 gap-0 border-0 shadow-none'
           : `p-3 gap-2 border-2 border-white ${platformCardShadow(platform)}`
@@ -1752,7 +1790,14 @@ export default function ChannelExplorePopup({
         onPointerDown={fullscreen ? undefined : onPopupDrag}
       >
         {!fullscreen && (
-          <div className="flex items-start justify-between gap-2 shrink-0">
+          <div
+            className="flex items-start justify-between gap-2 shrink-0"
+            draggable={frameMode && !fullscreen}
+            onDragStart={frameMode && !fullscreen ? (e) => {
+              e.dataTransfer.setData('text/plain', encodeFrameDragPopupId(id));
+              e.dataTransfer.effectAllowed = 'move';
+            } : undefined}
+          >
             <div className="min-w-0 flex items-start gap-1.5">
               <span
                 className="shrink-0 w-5 text-center text-[11px] font-mono font-bold tabular-nums leading-tight pt-0.5"

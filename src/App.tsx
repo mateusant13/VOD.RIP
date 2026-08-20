@@ -128,6 +128,10 @@ import FrameToggle from './components/FrameToggle';
 import FrameOverlay from './components/FrameOverlay';
 import PanelResizer from './components/PanelResizer';
 import './styles/frame.css';
+import {
+  decodeFrameDragPayload,
+  getFrameCellRect,
+} from './frameLayout';
 // ─── TYPES (migrated to src/types.ts) ───────────────
 
 interface ChannelLiveStatus {
@@ -768,17 +772,26 @@ export default function App() {
   });
   useEffect(() => { try { localStorage.setItem('vodrip.ui.frameMode', frameMode ? '1' : '0'); } catch {} }, [frameMode]);
   // Frame cell contents: which card is in each grid cell (null = empty)
-  const [_frameCellContents, setFrameCellContents] = useState<(string | null)[]>(Array(6).fill(null));
-  const handleDropCell = useCallback((index: number, cardId: string) => {
+  const [frameCellContents, setFrameCellContents] = useState<(string | null)[]>(Array(6).fill(null));
+  const pendingFrameDropRef = useRef<{ index: number; url: string } | null>(null);
+  const [frameLayoutTick, setFrameLayoutTick] = useState(0);
+  useEffect(() => {
+    if (!frameMode) return;
+    const onResize = () => setFrameLayoutTick((t) => t + 1);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, [frameMode]);
+
+  const assignPopupToFrameCell = useCallback((index: number, popupId: string) => {
     setFrameCellContents((prev) => {
       const next = [...prev];
-      // Remove card from any previous cell it occupied
-      const prevIdx = next.indexOf(cardId);
+      const prevIdx = next.indexOf(popupId);
       if (prevIdx !== -1) next[prevIdx] = null;
-      next[index] = cardId;
+      next[index] = popupId;
       return next;
     });
   }, []);
+
   const [previewPanelWidth, setPreviewPanelWidth] = useState(initialPanelLayout.previewPanelWidth);
   const [previewVideoAspect, setPreviewVideoAspect] = useState(PREVIEW_VIDEO_ASPECT_DEFAULT);
   const [urlAsidePanelSize, setUrlAsidePanelSize] = useState(initialPanelLayout.urlAside);
@@ -3425,6 +3438,7 @@ export default function App() {
   const closeExplorePopup = useCallback((id: string) => {
     explorePauseMapRef.current.delete(id);
     dropPopupZ(id);
+    setFrameCellContents((prev) => prev.map((cell) => (cell === id ? null : cell)));
     setExplorePopups((prev) => prev.filter((p) => p.id !== id));
   }, [dropPopupZ]);
 
@@ -3482,6 +3496,37 @@ export default function App() {
       return next;
     });
   }, [pauseAllExplorePopups, bringPopupToFront, channelContentFilter]);
+
+  const handleDropCell = useCallback((index: number, raw: string) => {
+    const parsed = decodeFrameDragPayload(raw);
+    let popupId: string | null = null;
+    if (parsed.kind === 'popup') {
+      popupId = parsed.id;
+    } else {
+      const existing = explorePopups.find((ep) => ep.vod.url === parsed.url);
+      if (existing) {
+        popupId = existing.id;
+      } else {
+        const video = visibleChannelVideos.find((v) => buildVodUrl(v) === parsed.url);
+        if (video) {
+          pendingFrameDropRef.current = { index, url: parsed.url };
+          openExplorePlayer(video);
+          return;
+        }
+      }
+    }
+    if (!popupId || !explorePopups.some((ep) => ep.id === popupId)) return;
+    assignPopupToFrameCell(index, popupId);
+  }, [explorePopups, visibleChannelVideos, openExplorePlayer, assignPopupToFrameCell]);
+
+  useEffect(() => {
+    const pending = pendingFrameDropRef.current;
+    if (!pending) return;
+    const popup = explorePopups.find((ep) => ep.vod.url === pending.url);
+    if (!popup) return;
+    pendingFrameDropRef.current = null;
+    assignPopupToFrameCell(pending.index, popup.id);
+  }, [explorePopups, assignPopupToFrameCell]);
 
   /**
    * Archive search → open the hit in the explore-player flow at its offset.
@@ -7824,6 +7869,13 @@ export default function App() {
               vod={entry.vod}
               zIndex={EXPLORE_POPUP_Z + (popupZOrder[entry.id] ?? 0)}
               stackIndex={entry.layoutIndex}
+              frameMode={frameMode}
+              frameSnapRect={(() => {
+                void frameLayoutTick;
+                if (!frameMode) return null;
+                const cellIdx = frameCellContents.indexOf(entry.id);
+                return cellIdx >= 0 ? getFrameCellRect(cellIdx) : null;
+              })()}
               onClose={() => closeExplorePopup(entry.id)}
               onHandoffToMain={(vod: ExplorePopupVod, timeSec: number, trim?: { start: number; end: number } | null, chat?: ChatMarkers | null) => carryExploreToUrl(vod, timeSec, trim, chat)}
               onRegisterPause={registerExplorePause}
