@@ -474,7 +474,7 @@ def _maybe_translate(
         if not ct.enabled() or ct.nllb_dir() is None:
             return text, False
         evidence = captioner._evidence_family
-        # Lock session family from evidence (immediate) or SLID votes (majority).
+        # Lock session family from evidence (immediate) or SLID/ASR votes (majority).
         if captioner._session_family is None:
             if evidence is not None:
                 locked = ct.lock_source_family(evidence, captioner._lang_votes, asr_lang=lang)
@@ -484,6 +484,19 @@ def _maybe_translate(
                 fam = ct.detect_language(audio)
                 if fam:
                     captioner._lang_votes.append(fam)
+                locked = ct.lock_source_family(
+                    evidence, captioner._lang_votes, asr_lang=lang,
+                )
+                if locked:
+                    captioner._session_family = locked
+            elif lang:
+                # SLID absent but NLLB present — parakeet asr_lang is the only
+                # gate signal; accumulate it so lock_source_family can reach
+                # SLID_VOTE_MIN (without this branch translation never started).
+                from services.caption_translate import _TARGET_TOKEN
+
+                if lang in _TARGET_TOKEN:
+                    captioner._lang_votes.append(lang)
                 locked = ct.lock_source_family(
                     evidence, captioner._lang_votes, asr_lang=lang,
                 )

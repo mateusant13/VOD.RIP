@@ -389,6 +389,20 @@ def test_maybe_translate_slid_vote_flips_gate(monkeypatch):
     assert live_captions._maybe_translate(c, "hi", b"a") == ("PT(hi)", True)
 
 
+
+
+def test_maybe_translate_asr_only_without_slid(monkeypatch):
+    """NLLB without SLID: parakeet asr_lang votes must still lock + translate."""
+    monkeypatch.setattr(ct, "enabled", lambda: True)
+    monkeypatch.setattr(ct, "nllb_dir", lambda: object())
+    monkeypatch.setattr(ct, "slid_dir", lambda: None)
+    monkeypatch.setattr(ct, "app_language_family", lambda: "pt")
+    monkeypatch.setattr(ct, "translate", lambda text, fam, source_family=None: f"PT({text})")
+
+    c = _captioner()
+    assert live_captions._maybe_translate(c, "hi", b"a", lang="en") == ("hi", False)
+    assert live_captions._maybe_translate(c, "hi", b"a", lang="en") == ("PT(hi)", True)
+
 # --- NLLB hypothesis decode --------------------------------------------------
 
 
