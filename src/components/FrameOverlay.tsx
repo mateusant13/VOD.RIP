@@ -25,28 +25,38 @@ export function FrameOverlay({
   const [dragging, setDragging] = useState(false);
 
   // Track global HTML5 drag lifecycle — grid only becomes interactive while a drag is active.
+  const endDrag = useCallback(() => {
+    setDragging(false);
+    setHoverCell(null);
+    delete document.body.dataset.frameDragging;
+  }, []);
+
   useEffect(() => {
-    if (!active) return;
+    if (!active) {
+      endDrag();
+      return;
+    }
+    // Recover from a prior crash/tab kill that left the body flag set.
+    delete document.body.dataset.frameDragging;
     const onStart = () => {
       setDragging(true);
       document.body.dataset.frameDragging = '1';
     };
-    const onEnd = () => {
-      setDragging(false);
-      delete document.body.dataset.frameDragging;
-    };
+    const onEnd = () => endDrag();
     document.addEventListener('dragstart', onStart, true);
     document.addEventListener('dragend', onEnd, true);
+    document.addEventListener('drop', onEnd, true);
     return () => {
-      onEnd();
+      endDrag();
       document.removeEventListener('dragstart', onStart, true);
       document.removeEventListener('dragend', onEnd, true);
+      document.removeEventListener('drop', onEnd, true);
     };
-  }, [active]);
+  }, [active, endDrag]);
 
   const onDragOver = useCallback((e: React.DragEvent, idx: number) => {
     e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
     setHoverCell(idx);
   }, []);
 
@@ -56,10 +66,9 @@ export function FrameOverlay({
     e.preventDefault();
     e.stopPropagation();
     const data = e.dataTransfer.getData('text/plain') || String(idx);
-    setHoverCell(null);
-    setDragging(false);
+    endDrag();
     onDropCell?.(idx, data);
-  }, [onDropCell]);
+  }, [onDropCell, endDrag]);
 
   if (!active) return null;
 
@@ -75,6 +84,7 @@ export function FrameOverlay({
         padding: 8,
         // ponytail: upgrade to IntersectionObserver-driven visibility for smoother UX
         pointerEvents: dragging ? 'auto' : 'none',
+        opacity: dragging ? 1 : 0,
         zIndex: dragging ? EXPLORE_POPUP_Z + 20 : 1,
       }}
     >
