@@ -9,4 +9,12 @@ describe('frameLayout', () => {
     expect(b.x).toBeGreaterThan(a.x);
     expect(a.w).toBeGreaterThan(100);
   });
+
+  it('uses a 2-column grid at the 1100px breakpoint', () => {
+    const a = getFrameCellRect(0, 1100, 800);
+    const b = getFrameCellRect(1, 1100, 800);
+    const c = getFrameCellRect(2, 1100, 800);
+    expect(b.x).toBeGreaterThan(a.x);
+    expect(c.y).toBeGreaterThan(a.y);
+  });
 });

@@ -247,6 +247,15 @@ def test_live_session_archive_fields() -> None:
         )
         assert sess.is_live is True
         assert sess.playlist_ttl_sec == 0.5
+        # create_live_session returns immediately with the master URL; bg prewarm
+        # resolves the media variant off the POST critical path.
+        assert sess.entry_url == "http://cdn.example.com/master.m3u8"
+        deadline = time.monotonic() + 2.0
+        while (
+            sess.entry_url == "http://cdn.example.com/master.m3u8"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
         assert sess.entry_url == "http://cdn.example.com/media.m3u8"
         # archive resolve is lazy (off the playback critical path)
         assert sess.archive_url is None and sess.archive_entry_url is None
