@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { FRAME_FRAME_GRID_CELLS } from '../frameLayout';
+import { FRAME_GRID_CELLS } from '../frameLayout';
 import { EXPLORE_POPUP_Z } from '../layoutUtils';
 
 /**
