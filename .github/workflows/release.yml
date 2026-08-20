@@ -56,3 +56,25 @@ jobs:
         run: |
           npx playwright install chromium --with-deps
           npm run test:e2e 2>&1 || echo "::warning::Playwright e2e had failures (non-blocking)"
+
+  e2e-frame-live:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      CI: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Install dependencies
+        run: |
+          pip install -r backend/requirements.txt
+          npm ci
+      - name: Playwright frame-mode + live-badge e2e
+        run: |
+          npx playwright install chromium --with-deps
+          npm run test:e2e:frame-live
