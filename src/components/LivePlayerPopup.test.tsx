@@ -613,6 +613,21 @@ describe('LivePlayerPopup YouTube live chat', () => {
     expect(es).toBeTruthy();
     expect(decodeURIComponent(es.url)).toContain('platform=youtube&slug=@titiltei');
   });
+
+  it('opens caption SSE for YouTube live streams (same ASR path as Twitch/Kick)', async () => {
+    mockFetch();
+    vi.stubGlobal('EventSource', FakeEventSource);
+    FakeEventSource.instances = [];
+    renderYoutubePopup(
+      'https://rr2---sn-ab5l6n7k.googlevideo.com/videoplayback/expire/1785600000000/master.m3u8',
+    );
+    await screen.findByTitle('Fullscreen');
+    await screen.findByTitle('Hide captions');
+    const captionEs = FakeEventSource.instances.filter((es) => es.url.includes('/api/live/captions'));
+    await waitFor(() => expect(captionEs).toHaveLength(1));
+    expect(decodeURIComponent(captionEs[0].url)).toContain('platform=youtube');
+    expect(decodeURIComponent(captionEs[0].url)).toContain('channel=titiltei');
+  });
 });
 
 describe('LivePlayerPopup multi chat', () => {

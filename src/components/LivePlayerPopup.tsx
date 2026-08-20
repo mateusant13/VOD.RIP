@@ -504,8 +504,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   // user's intent: the transcript IS the feature), toggle hides them.
   const captionSource = useMemo(() => {
     const plat = (activeEntry.platform || '').toLowerCase();
-    if (plat !== 'twitch' && plat !== 'kick') return null;
-    const saved = plat === 'kick' ? channel?.kickSlug : channel?.twitchSlug;
+    if (plat !== 'twitch' && plat !== 'kick' && plat !== 'youtube') return null;
+    const saved = plat === 'kick' ? channel?.kickSlug
+      : plat === 'twitch' ? channel?.twitchSlug
+      : channel?.youtubeSlug;
     const slug = liveChatSlugFromUrl(activeEntry.url, plat) ?? saved ?? channelSlug;
     return slug ? { platform: plat, channel: slug } : null;
   }, [activeEntry.url, activeEntry.platform, channel, channelSlug]);
