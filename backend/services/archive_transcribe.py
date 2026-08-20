@@ -3046,15 +3046,15 @@ def _in_intra_vod_hybrid() -> bool:
     return bool(getattr(_intra_vod_tls, "active", False))
 
 
-def _hybrid_chunk_slots() -> list[tuple[str, str]]:
+def _hybrid_chunk_slots(plan: Optional[tuple[tuple[str, str], ...]] = None) -> list[tuple[str, str]]:
     """Device pins for intra-VOD chunk workers (empty -> sequential path).
 
     Requires multi-copy pool mode with at least two usable lanes.  While a
     live-caption session is active the GPU lane is omitted — only CPU chunk
     workers run so the captioner's VRAM reservation stays untouched."""
-    if not _in_multi_mode():
+    if plan is None and not _in_multi_mode():
         return []
-    plan = tuple(getattr(_multi_tls, "plan", None) or _worker_plan())
+    plan = tuple(plan or getattr(_multi_tls, "plan", None) or _worker_plan())
     cpu_slots = [p for p in plan if p[0] == "cpu"]
     if caption_session_active():
         return cpu_slots if len(cpu_slots) >= 2 else []
@@ -3193,29 +3193,27 @@ def _transcribe_chunks_hybrid(
     """Fan missing chunks to GPU+CPU chunk-worker threads; return shared state."""
     plan = tuple(getattr(_multi_tls, "plan", None) or _worker_plan())
     state = _ChunkTranscribeState(seg_idx, existing)
-    work: queue.Queue[Optional[int]] = queue.Queue()
-    for ci in missing:
-        work.put(ci)
-    for _ in slots:
-        work.put(None)  # one sentinel per worker — clean shutdown
+    n_slots = len(slots)
+    assignments: list[list[int]] = [[] for _ in range(n_slots)]
+    for n, ci in enumerate(missing):
+        assignments[n % n_slots].append(ci)
 
-    def _worker(pin: tuple[str, str]) -> None:
+    def _worker(slot_idx: int, pin: tuple[str, str]) -> None:
         _chunk_worker_init(plan, pin)
         local_model = _parakeet_model()
         use_cuda = pin[0] == "cuda"
         engine_batch = _parakeet_batch_size() if use_cuda else 1
         engine_kwargs = {"batch_size": engine_batch}
-        while True:
-            ci = work.get()
-            if ci is None:
-                return
+        for ci in assignments[slot_idx]:
             if state.twin_won:
                 continue
             cs, ce = chunks[ci]
             if use_cuda:
-                if not _gpu_gate_try_acquire(platform, video_id):
-                    work.put(ci)
+                while not _gpu_gate_try_acquire(platform, video_id):
+                    if state.twin_won:
+                        break
                     time.sleep(0.25)
+                if state.twin_won:
                     continue
             try:
                 _gpu_thermal_guard()
@@ -3262,7 +3260,7 @@ def _transcribe_chunks_hybrid(
             max_workers=len(slots),
             thread_name_prefix="chunk-hybrid",
         ) as pool:
-            futs = [pool.submit(_worker, pin) for pin in slots]
+            futs = [pool.submit(_worker, i, pin) for i, pin in enumerate(slots)]
             for fut in futs:
                 fut.result()
     finally:
@@ -4596,10 +4594,14 @@ def _process_job(job: dict, *, multi: bool = False) -> dict:
         # stay ordered priority DESC. CPU-pinned threads and non-transcribe
         # kinds never touch the gate — CPU lanes keep draining in parallel.
         _pin = _thread_pin()
+        _thread_plan = getattr(_multi_tls, "plan", None)
         _defer_gpu_gate = (
             multi
             and job.get("kind") == "transcribe"
-            and len(_hybrid_chunk_slots()) >= 2
+            and _thread_plan is not None
+            and _pin is not None
+            and _pin[0] == "cuda"
+            and len(_hybrid_chunk_slots(_thread_plan)) >= 2
         )
         if (
             job.get("kind") == "transcribe"
