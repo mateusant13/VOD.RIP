@@ -49,6 +49,7 @@ import LiveChatPanel, { LIVE_CHAT_PANEL_W } from './LiveChatPanel';
 import TwitchLogoIcon from './TwitchLogoIcon';
 import TwitchClipPopup from './TwitchClipPopup';
 import { previewRetryAfterError, type PreviewRetryState } from '../previewRetry';
+import { attachPreviewBufferingListeners, type PreviewBufferingHandle } from '../previewPlayerUtils';
 import { noteUserUnpause, pauseOtherPreviews, registerPreviewPlayback } from '../previewPlaybackBus';
 import { nextLiveEntry } from '../liveEntryFallback';
 import { fmtDuration } from '../formatters';
@@ -415,7 +416,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
 
   // Buffering UX (mirrors the mini preview player's waiting→spinner debounce)
   const [buffering, setBuffering] = useState(false);
-  const bufferingTimerRef = useRef<number | null>(null);
+  const bufferingHandleRef = useRef<PreviewBufferingHandle | null>(null);
   /** True once the video has started playing at least once (playing/canplay
    *  fired). The buffering overlay is suppressed during the initial load
    *  spinner and only shows after playback has started then stalled. */
@@ -1046,11 +1047,8 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       window.clearTimeout(pendingReplaySeekRef.current);
       pendingReplaySeekRef.current = null;
     }
-    if (bufferingTimerRef.current != null) {
-      window.clearTimeout(bufferingTimerRef.current);
-      bufferingTimerRef.current = null;
-      setBuffering(false);
-    }
+    bufferingHandleRef.current?.clearStall();
+    setBuffering(false);
     if (hlsRef.current) {
       try {
         hlsRef.current.destroy();
@@ -1074,27 +1072,6 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     stallGuardRef.current = { at: 0, count: 0 };
   }, []);
 
-  // Debounced waiting→overlay (mirrors attachPreviewBufferingListeners).
-  /** Debounced waiting→overlay. 1200ms threshold suppresses transient stalls
-   *  (proxy jitter, segment decode hiccup) and the initial-load waiting
-   *  events — only shows the spinner AFTER playback has started once
-   *  (hasPlayedOnceRef) and then stalled. Suppresses the initial spinner
-   *  flicker when the live stream is buffering for the first time. */
-  const showBuffering = useCallback(() => {
-    if (!hasPlayedOnceRef.current) return; // initial load — the spinner covers it
-    if (bufferingTimerRef.current != null) return;
-    bufferingTimerRef.current = window.setTimeout(() => {
-      bufferingTimerRef.current = null;
-      setBuffering(true);
-    }, 1200);
-  }, []);
-  const clearBuffering = useCallback(() => {
-    if (bufferingTimerRef.current != null) {
-      window.clearTimeout(bufferingTimerRef.current);
-      bufferingTimerRef.current = null;
-    }
-    setBuffering(false);
-  }, []);
 
   /** ONE invisible session recreate per popup — the first fatal NETWORK_ERROR
    *  deletes the stale session and re-runs the mount effect (re-POST + re-
@@ -1616,6 +1593,18 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
+    const bufferingHandle = attachPreviewBufferingListeners(video, (stalling) => {
+      if (stalling && !hasPlayedOnceRef.current) return;
+      setBuffering(stalling);
+    });
+    bufferingHandleRef.current = bufferingHandle;
+    const onTimeClearBuffer = () => {
+      if (!hasPlayedOnceRef.current) return;
+      if (video.readyState >= 3 && !video.paused && video.buffered.length) {
+        const ahead = video.buffered.end(video.buffered.length - 1) - video.currentTime;
+        if (ahead > 0.15) bufferingHandle.clearStall();
+      }
+    };
     const onPlay = () => { setPaused(false); userPausedRef.current = false; };
     const onPause = () => {
       setPaused(true);
@@ -1664,28 +1653,26 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     video.addEventListener('volumechange', onVolumeChange);
     video.addEventListener('timeupdate', onTime);
     video.addEventListener('durationchange', onDuration);
-    video.addEventListener('waiting', showBuffering);
-    video.addEventListener('playing', clearBuffering);
+    video.addEventListener('timeupdate', onTimeClearBuffer);
     video.addEventListener('playing', onPlayingMarkPlayed);
     video.addEventListener('playing', onFirstFrame);
     video.addEventListener('timeupdate', onFirstFrame);
     video.addEventListener('canplay', onPlayingMarkPlayed);
-    video.addEventListener('canplay', clearBuffering);
     return () => {
+      bufferingHandle.detach();
+      bufferingHandleRef.current = null;
       video.removeEventListener('play', onPlay);
       video.removeEventListener('pause', onPause);
       video.removeEventListener('volumechange', onVolumeChange);
       video.removeEventListener('timeupdate', onTime);
       video.removeEventListener('durationchange', onDuration);
-      video.removeEventListener('waiting', showBuffering);
-      video.removeEventListener('playing', clearBuffering);
       video.removeEventListener('playing', onPlayingMarkPlayed);
       video.removeEventListener('playing', onFirstFrame);
       video.removeEventListener('timeupdate', onFirstFrame);
+      video.removeEventListener('timeupdate', onTimeClearBuffer);
       video.removeEventListener('canplay', onPlayingMarkPlayed);
-      video.removeEventListener('canplay', clearBuffering);
     };
-  }, [showBuffering, clearBuffering, captionClockSync]);
+  }, [captionClockSync]);
 
   // Track fullscreen state — element-equality like App.tsx and
   // ChannelExplorePopup: this popup only claims fullscreen when IT is the
