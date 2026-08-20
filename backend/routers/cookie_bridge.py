@@ -5,8 +5,10 @@ POST /api/session/cookies  {token, cookies:[...]}  — pairing happens on the
     first successful POST (any token becomes the paired token); later calls
     must present the same token or get 403. Returns 403 while the bridge is
     disabled (cookie_bridge_enabled setting).
-GET  /api/session/cookies/pull?platform=  — Netscape cookies.txt (text/plain)
-    with only the keep-listed cookie names for that platform.
+GET  /api/session/cookies/pull?platform=&token=  — Netscape cookies.txt (text/plain)
+    with only the keep-listed cookie names for that platform. Requires
+    X-Cookie-Bridge-Token header or matching token query param and an
+    enabled, paired bridge.
 GET  /api/session/cookies/status — {paired, enabled, platforms:{platform:{count, lastGrabAt, expiredCount}},
     youtube_gate_active, youtube_gate_remaining_sec} (the any-tab bot-gate banner polls these)
 GET  /api/session/cookies/token  — the paired token (Settings diagnostics).
@@ -69,6 +71,17 @@ def _require_platform(platform: str) -> str:
 
 def _paired_token() -> str:
     return (settings_mgr.get().cookie_bridge_token or "").strip()
+
+def _require_bridge_auth(request: Request, token: Optional[str] = None) -> None:
+    s = settings_mgr.get()
+    if not s.cookie_bridge_enabled:
+        raise HTTPException(status_code=403, detail="cookie bridge disabled")
+    paired = _paired_token()
+    if not paired:
+        raise HTTPException(status_code=403, detail="cookie bridge not paired")
+    supplied = (request.headers.get("X-Cookie-Bridge-Token") or token or "").strip()
+    if not supplied or supplied != paired:
+        raise HTTPException(status_code=403, detail="invalid or missing bridge token")
 
 
 def _ext_crx_path() -> Path:
@@ -1016,16 +1029,7 @@ async def session_cookies_ingest(body: dict):
         settings_mgr.save(s)
         logger.info("cookie bridge paired (token set)")
     elif token != paired:
-        # Self-healing re-pair: an extension reinstall / storage wipe mints a fresh
-        # UUID that will never match the paired token — the old hard-403 left the
-        # bridge permanently broken with no recovery path. The endpoint is
-        # localhost-only with no CORS middleware, so a cross-site page can't read
-        # the token or deliver a valid POST; adopting the incoming token on
-        # mismatch restores pairing without weakening that model.
-        logger.warning("cookie bridge re-paired (token changed: %s... -> %s...)", paired[:8], token[:8])
-        s = settings_mgr.get()
-        s.cookie_bridge_token = token
-        settings_mgr.save(s)
+        raise HTTPException(status_code=403, detail="token mismatch")
     cookies = body.get("cookies")
     if not isinstance(cookies, list):
         raise HTTPException(status_code=422, detail="cookies must be a list")
@@ -1034,7 +1038,8 @@ async def session_cookies_ingest(body: dict):
 
 
 @router.get("/api/session/cookies/pull")
-async def session_cookies_pull(platform: str):
+async def session_cookies_pull(request: Request, platform: str, token: Optional[str] = None):
+    _require_bridge_auth(request, token)
     p = _require_platform(platform)
     return PlainTextResponse(
         cookie_store.pull_netscape(p),

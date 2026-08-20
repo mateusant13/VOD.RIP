@@ -542,6 +542,76 @@ async def test_kill_switch_blocks_ingest(client):
     })
     assert resp.status_code == 200
 
+async def _pair_with_token(client, token: str = "tok-1"):
+    resp = await client.post("/api/session/cookies", json={
+        "token": token,
+        "cookies": [{
+            "name": "auth_token", "value": "v", "domain": "kick.com",
+            "path": "/", "secure": True, "httpOnly": True,
+        }],
+    })
+    assert resp.status_code == 200
+    return resp
+
+
+async def test_repair_rejected_when_token_differs(client):
+    await _pair_with_token(client, "tok-1")
+    resp = await client.post("/api/session/cookies", json={
+        "token": "tok-2", "cookies": [],
+    })
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "token mismatch"
+    assert settings_mgr.get().cookie_bridge_token == "tok-1"
+
+
+async def test_pull_requires_bridge_auth(client):
+    await _pair_with_token(client, "tok-1")
+    resp = await client.get("/api/session/cookies/pull", params={"platform": "kick"})
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "invalid or missing bridge token"
+
+
+async def test_pull_accepts_header_token(client):
+    await _pair_with_token(client, "tok-1")
+    resp = await client.get(
+        "/api/session/cookies/pull",
+        params={"platform": "kick"},
+        headers={"X-Cookie-Bridge-Token": "tok-1"},
+    )
+    assert resp.status_code == 200
+    assert "auth_token" in resp.text
+
+
+async def test_pull_accepts_query_token(client):
+    await _pair_with_token(client, "tok-1")
+    resp = await client.get(
+        "/api/session/cookies/pull",
+        params={"platform": "kick", "token": "tok-1"},
+    )
+    assert resp.status_code == 200
+    assert "auth_token" in resp.text
+
+
+async def test_pull_rejects_wrong_token(client):
+    await _pair_with_token(client, "tok-1")
+    resp = await client.get(
+        "/api/session/cookies/pull",
+        params={"platform": "kick", "token": "wrong"},
+    )
+    assert resp.status_code == 403
+
+
+async def test_pull_blocked_when_disabled(client):
+    await _pair_with_token(client, "tok-1")
+    resp = await client.post("/api/session/cookies/disable")
+    assert resp.status_code == 200
+    resp = await client.get(
+        "/api/session/cookies/pull",
+        params={"platform": "kick", "token": "tok-1"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "cookie bridge disabled"
+
 
 async def test_settings_roundtrip_flag(client):
     resp = await client.post("/api/settings", json={"cookie_bridge_enabled": False})
