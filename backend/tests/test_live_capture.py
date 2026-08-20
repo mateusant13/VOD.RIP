@@ -280,6 +280,64 @@ def test_youtube_live_info_returns_video_id(monkeypatch) -> None:
     assert out["platform"] == "YouTube"
 
 
+def test_probe_quick_skips_media_ad_loop(monkeypatch) -> None:
+    """quick=True returns after embed GQL+usher build — no media fetches."""
+    from services.live_capture import _TWITCH_MASTER_CACHE, probe_twitch_live_master
+
+    _TWITCH_MASTER_CACHE.clear()
+    seen: list[str] = []
+
+    def fake_builder(login: str, pt: str):
+        seen.append(pt)
+        return {"url": f"https://usher.ttvnw.net/hls/{login}?pt={pt}", "player_type": pt}
+
+    monkeypatch.setattr("services.live_capture._twitch_master_for_player_type", fake_builder)
+    monkeypatch.setattr(
+        "services.live_capture._twitch_pick_media_variant",
+        lambda u: (_ for _ in ()).throw(AssertionError("quick must not fetch media")),
+    )
+
+    result = probe_twitch_live_master("fastchan", quick=True)
+    assert result is not None
+    assert result["player_type"] == "embed"
+    assert seen == ["embed"]
+
+
+def test_twitch_live_info_uses_gql_quick_path(monkeypatch) -> None:
+    """twitch_live_info must not call yt-dlp on the hot path."""
+    from services.live_capture import twitch_live_info
+
+    monkeypatch.setattr(
+        "services.twitch_gql_service.get_channel_stream_status_sync",
+        lambda login: {
+            "live": True,
+            "started_at": "2026-08-20T00:00:00Z",
+            "title": "Live Title",
+            "viewers": 1234,
+        },
+    )
+    monkeypatch.setattr(
+        "services.live_capture.probe_twitch_live_master",
+        lambda login, quick=False, **kw: {
+            "url": f"https://usher.ttvnw.net/hls/{login}?pt=embed",
+            "headers": {"Referer": "https://www.twitch.tv/"},
+            "player_type": "embed",
+            "ad_free": False,
+        } if quick else None,
+    )
+
+    def fail_ytdlp(*a, **k):
+        raise AssertionError("yt-dlp should not run on fast path")
+
+    monkeypatch.setattr("services.live_capture._twitch_live_info_ytdlp_fallback", fail_ytdlp)
+
+    out = twitch_live_info("SomeChannel")
+    assert out is not None
+    assert out["title"] == "Live Title"
+    assert out["viewers"] == 1234
+    assert "usher.ttvnw.net" in out["url"]
+
+
 if __name__ == "__main__":
     test_progress_hook_shape()
     test_live_router_imports()

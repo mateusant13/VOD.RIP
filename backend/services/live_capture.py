@@ -113,7 +113,7 @@ def _twitch_usher_master_url(login: str, sig: str, token: str) -> str:
         # LL-HLS: short segments + PART tags — hls.js 1.6 lowLatencyMode. The
         # preview session probes the media playlist for #EXT-X-PART-INF at
         # session creation and falls back to a non-LL master if absent.
-        "low_latency": "true",
+        "low_latency": "false",
         "p": str(random.randint(1_000_000, 9_999_999)),
         # Twitch usher currently rejects the legacy nauth/nauthsig pair with
         # HTTP 403 but accepts sig/token (the form vaft uses) — verified live
@@ -167,6 +167,8 @@ def probe_twitch_live_master(
     login: str,
     player_types: Optional[Sequence[str]] = None,
     skip_cache: bool = False,
+    *,
+    quick: bool = False,
 ) -> Optional[dict]:
     """Rotate across player types (vaft order) and return the first ad-free master.
 
@@ -178,10 +180,10 @@ def probe_twitch_live_master(
     login = (login or "").strip().lower()
     if not login:
         return None
-    order = tuple(player_types) if player_types else _TWITCH_PLAYER_TYPES
+    order = ("embed",) if quick else (tuple(player_types) if player_types else _TWITCH_PLAYER_TYPES)
     if not order:
         return None
-    if not skip_cache:
+    if not skip_cache and not quick:
         with _TWITCH_MASTER_LOCK:
             cached = _TWITCH_MASTER_CACHE.get(login)
         if cached and time.time() - cached[0] < _TWITCH_MASTER_TTL_SEC:
@@ -198,6 +200,14 @@ def probe_twitch_live_master(
             continue
         if first_built is None:
             first_built = built
+        if quick:
+            result = {
+                "url": built["url"],
+                "headers": dict(_TWITCH_HEADERS),
+                "player_type": built["player_type"],
+                "ad_free": False,
+            }
+            break
         media_url = _twitch_pick_media_variant(built["url"])
         if media_url is None:
             continue
@@ -224,7 +234,7 @@ def probe_twitch_live_master(
             "ad_free": False,
         }
 
-    if result is not None and not skip_cache:
+    if result is not None and not skip_cache and not quick:
         with _TWITCH_MASTER_LOCK:
             _TWITCH_MASTER_CACHE[login] = (time.time(), result)
     return result
@@ -305,74 +315,113 @@ def kick_archive_info(slug: str) -> Optional[dict]:
         return None
 
 
-def twitch_live_info(login: str) -> Optional[dict]:
-    """Return live-stream metadata dict or None if offline (yt-dlp page
-    scrape). The playback URL is upgraded to a fresh usher master from
-    ``probe_twitch_live_master`` so the live popup can rotate player types
-    (the rotate endpoint rejects non-usher masters, and yt-dlp's CDN URL is
-    not rotation-capable). The probe is cached 60s per channel.
-    """
-    info: Optional[dict] = None
+def _twitch_live_info_ytdlp_fallback(login: str) -> Optional[dict]:
+    """Slow fallback when GQL + usher probe fail."""
+    import yt_dlp
 
-    if info is None:
-        import yt_dlp
+    from services.ytdlp_guard import ytdlp_console_logger
 
-        from services.ytdlp_guard import ytdlp_console_logger
-
-        url = f"https://www.twitch.tv/{login}"
-        try:
-            with yt_dlp.YoutubeDL(
-                {"quiet": True, "no_warnings": True, "logger": ytdlp_console_logger()}
-            ) as ydl:
-                info = ydl.extract_info(url, download=False)
-        except Exception as exc:
-            logger.debug("twitch_live_info(%r) failed: %s", login, exc)
-            return None
-
-        if not info or not info.get("is_live"):
-            return None
-
-        formats = info.get("formats") or []
-        # Pick the best m3u8 format at ≤720p
-        candidates = [
-            f for f in formats
-            if f.get("protocol") in ("m3u8", "m3u8_native") and f.get("vcodec") != "none"
-        ]
-        best = None
-        for f in candidates:
-            h = int(f.get("height") or 0)
-            if best is None or (h <= 720 and h > int(best.get("height") or 0)):
-                best = f
-        if not best:
-            # fallback: first m3u8
-            best = next((f for f in candidates), None)
-        if not best:
-            return None
-
-        info = {
-            "url": best["url"],
-            "headers": {
-                "Referer": "https://www.twitch.tv/",
-                "Origin": "https://www.twitch.tv/",
-            },
-            "title": info.get("title") or login,
-            "viewers": info.get("viewer_count") or 0,
-            "platform": "Twitch",
-            # unix-epoch stream start (yt-dlp) — archive chat sink anchor.
-            "started_at": info.get("start_time"),
-        }
-
-    # Upgrade to a rotation-capable usher master (vaft extras for the live
-    # popup's rotation wiring). Probe failure keeps the existing URL.
+    url = f"https://www.twitch.tv/{login}"
     try:
-        probed = probe_twitch_live_master(login)
-        if probed and probed.get("url"):
-            info["url"] = probed["url"]
-            info["headers"] = dict(probed.get("headers") or {})
-            info["player_type"] = probed.get("player_type")
-            info["ad_free"] = bool(probed.get("ad_free"))
+        with yt_dlp.YoutubeDL(
+            {"quiet": True, "no_warnings": True, "logger": ytdlp_console_logger()}
+        ) as ydl:
+            raw = ydl.extract_info(url, download=False)
     except Exception as exc:
-        logger.debug("twitch_live_info(%r): usher probe failed — keeping existing URL: %s", login, exc)
+        logger.debug("twitch_live_info(%r) yt-dlp fallback failed: %s", login, exc)
+        return None
+
+    if not raw or not raw.get("is_live"):
+        return None
+
+    formats = raw.get("formats") or []
+    candidates = [
+        f for f in formats
+        if f.get("protocol") in ("m3u8", "m3u8_native") and f.get("vcodec") != "none"
+    ]
+    best = None
+    for f in candidates:
+        h = int(f.get("height") or 0)
+        if best is None or (h <= 720 and h > int(best.get("height") or 0)):
+            best = f
+    if not best:
+        best = next((f for f in candidates), None)
+    if not best:
+        return None
+
+    return {
+        "url": best["url"],
+        "headers": {
+            "Referer": "https://www.twitch.tv/",
+            "Origin": "https://www.twitch.tv/",
+        },
+        "title": raw.get("title") or login,
+        "viewers": raw.get("viewer_count") or 0,
+        "platform": "Twitch",
+        "started_at": raw.get("start_time"),
+    }
+
+
+def twitch_live_info(login: str) -> Optional[dict]:
+    """Return live-stream metadata dict or None if offline.
+
+    Fast path: GQL live-status + quick usher probe (~0.5-1.5s). yt-dlp only
+    when that fails. Full vaft ad-rotation probe runs in a background thread.
+    """
+    login = (login or "").strip().lower()
+    if not login:
+        return None
+
+    from services.twitch_gql_service import get_channel_stream_status_sync
+
+    status = get_channel_stream_status_sync(login)
+    if status is not None and not status.get("live"):
+        return None
+
+    try:
+        probed = probe_twitch_live_master(login, quick=True)
+    except Exception as exc:
+        logger.debug("twitch_live_info(%r): quick probe failed: %s", login, exc)
+        probed = None
+
+    if probed and probed.get("url"):
+        info = {
+            "url": probed["url"],
+            "headers": dict(probed.get("headers") or {}),
+            "title": (status or {}).get("title") or login,
+            "viewers": (status or {}).get("viewers") or 0,
+            "platform": "Twitch",
+            "started_at": (status or {}).get("started_at"),
+            "player_type": probed.get("player_type"),
+            "ad_free": bool(probed.get("ad_free")),
+        }
+        with _TWITCH_MASTER_LOCK:
+            cached = _TWITCH_MASTER_CACHE.get(login)
+        if not cached or time.time() - cached[0] >= _TWITCH_MASTER_TTL_SEC:
+            threading.Thread(
+                target=lambda ch=login: probe_twitch_live_master(ch, skip_cache=True),
+                daemon=True,
+                name=f"twitch-probe-warm-{login}",
+            ).start()
+        return info
+
+    info = _twitch_live_info_ytdlp_fallback(login)
+    if not info:
+        return None
+
+    try:
+        full = probe_twitch_live_master(login)
+        if full and full.get("url"):
+            info["url"] = full["url"]
+            info["headers"] = dict(full.get("headers") or {})
+            info["player_type"] = full.get("player_type")
+            info["ad_free"] = bool(full.get("ad_free"))
+    except Exception as exc:
+        logger.debug(
+            "twitch_live_info(%r): usher probe failed — keeping yt-dlp URL: %s",
+            login,
+            exc,
+        )
     return info
 
 

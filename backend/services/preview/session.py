@@ -937,19 +937,24 @@ class PreviewManager:
                 except Exception:
                     pass
 
-        try:
-            with ThreadPoolExecutor(
-                max_workers=2, thread_name_prefix="live-create"
-            ) as pool:
-                # Resolve one media playlist (prewarm) and probe LL-HLS support.
-                # Twitch LL masters advertise #EXT-X-PART-INF on their media
-                # playlists; if the low_latency=true master yields none, fall
-                # back to the plain master. The LL probe stays dependent on the
-                # resolved entry_url — only the two master fetches overlap.
-                session.entry_url = _resolve_and_warm_master(pool, url)
-                session.allowed_hosts.update(_hosts_for_url(session.entry_url))
-        except Exception as exc:
-            logger.debug("live session %s media resolve failed: %s", session_id[:8], exc)
+        # Prewarm off the POST critical path — return session_id immediately so
+        # the popup can attach hls.js while the master/variant resolve runs.
+        def _bg_prewarm_live() -> None:
+            try:
+                with ThreadPoolExecutor(
+                    max_workers=2, thread_name_prefix="live-create"
+                ) as pool:
+                    entry = _resolve_and_warm_master(pool, url)
+                session.entry_url = entry
+                session.allowed_hosts.update(_hosts_for_url(entry))
+            except Exception as exc:
+                logger.debug("live session %s media resolve failed: %s", session_id[:8], exc)
+
+        threading.Thread(
+            target=_bg_prewarm_live,
+            daemon=True,
+            name=f"live-prewarm-{session_id[:8]}",
+        ).start()
         # DVR archive resolution is deferred to the first replay-playlist
         # request (_ensure_live_archive) — playback start must not wait on the
         # Twitch GQL / Kick API probe (1-2s). The frontend warms the rail by

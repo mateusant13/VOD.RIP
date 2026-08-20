@@ -989,6 +989,8 @@ query ChannelStream($login: String!) {
   user(login: $login) {
     stream {
       id
+      title
+      viewersCount
       startedAt
     }
   }
@@ -1019,7 +1021,12 @@ def get_channel_stream_status_sync(login: str) -> Optional[dict]:
         return None
     if not stream:
         return {"live": False, "started_at": None}
-    return {"live": True, "started_at": stream.get("startedAt") or None}
+    return {
+        "live": True,
+        "started_at": stream.get("startedAt") or None,
+        "title": stream.get("title") or None,
+        "viewers": int(stream.get("viewersCount") or 0),
+    }
 
 
 def twitch_video_created_at(vod_id_or_url: str) -> Optional[str]:
