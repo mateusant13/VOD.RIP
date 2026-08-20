@@ -789,6 +789,37 @@ async def test_captioner_acquire_lang_sets_target_family(monkeypatch):
     assert captioner._target_family is None
     captioner.release()
     captioner._thread.join(timeout=3.0)
+
+@pytest.mark.anyio
+async def test_captioner_acquire_lang_updates_active_session(monkeypatch):
+    """A second subscriber with ?lang=es must override the target while the
+    worker stays up — LAST explicit selection wins for the shared captioner."""
+    pipeline = _FakePipeline([], [])
+    live_captions = _install_pipeline(monkeypatch, pipeline)
+
+    loop = asyncio.get_running_loop()
+    captioner = live_captions.LiveCaptioner(
+        "twitch", "srdogg", loop, window_sec=1.5, poll_sec=0.02,
+    )
+    warmed: list = []
+    monkeypatch.setattr(
+        live_captions, "_warm_translate",
+        lambda evidence, target_family=None: warmed.append((evidence, target_family)),
+    )
+
+    captioner.acquire(None)
+    assert captioner._target_family is None
+    captioner.acquire("es")
+    assert captioner._target_family == "es"
+    assert warmed[-1] == (None, "es")
+    captioner.acquire(None)  # active session, absent lang keeps current target
+    assert captioner._target_family == "es"
+
+    captioner.release()
+    captioner.release()
+    captioner.release()
+    if captioner._thread is not None:
+        captioner._thread.join(timeout=3.0)
     assert (captioner.platform, captioner.channel) not in live_captions._CAPTIONERS
 
 

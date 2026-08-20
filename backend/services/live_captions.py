@@ -317,11 +317,11 @@ def _decode_audio_bytes(data: bytes) -> "Any":
 def _resolve_live_master(platform: str, channel: str) -> Optional[dict]:
     """Resolve the live master playlist — reuses the SAME resolver the
     ``/api/live/{platform}`` endpoint uses (services.live_capture), so auth /
-    token / ad-rotation logic stays in one place. Twitch goes through the
-    fast GQL+usher ``probe_twitch_live_master`` first (~1-3s, per-channel 60s
-    cache) instead of the yt-dlp page extract (3-15s) — the captioner must
-    not sit on the popup's open path. Returns ``{url, headers}`` or None
-    when the channel is offline / unreachable."""
+    token / ad-rotation logic stays in one place. Twitch uses
+    ``twitch_live_info`` (GQL + quick usher probe, ~0.5–1.5s) — the same
+    fast path as ``/api/live`` — not the full vaft ad-rotation probe
+    (1 GQL + usher + media per player type). Returns ``{url, headers}`` or
+    None when the channel is offline / unreachable."""
     if platform == "youtube":
         try:
             from services.yt_gate import youtube_gate_active
@@ -342,14 +342,9 @@ def _resolve_live_master(platform: str, channel: str) -> Optional[dict]:
         except Exception as exc:
             _record_error("hls", f"youtube resolve failed: {exc}", platform, channel)
             return None
-    from services.live_capture import kick_live_info, probe_twitch_live_master
+    from services.live_capture import kick_live_info, twitch_live_info
 
     if platform == "twitch":
-        probed = probe_twitch_live_master(channel)
-        if probed and probed.get("url"):
-            return {"url": probed["url"], "headers": probed.get("headers") or {}}
-        from services.live_capture import twitch_live_info
-
         info = twitch_live_info(channel)
         if not info or not info.get("url"):
             if info and info.get("reason"):
@@ -676,6 +671,7 @@ class LiveCaptioner:
         self._evidence_family: Optional[str] = None
         self._lang_votes: Deque[str] = deque(maxlen=5)
         self._session_family: Optional[str] = None
+        self._target_family: Optional[str] = None
         # Per-session translate-target override (?lang= on the SSE) — the
         # LAST explicit selection wins for all subscribers of the shared
         # captioner; None = follow the app language at flush time. ponytail:
@@ -731,6 +727,10 @@ class LiveCaptioner:
                     name=f"live-captions-{self.platform}-{self.channel}",
                 )
                 self._thread.start()
+            elif lang is not None:
+                # Active session: LAST explicit ?lang= wins for all subscribers.
+                self._target_family = lang
+                _warm_translate(self._evidence_family, lang)
     def release(self) -> None:
         """Refcount-- — stops the worker thread when the last subscriber
         leaves. Idempotent-safe: a second release on an already-released
