@@ -15,6 +15,8 @@ import requests
 
 from services.kick_api_service import get_channel_api as _get_kick_channel
 from services.os_services import _NO_WINDOW, _kill_pid, register_child_pid, unregister_child_pid
+from services.http_fingerprint import twitch_http_headers
+from services.youtube_fingerprint import youtube_http_headers
 from services.ytdlp_ffmpeg import _resolve_ffmpeg_exe
 
 logger = logging.getLogger(__name__)
@@ -76,7 +78,7 @@ _TWITCH_FALLBACK_PLAYER_TYPE = "embed"
 _TWITCH_MASTER_TTL_SEC = 60.0
 _TWITCH_MASTER_CACHE: dict = {}
 _TWITCH_MASTER_LOCK = threading.Lock()
-_TWITCH_HEADERS = {"Referer": "https://www.twitch.tv/", "Origin": "https://www.twitch.tv/"}
+_TWITCH_HEADERS = twitch_http_headers()
 
 
 def _twitch_gql_live_token(login: str, player_type: str) -> Optional[tuple]:
@@ -461,14 +463,7 @@ def youtube_live_info(handle: str) -> Optional[dict]:
     try:
         resp = requests.get(
             live_url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/125.0.0.0 Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-            },
+            headers=youtube_http_headers(extra={"Accept-Language": "en-US,en;q=0.9"}),
             timeout=15,
             allow_redirects=True,
         )

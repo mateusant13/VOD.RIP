@@ -409,15 +409,10 @@ try:
     assert _prog_head_lookup("__none__", 360) is None
 finally:
     preview_root = _orig_preview_root
-_DEFAULT_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
-_DEFAULT_TWITCH_HEADERS: dict = {
-    "Referer": "https://www.twitch.tv/",
-    "Origin": "https://www.twitch.tv",
-    "User-Agent": _DEFAULT_UA,
-}
+from services.http_fingerprint import BROWSER_USER_AGENT, twitch_http_headers
+
+_DEFAULT_UA = BROWSER_USER_AGENT
+_DEFAULT_TWITCH_HEADERS: dict = twitch_http_headers()
 _ALLOWED_HOST_SUFFIXES = (
     "kick.com",
     "clips.kick.com",

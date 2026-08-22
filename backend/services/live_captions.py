@@ -43,6 +43,7 @@ from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Deque, Optional
+from services.http_fingerprint import BROWSER_USER_AGENT
 from services.ytdlp_ffmpeg import _resolve_ffmpeg_exe
 from urllib.parse import urljoin
 
@@ -150,11 +151,6 @@ _BACKOFF_INITIAL_SEC = 1.0
 _BACKOFF_MAX_SEC = 15.0
 _QUEUE_MAX = 8  # bounded subscriber queue — slow consumers drop blocks
 _HTTP_TIMEOUT = 10.0
-_SEGMENT_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-)
-
 
 class _Offline(RuntimeError):
     """Channel confirmed offline or the stream ended."""
@@ -284,7 +280,7 @@ def _fetch(url: str, headers: dict) -> bytes:
     # REQUIRES Origin.  Strip Origin only for CDN hosts, keep it for usher.
     if (host == "ttvnw.net" or host.endswith(".ttvnw.net")) and host != "usher.ttvnw.net":
         hdrs = {k: v for k, v in hdrs.items() if k.lower() != "origin"}
-    hdrs.setdefault("User-Agent", _SEGMENT_UA)
+    hdrs.setdefault("User-Agent", BROWSER_USER_AGENT)
     resp = requests.get(url, headers=hdrs, timeout=_HTTP_TIMEOUT)
     resp.raise_for_status()
     return resp.content

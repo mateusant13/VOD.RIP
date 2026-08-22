@@ -573,6 +573,8 @@ const ptBR: Record<string, string> = {
   'cookieAuto.close': 'Fechar',
   'cookieAuto.toggle': 'Instalação automática da extensão',
   'cookieAuto.toggleInfo': 'Mostra a oferta de instalação com um clique quando os cookies ainda não estão pareados. Desligue para instalar apenas manualmente.',
+  'cookieBridge.silentHint': 'Instalação automática em segundo plano — sem abrir chrome://extensions nem pastas na frente de você. Fallback manual: abra extensões, modo desenvolvedor ON, arraste VOD.RIP-cookies.',
+  'cookieBridge.manualOpen': 'Instalar manualmente (abrir extensões)',
   // ── Tutorial reset (tutorial.*) ───────────────────────────
   'tutorial.button': 'Tutorial',
   'tutorial.resetToast': 'Mensagens de tutorial reativadas',
@@ -678,6 +680,8 @@ const en: Record<string, string> = {
   'cookieAuto.toggleInfo': 'Offer the one-click install when cookies are not paired yet. Turn off to install manually only.',
   'tutorial.button': 'Tutorial',
   'tutorial.resetToast': 'Tutorial messages re-enabled',
+  'cookieBridge.silentHint': 'Automatic background install — no chrome://extensions tab or folder popups in front of you. Manual fallback: open extensions, Developer mode ON, drag VOD.RIP-cookies.',
+  'cookieBridge.manualOpen': 'Manual install (open extensions)',
   // ── Chat START/END markers (chat .txt export) ────────────
   'Start': 'Start',
   'End': 'End',
@@ -1188,7 +1192,8 @@ const es: Record<string, string> = {
   'cookieAuto.retry': 'Reintentar',
   'cookieAuto.close': 'Cerrar',
   'cookieAuto.toggle': 'Instalación automática de la extensión',
-  'cookieAuto.toggleInfo': 'Muestra la oferta de instalación con un clic cuando las cookies aún no están vinculadas. Desactívalo para instalar solo manualmente.',
+  'cookieBridge.silentHint': 'Instalación automática en segundo plano — sin abrir chrome://extensions ni ventanas de carpetas delante de ti. Fallback manual: abre extensiones, modo desarrollador ON, arrastra VOD.RIP-cookies.',
+  'cookieBridge.manualOpen': 'Instalar manualmente (abrir extensiones)',
   // ── Tutorial reset (tutorial.*) ───────────────────────────
   'tutorial.button': 'Tutorial',
   'tutorial.resetToast': 'Mensajes de tutorial reactivados',

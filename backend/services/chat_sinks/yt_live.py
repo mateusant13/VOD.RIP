@@ -43,10 +43,7 @@ from services.live_capture import _YT_LIVE_PAGE_RE
 
 logger = logging.getLogger(__name__)
 
-_PAGE_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-)
+from services.youtube_fingerprint import youtube_http_headers
 _CHAT_FILE_GLOB = "*.live_chat.json*"  # matches both .part (live) and final rename
 _FILE_APPEAR_DEADLINE_SEC = 30.0
 
@@ -76,7 +73,7 @@ def resolve_live_video_id(handle: str) -> Optional[str]:
 
         resp = requests.get(
             live_url,
-            headers={"User-Agent": _PAGE_UA, "Accept-Language": "en-US,en;q=0.9"},
+            headers=youtube_http_headers(extra={"Accept-Language": "en-US,en;q=0.9"}),
             timeout=15,
             allow_redirects=True,
         )

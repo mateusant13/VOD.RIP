@@ -352,13 +352,11 @@ def browser_cookie_session(browser: str) -> tuple[Optional[str], requests.Sessio
 
     jar = extract_cookies_from_browser(name, logger=_QuietCookieLogger())
     http = requests.Session()
-    http.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-            " AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-    })
+    from services.youtube_fingerprint import youtube_http_headers
+
+    http.headers.update(
+        youtube_http_headers(extra={"Accept-Language": "en-US,en;q=0.9"})
+    )
     for cookie in jar:
         http.cookies.set(
             cookie.name,

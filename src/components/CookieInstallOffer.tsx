@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { CheckCircle2, Loader2, XCircle } from 'lucide-react';
-import { apiGet, apiPost } from '../hooks/useApiClient';
+import { apiPost } from '../hooks/useApiClient';
 import { markSeen } from '../lib/firstTime';
 import { useI18n } from '../i18n';
+import { runSilentCookieExtensionInstall } from '../lib/cookieAutoInstall';
 
 /**
  * First-run cookie-extension install offer (mounted in App.tsx).
@@ -17,28 +18,8 @@ import { useI18n } from '../i18n';
  * governed by the settings flag from then on.
  */
 
-interface AutoInstallStatus {
-  state: 'idle' | 'running' | 'done' | 'error';
-  installed: boolean;
-  error: string | null;
-}
-
-interface BridgeStatusWithInstall {
-  paired: boolean;
-  auto_install?: AutoInstallStatus;
-}
-
-interface AutoInstallResult {
-  ok: boolean;
-  started?: boolean;
-  alreadyInstalled?: boolean;
-  error?: string;
-}
 
 type Phase = 'idle' | 'installing' | 'installed' | 'failed';
-
-const POLL_MS = 2000;
-const INSTALL_TIMEOUT_MS = 120_000;
 
 export default function CookieInstallOffer({
   open,
@@ -71,38 +52,14 @@ export default function CookieInstallOffer({
     setPhase('installing');
     setError(null);
     try {
-      const res = await apiPost<AutoInstallResult>('/api/session/cookies/auto-install', {});
+      const res = await runSilentCookieExtensionInstall();
       if (!res.ok) {
-        setError(res.error ?? '');
+        setError(res.error || t('cookieAuto.timeout'));
         setPhase('failed');
         return;
       }
-      if (res.alreadyInstalled) {
-        markSeen('cookieInstall');
-        setPhase('installed');
-        return;
-      }
-      // Poll the background install until it settles (or times out).
-      const deadline = Date.now() + INSTALL_TIMEOUT_MS;
-      let last: BridgeStatusWithInstall | null = null;
-      while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, POLL_MS));
-        try {
-          last = await apiGet<BridgeStatusWithInstall>('/api/session/cookies/status');
-        } catch {
-          continue; // backend mid-restart — keep polling
-        }
-        const state = last.auto_install?.state;
-        if (state && state !== 'running') break;
-      }
-      const st = last?.auto_install;
-      if (st && (st.state === 'done' || st.installed)) {
-        markSeen('cookieInstall');
-        setPhase('installed');
-      } else {
-        setError(st?.error || t('cookieAuto.timeout'));
-        setPhase('failed');
-      }
+      markSeen('cookieInstall');
+      setPhase('installed');
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : '');
       setPhase('failed');

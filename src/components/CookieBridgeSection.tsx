@@ -4,6 +4,7 @@ import { apiGet, apiPost } from '../hooks/useApiClient';
 import InfoHint from './InfoHint';
 import ExtensionWaitOverlay from './ExtensionWaitOverlay';
 import { useI18n } from '../i18n';
+import { runSilentCookieExtensionInstall } from '../lib/cookieAutoInstall';
 
 /**
  * Cookie Bridge consent + diagnostics.
@@ -13,10 +14,8 @@ import { useI18n } from '../i18n';
  * enable/disable toggle is the kill switch (backend returns 403 for ingest
  * while disabled).
  *
- * Install flow (drag-and-drop): the backend materializes the unpacked
- * extension folder next to the packaged crx; the user opens
- * chrome://extensions, toggles Developer mode, and drops the folder onto
- * the page. No admin, no policy, no certs — works on unmanaged Windows.
+ * Install flow: primary path is silent auto-install (UIA, invisible to the
+ * user). Manual drag-and-drop remains as fallback in Settings.
  */
 
 interface PlatformBridgeStatus {
@@ -69,6 +68,7 @@ export default function CookieBridgeSection({
   const [ext, setExt] = useState<ExtSource | null>(null);
   const [busy, setBusy] = useState(false);
   const [opening, setOpening] = useState(false);
+  const [silentInstalling, setSilentInstalling] = useState(false);
   const [waitOpen, setWaitOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -115,6 +115,28 @@ export default function CookieBridgeSection({
       setError(t('Could not toggle Cookie Bridge — backend unreachable?'));
     }
     setBusy(false);
+  };
+
+
+  const silentInstall = async () => {
+    if (silentInstalling || opening) return;
+    setSilentInstalling(true);
+    setError(null);
+    try {
+      const res = await runSilentCookieExtensionInstall();
+      if (!res.ok) {
+        setError(
+          res.error
+            ? t('cookieAuto.failed', { error: res.error })
+            : t('cookieAuto.failedGeneric'),
+        );
+      } else {
+        await refresh();
+      }
+    } catch {
+      setError(t('Could not reach the backend to start install.'));
+    }
+    setSilentInstalling(false);
   };
 
   const openManager = async () => {
@@ -243,12 +265,21 @@ export default function CookieBridgeSection({
           <div className="flex items-center gap-2 flex-wrap">
             <button
               type="button"
+              onClick={() => void silentInstall()}
+              disabled={silentInstalling || opening}
+              className="flex items-center gap-1.5 bg-zinc-100 text-black font-black uppercase px-3 py-2 text-[11px] border-2 border-zinc-100 hover:bg-zinc-300 disabled:opacity-50"
+            >
+              {silentInstalling ? <Loader2 size={13} className="animate-spin" /> : <ShieldCheck size={13} />}
+              {t('cookieAuto.installNow')}
+            </button>
+            <button
+              type="button"
               onClick={() => void openManager()}
-              disabled={opening}
+              disabled={opening || silentInstalling}
               className="flex items-center gap-1.5 bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-[11px] border-2 border-zinc-600 hover:border-white hover:text-white disabled:opacity-50"
             >
               {opening ? <Loader2 size={13} className="animate-spin" /> : <ExternalLink size={13} />}
-              {t('Open extensions')}
+              {t('cookieBridge.manualOpen')}
             </button>
             <button
               type="button"
@@ -264,7 +295,7 @@ export default function CookieBridgeSection({
             ) : null}
           </div>
           <p className="text-[11px] text-zinc-400 font-mono leading-relaxed">
-            {t('Grab the')} <span className="text-zinc-200">VOD.RIP-cookies</span>{t('folder (the one marked “drag this folder above”) and drop it onto the extensions page (Developer mode ON):')}
+            {t('cookieBridge.silentHint')}
             <br />
             <span className="text-zinc-300 break-all">{ext.extension_dir}</span>
           </p>

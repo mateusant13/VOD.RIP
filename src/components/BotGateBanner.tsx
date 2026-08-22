@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
-import { AlertTriangle, BookOpen, ExternalLink, X } from 'lucide-react';
-import { apiGet, apiPost } from '../hooks/useApiClient';
+import { AlertTriangle, BookOpen, Loader2, X } from 'lucide-react';
+import { apiGet } from '../hooks/useApiClient';
 import { useI18n } from '../i18n';
+import { runSilentCookieExtensionInstall } from '../lib/cookieAutoInstall';
 
 /**
  * Any-tab banner for the YouTube bot-gate freeze.
@@ -10,8 +11,8 @@ import { useI18n } from '../i18n';
  * YouTube archive work is silently frozen and requeued — tell the user to
  * install the extension instead of waiting blind. Signal source is the same
  * GET /api/session/cookies/status CookieBridgeSection polls (two extra
- * fields); the install actions reuse its extension/open + extension/reveal
- * endpoints. Dismiss is session-scoped (sessionStorage) and re-arms when the
+ * fields); "Install now" runs silent auto-install (no chrome:// tab or
+ * Explorer popup). Dismiss is session-scoped (sessionStorage) and re-arms when the
  * gate lifts, so a future gate episode nags again.
  */
 
@@ -24,13 +25,6 @@ interface GateStatus {
   youtube_gate_remaining_sec: number;
 }
 
-interface OpenResult {
-  launched: boolean;
-  browser: string | null;
-  url: string | null;
-  /** True when a browser runs but its window could not be driven. */
-  blocked?: boolean;
-}
 
 export default function BotGateBanner({
   onOpenInstructions,
@@ -77,19 +71,14 @@ export default function BotGateBanner({
     if (installing) return;
     setInstalling(true);
     setError(null);
-    // Same order as CookieBridgeSection.openManager: browser tab first, then
-    // the Explorer reveal. Each failure handled independently.
-    const openRes = await apiPost<OpenResult>('/api/session/cookies/extension/open', {}).catch(() => null);
-    if (openRes === null) {
-      setError(t('Could not reach the backend to open the browser tab.'));
-    } else if (!openRes.launched) {
-      setError(
-        openRes.blocked
-          ? t('Browser window could not be focused — open chrome://extensions manually and drop the folder.')
-          : t('No Chromium browser found — open chrome://extensions manually and drop the folder.'),
-      );
+    try {
+      const res = await runSilentCookieExtensionInstall();
+      if (!res.ok) {
+        setError(res.error ? t('cookieAuto.failed', { error: res.error }) : t('cookieAuto.failedGeneric'));
+      }
+    } catch {
+      setError(t('Could not reach the backend to start install.'));
     }
-    void apiPost<{ ok: boolean }>('/api/session/cookies/extension/reveal', {}).catch(() => null);
     setInstalling(false);
   };
 
@@ -123,7 +112,7 @@ export default function BotGateBanner({
                 disabled={installing}
                 className="flex items-center gap-1.5 bg-amber-500 text-black font-black uppercase px-3 py-1.5 text-[11px] border-2 border-amber-500 hover:bg-amber-400 hover:border-amber-400 disabled:opacity-50"
               >
-                <ExternalLink size={13} />
+                {installing ? <Loader2 size={13} className="animate-spin" /> : null}
                 {t('botGate.installNow')}
               </button>
             </div>

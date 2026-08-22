@@ -21,8 +21,9 @@ Fallback file (same JSON): `I:\!watcher\status\now.json`
 |---|---|
 | `gaming` | **Continue.** Do not kill ffmpeg/cargo/whisper/chrome. Do not start a second copy because the first looks slow. GPU jobs keep running at idle GPU class. |
 | `steady` | Continue. User is at the desktop; you are already capped. |
-| `cruise` | Continue, you may go faster. |
-| `emergency` | Continue at a hard clamp. Do not retry-loop. |
+| `watching` | Continue gently — user is watching media. Do not spike. |
+| `cruise` | User is AFK. You may use more CPU. Do not allocate until the box OOMs. |
+| `emergency` | Continue at a hard clamp (CPU or RAM). Do not retry-loop. Do not kill. |
 
 `defer_gpu` is false on purpose: Whisper/VLM stay resident so CUDA caches do not go cold. The watcher lowers their GPU scheduling class instead of pausing them.
 

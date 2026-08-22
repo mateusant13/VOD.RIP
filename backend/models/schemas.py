@@ -119,8 +119,8 @@ class AppSettings(BaseModel):
     cookie_bridge_token: str = ""
     cookie_bridge_enabled: bool = True
     # One-click cookie-extension install (Settings toggle): when ON, the
-    # first-run offer auto-installs the unpacked extension via CDP; OFF =
-    # manual drag-and-drop only. Absent on older backends -> ON (getattr).
+    # first-run offer auto-installs the unpacked extension via silent UIA
+    # (cookie_extension_auto_install.ps1); OFF = manual drag-and-drop only. Absent on older backends -> ON (getattr).
     auto_install_extension: bool = True
     entity_watch_enabled: bool = True
     # Archived VOD retention: keep only the newest N video FILES per platform;

@@ -1,5 +1,5 @@
-# One-click extension auto-install (productized CookieInstallWorker flow)
-# + zero-window version reload.
+# VOD.RIP cookie-extension silent auto-install (CookieInstallWorker flow)
+# + zero-window version reload. NOT Kick Overlay — that lives in vendor/kick-overlay/.
 #
 # INSTALL path (first-time only): drive the user's REAL profile entirely by
 # UIA, SILENTLY — spawn chrome --new-window (reuses the RUNNING instance,
@@ -35,9 +35,9 @@
 #
 # Usage:
 #   powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `
-#     cookie_auto_install.ps1 -ExtensionDir "C:\...\VOD.RIP-cookies" `
+#     cookie_extension_auto_install.ps1 -ExtensionDir "C:\...\VOD.RIP-cookies" `
 #     [-Browser chrome|msedge|brave] [-DebugPort 7897] [-DryRun]
-#   cookie_auto_install.ps1 -ExtensionDir "C:\...\VOD.RIP-cookies" -ReloadOnly `
+#   cookie_extension_auto_install.ps1 -ExtensionDir "C:\...\VOD.RIP-cookies" -ReloadOnly `
 #     [-ExpectedVersion 0.8.6] [-DryRun]
 #
 # -ReloadOnly: ZERO-WINDOW reload of a live unpacked extension. Chrome does
@@ -77,9 +77,9 @@ $ErrorActionPreference = 'Stop'
 $EXT_NAME = Split-Path -Leaf $ExtensionDir
 try { $EXT_NAME = (Get-Content -LiteralPath (Join-Path $ExtensionDir 'manifest.json') -Raw | ConvertFrom-Json).name } catch { }
 
-$script:koT0 = [DateTime]::UtcNow
+$script:installT0 = [DateTime]::UtcNow
 function Write-ProgressLog([string]$msg) {
-    [Console]::Error.WriteLine(("[{0,6:N0}ms] {1}" -f ([DateTime]::UtcNow - $script:koT0).TotalMilliseconds, $msg))
+    [Console]::Error.WriteLine(("[{0,6:N0}ms] {1}" -f ([DateTime]::UtcNow - $script:installT0).TotalMilliseconds, $msg))
 }
 
 # ---- Chrome 151 profile-based verification ----

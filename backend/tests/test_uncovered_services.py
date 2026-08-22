@@ -95,6 +95,25 @@ def test_youtube_fingerprint_headers():
     assert "Accept-Language" in headers
 
 
+
+
+def test_http_fingerprint_centralized():
+    """http_fingerprint: app UA vs browser/Twitch headers stay consistent."""
+    from services._version import USER_AGENT
+    from services.http_fingerprint import (
+        BROWSER_USER_AGENT,
+        TWITCH_USER_AGENT,
+        twitch_http_headers,
+    )
+    from services.youtube_fingerprint import YT_USER_AGENT
+
+    assert "VOD.RIP" in USER_AGENT
+    assert BROWSER_USER_AGENT == YT_USER_AGENT
+    assert TWITCH_USER_AGENT == YT_USER_AGENT
+    twitch = twitch_http_headers()
+    assert twitch["User-Agent"] == YT_USER_AGENT
+    assert twitch["Referer"] == "https://www.twitch.tv/"
+    assert twitch["Origin"] == "https://www.twitch.tv/"
 def test_youtube_ytdlp_update_stamp(tmp_path, monkeypatch):
     """youtube_ytdlp_update: stamp file write/read roundtrip."""
     from services import youtube_ytdlp_update

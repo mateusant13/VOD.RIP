@@ -1,4 +1,9 @@
-# Opens the browser's extensions manager in a NEW tab of a RUNNING Chromium
+# MANUAL cookie-extension install helper — visible to the user.
+# Opens chrome://extensions in a NEW tab (foreground + keystrokes). The silent
+# auto-install path is scripts/cookie_extension_auto_install.ps1 (UIA, alpha-0,
+# no focus steal) — use that for "Install now" / first-run / bot-gate flows.
+#
+# Opens the extensions manager in a NEW tab of a RUNNING Chromium
 # browser — never reuses or navigates the active tab, never opens a stray
 # window, never changes a visible window's size or fullscreen state.
 #

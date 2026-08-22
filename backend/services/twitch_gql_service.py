@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+
+from services.http_fingerprint import twitch_http_headers
 import random
 import re
 import urllib.error
@@ -446,10 +448,7 @@ def _resolve_cloudfront_variants(vod_id: str, video_data: dict) -> List[Dict[str
 
     def _responsive(url: str) -> bool:
         try:
-            req = urllib.request.Request(url, headers={
-                "Referer": "https://www.twitch.tv/",
-                "Origin": "https://www.twitch.tv",
-            })
+            req = urllib.request.Request(url, headers=twitch_http_headers())
             with urllib.request.urlopen(req, timeout=10) as r:
                 return r.status == 200 and bool(r.read(65536))
         except (urllib.error.HTTPError, urllib.error.URLError, OSError):
@@ -527,14 +526,7 @@ def get_vod_playback_sync(url_or_id: str) -> Tuple[str, dict, List[Dict[str, Any
         })
         master_url = f"https://usher.ttvnw.net/vod/v2/{vid}.m3u8?{query}"
 
-        headers: dict = {
-            "Referer": "https://www.twitch.tv/",
-            "Origin": "https://www.twitch.tv",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-            ),
-        }
+        headers = twitch_http_headers()
         try:
             req = urllib.request.Request(master_url, headers=headers, method="GET")
             with urllib.request.urlopen(req, timeout=15) as resp:
@@ -549,10 +541,7 @@ def get_vod_playback_sync(url_or_id: str) -> Tuple[str, dict, List[Dict[str, Any
     cf_variants = _resolve_cloudfront_variants(vid, video_data)
     if not cf_variants:
         raise RuntimeError(f"No playable variants for VOD {vid}")
-    cf_headers: dict = {
-        "Referer": "https://www.twitch.tv/",
-        "Origin": "https://www.twitch.tv",
-    }
+    cf_headers: dict = twitch_http_headers()
     # Use the highest quality variant as the "master" URL placeholder.
     # The synthetic master playlist later built by the caller uses
     # absolute variant URLs, so the base is irrelevant.
@@ -873,14 +862,7 @@ def list_channel_clips_sync(
 
 def _twitch_vod_playback_for_estimate(video_id: str) -> tuple[Optional[str], dict, list]:
     """HLS URL, authenticated headers, and formats from one yt-dlp probe."""
-    empty_headers: dict = {
-        "Referer": "https://www.twitch.tv/",
-        "Origin": "https://www.twitch.tv",
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        ),
-    }
+    empty_headers: dict = twitch_http_headers()
     try:
         import yt_dlp
 

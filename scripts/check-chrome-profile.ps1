@@ -38,7 +38,7 @@ if ($procs.Count -gt 0) {
   $cdp = @($procs | Where-Object { $_.CommandLine -match '--remote-debugging-port' })
   $cdpReal = @($cdp | Where-Object { $_.CommandLine -match $esc -and $_.CommandLine -notmatch $escCp })
   if ($alt.Count -gt 0) { $problems += "$($alt.Count) processo(s) com user-data-dir ALTERNATIVO (junction/perfil copiado)" }
-  if ($cdpReal.Count -gt 0) { $notes += "$($cdpReal.Count) processo(s) com CDP no perfil REAL - esperado durante o auto-install da extensao (scripts/cookie_auto_install.ps1); aguardar concluir" }
+  if ($cdpReal.Count -gt 0) { $notes += "$($cdpReal.Count) processo(s) com CDP no perfil REAL - esperado durante o auto-install da extensao (scripts/cookie_extension_auto_install.ps1); aguardar concluir" }
   if ($cdp.Count -gt $cdpReal.Count) { $problems += "$($cdp.Count - $cdpReal.Count) processo(s) com --remote-debugging-port fora do perfil real" }
 }
 

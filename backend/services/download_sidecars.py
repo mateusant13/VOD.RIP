@@ -207,7 +207,7 @@ def write_thumbnail_sidecar(thumbnail: Optional[str], output_file: str) -> Optio
 
         url = _resolve_thumb_placeholders(str(thumbnail))
         req = urllib.request.Request(
-            url, headers={"User-Agent": "Mozilla/5.0 (VOD.RIP thumbnail)"}
+            url, headers={"User-Agent": __import__("services._version", fromlist=["USER_AGENT"]).USER_AGENT}
         )
         with urllib.request.urlopen(req, timeout=_THUMB_FETCH_TIMEOUT) as resp:
             body = resp.read(_THUMB_SIZE_CAP + 1)

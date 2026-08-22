@@ -10,20 +10,22 @@ const GATED_UNPAIRED = {
 
 function mockFetch(overrides: Record<string, unknown> = {}) {
   const calls: string[] = [];
+  let installStarted = false;
   const fn = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
     calls.push(url);
+    if (url.includes('/api/session/cookies/auto-install')) {
+      const body = overrides.autoInstall ?? { ok: true, started: true };
+      if (body.ok) installStarted = true;
+      return new Response(JSON.stringify(body), { status: 200 });
+    }
     if (url.includes('/api/session/cookies/status')) {
-      return new Response(JSON.stringify(overrides.status ?? GATED_UNPAIRED), { status: 200 });
-    }
-    if (url.includes('/api/session/cookies/extension/open')) {
-      return new Response(
-        JSON.stringify(overrides.open ?? { launched: true, browser: 'chrome', url: 'chrome://extensions/' }),
-        { status: 200 },
-      );
-    }
-    if (url.includes('/api/session/cookies/extension/reveal')) {
-      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      const base = (overrides.status ?? GATED_UNPAIRED) as Record<string, unknown>;
+      const auto = overrides.autoInstallStatus as Record<string, unknown> | undefined;
+      const auto_install = auto ?? (installStarted
+        ? { state: 'done', installed: true, error: null }
+        : undefined);
+      return new Response(JSON.stringify({ ...base, auto_install }), { status: 200 });
     }
     return new Response(JSON.stringify({}), { status: 404 });
   });
@@ -76,23 +78,26 @@ describe('BotGateBanner', () => {
     await waitFor(() => expect(screen.queryByText(MESSAGE)).not.toBeInTheDocument());
   });
 
-  it('Install now posts extension/open and extension/reveal', async () => {
+  it('Install now runs silent auto-install', async () => {
     const { calls } = mockFetch();
     render(<BotGateBanner onOpenInstructions={() => {}} />);
     await screen.findByText('Install now');
     fireEvent.click(screen.getByText('Install now'));
     await waitFor(() => {
-      expect(calls.some((c) => c.includes('/api/session/cookies/extension/open'))).toBe(true);
-      expect(calls.some((c) => c.includes('/api/session/cookies/extension/reveal'))).toBe(true);
+      expect(calls.some((c) => c.includes('/api/session/cookies/auto-install'))).toBe(true);
+      expect(calls.some((c) => c.includes('/api/session/cookies/extension/open'))).toBe(false);
     });
   });
 
-  it('Install now failure surfaces the manual-install hint', async () => {
-    mockFetch({ open: { launched: false, browser: null, url: null } });
+  it('Install now failure surfaces an error message', async () => {
+    mockFetch({
+      autoInstall: { ok: false, error: 'driver missing' },
+      autoInstallStatus: { state: 'error', installed: false, error: 'driver missing' },
+    });
     render(<BotGateBanner onOpenInstructions={() => {}} />);
     await screen.findByText('Install now');
     fireEvent.click(screen.getByText('Install now'));
-    await screen.findByText(/No Chromium browser found/);
+    await screen.findByText(/driver missing/);
   });
 
   it('Open instructions fires the settings-navigation callback', async () => {

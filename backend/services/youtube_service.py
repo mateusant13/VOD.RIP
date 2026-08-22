@@ -339,9 +339,11 @@ def _fetch_youtube_rss_rows(
         def _norm_title(t: str) -> str:
             return _re.sub(r"[^a-z0-9]", "", (t or "").lower())
 
+        from services._version import USER_AGENT
+
         req = urllib.request.Request(
             f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}",
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers={"User-Agent": USER_AGENT},
         )
         raw = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", "replace")
         ns = {

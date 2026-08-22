@@ -18,6 +18,8 @@ import ssl
 import struct
 from typing import Optional
 
+from services._version import USER_AGENT
+
 MAX_FRAME_SIZE = 1 << 20  # 1 MiB — generous for Pusher chat events
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -72,7 +74,7 @@ class WSClient:
                 "Connection: Upgrade\r\n"
                 f"Sec-WebSocket-Key: {key}\r\n"
                 "Sec-WebSocket-Version: 13\r\n"
-                f"User-Agent: VOD.RIP/1.0\r\n"
+                f"User-Agent: {USER_AGENT}\r\n"
                 + (f"Origin: {self._origin}\r\n" if self._origin else "")
                 + "\r\n"
             )

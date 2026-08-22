@@ -22,7 +22,7 @@ GET  /api/extension/status — {ok, version (the app's staged copy), reloadTo
     push payload carries no id)}. The extension's SW polls this on a 30s
     alarm and after content-script messages.
 POST /api/extension/reload {to:<version>} — persist the reload directive
-    (scripts/kick_overlay_install.ps1 -ReloadOnly calls this after staging).
+    (scripts/cookie_extension_auto_install.ps1 -ReloadOnly calls this after staging).
 POST /api/extension/reload-done {version:<version>} — fresh-SW confirmation;
     clears the directive when the version matches the staged copy.
 """
@@ -230,7 +230,7 @@ def _ext_bundled_version() -> str:
 # --- zero-window version reload directive ----------------------------------
 # Chrome does NOT hot-reload a loaded unpacked extension when its folder on
 # disk changes; the SW must re-register first. The reload is directive-based
-# and window-free: the caller (scripts/kick_overlay_install.ps1 -ReloadOnly,
+# and window-free: the caller (scripts/cookie_extension_auto_install.ps1 -ReloadOnly,
 # after staging the new copy) POSTs /api/extension/reload {to:<version>};
 # the extension's service worker polls this status endpoint on its 30s alarm
 # (and on content-script messages) and chrome.runtime.reload()s ITSELF in
@@ -523,7 +523,7 @@ def _find_browser(name: str) -> Optional[Path]:
 def _drive_extension_tab() -> Optional[tuple[str, str]]:
     """Open the extensions manager in a NEW tab of a RUNNING browser.
 
-    Runs scripts/open_extension_new_tab.ps1, which picks a default-profile
+    Runs scripts/manual_extension_manager_tab.ps1, which picks a default-profile
     Chromium window (never another profile or incognito), brings it to the
     foreground WITHOUT changing a visible window's state (no restore, no
     ALT-tap), opens a NEW tab (Ctrl+T), and types the URL into the omnibox
@@ -543,7 +543,7 @@ def _drive_extension_tab() -> Optional[tuple[str, str]]:
     when no browser is running at all (caller may spawn a fresh instance), or
     ("blocked", None) when a browser runs but its window could not be driven.
     """
-    script = Path(__file__).resolve().parent.parent / "scripts" / "open_extension_new_tab.ps1"
+    script = Path(__file__).resolve().parent.parent / "scripts" / "manual_extension_manager_tab.ps1"
     if not script.is_file():
         # Without the driver script we cannot know whether a browser process
         # is alive — refuse to spawn blind rather than risk the stray window.
@@ -573,7 +573,7 @@ def _drive_extension_tab() -> Optional[tuple[str, str]]:
 
 
 def _open_extension_manager() -> dict:
-    """Open the browser's extensions manager in a NEW tab, always.
+    """MANUAL install: open extensions manager in a NEW tab (visible).
 
     When a Chromium browser is running, drive it with keystrokes (new tab
     first, then navigate — the active tab is never touched); when the ps1
@@ -637,13 +637,13 @@ def _wake_extension_browser() -> None:
             subprocess.Popen(
                 [
                     str(path),
-                    "--new-window",
+                    "--new-tab",
                     "--window-position=-32000,-32000",
                     url,
                 ],
                 **kwargs,
             )
-            logger.info("cookie wake-up: opened %s to activate extension SW", name)
+            logger.info("cookie wake-up: background tab on %s to activate extension SW", name)
             return
         except OSError as exc:
             logger.debug("cookie wake-up %s failed: %s", name, exc)
@@ -703,7 +703,7 @@ async def extension_reload_done(body: dict):
 # the extension card and capture its ID, close the hidden window. No CDP:
 # Chrome 151 refuses --remote-debugging-port on the real profile (the old
 # debug-instance mechanism failed with "browser did not expose the debug
-# port"). The whole automation lives in scripts/kick_overlay_install.ps1
+# port"). The whole automation lives in scripts/cookie_extension_auto_install.ps1
 # (BCL only — Add-Type P/Invoke + UIAutomation); the route here only spawns
 # it in a background thread and mirrors its state in _AUTO_INSTALL_STATE.
 # Windows-only in practice (the ps1 is the driver); on other platforms the
@@ -728,16 +728,12 @@ def _ext_src_override() -> Optional[Path]:
 
 
 def _auto_install_script() -> Path:
-    # The silent driver: same CLI/JSON contract as cookie_auto_install.ps1
-    # but the UIA install is keyboard-free and event-driven (alpha-0 window,
-    # WinEvent picker discovery, ValuePattern SetValue — no posted keys, no
-    # visible typing; ~3-4s vs the old char-by-char fallback). cookie_auto_install.ps1
-    # stays as the reference/fallback copy.
-    return Path(__file__).resolve().parent.parent / "scripts" / "kick_overlay_install.ps1"
+    # Silent UIA driver (alpha-0 on-screen window, no focus steal, no visible typing).
+    return Path(__file__).resolve().parent.parent / "scripts" / "cookie_extension_auto_install.ps1"
 
 
 def _run_auto_install_script(browser: str, extension_dir: Path, port: int = 7897) -> dict:
-    """Run scripts/kick_overlay_install.ps1; parse the trailing JSON result line.
+    """Run scripts/cookie_extension_auto_install.ps1; parse the trailing JSON result line.
 
     The script prints human progress to stderr and exactly one JSON object as
     its final stdout line. Best-effort: any failure yields an error dict, never
@@ -920,7 +916,7 @@ async def session_cookies_auto_install():
     """One-click cookie-extension install (productized proven flow).
 
     Already paired -> short-circuit without touching the browser. Otherwise
-    spawn the automation (scripts/cookie_auto_install.ps1) in a background
+    spawn the automation (scripts/cookie_extension_auto_install.ps1) in a background
     thread and return immediately — progress/result are mirrored by
     GET /api/session/cookies/status -> auto_install while the frontend
     shows a spinner. Never blocks the event loop: the ps1 runs in a thread.

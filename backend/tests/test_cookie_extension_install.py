@@ -202,7 +202,7 @@ def test_open_extension_manager_no_browser_returns_false(monkeypatch):
 # regression in the driver (restore of visible windows, clipboard paste,
 # wrong-profile pick, blind spawn) fails the suite.
 
-_PS1_PATH = Path(__file__).resolve().parent.parent / "scripts" / "open_extension_new_tab.ps1"
+_PS1_PATH = Path(__file__).resolve().parent.parent / "scripts" / "manual_extension_manager_tab.ps1"
 
 
 def _ps1_source() -> str:
