@@ -21,10 +21,10 @@ pystray>=0.19.0
 Pillow>=10.0.0
 
 # ── Semantic search (services/archive_embed.py) ───────────────────────────
-# Local int8 ONNX models (e5-small embedder + mmarco reranker) run through
+# Local int8 ONNX model (e5-small embedder) runs through
 # onnxruntime; tokenization is the `tokenizers` lib — no transformers at
-# runtime. onnxruntime-gpu is NOT a dependency: the GPU paths are torch fp16
-# in archive_db (scan) and the sherpa-onnx CUDA wheel's BUNDLED onnxruntime
+# runtime. onnxruntime-gpu is NOT a dependency: the GPU paths are the
+# sherpa-onnx CUDA wheel's BUNDLED onnxruntime
 # in archive_transcribe (parakeet). NVIDIA drivers are backward compatible,
 # so a CUDA-13-era driver (e.g. 610.x, CUDA 13.3) runs the CUDA-12 runtime
 # DLLs both paths need; no standalone onnxruntime-gpu wheel is required.

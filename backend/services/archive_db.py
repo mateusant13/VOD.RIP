@@ -4043,10 +4043,10 @@ _EMBED_BACKFILL_CAP = 50_000  # segments embedded inline per semantic query
 # page-faulting 2.8GB) complete instead of silently dropping the concept
 # tier on the user's very first semantic search.
 _SEMANTIC_TIME_BUDGET_S = 12.0
-# Semantic candidate pool cap: bounds the candidates query and the
+# Semantic candidate pool cap: bounds the candidate id/score slices and the
 # per-candidate metadata fetch. The top ~3x fetch get output; the rest of
 # the pool is headroom for the per-video cap.
-_SEMANTIC_RERANK_CAND_CAP = 60
+_SEMANTIC_CAND_CAP = 60
 
 # RAM + disk cache of the full (sorted transcript_id, vec) matrix for the
 # semantic scan. Reading the corpus blobs is the dominant cost (~80s at
@@ -4066,10 +4066,10 @@ _embed_matrix_lock = threading.Lock()
 # session, so a stale key can never serve a vector produced by a different
 # model. Bounded by maxsize; popitem(last=False) evicts the
 # least-recently-used entry.
-# (The mmarco cross-encoder rerank used to run here too — it was removed:
-# English-trained, it reordered good pt-BR cosine rankings into junk,
-# e.g. 0.974 'estratagema magnam' over 0.28 'queimada estranha'. The
-# multilingual e5 cosine order stands.)
+# Ranking is the cosine order itself — the cross-encoder that used to sit
+# on top was removed: English-trained, it reordered good pt-BR cosine
+# rankings into junk, e.g. 0.974 'estratagema magnam' over 0.28 'queimada
+# estranha'.
 _embed_query_cache: "collections.OrderedDict[tuple, object]" = collections.OrderedDict()
 _EMBED_QUERY_CACHE_MAX = 64
 # Session-level RESPONSE cache for the whole semantic pass: an identical
@@ -4285,15 +4285,15 @@ def _semantic_search(
     want_yt_video: bool = False,
 ) -> Optional[list[dict]]:
     """Concept pass over transcript embeddings: cosine scan of the filtered
-    scope, segments embedded lazily (bounded per query), then an optional
-    mmarco rerank of the top candidates. Returns hits shaped like
-    _table_search rows with score (0..1) and a 'semantic' flag, or None when
-    the embedding backend is unavailable — the caller then serves pure
-    lexical results.
+    scope with segments embedded lazily (bounded per query), ranked by
+    cosine similarity alone — no second-stage model sits on top. Returns hits shaped
+    like _table_search rows with score (0..1) and a 'semantic' flag, or
+    None when the embedding backend is unavailable — the caller then serves
+    pure lexical results.
 
     Hot path: the scope query selects ids only (no vec blobs, no text), the
-    scan is a GPU fp16 matmul over the cached matrix, and metadata is
-    fetched for just the top candidates."""
+    scan is a numpy BLAS matmul over the mmap'd matrix cache, and metadata
+    is fetched for just the top candidates."""
     import numpy as np
 
     from services import archive_embed  # lazy: onnxruntime stays out of boot
@@ -4433,7 +4433,7 @@ def _semantic_search(
     if _over_budget():
         return None
     order = np.argsort(-scores)
-    top_n = min(max(fetch * 2, 30), _SEMANTIC_RERANK_CAND_CAP)
+    top_n = min(max(fetch * 2, 30), _SEMANTIC_CAND_CAP)
     cand_ids = [int(scope_ids[int(i)]) for i in order[:top_n]]
     cand_scores = [float(scores[int(i)]) for i in order[:top_n]]
     if not cand_ids:
@@ -4451,7 +4451,7 @@ def _semantic_search(
     by_id = {r["transcript_id"]: dict(r) for r in rows}
     # Placeholder/empty rows ('[&nbsp;__&nbsp;]', 'Ã,') are semantically
     # empty — they embed to a dense region and rank near many queries, so
-    # they never enter the rerank pool (see _semantic_noise).
+    # they never enter the candidate pool (see _semantic_noise).
     cand = []
     keep = []
     for i, s in zip(cand_ids, cand_scores):
@@ -4460,12 +4460,12 @@ def _semantic_search(
             cand.append(r)
             keep.append(s)
     cand_scores = keep
-    # Candidate order IS the cosine order: the mmarco cross-encoder rerank
-    # used to reorder these, but it is English-trained — on pt-BR queries
-    # it ranked junk above real matches ('estratagema magnam' 0.974 over
-    # 'queimada estranha' 0.28 for 'estranheza'; for 'vale da estranheza'
-    # it demoted 0.90 cosine hits to 0.26). The multilingual e5 cosine
-    # ranking stands as-is.
+    # Candidate order IS the cosine order, descending — no second-stage
+    # model reorders it (the removed cross-encoder was English-trained: on
+    # pt-BR queries it ranked junk above real matches, e.g. 'estratagema
+    # magnam' 0.974 over 'queimada estranha' 0.28 for 'estranheza'; for
+    # 'vale da estranheza' it demoted 0.90 cosine hits to 0.26). The
+    # multilingual e5 cosine ranking stands as-is.
     out: list[dict] = []
     per_video: dict[tuple[str, str], int] = {}
     for cos, r in zip(cand_scores, cand):

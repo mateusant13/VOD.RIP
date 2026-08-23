@@ -1,10 +1,10 @@
-"""Real-model semantic search e2e (multilingual e5 embedder + mMARCO reranker).
+"""Real-model semantic search e2e (multilingual e5 embedder).
 
 Builds a tiny scratch archive and asserts with REAL ONNX vectors that:
-  * the multilingual reranker ranks the relevant PT segment first and its
-    scores discriminate (non-degenerate) on a Portuguese query,
+  * semantic search ranks the relevant PT segment first on a Portuguese
+    query,
   * ASR placeholder rows ([&nbsp;__&nbsp;]) never reach the hits,
-  * semantic search returns hits (embedder + rerank both functional).
+  * semantic search returns hits (embedder functional end to end).
 
 Skips at collection when the ONNX models are absent — point
 VODRIP_EMBED_CACHE at a real model cache to run it (the default pytest env
@@ -53,7 +53,7 @@ def _models_present() -> bool:
         all(
             (root / d / "model.onnx").is_file()
             and (root / d / "tokenizer.json").is_file()
-            for d in (archive_embed.MODEL_ID, archive_embed._RERANK_MODEL_DIR)
+            for d in (archive_embed.MODEL_ID,)
         )
         for root in dict.fromkeys(roots)  # dedupe, keep order
     )
@@ -115,13 +115,6 @@ def test_real_model_ranks_relevant_pt_segment_first():
     assert hits[0]["semantic"] is True
     assert "molho" in (hits[0]["text"] or "").lower(), hits[0]["text"]
 
-    # the reranker itself must discriminate on this PT pair (spread above
-    # the degenerate floor — the old English model collapsed to ~0.000 here)
-    rk = archive_embed.rerank("qual a melhor receita de molho", [
-        "vamos fazer um molho de tomate caseiro com manjericão",
-        "hoje tem campeonato de futebol na televisão",
-    ])
-    assert rk is not None and rk[0] > rk[1], rk
 
 
 def test_real_model_filters_placeholder_rows():

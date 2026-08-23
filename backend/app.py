@@ -798,7 +798,7 @@ async def _app_lifespan(_app: FastAPI):
 
     # Semantic-embedding backfill — embed transcript segments that lack a
     # vector, in the background, so the first SEMANTIC search doesn't pay
-    # the inline backfill cost (up to 50k segments through torch on the
+    # the inline backfill cost (up to 50k segments through ONNX on the
     # request path). Only meaningful archives trigger it (>=500 missing);
     # after a complete pass every boot finds 0 missing and exits at once.
     # VODRIP_EMBED_BACKFILL=0 opts out (tests/constrained boxes).
