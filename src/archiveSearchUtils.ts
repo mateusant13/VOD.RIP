@@ -74,12 +74,13 @@ export const ARCHIVE_SOURCES = ['transcript', 'chat'] as const;
 export type ArchiveSource = (typeof ARCHIVE_SOURCES)[number];
 
 /** Transcript language filter values sent to /api/archive/search?lang=… */
-export const ARCHIVE_LANGS = ['pt', 'en'] as const;
+export const ARCHIVE_LANGS = ['pt', 'en', 'es'] as const;
 export type ArchiveLang = (typeof ARCHIVE_LANGS)[number];
 
 export const ARCHIVE_LANG_LABELS: Record<string, string> = {
   pt: 'PT-BR',
   en: 'EN',
+  es: 'ES',
 };
 
 export const ARCHIVE_KIND_LABELS: Record<ArchiveKind, string> = {
@@ -200,7 +201,9 @@ export interface ArchiveSearchFilterParams {
   hint?: boolean;
   /** Concept search: embedding pass over transcript segments (semantic=1). */
   semantic?: boolean;
-  /** exact (default consecutive phrase) | broad (fuzzy) | semantic. */
+  /** exact (consecutive phrase) | broad | semantic. ALWAYS sent on the
+   *  wire — the backend default is 'broad', so omission would silently
+   *  turn an exact-phrase search into fuzzy matching. */
   mode?: 'exact' | 'broad' | 'semantic';
 }
 
@@ -229,7 +232,7 @@ export function buildSearchUrl(p: ArchiveSearchFilterParams): string {
   if (username) params.set('username', username);
   if (p.hint === false) params.set('hint', '0');
   if (p.semantic) params.set('semantic', '1');
-  if (p.mode && p.mode !== 'exact') params.set('mode', p.mode);
+  if (p.mode) params.set('mode', p.mode);
   params.set('limit', String(p.limit ?? 30));
   return `/api/archive/search?${params.toString()}`;
 }

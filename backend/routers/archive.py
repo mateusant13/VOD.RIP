@@ -639,16 +639,18 @@ async def archive_search(
     limit: int = Query(20, ge=1, le=100000),
     hint: bool = Query(True),
     semantic: bool = Query(False),
-    mode: str = Query("exact"),
+    # Defaults mirror archive_db.search(): an omitted mode is 'broad' (fuzzy
+    # expansion), NOT the old exact-phrase default.
+    mode: str = Query("broad"),
 ):
     # Semantic (embedding) search is expensive per candidate — its cap stays
     # tight. Literal-word queries may page through every match ("infinite
     # results"): the frontend asks for a large limit and renders incrementally.
     if not isinstance(mode, str):
-        mode = "exact"
-    mode = (mode or "exact").strip().lower()
+        mode = "broad"
+    mode = (mode or "broad").strip().lower()
     if mode not in ("exact", "broad", "semantic"):
-        mode = "exact"
+        mode = "broad"
     if mode == "semantic":
         semantic = True
     if semantic:
@@ -770,7 +772,11 @@ async def archive_search_remote(
     (the panel fetch cap), so old series are unreachable locally. This runs
     the channel's own YouTube search tab via yt-dlp and returns flat hits in
     the archive-search hit shape (kind='youtube'). Fetch failures return
-    [] + error (never a 500) — the UI surfaces it as a note."""
+    [] + error (never a 500) — the UI surfaces it as a note.
+
+    Gating contract lives in the FE (ArchiveSearchPopup): it only calls this
+    endpoint for unfiltered queries on a saved channel with a YouTube handle;
+    the backend intentionally does not re-check those conditions."""
     from deps import settings_mgr  # lazy: keeps routers.archive import-light
 
     handle: Optional[str] = None
@@ -837,7 +843,8 @@ async def archive_chat_window(
     """Chat for the video's whole canonical dedupe group, merged by offset.
 
     half > 0 → the classic ±half nearby window per member, merged; truncated
-    always False. half <= 0 → "from offset onward" per member, merged by
+    reports any member hitting its per-member row cap. half <= 0 → "from
+    offset onward" per member, merged by
     offset_sec (platform order breaks equal-offset ties) and sliced to
     `limit` rows — truncated reports the cut. Pagination is a per-platform
     keyset: the response's `next_offsets` carries each member's last
@@ -868,11 +875,13 @@ async def archive_chat_window(
     order = {p: i for i, p in enumerate(platforms)}
     if half is not None and half > 0:
         window: list[dict] = []
+        truncated = False
         for m in members:
-            msgs, _ = archive_db.chat_window(m["platform"], m["video_id"], offset, half, limit)
+            msgs, cut = archive_db.chat_window(m["platform"], m["video_id"], offset, half, limit)
             window.extend(msgs)
+            truncated = truncated or cut
         window.sort(key=lambda r: (r["offset_sec"], order[r["platform"]]))
-        return {"messages": window, "truncated": False, "platforms": platforms, "next_offsets": {}}
+        return {"messages": window, "truncated": truncated, "platforms": platforms, "next_offsets": {}}
     cap = max(1, int(limit))
     fetched: list[dict] = []
     truncated = False

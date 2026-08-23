@@ -426,9 +426,9 @@ describe('ArchiveSearchPopup', () => {
     const toggle = screen.getByRole('button', { name: 'CONTEXT' });
     expect(toggle).not.toBeDisabled();
     fireEvent.click(toggle);
-    // The lang filter now defaults to the UI language (en in tests), so it
-    // sits between q and semantic in the query string.
-    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra&lang=en&semantic=1')).toBeTruthy());
+    // The lang filter defaults to '' (all languages) — chips are opt-in.
+    // mode always rides along; it precedes semantic in the query string.
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra&mode=semantic&semantic=1')).toBeTruthy());
 
     // Concept search covers transcripts only — deselecting speech disables it.
     fireEvent.click(screen.getByRole('button', { name: 'speech' }));
@@ -439,7 +439,7 @@ describe('ArchiveSearchPopup', () => {
     fireEvent.click(screen.getByRole('button', { name: 'speech' }));
     await waitFor(() => expect(screen.getByRole('button', { name: 'CONTEXT' })).not.toBeDisabled());
     await waitFor(() =>
-      expect(searchUrlWith(fetchMock, 'q=zebra&lang=en&semantic=1')).toBeTruthy(),
+      expect(searchUrlWith(fetchMock, 'q=zebra&mode=semantic&semantic=1')).toBeTruthy(),
     );
   });
 
@@ -1282,6 +1282,23 @@ describe('ArchiveSearchPopup USER filter', () => {
     await waitFor(() => expect(searchUrlWith(fetchMock, 'username=Scriptingkata')).toBeTruthy());
     expect(searchUrlWith(fetchMock, 'q=')).toBeTruthy();
     expect(await screen.findByText('Scriptingkata:')).toBeInTheDocument();
+  });
+
+  it('author filter disables the source chips (backend coerces chat-only)', async () => {
+    const fetchMock = mockFetch([]);
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const user = screen.getByLabelText('Chat author');
+    fireEvent.change(user, { target: { value: 'Scriptingkata' } });
+    for (const name of ['speech', 'chat']) {
+      expect(screen.getByRole('button', { name })).toBeDisabled();
+      expect(screen.getByRole('button', { name })).toHaveAttribute(
+        'title',
+        'Source filters are off: searching by author returns chat messages only',
+      );
+    }
+    // Clearing the author re-enables the chips.
+    fireEvent.click(screen.getByTitle('Clear user filter'));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'speech' })).not.toBeDisabled());
   });
 
   it('empty query + user filter shows the author-only empty state', async () => {

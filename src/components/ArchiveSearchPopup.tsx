@@ -47,6 +47,7 @@ import {
   snippetAroundMatch,
   type ArchiveChatMessage,
   type ArchiveEnrichEntry,
+  type ArchiveLang,
   type ArchiveOpenTarget,
   type ArchiveSearchHit,
   type ArchiveSearchResponse,
@@ -56,7 +57,7 @@ import {
 import { deriveChannelDisplayName, displayTitle } from '../channelUtils';
 import { resolveChatColor } from '../chatColors';
 import { seekToTimestamp } from '../seekToTimestamp';
-import { langFamily, useI18n } from '../i18n';
+import { useI18n } from '../i18n';
 import type { SavedChannel } from '../types';
 import PlatformVodIcon from './PlatformVodIcon';
 
@@ -146,7 +147,7 @@ function videoTitle(video: ArchiveVideoRow | undefined, hit: ArchiveSearchHit): 
 }
 
 export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSeekOffset, embedded = false, scope, savedChannels, initialPos, initialChannel, onBringToFront }: ArchiveSearchPopupProps) {
-  const { t, lang } = useI18n();
+  const { t } = useI18n();
   const containerRef = useRef<HTMLDivElement>(null);
   const posRef = useRef<PanelPos | null>(null);
   // Seed exactly once from the caller-supplied anchor (else viewport top-right).
@@ -167,10 +168,11 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
   /** True = ignore the stored date range (default). A date pick unchecks it;
    *  re-checking keeps the stored values but search ignores them again. */
   const [everyDay, setEveryDay] = useState(true);
-  /** '' | 'pt' | 'en' — transcript language filter ('' = all). Defaults to
-   *  the app UI language; clicking the active chip again opts back into ''
-   *  (all languages). */
-  const [langFilter, setLangFilter] = useState<'' | 'pt' | 'en'>(langFamily(lang) === 'pt' ? 'pt' : 'en');
+  /** '' | 'pt' | 'en' | 'es' — transcript language filter ('' = all).
+   *  Always starts unfiltered: the UI language must never silently narrow
+   *  results. Chips appear when hits carry >= 2 languages; picking one is
+   *  an explicit user opt-in, clicking it again returns to all. */
+  const [langFilter, setLangFilter] = useState<'' | ArchiveLang>('');
   /** Chat author filter ('' = all authors); '@' tolerated, case-insensitive. */
   const [userFilter, setUserFilter] = useState('');
   const [searchMode, setSearchMode] = useState<'exact' | 'broad' | 'semantic'>('exact');
@@ -447,8 +449,8 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
     setKindFilter((cur) => (cur.includes(k) ? cur.filter((x) => x !== k) : [...cur, k]));
   }, []);
 
-  const toggleLang = useCallback((lang: 'pt' | 'en') => {
-    setLangFilter((cur) => (cur === lang ? '' : lang));
+  const toggleLang = useCallback((l: ArchiveLang) => {
+    setLangFilter((cur) => (cur === l ? '' : l));
   }, []);
 
   /** Distinct transcript languages among current hits (chips show only when ≥2). */
@@ -532,7 +534,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
       limit: searchMode === 'semantic' ? SEARCH_LIMIT_SEMANTIC : SEARCH_LIMIT_LITERAL,
       hint: hintDisabled ? false : undefined,
       semantic: searchMode === 'semantic' && sourceFilter.includes('transcript'),
-      mode: searchMode === 'semantic' ? 'semantic' : searchMode,
+      mode: searchMode,  // always on the wire — backend default is 'broad'
     });
     void apiGet<ArchiveSearchResponse>(url)
       .then((res) => {
@@ -988,11 +990,17 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
             <div className="flex border-2 border-zinc-700">
               {ARCHIVE_SOURCES.map((s, i) => {
                 const on = sourceFilter.includes(s);
+                // An active author filter makes the backend search chat only
+                // (it coerces source=chat) — disable the chips instead of
+                // letting them silently claim a scope they cannot deliver.
+                const authorLock = userFilter.trim().length > 0;
                 return (
                   <button
                     key={s}
                     type="button"
                     aria-pressed={on}
+                    disabled={authorLock}
+                    title={authorLock ? t('Source filters are off: searching by author returns chat messages only') : undefined}
                     onClick={() =>
                       setSourceFilter((cur) => {
                         const next = on
@@ -1004,7 +1012,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                         return next.length > 0 ? next : [...ARCHIVE_SOURCES];
                       })
                     }
-                    className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
+                    className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
                       i > 0 ? 'border-l-2 border-zinc-700' : ''
                     } ${
                       on

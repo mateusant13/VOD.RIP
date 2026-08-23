@@ -969,8 +969,14 @@ def test_search_lang_filter_pt_en_and_hits_carry_lang():
             ("message", "filter-t-yt"),
             ("transcript", "lang-en"),
         }
-        # lang values other than pt/en are ignored -> all 8 hits
-        assert len(archive_db.search("zebra", lang="es")) == 8
+        # es shares pt's semantics: NULL-or-LIKE 'es%' -> the two untagged
+        # transcripts plus the tagged es one, alongside all chat rows.
+        assert _hit_ids(archive_db.search("zebra", lang="es")) == {
+            ("message", "filter-t-lubu"), ("message", "filter-t-titiltei"),
+            ("message", "filter-t-yt"),
+            ("transcript", "filter-t-lubu"), ("transcript", "lang-none"),
+            ("transcript", "lang-es"),
+        }
         # hits carry lang: transcripts the stored tag, messages None
         by_id = {}
         for h in archive_db.search("zebra"):
