@@ -2451,13 +2451,23 @@ def _decode_to_shards(
 ) -> Iterator[tuple[float, Any]]:
     """Decode ONCE to fixed-duration int16 PCM shard files; yield (start_sec, np.ndarray).
 
-    One ffmpeg process pipes mono 16 kHz s16 (int16 — half the disk of
-    float32, no speech precision loss) to stdout; stdout is sliced into
-    shard-sized buffers and each spilled to ``<out_dir>/shard_%06d.i16``.
-    Peak RAM is a couple of shard buffers, independent of media length.
-    With out_dir=None a temp dir is created and removed when the iterator is
-    exhausted or closed (also on failure); callers that need the files after
-    the loop (transcribe_video) pass their own dir and own its lifecycle."""
+    One ffmpeg process pipes mono 16 kHz s16le PCM (int16 — half the disk of
+    float32, no speech precision loss) to stdout. A daemon feeder thread runs
+    the read → spill-shard-file → convert loop alone and hands finished
+    shards to this generator through a bounded queue (maxsize=2), so the
+    consumer's VAD / ASR work overlaps the next decode instead of strictly
+    alternating with it. Peak RAM stays a couple of shard buffers (queue
+    depth × one float32 array, plus the in-flight int16 read), independent
+    of media length. Shard boundaries stay byte-identical to the sequential
+    version — same stdout reads, same slicing — which the resume contract
+    relies on. With out_dir=None a temp dir is created and removed when the
+    iterator is exhausted or closed (also on failure); callers that need the
+    files after the loop (transcribe_video) pass their own dir and own its
+    lifecycle. Lifecycle is otherwise unchanged: transcription_cpu_limiter(1)
+    is held for the generator's whole life, and on exhaust, close
+    (GeneratorExit) or error the ffmpeg process is killed, the streams closed
+    and the feeder joined promptly. An ffmpeg nonzero exit or a feeder
+    OSError is re-raised here after the already-queued shards were yielded."""
     import numpy as np
 
     if shard_sec is None:
@@ -2473,43 +2483,220 @@ def _decode_to_shards(
         "-f", "s16le", "-ac", "1", "-ar", str(SAMPLE_RATE), "-",
     ]
     proc: Optional[sp.Popen] = None
+    feeder: Optional[threading.Thread] = None
+    _stop = threading.Event()
+    # Items: (start_sec, arr) shards, then ONE terminal (None, exc-or-None).
+    # maxsize=2 caps peak RAM at a couple of shard buffers even when the
+    # consumer (VAD/GPU inference) lags the decode.
+    qout: queue.Queue = queue.Queue(maxsize=2)
+
+    def _feed() -> None:
+        idx = 0
+
+        def _put(item: tuple) -> bool:
+            while True:
+                try:
+                    qout.put(item, timeout=0.25)
+                    return True
+                except queue.Full:
+                    if _stop.is_set():
+                        return False  # consumer left; teardown owns the rest
+
+        try:
+            while not _stop.is_set():
+                raw = proc.stdout.read(shard_bytes)
+                if not raw:
+                    break
+                fpath = tmpdir / f"shard_{idx:06d}.i16"
+                fpath.write_bytes(raw)
+                # int16 on disk, float32 [-1, 1] to consumers (astype makes a
+                # fresh writable array — torch.from_numpy safe).
+                arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                if not _put((idx * shard_sec, arr)):
+                    return
+                idx += 1
+            proc.wait()
+            if proc.returncode != 0:
+                stderr = (proc.stderr.read() or b"").decode("utf-8", "replace")[-300:]
+                raise RuntimeError(f"ffmpeg decode failed for {path}: {stderr}")
+        except BaseException as exc:  # forwarded verbatim; the consumer re-raises it
+            _put((None, exc))
+            return
+        _put((None, None))  # clean EOF
+
     _ffmpeg_guard = transcription_cpu_limiter(1)
     _ffmpeg_guard.__enter__()
     try:
         proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE, creationflags=_NO_WINDOW)
-        idx = 0
+        feeder = threading.Thread(target=_feed, name="vodrip-shard-feeder", daemon=True)
+        feeder.start()
         while True:
-            raw = proc.stdout.read(shard_bytes)
-            if not raw:
+            start_sec, payload = qout.get()
+            if start_sec is None:  # terminal: payload carries the feeder's error, if any
+                if payload is not None:
+                    raise payload
                 break
-            fpath = tmpdir / f"shard_{idx:06d}.i16"
-            fpath.write_bytes(raw)
-            # int16 on disk, float32 [-1, 1] to consumers (astype makes a
-            # fresh writable array — torch.from_numpy safe).
-            arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-            yield idx * shard_sec, arr
-            idx += 1
-        proc.wait()
-        if proc.returncode != 0:
-            stderr = (proc.stderr.read() or b"").decode("utf-8", "replace")[-300:]
-            raise RuntimeError(f"ffmpeg decode failed for {path}: {stderr}")
+            yield start_sec, payload
     finally:
         if proc is not None:
-            for stream in (proc.stdout, proc.stderr):
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except OSError:
-                        pass
+            _stop.set()  # unblocks a feeder put parked on a full queue
             if proc.poll() is None:  # abandoned mid-yield — stop the decode
                 try:
                     proc.kill()
                 except OSError:
                     pass
                 proc.wait()
+            if feeder is not None:
+                # The dead pipe ends a blocked read; join before closing the
+                # streams so the reader is really gone.
+                feeder.join(timeout=10)
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
         if own_dir:
             shutil.rmtree(tmpdir, ignore_errors=True)
         _ffmpeg_guard.__exit__(None, None, None)
+
+
+def _selfcheck_shard_decode() -> None:
+    """Pipelined-decode invariants via a fake ffmpeg (no subprocess, no
+    models, no GPU): shard boundaries and float values byte-identical to a
+    straight sequential slice of the same PCM stream, ffmpeg/feeder errors
+    re-raised after the queued shards drain, and an early close() tearing
+    down (kill + join + own-dir removal) without hanging even though the
+    feeder is parked on a full queue."""
+    import numpy as np
+
+    shard_sec = 1.0
+    samples_per_shard = int(shard_sec * SAMPLE_RATE)
+    shard_bytes = samples_per_shard * 2  # int16
+    _raw = np.arange(samples_per_shard * 8 + 5000, dtype="<i2").tobytes()
+    _chunks = [_raw[i * shard_bytes : (i + 1) * shard_bytes] for i in range(8)]
+    _chunks.append(_raw[8 * shard_bytes:])  # short trailing shard
+
+    class _FakeStdout:
+        def __init__(self, chunks: list) -> None:
+            self._chunks = chunks
+
+        def read(self, n: int) -> bytes:
+            return self._chunks.pop(0)[:n] if self._chunks else b""
+
+        def close(self) -> None:
+            pass
+
+    class _FakeStderr:
+        def __init__(self, text: bytes = b"") -> None:
+            self._text = text
+
+        def read(self) -> bytes:
+            return self._text
+
+        def close(self) -> None:
+            pass
+
+    class _BrokenStdout:
+        """First read succeeds, then the pipe vanishes."""
+
+        def __init__(self, first: bytes) -> None:
+            self._first = first
+
+        def read(self, n: int) -> bytes:
+            if not self._first:
+                raise OSError("pipe vanished")
+            head, self._first = self._first[:n], b""
+            return head
+
+        def close(self) -> None:
+            pass
+
+    class _FakeProc:
+        def __init__(self, chunks: list, rc: int = 0, err: bytes = b"", stdout: Any = None) -> None:
+            self.stdout = stdout if stdout is not None else _FakeStdout(list(chunks))
+            self.stderr = _FakeStderr(err)
+            self.returncode = rc
+            self.kills = 0
+            self.waits = 0
+
+        def kill(self) -> None:
+            self.kills += 1
+
+        def poll(self) -> Optional[int]:
+            return self.returncode if (self.waits or self.kills) else None
+
+        def wait(self) -> int:
+            self.waits += 1
+            return self.returncode
+
+    _tmp = Path(tempfile.mkdtemp(prefix="vodrip-selfcheck-scrub-"))
+    _saved_popen, _saved_mkdtemp = sp.Popen, tempfile.mkdtemp
+    _made: list[Path] = []
+    try:
+        # Own-dir decodes must land inside the scratch dir so the leak checks
+        # below stay hermetic (a live worker's real vodrip-shards-* dirs are
+        # nobody's business).
+        def _scoped_mkdtemp(prefix: str = "", dir=None, **kw) -> str:
+            d = Path(_saved_mkdtemp(prefix=prefix, dir=dir if dir is not None else _tmp, **kw))
+            _made.append(d)
+            return str(d)
+        tempfile.mkdtemp = _scoped_mkdtemp
+
+        # happy path — borrowed out_dir so the spill files survive for the
+        # size asserts; starts, values and files must match a sequential decode
+        _own = Path(tempfile.mkdtemp(prefix="", dir=_tmp))
+        sp.Popen = lambda *a, **k: _FakeProc(_chunks)
+        got = list(_decode_to_shards("fake.wav", ffmpeg_bin="ffmpeg", shard_sec=shard_sec, out_dir=str(_own)))
+        assert [s for s, _ in got] == [float(i) for i in range(len(got))], (
+            f"start drift: {[s for s, _ in got]}"
+        )
+        want = np.frombuffer(_raw, dtype=np.int16).astype(np.float32) / 32768.0
+        lo = 0
+        for i, (_, arr) in enumerate(got):
+            assert (_own / f"shard_{i:06d}.i16").stat().st_size == len(arr) * 2
+            assert np.array_equal(arr, want[lo : lo + len(arr)]), (
+                f"shard {i} bytes differ from the sequential decode"
+            )
+            lo += len(arr)
+        assert lo == len(want), "shards must cover the whole stream"
+
+        # ffmpeg nonzero exit after clean EOF — same RuntimeError as ever
+        _bad = _FakeProc([], rc=1, err=b"fake boom")
+        sp.Popen = lambda *a, **k: _bad
+        try:
+            list(_decode_to_shards("fake.wav", ffmpeg_bin="ffmpeg", shard_sec=shard_sec))
+            raise AssertionError("nonzero ffmpeg exit must raise")
+        except RuntimeError as exc:
+            assert "ffmpeg decode failed" in str(exc) and "fake boom" in str(exc), str(exc)
+        assert _bad.kills == 0 and _bad.waits >= 1, "clean EOF must reap, never kill"
+
+        # OSError mid-read — forwarded verbatim, teardown still runs (own dir removed)
+        _err = _FakeProc([], stdout=_BrokenStdout(_chunks[0]))
+        sp.Popen = lambda *a, **k: _err
+        try:
+            list(_decode_to_shards("fake.wav", ffmpeg_bin="ffmpeg", shard_sec=shard_sec))
+            raise AssertionError("feeder OSError must surface to the consumer")
+        except OSError as exc:
+            assert "pipe vanished" in str(exc), str(exc)
+        assert _err.kills == 1 and _err.waits >= 1, "mid-stream failure must stop the decode"
+
+        # early close with the feeder parked on a full queue (8 shards pending,
+        # 1 consumed) — close() must return promptly, kill the decode and clean up
+        _early = _FakeProc(_chunks)
+        sp.Popen = lambda *a, **k: _early
+        gen = _decode_to_shards("fake.wav", ffmpeg_bin="ffmpeg", shard_sec=shard_sec)
+        next(gen)
+        gen.close()
+        assert _early.kills == 1 and _early.waits >= 1, "close must stop the decode"
+
+        assert [p.name for p in _tmp.iterdir() if p.name.startswith("vodrip-shards-")] == [], (
+            "own_dir leak on an error/close path"
+        )
+    finally:
+        sp.Popen = _saved_popen
+        tempfile.mkdtemp = _saved_mkdtemp
+        shutil.rmtree(_tmp, ignore_errors=True)
 
 
 def _merge_speech_regions(
@@ -5867,6 +6054,10 @@ def _run_module_selfcheck() -> None:
         _parakeet_provider = _saved_guard_prov
         _gpu_util = _saved_guard_util
         time.sleep = _saved_guard_sleep
+
+    # pipelined sharded decode: fake-ffmpeg check of the feeder thread's
+    # determinism, error forwarding and teardown (no subprocess, no models).
+    _selfcheck_shard_decode()
 
 if os.environ.get("VODRIP_TRANSCRIBE_SELFCHECK", "").strip().lower() in ("1", "true", "yes", "on"):
     _run_module_selfcheck()
