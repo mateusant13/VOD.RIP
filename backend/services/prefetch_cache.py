@@ -29,8 +29,12 @@ cache window (1h) — the freshness gate matches that window.
 
 Eviction: each pass keeps only the 5 most recent per (channel, platform)
 (union across saved channels); anything else on that platform is dropped when
-a newer VOD appears. A global byte budget bounds disk. Per-platform totals are
-logged each pass.
+a newer VOD appears. A global byte budget bounds disk: past the budget the
+LEAST-recently-demanded dirs go first, ranked by max(fetched_at, last_hit).
+Every serve-path cache hit (segment or playlist lookup) bumps the video's
+``last_hit`` (plus a ``hits`` counter) in its manifest.json, throttled to at
+most one write per 60s per video. Manifests without ``last_hit`` (never
+demanded) rank purely by fetched_at. Per-platform totals are logged each pass.
 """
 from __future__ import annotations
 
@@ -69,6 +73,7 @@ PREFETCH_MAX_SEGMENTS = 6      # hard cap on segments per VOD (segments can be 1
 PREFETCH_MAX_VIDEO_BYTES = 16 * 1024 * 1024  # per-VOD byte cap (1x 720p60 10s seg ≈ 4.3MB)
 PREFETCH_FRESH_SEC = 3600.0    # re-fetch at most hourly — matches resolve-cache TTL
 PREFETCH_FAILED_BACKOFF_SEC = 3600.0  # don't retry a failed VOD within an hour
+PREFETCH_HIT_PERSIST_SEC = 60.0  # throttle: >=60s between last_hit manifest writes per video
 PREFETCH_MAX_BYTES = 750 * 1024 * 1024  # global disk budget
 PREFETCH_PER_PASS = 4          # fetch budget per scheduler pass (like other legs)
 # The variant the frontend pins for the FIRST play (previewPlayerUtils:
@@ -81,6 +86,8 @@ _KICK_VOD_RE = re.compile(r"/videos/([\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12})",
 _worker_thread: Optional[threading.Thread] = None
 _worker_lock = threading.Lock()
 _manifest_lock = threading.Lock()
+_hit_ts: Dict[Tuple[str, str], float] = {}          # (platform, video_id) -> last serve-path cache hit
+_hit_persist_ts: Dict[Tuple[str, str], float] = {}  # last manifest last_hit write (throttle gate)
 
 
 def prefetch_root() -> Path:
@@ -141,6 +148,46 @@ def _platform_video_id(session: PreviewSession) -> Optional[Tuple[str, str]]:
     return None
 
 
+def _persist_due(last: float, now: float) -> bool:
+    """Throttle gate: at most one ``last_hit`` manifest write per video per
+    PREFETCH_HIT_PERSIST_SEC."""
+    return now - last >= PREFETCH_HIT_PERSIST_SEC
+
+
+def _persist_hit(platform: str, video_id: str, ts: float) -> None:
+    """Record a demand hit in the video's manifest (best-effort, like
+    _touch_manifest). Compares against the last_hit value being replaced, so
+    the write stays at most once per PREFETCH_HIT_PERSIST_SEC per video even
+    across restarts."""
+    with _manifest_lock:
+        man = _load_manifest(platform, video_id)
+        if not _persist_due(float(man.get("last_hit") or 0.0), ts):
+            return
+        man["last_hit"] = ts
+        man["hits"] = int(man.get("hits") or 0) + 1
+        try:
+            _video_dir(platform, video_id).mkdir(parents=True, exist_ok=True)
+            _manifest_path(platform, video_id).write_text(json.dumps(man, indent=1))
+        except OSError:
+            pass
+
+
+def _note_demand(platform: str, video_id: str) -> None:
+    """Serve-path cache-hit bookkeeping: bump the in-memory last-demand map
+    that budget eviction ranks by, and persist last_hit/hits to the manifest
+    throttled — the hot path never blocks beyond that one small write."""
+    key = (platform, video_id)
+    now = time.time()
+    _hit_ts[key] = now
+    if not _persist_due(_hit_persist_ts.get(key, 0.0), now):
+        return
+    _hit_persist_ts[key] = now  # ponytail: optimistic gate — a failed write retries in 60s, not every hit
+    try:
+        _persist_hit(platform, video_id, now)
+    except Exception:  # noqa: BLE001 — bookkeeping must never break a serve
+        logger.debug("prefetch demand persist failed", exc_info=True)
+
+
 def lookup_prefetched_segment(
     session: PreviewSession, upstream_url: str
 ) -> Optional[bytes]:
@@ -157,7 +204,9 @@ def lookup_prefetched_segment(
     path = _segment_path(key[0], key[1], upstream_url)
     try:
         if path.is_file():
-            return path.read_bytes()
+            data = path.read_bytes()
+            _note_demand(key[0], key[1])
+            return data
     except OSError:
         return None
     return None
@@ -189,6 +238,7 @@ def lookup_prefetched_playlist(
         return None
     if not rewritten.lstrip().startswith("#EXTM3U"):
         return None
+    _note_demand(key[0], key[1])  # hit: completed-VOD playlist served from cache
     return rewritten.encode("utf-8")
 
 
@@ -522,9 +572,17 @@ def _evict_platform(platform: str, keep_ids: set) -> int:
     return removed
 
 
+def _demand_score(man: dict) -> float:
+    """Budget-eviction rank: when this VOD was last DEMANDED — max of
+    fetched_at and last_hit. Never-hit manifests lack last_hit, so they rank
+    purely by fetched_at (same ordering as the previous oldest-first rule)."""
+    return max(float(man.get("fetched_at") or 0.0), float(man.get("last_hit") or 0.0))
+
+
 def _enforce_budget() -> Dict[str, float]:
-    """Drop oldest (by fetched_at) video dirs past the global byte budget.
-    Returns per-platform totals in MB for the pass log."""
+    """Drop LEAST-recently-demanded video dirs past the global byte budget —
+    rank = max(fetched_at, last_hit), so cache hits (_note_demand) keep a VOD
+    alive. Returns per-platform totals in MB for the pass log."""
     root = prefetch_root()
     totals: Dict[str, float] = {p: 0.0 for p in PLATFORM_ORDER}
     if not root.is_dir():
@@ -535,8 +593,7 @@ def _enforce_budget() -> Dict[str, float]:
         for vid_dir in sorted(p for p in platform_dir.iterdir() if p.is_dir()):
             size = _dir_size(vid_dir)
             totals[platform] = totals.get(platform, 0.0) + size
-            fetched = _load_manifest(platform, vid_dir.name).get("fetched_at") or 0.0
-            entries.append((float(fetched), size, vid_dir))
+            entries.append((_demand_score(_load_manifest(platform, vid_dir.name)), size, vid_dir))
     total = sum(e[1] for e in entries)
     if total > PREFETCH_MAX_BYTES:
         for _fetched, size, d in sorted(entries):
@@ -639,3 +696,16 @@ assert _platform_video_id(_fake_session("https://www.twitch.tv/videos/123", "Liv
 assert _segment_path("twitch", "1", "https://x/0.ts").name == _segment_path("twitch", "1", "https://x/0.ts").name
 assert _segment_path("twitch", "1", "https://x/0.ts").parent == _video_dir("twitch", "1")
 assert _segment_path("twitch", "2", "https://x/0.ts") != _segment_path("twitch", "1", "https://x/0.ts")
+# demand-aware eviction + hit-persist throttle (pure logic) ------------------
+assert _demand_score({}) == 0.0
+assert _demand_score({"fetched_at": 100.0}) == 100.0  # legacy manifest without last_hit ranks by fetch recency
+assert _demand_score({"fetched_at": 100.0, "last_hit": 40.0}) == 100.0  # stale hit never lowers the rank
+assert _demand_score({"fetched_at": 100.0, "last_hit": 400.0}) == 400.0  # demanded beats freshly fetched
+_ranked = sorted([  # same list, shuffled insert order: eviction picks lowest score first
+    (_demand_score({"fetched_at": 9000.0, "last_hit": 60.0}), "hot"),
+    (_demand_score({"fetched_at": 1000.0}), "old-never-hit"),
+    (_demand_score({"fetched_at": 5000.0, "last_hit": 400.0}), "stale-demand"),
+])
+assert [name for _, name in _ranked] == ["old-never-hit", "stale-demand", "hot"]  # least-recently-demanded evicted first
+assert _persist_due(0.0, 59.9) is False and _persist_due(0.0, 60.0) is True  # <=1 manifest write / 60s / video
+assert _persist_due(100.0, 159.9) is False and _persist_due(100.0, 160.0) is True
