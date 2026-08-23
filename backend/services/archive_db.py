@@ -626,18 +626,24 @@ def _migrate_transcript_data(conn: sqlite3.Connection) -> None:
        language family (pt/en/es) — makes the channel-family search
        exclusion (_channel_lang_exclusion) effective for pre-lang builds
        where every row is untagged. Unknown channel languages stay NULL.
+
+    Both steps mutate rows whose embeddings may already be stored, so every
+    touched id has its vector deleted in batches (missing_embedding_segments
+    re-enqueues them; the inline backfill re-embeds against the new data).
     """
     # (1) entity unescape + turn-marker strip.
     legacy = conn.execute(
         "SELECT id, text FROM transcripts "
         "WHERE text LIKE '%&amp;%' OR text LIKE '%&lt;%' OR text LIKE '%&gt;%'"
     ).fetchall()
+    mutated_ids: list[int] = []
     for r in legacy:
         clean = _clean_legacy_transcript_text(r["text"])
         if clean != r["text"]:
             conn.execute(
                 "UPDATE transcripts SET text = ? WHERE id = ?", (clean, r["id"])
             )
+            mutated_ids.append(r["id"])
     # (2) lang backfill from the video's channel language family. Only
     # known families (pt/en/es) are stamped — the exclusion only fires for
     # them; raw codes ('ja', ...) keep NULL so the tally never mistakes a
@@ -657,6 +663,18 @@ def _migrate_transcript_data(conn: sqlite3.Connection) -> None:
            ) LIMIT 1"""
     ).fetchone()
     if need_lang is not None:
+        # Collect the ids BEFORE the sweep — after it, lang IS NULL no
+        # longer matches the same predicate.
+        lang_rows = conn.execute(
+            """SELECT t.id FROM transcripts t WHERE t.lang IS NULL AND EXISTS (
+                   SELECT 1 FROM videos v
+                   WHERE v.platform = t.platform AND v.video_id = t.video_id
+                     AND v.channel_language IS NOT NULL AND v.channel_language != ''
+                     AND lower(substr(v.channel_language, 1,
+                          instr(v.channel_language || '-', '-') - 1)) IN ('pt','en','es')
+               )"""
+        ).fetchall()
+        mutated_ids.extend(r["id"] for r in lang_rows)
         conn.execute(
             """UPDATE transcripts SET lang = (
                    SELECT lower(substr(v.channel_language, 1,
@@ -674,6 +692,15 @@ def _migrate_transcript_data(conn: sqlite3.Connection) -> None:
                           instr(v2.channel_language || '-', '-') - 1))
                          IN ('pt','en','es')
                )"""
+        )
+    # Batched vector invalidation: chunked to stay under
+    # SQLITE_MAX_VARIABLE_NUMBER.
+    for i in range(0, len(mutated_ids), _SQLITE_IN_CHUNK):
+        chunk = mutated_ids[i : i + _SQLITE_IN_CHUNK]
+        conn.execute(
+            f"DELETE FROM transcript_embeddings WHERE transcript_id "
+            f"IN ({','.join('?' * len(chunk))})",
+            chunk,
         )
 
 
@@ -2001,11 +2028,19 @@ def set_transcript_lang(platform: str, video_id: str, lang: Optional[str]) -> in
     Used by the done-time channel-language correction: when the whisper
     detection disagrees with the now-known channel language, the stored
     rows are re-stamped so search filters agree with the channel decision.
-    Returns the number of rows touched."""
+    The rows' stored embeddings are dropped so the inline backfill
+    re-embeds them (a stale vector would keep serving pre-correction
+    content). Returns the number of rows touched."""
     cur = execute(
         "UPDATE transcripts SET lang = ? WHERE platform = ? AND video_id = ?",
         (lang, platform, video_id),
     )
+    if cur.rowcount:
+        execute(
+            "DELETE FROM transcript_embeddings WHERE transcript_id IN "
+            "(SELECT id FROM transcripts WHERE platform = ? AND video_id = ?)",
+            (platform, video_id),
+        )
     return cur.rowcount
 
 
@@ -2586,17 +2621,6 @@ def transcript_rows_after(cursor: int, limit: int) -> list[dict]:
     ]
 
 
-def recent_transcripts(platform: str, video_id: str, limit: int = 200) -> list[dict]:
-    """Transcript rows for one video (used to highlight hits in the viewer)."""
-    return [
-        dict(r)
-        for r in query(
-            "SELECT * FROM transcripts WHERE platform = ? AND video_id = ? "
-            "ORDER BY seg_idx LIMIT ?",
-            (platform, video_id, limit),
-        )
-    ]
-
 
 def worker_heartbeat(tag: str, pid: Optional[int] = None) -> None:
     """Stamp a worker liveness row (upsert); workers call this every poll
@@ -2973,10 +2997,6 @@ def search(
             channel = hint
             q = " ".join(q.split()[1:]) or q
             _channel_hint_out.append(hint)
-    loops = (
-        ("transcript", "transcripts_fts", "transcripts", "t.start_sec", "t.lang"),
-        ("message", "messages_fts", "messages", "t.offset_sec", "NULL"),
-    )
     if username:
         # Chat-only: transcripts/title rows have no author.
         source = "chat"
@@ -3218,7 +3238,10 @@ def search(
             # A multi-word hit that reached only the fuzzy OR tier matched a
             # subset of the query — flag it so UIs can say "closest match".
             h["partial"] = not (phr or andf)
-            h["_tbl"] = tbl_idx
+            # Table priority for the merge sort: transcripts (2) above
+            # messages (1) above title rows (-1) — the sort is reversed,
+            # so the bigger value ranks first.
+            h["_tbl"] = 2 - tbl_idx
             merged.append(h)
     # Video-title pass: matching titles surface saved-channel uploads that
     # have no transcript/chat yet (the channel index accumulates every
@@ -3257,7 +3280,8 @@ def search(
     # a strong hit from an older video outranks a weak hit from a newer one.
     # NULL dates (LEFT JOIN miss — no videos row) sort last so archived
     # content never hides behind orphan rows. Equal scores resolve by table
-    # priority (transcripts before messages), then by raw score — raw BM25
+    # priority (transcripts before messages; title rows carry no table slot
+    # and rank behind every content hit), then by raw score — raw BM25
     # is only comparable WITHIN a table, so it must never be the
     # cross-table tie-break.
     # Duplicate/overlapping transcript rows (re-fetched VTTs, whisper split
@@ -3280,16 +3304,18 @@ def search(
     # chat can't take the whole page; small/default limits keep the tight
     # cap (the multi-token relevance floor above already culled
     # single-token noise for multi-word queries).
+    # Never unlimited: a >=10k export lifts the cap to _LITERAL_PER_VIDEO_CAP
+    # exactly like any other big batch (10**9 once let one video flood it).
     cap = (
         _HITS_PER_VIDEO_CAP
         if int(limit) <= _HITS_PER_VIDEO_CAP * 10
-        else (10**9 if int(limit) >= 10_000 else _LITERAL_PER_VIDEO_CAP)
+        else _LITERAL_PER_VIDEO_CAP
     )
     per_video: dict[tuple[str, str], int] = {}
     out: list[dict] = []
     for h in sorted(
         merged,
-        key=lambda h: (not h["partial"], h["score"], h["date"] is not None, h["date"] or "", h.pop("_tbl", 0), h.pop("_raw", 0.0)),
+        key=lambda h: (not h["partial"], h["score"], h["date"] is not None, h["date"] or "", h.pop("_tbl", -1), h.pop("_raw", 0.0)),
         reverse=True,
     ):
         key = (h["platform"], h["video_id"])
@@ -4397,10 +4423,15 @@ def _semantic_search(
     else:
         if _over_budget():
             return None
+        # LEFT JOIN videos, matching the lexical passes: transcript rows
+        # whose video was never indexed stay in scope when only segment-
+        # native filters (platform/video_id/lang) are active; video-backed
+        # filters (channel/kind/date) exclude them exactly as the lexical
+        # WHERE fragments do (NULL video columns never match).
         sql = (
             "SELECT t.id AS id FROM transcripts t "
             "JOIN transcript_embeddings e ON e.transcript_id = t.id "
-            "JOIN videos v ON v.platform = t.platform AND v.video_id = t.video_id "
+            "LEFT JOIN videos v ON v.platform = t.platform AND v.video_id = t.video_id "
             "WHERE 1=1"
         )
         params: list[Any] = []
@@ -4865,7 +4896,7 @@ def _damerau_levenshtein(a: str, b: str, max_dist: int) -> Optional[int]:
                 t = prev[j - 1] + cost
                 if t < v:
                     v = t
-                if ai == b[j - 2] and a[i - 2] == bj:
+                if j > 1 and ai == b[j - 2] and a[i - 2] == bj:
                     t = prev2_row[j - 2] + cost
                     if t < v:
                         v = t
@@ -5334,6 +5365,13 @@ def _now_iso() -> str:
 # FTS index entries cascade via the AFTER DELETE triggers on the content
 # tables — scrub content rows only (external-content FTS owns no row data).
 def _run_module_selfcheck() -> None:
+    # Distance-contract asserts first (no DB): the transposition branch reads
+    # b[j - 2]/prev2_row[j - 2], valid only for j > 1 — without the guard the
+    # negative index wrapped around and fabricated too-low distances.
+    assert _damerau_levenshtein("abc", "acb", 1) == 1, "adjacent transposition is one edit"
+    assert _damerau_levenshtein("aaa", "a", 2) == 2, "j<2 wrap must not fake a cheaper path"
+    assert _damerau_levenshtein("bbb", "b", 2) == 2, "j<2 wrap must not fake a cheaper path"
+    assert _damerau_levenshtein("abbba", "bab", 2) is None, "wrap must not fake an in-budget path"
     _conn_selfcheck = get_conn()
     _selfcheck_platform = "twitch"
     _selfcheck_video = "__archive_selfcheck__"
@@ -5511,6 +5549,48 @@ def _run_module_selfcheck() -> None:
         (_selfcheck_platform, _collapse_video),
     )
     assert _n == 1 and len(_sc_rows) == 2, "different text must not collapse"
+
+    # Tie-break contract: the identical phrase in both content tables scores
+    # 1.5 in each (phrase boost) -> full tie -> transcripts above messages.
+    insert_transcript(
+        _selfcheck_platform,
+        _selfcheck_video,
+        [{"seg_idx": 50, "start_sec": 40.0, "end_sec": 41.0,
+          "text": "empate simultaneo conteudo", "words": []}],
+        lang="pt",
+    )
+    insert_messages(
+        _selfcheck_platform,
+        _selfcheck_video,
+        [{"offset_sec": 41.0, "username": "checker",
+          "text": "empate simultaneo conteudo"}],
+    )
+    _tie_hits = search("empate simultaneo conteudo", video_id=_selfcheck_video)
+    assert [_h["kind"] for _h in _tie_hits[:2]] == ["transcript", "message"], (
+        "full ties must rank transcripts before messages"
+    )
+
+    # Literal-mode per-video cap: large limits lift 3 -> _LITERAL_PER_VIDEO_CAP
+    # but stay BOUNDED (limit>=10000 used to lift the cap to 10**9).
+    insert_messages(
+        _selfcheck_platform,
+        _selfcheck_video,
+        [
+            {"offset_sec": 200.0 + i * 0.5, "username": f"capper{i:02d}",
+             "text": f"capmode sonda numero {i}"}
+            for i in range(_LITERAL_PER_VIDEO_CAP + 5)
+        ],
+    )
+    _cap_hits = search("capmode", video_id=_selfcheck_video, limit=10_000)
+    assert (
+        sum(1 for _h in _cap_hits if _h["kind"] == "message")
+        == _LITERAL_PER_VIDEO_CAP
+    ), "literal mode must keep the per-video cap bounded for huge limits"
+    _cap_small = search("capmode", video_id=_selfcheck_video, limit=10)
+    assert len(_cap_small) == _HITS_PER_VIDEO_CAP, (
+        "small limits keep the tight per-video cap"
+    )
+
     with _lock:
         _sc_conn = get_conn()
         with _sc_conn:
