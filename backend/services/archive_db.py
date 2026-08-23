@@ -1538,8 +1538,8 @@ def chat_window(
     CHAT_WINDOW_HALF_LIMIT rows; truncated always False). half <= 0 → "from
     offset onward": every row with offset_sec >= offset_sec, capped at
     `limit` rows (default CHAT_FROM_OFFSET_LIMIT) — the popup's
-    whole-history-from-hit view. The +1 probe distinguishes "hit the cap
-    exactly" from "tail cut off".
+    whole-history-from-hit view. Both caps probe LIMIT cap+1, so truncated
+    is honest: True only when a tail beyond the cap was cut off.
 
     A truncated tail is paginated by re-calling with offset_sec = the last
     delivered row's offset_sec: the inclusive >= boundary re-returns rows
@@ -1549,14 +1549,15 @@ def chat_window(
     page cap, this would stall (the page never advances past the run) —
     upgrade path: keyset pagination on (offset_sec, id)."""
     if half is not None and half > 0:
+        cap = CHAT_WINDOW_HALF_LIMIT
         rows = query(
             """SELECT * FROM messages
                WHERE platform = ? AND video_id = ?
                  AND offset_sec BETWEEN ? AND ?
                ORDER BY offset_sec LIMIT ?""",
-            (platform, video_id, offset_sec - half, offset_sec + half, CHAT_WINDOW_HALF_LIMIT),
+            (platform, video_id, offset_sec - half, offset_sec + half, cap + 1),
         )
-        return [dict(r) for r in rows], False
+        return [dict(r) for r in rows[:cap]], len(rows) > cap
     cap = CHAT_FROM_OFFSET_LIMIT if limit is None else max(1, int(limit))
     rows = query(
         """SELECT * FROM messages
@@ -2922,8 +2923,9 @@ def search(
     started_at date part; source narrows to one content kind ("chat" →
     messages only, "transcript" → transcripts only, "both" default);
     video_id scopes to a single archived video; lang filters transcripts
-    only ('pt' → lang IS NULL OR LIKE 'pt%' — untagged whisper rows are PT
-    content; 'en' → lang = 'en'; other values ignored). The videos join is
+    only ('pt'/'es' → lang IS NULL OR LIKE '<lang>%' — untagged whisper rows
+    are PT-family content; 'en' → lang = 'en'; other values ignored). The
+    videos join is
     LEFT so rows whose video was never indexed still surface when no
     video-backed filter is active.
 
@@ -3546,6 +3548,9 @@ def _table_search(
         if lng == "pt":
             # Untagged rows (whisper without detected language) are PT content.
             sql += " AND (t.lang IS NULL OR t.lang LIKE 'pt%')"
+        elif lng == "es":
+            # Same NULL-or-family-prefix semantics as pt (es-mx etc. included).
+            sql += " AND (t.lang IS NULL OR t.lang LIKE 'es%')"
         elif lng == "en":
             sql += " AND t.lang = 'en'"
     if hit_kind == "transcript":
@@ -3785,6 +3790,9 @@ def _append_content_filters(
         if lng == "pt":
             # Untagged rows (whisper without detected language) are PT content.
             parts.append(f"({table}.lang IS NULL OR {table}.lang LIKE 'pt%')")
+        elif lng == "es":
+            # Same NULL-or-family-prefix semantics as pt (es-mx etc. included).
+            parts.append(f"({table}.lang IS NULL OR {table}.lang LIKE 'es%')")
         elif lng == "en":
             parts.append(f"{table}.lang = 'en'")
 

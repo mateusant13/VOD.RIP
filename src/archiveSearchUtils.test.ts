@@ -158,19 +158,19 @@ describe('groupChatWindow', () => {
 
 describe('buildSearchUrl', () => {
   it('sends q and the default limit only', () => {
-    expect(buildSearchUrl({ query: 'shaco' })).toBe('/api/archive/search?q=shaco&limit=30');
+    expect(buildSearchUrl({ query: 'shaco' })).toBe('/api/archive/search?q=shaco&mode=exact&limit=30');
   });
 
   it('URL-encodes the query and honors a custom limit', () => {
     expect(buildSearchUrl({ query: 'lol classico', limit: 10 })).toBe(
-      '/api/archive/search?q=lol+classico&limit=10',
+      '/api/archive/search?q=lol+classico&mode=exact&limit=10',
     );
   });
 
   it('omits unset filters entirely', () => {
     expect(
       buildSearchUrl({ query: 'x', channel: '', platforms: [], kinds: [], dateFrom: '', dateTo: '' }),
-    ).toBe('/api/archive/search?q=x&limit=30');
+    ).toBe('/api/archive/search?q=x&mode=exact&limit=30');
   });
 
   it('adds channel, comma-joined platforms and kinds, and date bounds', () => {
@@ -184,56 +184,68 @@ describe('buildSearchUrl', () => {
     });
     expect(url).toBe(
       '/api/archive/search?q=bronzinhos&channel=lubu&platform=twitch%2Ckick'
-      + '&kind=vod%2Cclip&date_from=2026-07-30&date_to=2026-08-01&limit=30',
+      + '&kind=vod%2Cclip&date_from=2026-07-30&date_to=2026-08-01&mode=exact&limit=30',
     );
   });
 
   it('drops invalid calendar dates instead of sending them', () => {
     const url = buildSearchUrl({ query: 'x', dateFrom: '2026-02-30', dateTo: 'not-a-date' });
-    expect(url).toBe('/api/archive/search?q=x&limit=30');
+    expect(url).toBe('/api/archive/search?q=x&mode=exact&limit=30');
   });
 
   it('emits source as CSV subset, omits when all selected or empty, and videoId when set', () => {
     expect(buildSearchUrl({ query: 'x', source: ['transcript'] })).toBe(
-      '/api/archive/search?q=x&source=transcript&limit=30',
+      '/api/archive/search?q=x&source=transcript&mode=exact&limit=30',
     );
     expect(buildSearchUrl({ query: 'x', source: ['chat'] })).toBe(
-      '/api/archive/search?q=x&source=chat&limit=30',
+      '/api/archive/search?q=x&source=chat&mode=exact&limit=30',
     );
     expect(buildSearchUrl({ query: 'x', videoId: 'abc123' })).toBe(
-      '/api/archive/search?q=x&video_id=abc123&limit=30',
+      '/api/archive/search?q=x&video_id=abc123&mode=exact&limit=30',
     );
     // All sources selected = backend default 'both' — param omitted.
     expect(buildSearchUrl({ query: 'x', source: ['transcript', 'chat'], videoId: 'v1' })).toBe(
-      '/api/archive/search?q=x&video_id=v1&limit=30',
+      '/api/archive/search?q=x&video_id=v1&mode=exact&limit=30',
     );
     // Empty selection = same default — omitted.
     expect(buildSearchUrl({ query: 'x', source: [], videoId: '' })).toBe(
-      '/api/archive/search?q=x&limit=30',
+      '/api/archive/search?q=x&mode=exact&limit=30',
     );
   });
 
   it('emits lang only when set, after dates', () => {
     expect(buildSearchUrl({ query: 'x', lang: 'pt' })).toBe(
-      '/api/archive/search?q=x&lang=pt&limit=30',
+      '/api/archive/search?q=x&lang=pt&mode=exact&limit=30',
     );
     expect(
       buildSearchUrl({ query: 'x', lang: 'en', dateFrom: '2026-07-30' }),
-    ).toBe('/api/archive/search?q=x&date_from=2026-07-30&lang=en&limit=30');
+    ).toBe('/api/archive/search?q=x&date_from=2026-07-30&lang=en&mode=exact&limit=30');
     expect(buildSearchUrl({ query: 'x', lang: '' })).toBe(
-      '/api/archive/search?q=x&limit=30',
+      '/api/archive/search?q=x&mode=exact&limit=30',
+    );
+  });
+
+  it('always sends mode — the backend default is broad, not exact', () => {
+    expect(buildSearchUrl({ query: 'x', mode: 'broad' })).toBe(
+      '/api/archive/search?q=x&mode=broad&limit=30',
+    );
+    expect(buildSearchUrl({ query: 'x', mode: 'semantic' })).toBe(
+      '/api/archive/search?q=x&mode=semantic&limit=30',
+    );
+    expect(buildSearchUrl({ query: 'x' })).toBe(
+      '/api/archive/search?q=x&mode=exact&limit=30',
     );
   });
 
   it('emits semantic only when enabled', () => {
     expect(buildSearchUrl({ query: 'x', semantic: true })).toBe(
-      '/api/archive/search?q=x&semantic=1&limit=30',
+      '/api/archive/search?q=x&semantic=1&mode=exact&limit=30',
     );
     expect(buildSearchUrl({ query: 'x', semantic: false })).toBe(
-      '/api/archive/search?q=x&limit=30',
+      '/api/archive/search?q=x&mode=exact&limit=30',
     );
     expect(buildSearchUrl({ query: 'x', semantic: true, lang: 'pt' })).toBe(
-      '/api/archive/search?q=x&lang=pt&semantic=1&limit=30',
+      '/api/archive/search?q=x&lang=pt&semantic=1&mode=exact&limit=30',
     );
   });
 });
@@ -311,37 +323,37 @@ describe('buildArchiveVodUrl', () => {
 
 describe('buildSearchUrl username filter', () => {
   it('omits the username param when unset or empty', () => {
-    expect(buildSearchUrl({ query: 'x' })).toBe('/api/archive/search?q=x&limit=30');
-    expect(buildSearchUrl({ query: 'x', username: '' })).toBe('/api/archive/search?q=x&limit=30');
-    expect(buildSearchUrl({ query: 'x', username: null })).toBe('/api/archive/search?q=x&limit=30');
+    expect(buildSearchUrl({ query: 'x' })).toBe('/api/archive/search?q=x&mode=exact&limit=30');
+    expect(buildSearchUrl({ query: 'x', username: '' })).toBe('/api/archive/search?q=x&mode=exact&limit=30');
+    expect(buildSearchUrl({ query: 'x', username: null })).toBe('/api/archive/search?q=x&mode=exact&limit=30');
   });
 
   it('sends the username param', () => {
     expect(buildSearchUrl({ query: 'x', username: 'scriptingkata' })).toBe(
-      '/api/archive/search?q=x&username=scriptingkata&limit=30',
+      '/api/archive/search?q=x&username=scriptingkata&mode=exact&limit=30',
     );
   });
 
   it('strips a leading @ (YouTube stores the @handle)', () => {
     expect(buildSearchUrl({ query: 'x', username: '@Scriptingkata' })).toBe(
-      '/api/archive/search?q=x&username=Scriptingkata&limit=30',
+      '/api/archive/search?q=x&username=Scriptingkata&mode=exact&limit=30',
     );
   });
 
   it('URL-encodes display names with spaces', () => {
     expect(buildSearchUrl({ query: 'x', username: 'Scripting Kata' })).toBe(
-      '/api/archive/search?q=x&username=Scripting+Kata&limit=30',
+      '/api/archive/search?q=x&username=Scripting+Kata&mode=exact&limit=30',
     );
   });
 
   it('passes comma-separated user lists through unmodified', () => {
     expect(buildSearchUrl({ query: '', username: 'Scriptingkata,AlguemAe' })).toBe(
-      '/api/archive/search?q=&username=Scriptingkata%2CAlguemAe&limit=30',
+      '/api/archive/search?q=&username=Scriptingkata%2CAlguemAe&mode=exact&limit=30',
     );
     // A leading @ on the first token is stripped client-side; the backend
     // strips per token too (YouTube stores @handles).
     expect(buildSearchUrl({ query: 'x', username: '@Scriptingkata,@aranha' })).toBe(
-      '/api/archive/search?q=x&username=Scriptingkata%2C%40aranha&limit=30',
+      '/api/archive/search?q=x&username=Scriptingkata%2C%40aranha&mode=exact&limit=30',
     );
   });
 });

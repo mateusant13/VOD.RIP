@@ -286,6 +286,8 @@ const ptBR: Record<string, string> = {
   'Broad match: close spellings and related words':
     'Busca ampla: grafias próximas e palavras relacionadas',
   'Only show {lang} transcript rows': 'Mostrar apenas linhas de transcrição {lang}',
+  'Source filters are off: searching by author returns chat messages only':
+    'Filtros de fonte desativados: a busca por autor retorna apenas mensagens do chat',
   'Chat author': 'Autor do chat',
   'Chat author filter — comma-separate multiple users; leave the search box empty to list their whole history':
     'Filtro de autor do chat — separe vários usuários por vírgula; deixe a caixa de pesquisa vazia para listar todo o histórico',
@@ -917,6 +919,8 @@ const es: Record<string, string> = {
   'Broad match: close spellings and related words':
     'Búsqueda amplia: grafías cercanas y palabras relacionadas',
   'Only show {lang} transcript rows': 'Mostrar solo filas de transcripción en {lang}',
+  'Source filters are off: searching by author returns chat messages only':
+    'Filtros de origen desactivados: la búsqueda por autor devuelve solo mensajes del chat',
   'Chat author': 'Autor del chat',
   'Chat author filter — comma-separate multiple users; leave the search box empty to list their whole history': 'Filtro de autor del chat — separa varios usuarios con comas; deja el cuadro de búsqueda vacío para listar todo su historial',
   'Clear user filter': 'Borrar filtro de usuario',
