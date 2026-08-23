@@ -97,9 +97,6 @@ def _patch_embedder(monkeypatch):
         services.archive_embed, "embed_query",
         lambda q: _fake_vec([q], "query: "),
     )
-    # Rerank is real-model (mmarco) — irrelevant to these logic tests and
-    # machine-dependent; force the cosine fallback path.
-    monkeypatch.setattr(services.archive_embed, "rerank", lambda q, texts: None)
     yield calls
 
 
@@ -280,7 +277,7 @@ def test_semantic_typo_and_exact_queries_agree(_patch_embedder, monkeypatch):
     )
     typo = archive_db.search("recita de molho", semantic=True, limit=10)
     assert seen and seen[0] == "receita de molho", seen
-    # same embedded text -> same rerank cache key -> identical top hit
+    # same embedded text -> same query-embed cache key -> identical top hit
     assert typo and typo[0]["semantic"] is True
     assert typo[0]["offset_sec"] == exact[0]["offset_sec"]
 
@@ -334,9 +331,8 @@ def test_semantic_noise_rows_never_rank(_patch_embedder):
     assert archive_db._semantic_noise("o gato corre") is False
 
 
-def test_semantic_rerank_degenerate_scores_detected(_patch_embedder):
-    import services.archive_embed
-
-    assert services.archive_embed._scores_degenerate([]) is False
-    assert services.archive_embed._scores_degenerate([0.5, 0.5, 0.501]) is True
-    assert services.archive_embed._scores_degenerate([0.1, 0.9]) is False
+def test_semantic_noise_predicate_unit_contract(_patch_embedder):
+    assert archive_db._semantic_noise("[&nbsp;__&nbsp;]") is True
+    assert archive_db._semantic_noise("Ã,") is True
+    assert archive_db._semantic_noise("[risadas]") is False
+    assert archive_db._semantic_noise("o gato corre") is False
