@@ -71,6 +71,7 @@ export default function CookieBridgeSection({
   const [silentInstalling, setSilentInstalling] = useState(false);
   const [waitOpen, setWaitOpen] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [clearing, setClearing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const { t } = useI18n();
 
@@ -100,6 +101,27 @@ export default function CookieBridgeSection({
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+
+  const clearStored = async () => {
+    if (!status || busy || clearing || !token) return;
+    if (!window.confirm(t('Delete all stored bridge cookies from this machine?'))) return;
+    setClearing(true);
+    setError(null);
+    try {
+      const res = await apiPost<{ cleared: number }>(
+        '/api/session/cookies/clear',
+        {},
+        { headers: { 'X-Cookie-Bridge-Token': token } },
+      );
+      if (res.cleared > 0) {
+        await refresh();
+      }
+    } catch {
+      setError(t('Could not clear stored cookies — backend unreachable?'));
+    }
+    setClearing(false);
+  };
 
   const toggle = async () => {
     if (!status || busy) return;
@@ -223,6 +245,16 @@ export default function CookieBridgeSection({
       </div>
 
       {error ? <p className="text-[11px] text-red-400 font-mono">{error}</p> : null}
+
+      <button
+        type="button"
+        onClick={() => void clearStored()}
+        disabled={!status || busy || clearing || !token || !enabled}
+        className="self-start bg-zinc-900 text-red-400 font-black uppercase px-3 py-2 text-[11px] border-2 border-red-900 hover:border-red-500 disabled:opacity-50"
+      >
+        {clearing ? <Loader2 size={13} className="animate-spin inline" /> : null}
+        {t('Apagar cookies armazenados')}
+      </button>
 
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] font-mono">
         {Object.keys(platforms).length > 0 ? (

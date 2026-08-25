@@ -71,6 +71,25 @@ def _require_platform(platform: str) -> str:
 def _paired_token() -> str:
     return (settings_mgr.get().cookie_bridge_token or "").strip()
 
+_LOOPBACK_CLIENT_HOSTS = frozenset({"127.0.0.1", "::1"})
+_LOOPBACK_HOST_NAMES = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+
+def _require_loopback(request: Request) -> None:
+    """Reject non-loopback clients — cookie bridge routes are local-only.
+
+    Requires the TCP client address and the Host header to both indicate
+    loopback, blocking rebinding/proxy paths while preserving the installed
+    extension talking to http://127.0.0.1:7897.
+    """
+    client_host = (request.client.host if request.client else "") or ""
+    if client_host not in _LOOPBACK_CLIENT_HOSTS:
+        raise HTTPException(status_code=403, detail="loopback clients only")
+    host = (request.headers.get("host") or "").split(":", 1)[0].strip().lower()
+    if host not in _LOOPBACK_HOST_NAMES:
+        raise HTTPException(status_code=403, detail="loopback host required")
+
+
 def _require_bridge_auth(request: Request, token: Optional[str] = None) -> None:
     s = settings_mgr.get()
     if not s.cookie_bridge_enabled:
@@ -898,7 +917,8 @@ async def session_cookies_extension_reveal():
 
 
 @router.post("/api/session/cookies/enable")
-async def session_cookies_enable():
+async def session_cookies_enable(request: Request):
+    _require_loopback(request)
     s = settings_mgr.get()
     s.cookie_bridge_enabled = True
     settings_mgr.save(s)
@@ -960,7 +980,8 @@ async def session_cookies_auto_install():
 
 
 @router.get("/api/session/cookies/status")
-async def session_cookies_status():
+async def session_cookies_status(request: Request):
+    _require_loopback(request)
     gate_sec = gate_remaining_sec()
     # Watchdog: detect a dead auto-install thread — if state is "running" for
     # >5 min and no live thread is found, the worker crashed without updating
@@ -1001,7 +1022,8 @@ async def session_cookies_status():
 
 
 @router.post("/api/session/cookies/disable")
-async def session_cookies_disable():
+async def session_cookies_disable(request: Request):
+    _require_loopback(request)
     s = settings_mgr.get()
     s.cookie_bridge_enabled = False
     settings_mgr.save(s)
@@ -1009,7 +1031,8 @@ async def session_cookies_disable():
 
 
 @router.post("/api/session/cookies")
-async def session_cookies_ingest(body: dict):
+async def session_cookies_ingest(request: Request, body: dict):
+    _require_loopback(request)
     current = settings_mgr.get()
     if not current.cookie_bridge_enabled:
         raise HTTPException(status_code=403, detail="cookie bridge disabled")
@@ -1034,6 +1057,7 @@ async def session_cookies_ingest(body: dict):
 
 @router.get("/api/session/cookies/pull")
 async def session_cookies_pull(request: Request, platform: str, token: Optional[str] = None):
+    _require_loopback(request)
     _require_bridge_auth(request, token)
     p = _require_platform(platform)
     return PlainTextResponse(
@@ -1045,7 +1069,17 @@ async def session_cookies_pull(request: Request, platform: str, token: Optional[
 @router.get("/api/session/cookies/token")
 async def session_cookies_token(request: Request, token: Optional[str] = None):
     """Return the paired bridge token (Settings diagnostics). Same auth as pull."""
+    _require_loopback(request)
     _require_bridge_auth(request, token)
     ip = request.client.host if request.client else "unknown"
     logger.info("token endpoint accessed by %s", ip)
     return {"token": _paired_token()}
+
+
+@router.post("/api/session/cookies/clear")
+async def session_cookies_clear(request: Request, token: Optional[str] = None):
+    """Delete all stored bridge cookies (explicit revoke). Same auth as pull."""
+    _require_loopback(request)
+    _require_bridge_auth(request, token)
+    cleared = cookie_store.clear()
+    return {"cleared": cleared}

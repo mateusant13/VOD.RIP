@@ -109,6 +109,55 @@ def test_status_shape_per_platform(bridge_db):
     assert "twitch" not in st, "platforms without rows must be absent"
 
 
+def test_corrupt_encrypted_row_purged_on_read(bridge_db):
+    from services.cookie_store import list_cookies, pull_netscape
+
+    _seed(bridge_db, "youtube", "SID", "good-sid")
+    with bridge_db._lock:
+        conn = bridge_db.get_conn()
+        conn.execute(
+            """INSERT INTO session_cookies
+               (platform, name, domain, path, secure, http_only, value_enc, expires, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("youtube", "APISID", ".youtube.com", "/", 1, 0, "not-valid-ciphertext", 1900000000.0, "2020-01-01T00:00:00+00:00"),
+        )
+        conn.commit()
+    rows = list_cookies("youtube")
+    assert [c["name"] for c in rows] == ["SID"]
+    assert rows[0]["value"] == "good-sid"
+    assert "APISID" not in pull_netscape("youtube")
+    with bridge_db._lock:
+        n = bridge_db.get_conn().execute(
+            "SELECT COUNT(*) FROM session_cookies WHERE name = ?", ("APISID",)
+        ).fetchone()[0]
+    assert n == 0
+
+
+def test_upsert_drops_oversized_value(bridge_db):
+    big = "x" * 8193
+    accepted, dropped = bridge_db.upsert_cookies([
+        {"name": "SID", "domain": ".youtube.com", "path": "/", "value": big, "expirationDate": 1900000000},
+        {"name": "SID", "domain": ".youtube.com", "path": "/", "value": "ok", "expirationDate": 1900000000},
+    ])
+    assert accepted == 1 and dropped == 1
+    assert bridge_db.list_cookies("youtube")[0]["value"] == "ok"
+
+
+def test_upsert_drops_invalid_cookie_name(bridge_db):
+    accepted, dropped = bridge_db.upsert_cookies([
+        {"name": "bad name", "domain": ".youtube.com", "path": "/", "value": "v", "expirationDate": 1900000000},
+        {"name": "SID", "domain": ".youtube.com", "path": "/", "value": "ok", "expirationDate": 1900000000},
+    ])
+    assert accepted == 1 and dropped == 1
+
+
+def test_decrypt_token_raises_on_garbage():
+    from services.token_crypto import CookieDecryptError, decrypt_token
+    import pytest
+    with pytest.raises(CookieDecryptError):
+        decrypt_token("not-valid-ciphertext")
+
+
 # --- gate logic -------------------------------------------------------------
 
 def test_flag_defaults_and_disable():
@@ -471,7 +520,7 @@ def ext_state(tmp_path):
 @pytest.fixture
 async def client():
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+    async with AsyncClient(transport=transport, base_url="http://127.0.0.1") as ac:
         yield ac
 
 
@@ -638,6 +687,45 @@ async def test_pull_blocked_when_disabled(client):
     )
     assert resp.status_code == 403
     assert resp.json()["detail"] == "cookie bridge disabled"
+
+
+async def test_ingest_rejects_remote_client(client):
+    transport = ASGITransport(app=app, client=("8.8.8.8", 12345))
+    async with AsyncClient(transport=transport, base_url="http://127.0.0.1") as remote:
+        resp = await remote.post("/api/session/cookies", json={"token": "tok-1", "cookies": []})
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "loopback clients only"
+
+
+async def test_token_rejects_remote_client(client):
+    await _pair_with_token(client, "tok-1")
+    transport = ASGITransport(app=app, client=("8.8.8.8", 12345))
+    async with AsyncClient(transport=transport, base_url="http://127.0.0.1") as remote:
+        resp = await remote.get(
+            "/api/session/cookies/token",
+            headers={"X-Cookie-Bridge-Token": "tok-1"},
+        )
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "loopback clients only"
+
+
+async def test_clear_requires_bridge_auth(client):
+    await _pair_with_token(client, "tok-1")
+    resp = await client.post("/api/session/cookies/clear", json={})
+    assert resp.status_code == 403
+
+
+async def test_clear_deletes_stored_cookies(client):
+    await _pair_with_token(client, "tok-1")
+    resp = await client.post(
+        "/api/session/cookies/clear",
+        json={},
+        headers={"X-Cookie-Bridge-Token": "tok-1"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["cleared"] == 1
+    body = (await client.get("/api/session/cookies/status")).json()
+    assert body["platforms"] == {}
 
 
 async def test_settings_roundtrip_flag(client):

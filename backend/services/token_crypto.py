@@ -10,6 +10,10 @@ import socket
 _KEY_CACHE: bytes | None = None
 
 
+class CookieDecryptError(ValueError):
+    """Raised when a stored ciphertext cannot be decrypted (corrupt or foreign)."""
+
+
 def _derive_key() -> bytes:
     global _KEY_CACHE
     if _KEY_CACHE is not None:
@@ -33,8 +37,8 @@ def encrypt_token(plaintext: str | None) -> str | None:
 def decrypt_token(ciphertext: str | None) -> str | None:
     """Return decrypted plaintext, or None if input is None.
 
-    Backward compatible: if decryption fails, the input is returned as-is
-    so old unencrypted tokens still load correctly.
+    Raises CookieDecryptError on any decryption failure — callers must not
+    treat undecryptable ciphertext as a cookie value.
     """
     if ciphertext is None:
         return None
@@ -44,5 +48,7 @@ def decrypt_token(ciphertext: str | None) -> str | None:
         key = base64.urlsafe_b64encode(_derive_key())
         f = Fernet(key)
         return f.decrypt(ciphertext.encode()).decode()
-    except (InvalidToken, Exception):
-        return ciphertext
+    except InvalidToken as exc:
+        raise CookieDecryptError("invalid token ciphertext") from exc
+    except Exception as exc:
+        raise CookieDecryptError(f"decryption failed: {exc}") from exc
