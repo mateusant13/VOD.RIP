@@ -52,6 +52,9 @@ function mockFetch(overrides: Record<string, unknown> = {}) {
     if (url.includes('/api/session/cookies/extension/reveal')) {
       return new Response(JSON.stringify({ ok: true }), { status: (overrides.revealStatus as number | undefined) ?? 200 });
     }
+    if (url.includes('/api/session/cookies/clear')) {
+      return new Response(JSON.stringify({ cleared: 2 }), { status: 200 });
+    }
     return new Response(JSON.stringify({}), { status: 404 });
   });
   vi.stubGlobal('fetch', fn);
@@ -146,6 +149,18 @@ describe('CookieBridgeSection extension install flow', () => {
     await screen.findByText('Show folder');
     fireEvent.click(screen.getByText('Show folder'));
     await waitFor(() => expect(calls.some((c) => c.includes('/extension/reveal'))).toBe(true));
+  });
+
+
+  it('clear stored cookies confirms then posts clear route', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const { calls } = mockFetch();
+    render(<CookieBridgeSection />);
+    await screen.findByText('Apagar cookies armazenados');
+    fireEvent.click(screen.getByText('Apagar cookies armazenados'));
+    await waitFor(() => expect(confirm).toHaveBeenCalled());
+    await waitFor(() => expect(calls.some((c) => c.includes('/api/session/cookies/clear'))).toBe(true));
+    confirm.mockRestore();
   });
 
   it('open click shows the waiting overlay and Close dismisses it', async () => {
