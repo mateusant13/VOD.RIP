@@ -126,7 +126,7 @@ global.fetch = () => Promise.reject(new Error('stub-fetch'));
 const src = fs.readFileSync('content.js', 'utf8');
 // Run in a Function scope so top-level consts/functions are accessible.
 const scope = {};
-const fn = new Function('window', 'document', 'location', 'navigator', src + '\n;return {KO, probe, apply, ensureYtHls, injectStyles, teardown, setPlayer, rectTick};');
+const fn = new Function('window', 'document', 'location', 'navigator', src + '\n;return {KO, probe, apply, ensureYtHls, injectStyles, teardown, setPlayer, rectTick, mount, updateKickBar};');
 const api = fn(global, doc, global.location, global.navigator);
 const KO = api.KO;
 
@@ -141,7 +141,12 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
   assert.ok(!styleEl.textContent.includes('appendChild(st)'), 'CSS must not contain the stray appendChild text');
   assert.ok(styleEl.textContent.includes('#ko-wrap{position:fixed'), 'CSS body present');
   assert.ok(styleEl.textContent.includes('#ko-wrap.ko-yt #ko-top{display:none;}'), 'stale LIVE pill hidden in yt mode');
-  console.log('A injectStyles: style appended, no stray JS in CSS, yt-mode top hidden — OK');
+  assert.ok(styleEl.textContent.includes('#ko-bar{position:absolute;left:0;right:0;bottom:0;pointer-events:auto;opacity:1;'), 'control bar defaults visible');
+  assert.ok(styleEl.textContent.includes('#ko-wrap:not(.ko-hot) #ko-bar{opacity:0;}'), 'bar fades when not hot');
+  assert.ok(styleEl.textContent.includes('#ko-wrap.ko-offline #ko-top{display:none;}'), 'offline LIVE pill hidden');
+  assert.ok(styleEl.textContent.includes('#ko-seekbar{position:absolute;top:6px;'), 'seek bar contained inside bar');
+  assert.ok(!styleEl.textContent.includes('top:-28px'), 'seek bar no longer extends above bar');
+  console.log('A injectStyles: style appended, bar/seek/offline CSS — OK');
 
   // ---- C: ensureYtHls TTL + backoff -----------------------------------------
   KO.slug = 'rodil';
@@ -400,10 +405,9 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
   await settle(50); // let the handler's apply() settle
   assert.strictEqual(KO.twDeleted, true);
   assert.strictEqual(delVideo.removed, 1, 'delete removes the current twitch video');
-  assert.ok(KO.lastRect && KO.lastRect.width === 1280 && KO.lastRect.height === 720, 'lastRect primed with the viewport');
+  assert.ok(!KO.lastRect || KO.lastRect.width !== 1280 || KO.lastRect.height !== 720, 'tw-delete must not prime full viewport lastRect');
   assert.strictEqual(KO.wrap.style.display, 'block', 'wrap kept visible in the loading state');
-  assert.strictEqual(KO.wrap.style.width, '1280px', 'wrap covers the viewport width');
-  assert.strictEqual(KO.wrap.style.height, '720px', 'wrap covers the viewport height');
+  assert.ok(!KO.wrap.style.width || KO.wrap.style.width !== '1280px', 'wrap not forced to viewport width without a measured rect');
   assert.strictEqual(KO.statusChip.textContent, 'YT ✕', 'chip reports the yt failure with the wrap up');
   assert.strictEqual(KO.statusChip.style.display, 'block', 'chip visible with the wrap up');
 
@@ -422,7 +426,7 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
   mo.cb([{ addedNodes: [twVideo] }]);
   assert.strictEqual(twVideo.removed, 0, "observer no-ops while player === 'twitch'");
   KO.player = 'youtube';
-  console.log('K tw_delete: video removed, viewport-pinned wrap kept up, observer re-applies on re-render — OK');
+  console.log('K tw_delete: video removed, wrap kept up without viewport priming, observer re-applies — OK');
 
   // ---- L: yt frame-death watchdog -------------------------------------------
   KO.player = 'youtube';
@@ -449,6 +453,134 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
   api.rectTick();
   assert.strictEqual(fakeFrame.removed, 0, 'recent st heartbeat keeps the frame');
   console.log('L yt watchdog: 30s silence removes the frame, resets ready/ytWin — OK');
+
+  // ---- M/N/O/P: kick overlay UI fixes (fs icon, bar hot, badge offline, no viewport prime) ----
+  const makeNode = (tag) => {
+    const node = {
+      tagName: (tag || 'div').toUpperCase(),
+      nodeType: 1,
+      id: '',
+      innerHTML: '',
+      textContent: '',
+      style: { display: '' },
+      dataset: {},
+      children: [],
+      parentElement: null,
+      className: '',
+      classList: {
+        _s: new Set(),
+        add(...a) { a.forEach((x) => this._s.add(x)); },
+        remove(...a) { a.forEach((x) => this._s.delete(x)); },
+        contains(x) { return this._s.has(x); },
+      },
+      appendChild(c) { this.children.push(c); c.parentElement = this; return c; },
+      remove() { this.removed = (this.removed || 0) + 1; },
+      _ev: {},
+      addEventListener(type, fn) { this._ev[type] = fn; },
+      removeEventListener(type, fn) { if (this._ev[type] === fn) delete this._ev[type]; },
+      setAttribute() {},
+      getAttribute() { return null; },
+      querySelector(sel) {
+        if (!sel || sel[0] !== '#') return null;
+        const want = sel.slice(1);
+        const all = [];
+        const walk = (n) => { all.push(n); n.children.forEach(walk); };
+        walk(this);
+        return all.find((n) => n.id === want) || null;
+      },
+      querySelectorAll() { return []; },
+      getBoundingClientRect: () => ({ left: 10, top: 20, width: 400, height: 300 }),
+      isConnected: true,
+      offsetWidth: 400,
+      offsetHeight: 300,
+    };
+    Object.defineProperty(node, 'innerHTML', {
+      set(html) {
+        node._html = html;
+        node.children = [];
+        const re = /<(button|div|span)[^>]*id="([^"]+)"/g;
+        let m;
+        while ((m = re.exec(html))) {
+          const child = makeNode(m[1]);
+          child.id = m[2];
+          node.appendChild(child);
+        }
+      },
+      get() { return node._html || ''; },
+    });
+    return node;
+  };
+
+  const mountDoc = {
+    head: doc.head,
+    body: makeNode('body'),
+    documentElement: doc.documentElement,
+    hidden: false,
+    hasFocus: () => true,
+    fullscreenElement: null,
+    createElement: (t) => makeNode(t),
+    getElementById: () => null,
+    querySelector: (sel) => (sel === 'main' ? mountDoc.body : null),
+    querySelectorAll: (sel) => (sel === 'video' ? fakeVideos : []),
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  const mountApi = new Function('window', 'document', 'location', 'navigator', src + '\n;return {KO, mount, updateKickBar, teardown, injectStyles};')(
+    global, mountDoc, global.location, global.navigator,
+  );
+  const mKO = mountApi.KO;
+  mountApi.injectStyles();
+  mountApi.mount();
+  assert.ok(mKO.wrap, 'mount creates wrap');
+  const fsNode = mKO.wrap.querySelector('#ko-fs');
+  assert.ok(fsNode && fsNode.innerHTML.includes('viewBox'), 'fullscreen button receives the fs SVG icon');
+  assert.ok(mKO.wrap.classList.contains('ko-hot'), 'wrap starts hot so the control bar is visible');
+  console.log('M fs icon: mount assigns KO_SVG.fs to #ko-fs — OK');
+
+  const styleEl2 = appends.find((e) => e.id === 'ko-style');
+  assert.ok(styleEl2.textContent.includes('opacity:1'), 'bar visible-by-default CSS present');
+  console.log('N bar visibility: default opacity:1 + :not(.ko-hot) fade — OK');
+
+  const badgeWrap = {
+    style: { display: 'block' },
+    classList: {
+      _s: new Set(['ko-kick']),
+      add(...a) { a.forEach((x) => this._s.add(x)); },
+      remove(...a) { a.forEach((x) => this._s.delete(x)); },
+      contains(x) { return this._s.has(x); },
+      toggle(cls, on) { on ? this.add(cls) : this.remove(cls); },
+    },
+    querySelector: (sel) => {
+      if (sel === '#ko-live-dot') return { style: {} };
+      if (sel === '#ko-live-txt') return { textContent: '' };
+      if (sel === '#ko-livebadge') return { style: { cursor: '' } };
+      if (sel === '#ko-elapsed') return { textContent: '' };
+      if (sel === '#ko-play') return { dataset: {}, innerHTML: '' };
+      return null;
+    },
+  };
+  KO.wrap = badgeWrap;
+  KO.player = 'kick';
+  KO.kickOnDvr = false;
+  KO.kickState = null;
+  api.updateKickBar();
+  assert.ok(badgeWrap.classList.contains('ko-offline'), 'offline kickState hides LIVE badge via ko-offline');
+  KO.kickState = { state: 'Playing', pos: 1, lat: 1, dur: 10 };
+  api.updateKickBar();
+  assert.ok(!badgeWrap.classList.contains('ko-offline'), 'playing kickState shows LIVE badge');
+  KO.kickOnDvr = true;
+  KO.kickState = { state: 'Paused', pos: 1, lat: 1, dur: 10 };
+  api.updateKickBar();
+  assert.ok(!badgeWrap.classList.contains('ko-offline'), 'DVR mode keeps badge visible');
+  console.log('O badge offline: ko-offline toggles with kick playback state — OK');
+
+  KO.lastRect = null;
+  const delListener2 = runtimeMsgListeners[0];
+  await new Promise((res) => delListener2({ type: 'ko-delete-twitch' }, {}, () => res()));
+  assert.ok(!KO.lastRect || KO.lastRect.width !== global.innerWidth || KO.lastRect.height !== global.innerHeight, 'tw-delete without video does not prime viewport lastRect');
+  console.log('P tw-delete: no viewport lastRect priming — OK');
+
+  mountApi.teardown();
 
   console.log('\nALL CONTENT.JS FIX CHECKS PASSED');
   process.exit(0);

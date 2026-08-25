@@ -1,5 +1,9 @@
 // Kick Overlay — content script (runs on https://www.twitch.tv/*).
 //
+// Runs ONLY on https://www.twitch.tv/* (see manifest). It overlays the
+// streamer's Kick or YouTube stream onto the Twitch player page; kick.com
+// and youtube.com themselves are not modified by this content script.
+//
 // While enabled and the streamer is live on Kick or YouTube too, overlays
 // the streamer's REAL Kick or YouTube stream over the Twitch player so
 // Twitch ads become invisible and inaudible (Twitch keeps playing
@@ -819,6 +823,37 @@ function updateKickVolUI() {
   }
 }
 
+// Control bar auto-hide: visible on mount, fades after inactivity, returns on pointer activity.
+function setupHotBar(wrap) {
+  teardownHotBar();
+  KO.hotWrap = wrap;
+  const armHot = () => {
+    if (!KO.hotWrap) return;
+    KO.hotWrap.classList.add('ko-hot');
+    clearTimeout(KO.hotTimer);
+    KO.hotTimer = setTimeout(() => {
+      if (KO.hotWrap) KO.hotWrap.classList.remove('ko-hot');
+    }, 2600);
+  };
+  KO._hotArm = armHot;
+  wrap.addEventListener('pointermove', armHot);
+  wrap.addEventListener('pointerdown', armHot);
+  wrap.addEventListener('mouseenter', armHot);
+  armHot();
+}
+
+function teardownHotBar() {
+  clearTimeout(KO.hotTimer);
+  KO.hotTimer = null;
+  if (KO.hotWrap && KO._hotArm) {
+    KO.hotWrap.removeEventListener('pointermove', KO._hotArm);
+    KO.hotWrap.removeEventListener('pointerdown', KO._hotArm);
+    KO.hotWrap.removeEventListener('mouseenter', KO._hotArm);
+  }
+  KO.hotWrap = null;
+  KO._hotArm = null;
+}
+
 function mount() {
   if (KO.wrap) return;
   const wrap = document.createElement('div');
@@ -871,6 +906,8 @@ function mount() {
   });
   const muteBtn = bar.querySelector('#ko-mute');
   muteBtn.innerHTML = KO_SVG.sound;
+  const fsBtn = bar.querySelector('#ko-fs');
+  fsBtn.innerHTML = KO_SVG.fs;
   muteBtn.addEventListener('click', () => {
     KO.kickMuted = !KO.kickMuted;
     if (!KO.kickMuted && KO.kickVol === 0) KO.kickVol = 1;
@@ -994,21 +1031,11 @@ function mount() {
     else if (KO.wrap) KO.wrap.requestFullscreen().catch(() => {});
   });
   startRectLoop();
-
-  let hotTimer = null;
-  window.addEventListener('mousemove', (e) => {
-    if (!KO.wrap) return;
-    const r = KO.wrap.getBoundingClientRect();
-    if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) return;
-    KO.wrap.classList.add('ko-hot');
-    clearTimeout(hotTimer);
-    hotTimer = setTimeout(() => {
-      if (KO.wrap) KO.wrap.classList.remove('ko-hot');
-    }, 2600);
-  });
+  setupHotBar(wrap);
 }
 
 function teardown() {
+  teardownHotBar();
   stopRectLoop();
   if (KO.kickFrame) {
     try {
@@ -1163,6 +1190,8 @@ async function reconnect() {
 function updateKickBar() {
   if (!KO.wrap || KO.player !== 'kick') return;
   const st = KO.kickState;
+  const liveVisible = !!(st && (st.state === 'Playing' || st.state === 'Buffering' || KO.kickOnDvr));
+  KO.wrap.classList.toggle('ko-offline', !liveVisible);
   if (!st) return;
   const pos = st.pos || 0;
   const lat = st.lat;
@@ -1500,12 +1529,24 @@ function rectTick() {
       if (tv) {
         const prev = KO.lastRect;
         const r = twitchAnchorRect() || tv.getBoundingClientRect();
-        KO.lastRect = r;
+        const vw = window.innerWidth || 0;
+        const vh = window.innerHeight || 0;
+        let left = r.left;
+        let top = r.top;
+        let width = r.width;
+        let height = r.height;
+        if (vw > 0 && vh > 0) {
+          left = Math.max(0, Math.min(left, vw - 1));
+          top = Math.max(0, Math.min(top, vh - 1));
+          width = Math.min(width, vw - left);
+          height = Math.min(height, vh - top);
+        }
+        KO.lastRect = { left, top, width, height };
         const s = KO.wrap.style;
-        s.left = `${r.left}px`;
-        s.top = `${r.top}px`;
-        s.width = `${r.width}px`;
-        s.height = `${r.height}px`;
+        s.left = `${left}px`;
+        s.top = `${top}px`;
+        s.width = `${width}px`;
+        s.height = `${height}px`;
         // One-shot anomaly dump: the applied rect and the rendered box
         // disagree (the "mini player" symptom) — capture the constraint
         // source. Rate-limited 30s; renders fresh ground truth.
@@ -1606,6 +1647,8 @@ function rectTick() {
         KO.kickWin = null;
         KO.kickReady = false;
         KO.kickState = null;
+        KO.kickOnDvr = false;
+        if (KO.wrap) KO.wrap.classList.add('ko-offline');
         KO.pendingUrl = KO.activeUrl;
         kickFrame();
       }
@@ -1654,13 +1697,14 @@ function injectStyles() {
     '#ko-wrap.ko-kick #ko-yt{display:none;}' + // one rendering: the inactive player is hidden, not covered
     '#ko-wrap.ko-yt #ko-ivs{display:none;}' +
     '#ko-wrap.ko-yt iframe{width:100%;height:100%;border:0;display:block;pointer-events:auto;}' +
-    '#ko-bar{position:absolute;left:0;right:0;bottom:0;pointer-events:auto;opacity:0;transition:opacity .18s ease;' +
-    'display:flex;flex-direction:row;align-items:center;justify-content:space-between;padding:0 10px;color:#fff;' +
+    '#ko-bar{position:absolute;left:0;right:0;bottom:0;pointer-events:auto;opacity:1;transition:opacity .18s ease;' +
+    'display:flex;flex-direction:row;align-items:center;justify-content:space-between;padding:22px 10px 6px;color:#fff;' +
     'background:linear-gradient(0deg,rgba(0,0,0,.8),rgba(0,0,0,0));' +
     'font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}' +
+    '#ko-wrap:not(.ko-hot) #ko-bar{opacity:0;}' +
     '#ko-wrap.ko-yt #ko-bar{display:none;}' + // YT has native controls incl. LIVE chip
     '#ko-wrap.ko-yt #ko-top{display:none;}' + // stale LIVE pill in yt mode
-    '#ko-wrap.ko-hot #ko-bar{opacity:1;}' +
+    '#ko-wrap.ko-offline #ko-top{display:none;}' + // hide LIVE pill when kick is offline/not playing
     '#ko-reconnecting{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;' +
     'background:rgba(0,0,0,.82);color:#fff;font:700 15px system-ui,sans-serif;letter-spacing:.04em;pointer-events:none;}' +
     '.ko-g{display:flex;flex-direction:row;align-items:center;}' +
@@ -1680,17 +1724,17 @@ function injectStyles() {
     '#ko-volfill{position:absolute;left:0;top:0;bottom:0;border-radius:999px;background:#fff;}' +
     '#ko-volthumb{position:absolute;top:50%;width:16px;height:16px;border-radius:10px;background:#fff;' +
     'transform:translate(-50%,-50%);box-shadow:0 1px 3px rgba(0,0,0,.4);}' +
-    '#ko-seekbar{position:absolute;top:-28px;left:0;right:0;height:20px;cursor:pointer;touch-action:none;}' +
+    '#ko-seekbar{position:absolute;top:6px;left:10px;right:10px;height:14px;cursor:pointer;touch-action:none;}' +
     '#ko-track{position:absolute;left:0;right:0;bottom:0;height:4px;border-radius:2px;background:rgba(146,158,166,.5);}' +
     '#ko-seekbar:hover #ko-track{height:6px;bottom:-1px;}' +
     '#ko-fill{position:absolute;left:0;top:0;bottom:0;background:#53fc18;border-radius:2px;}' +
     '.ko-prog{position:absolute;left:0;right:0;bottom:0;height:4px;transform-origin:left;}' +
     '#ko-loaded{background:rgba(255,255,255,.5);}' +
     '#ko-loadind{background:rgba(255,255,255,.3);}' +
-    '#ko-thumb{position:absolute;bottom:-6px;width:16px;height:16px;border-radius:50%;background:#53fc18;' +
-    'transform:translateX(-50%);display:none;}' +
+    '#ko-thumb{position:absolute;top:50%;width:16px;height:16px;border-radius:50%;background:#53fc18;' +
+    'transform:translate(-50%,-50%);display:none;}' +
     '#ko-seekbar:hover #ko-thumb,#ko-seekbar.ko-drag #ko-thumb{display:block;}' +
-    '#ko-hov{position:absolute;bottom:26px;left:0;transform:translateX(-50%);background:rgba(0,0,0,.78);' +
+    '#ko-hov{position:absolute;top:-20px;left:0;transform:translateX(-50%);background:rgba(0,0,0,.78);' +
     'border-radius:6px;padding:4px 6px;font-size:12px;font-weight:700;color:#fff;' +
     'font-variant-numeric:tabular-nums;white-space:nowrap;display:none;pointer-events:none;z-index:2;}' +
     '#ko-top{position:absolute;top:0;left:0;right:0;pointer-events:none;display:flex;flex-direction:row;' +
@@ -1761,7 +1805,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     // Prime the pin: when no player rect was ever measured (deleted before
     // the first tick), the overlay covers the whole page instead of floating.
     if (!KO.lastRect) {
-      KO.lastRect = { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+      const ar = twitchAnchorRect();
+      if (ar && ar.width > 0 && ar.height > 0) {
+        KO.lastRect = { left: ar.left, top: ar.top, width: ar.width, height: ar.height };
+      }
     }
     // The point of the button is SEEING the overlay without the Twitch
     // player — if the current player is 'twitch' the overlay would stay
@@ -1775,11 +1822,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     // the black layer covers the deleted player slot (probe()'s hide sites
     // respect twDeleted via hideWrapForProbe()).
     if (KO.player === 'youtube' && KO.wrap && KO.wrap.style.display === 'none') {
-      const s = KO.wrap.style;
-      s.left = `${KO.lastRect.left}px`;
-      s.top = `${KO.lastRect.top}px`;
-      s.width = `${KO.lastRect.width}px`;
-      s.height = `${KO.lastRect.height}px`;
+      if (KO.lastRect) {
+        const s = KO.wrap.style;
+        s.left = `${KO.lastRect.left}px`;
+        s.top = `${KO.lastRect.top}px`;
+        s.width = `${KO.lastRect.width}px`;
+        s.height = `${KO.lastRect.height}px`;
+      }
       showWrap();
     }
     apply();
