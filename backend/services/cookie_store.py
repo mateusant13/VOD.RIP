@@ -15,18 +15,25 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
 
-from services.token_crypto import decrypt_token, encrypt_token
+from services.token_crypto import CookieDecryptError, decrypt_token, encrypt_token
 from services.settings import _get_appdata_dir
 
 logger = logging.getLogger(__name__)
 
 PLATFORMS = ("youtube", "twitch", "kick")
+
+# Printable ASCII cookie names ([ -~]) minus RFC 6265 separator characters.
+_COOKIE_NAME_RE = re.compile(r"^[!#$%&'*+\-.0-9A-Z^_`a-z|~]+$")
+_MAX_COOKIE_VALUE_LEN = 8192
+_MAX_DOMAIN_LEN = 253
+_MAX_PATH_LEN = 4096
 
 # Per-platform keep-lists — the ONLY cookie names the bridge accepts/stores.
 # kick.com: auth_token (+ g_session keeps the Kick session alive).
@@ -135,14 +142,89 @@ def is_kept(platform: str, name: str) -> bool:
     return (name or "") in KEEP_LISTS.get(platform, frozenset())
 
 
+def _valid_cookie_name(name: str) -> bool:
+    return bool(name) and len(name) <= 4096 and _COOKIE_NAME_RE.match(name) is not None
+
+
+def _valid_domain(domain: str) -> bool:
+    if not domain or len(domain) > _MAX_DOMAIN_LEN:
+        return False
+    return all(0x20 < ord(c) < 0x7F and c not in " \t" for c in domain)
+
+
+def _valid_path(path: str) -> bool:
+    if not path or len(path) > _MAX_PATH_LEN or not path.startswith("/"):
+        return False
+    return all(0x20 <= ord(c) < 0x7F for c in path)
+
+
+def _valid_expiration(expires: object) -> bool:
+    if expires is None:
+        return True
+    try:
+        float(expires)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _purge_row(platform: str, name: str, domain: str) -> None:
+    with _lock:
+        get_conn().execute(
+            "DELETE FROM session_cookies WHERE platform = ? AND name = ? AND domain = ?",
+            (platform, name, domain),
+        )
+        get_conn().commit()
+
+
+def _purge_undecryptable_rows(platform: Optional[str] = None) -> int:
+    """Delete rows whose value_enc cannot be decrypted; returns rows removed."""
+    sql = "SELECT platform, name, domain, value_enc FROM session_cookies"
+    params: tuple = ()
+    if platform:
+        sql += " WHERE platform = ?"
+        params = (platform,)
+    purged = 0
+    with _lock:
+        conn = get_conn()
+        rows = conn.execute(sql, params).fetchall()
+        for row in rows:
+            try:
+                decrypt_token(row["value_enc"])
+            except CookieDecryptError:
+                conn.execute(
+                    "DELETE FROM session_cookies WHERE platform = ? AND name = ? AND domain = ?",
+                    (row["platform"], row["name"], row["domain"]),
+                )
+                purged += 1
+        if purged:
+            conn.commit()
+    return purged
+
+
+def _decrypt_row_value(row: sqlite3.Row) -> Optional[str]:
+    """Decrypt one row; purge and return None when ciphertext is unreadable."""
+    try:
+        return decrypt_token(row["value_enc"])
+    except CookieDecryptError:
+        _purge_row(row["platform"], row["name"], row["domain"])
+        logger.warning(
+            "purged undecryptable cookie row platform=%s name=%s domain=%s",
+            row["platform"], row["name"], row["domain"],
+        )
+        return None
+
+
 # --- storage ---------------------------------------------------------------
 
 def upsert_cookies(cookies: list[dict]) -> tuple[int, int]:
     """Store keep-listed, platform-normalized cookies.
 
-    Drops (and returns as ``dropped``) cookies for unrelated domains or
-    names outside the platform keep-list — the extension pre-filters, this
-    is the authoritative second gate. Returns (accepted, dropped).
+    Drops (and returns as ``dropped``) cookies for unrelated domains, names
+    outside the platform keep-list, or entries that fail boundary validation
+    (name charset, value length, domain/path shape, expirationDate type) — the
+    extension pre-filters; this is the authoritative second gate.
+    Returns (accepted, dropped).
     """
     accepted = 0
     dropped = 0
@@ -156,18 +238,28 @@ def upsert_cookies(cookies: list[dict]) -> tuple[int, int]:
                 name = (c.get("name") or "").strip()
                 domain = (c.get("domain") or "").strip().lower()
                 value = c.get("value")
-                if not name or not domain or value is None:
+                path = str(c.get("path") or "/")
+                expires = c.get("expirationDate")
+                if (
+                    value is None
+                    or not _valid_cookie_name(name)
+                    or not _valid_domain(domain)
+                    or not _valid_path(path)
+                    or not _valid_expiration(expires)
+                    or not isinstance(value, str)
+                    or len(value) > _MAX_COOKIE_VALUE_LEN
+                ):
                     dropped += 1
                     continue
                 platform = platform_for_domain(domain)
                 if platform is None or not is_kept(platform, name):
                     dropped += 1
                     continue
-                expires = c.get("expirationDate")
                 try:
                     expires_f = float(expires) if expires is not None else None
                 except (TypeError, ValueError):
-                    expires_f = None
+                    dropped += 1
+                    continue
                 now = _now_iso()
                 conn.execute(
                     """INSERT INTO session_cookies
@@ -180,28 +272,26 @@ def upsert_cookies(cookies: list[dict]) -> tuple[int, int]:
                          value_enc=excluded.value_enc,
                          expires=excluded.expires, updated_at=excluded.updated_at""",
                     (
-                        platform,
-                        name,
-                        domain,
-                        str(c.get("path") or "/"),
+                        platform, name, domain, path,
                         1 if c.get("secure") else 0,
                         1 if c.get("httpOnly") else 0,
-                        encrypt_token(str(value)),
-                        expires_f,
-                        now,
+                        encrypt_token(value), expires_f, now,
                     ),
                 )
                 accepted += 1
     return accepted, dropped
 
 
-def clear(platform: Optional[str] = None) -> None:
-    """Delete stored cookies (all platforms, or one). Used by self-check and
-    a future 'disconnect bridge' affordance."""
-    if platform:
-        _execute("DELETE FROM session_cookies WHERE platform = ?", (platform,))
-    else:
-        _execute("DELETE FROM session_cookies")
+def clear(platform: Optional[str] = None) -> int:
+    """Delete stored cookies (all platforms, or one). Returns rows removed."""
+    with _lock:
+        conn = get_conn()
+        if platform:
+            cur = conn.execute("DELETE FROM session_cookies WHERE platform = ?", (platform,))
+        else:
+            cur = conn.execute("DELETE FROM session_cookies")
+        conn.commit()
+        return cur.rowcount
 
 
 # --- expiry ----------------------------------------------------------------
@@ -238,6 +328,7 @@ def _purge_expired_lazy() -> None:
 def counts() -> dict[str, int]:
     """Live (non-expired) cookie counts per platform."""
     _purge_expired_lazy()
+    _purge_undecryptable_rows()
     rows = _query(
         "SELECT platform, COUNT(*) AS n FROM session_cookies "
         "WHERE expires IS NULL OR expires > ? GROUP BY platform",
@@ -249,11 +340,13 @@ def counts() -> dict[str, int]:
 def status() -> dict[str, dict[str, object]]:
     """Per-platform {count, lastGrabAt, expiredCount} for the /status endpoint.
 
-    ``count`` counts live rows (expired rows are never served), ``expiredCount``
-    reports how many rows are past their expirationDate (extension push may
-    still be on the way), ``lastGrabAt`` is the newest updated_at (UTC ISO).
+    ``count`` counts live decryptable rows (expired and undecryptable rows are
+    never served), ``expiredCount`` reports how many rows are past their
+    expirationDate (extension push may still be on the way), ``lastGrabAt`` is
+    the newest updated_at (UTC ISO).
     """
     _purge_expired_lazy()
+    _purge_undecryptable_rows()
     now = time.time()
     rows = _query(
         """SELECT platform,
@@ -276,10 +369,11 @@ def status() -> dict[str, dict[str, object]]:
 def list_cookies(platform: str) -> list[dict]:
     """Keep-listed rows for one platform with values decrypted.
 
-    Expired rows are skipped (and lazily purged) — a stale SID must never
-    reach a consumer.
+    Expired and undecryptable rows are skipped (undecryptable rows are lazily
+    purged) — a stale SID or corrupt ciphertext must never reach a consumer.
     """
     _purge_expired_lazy()
+    _purge_undecryptable_rows(platform)
     rows = _query(
         "SELECT * FROM session_cookies WHERE platform = ? "
         "AND (expires IS NULL OR expires > ?) ORDER BY name, domain",
@@ -287,13 +381,16 @@ def list_cookies(platform: str) -> list[dict]:
     )
     out = []
     for r in rows:
+        value = _decrypt_row_value(r)
+        if value is None:
+            continue
         out.append({
             "name": r["name"],
             "domain": r["domain"],
             "path": r["path"],
             "secure": bool(r["secure"]),
             "httpOnly": bool(r["http_only"]),
-            "value": decrypt_token(r["value_enc"]),
+            "value": value,
             "expirationDate": r["expires"],
         })
     return out
