@@ -4084,4 +4084,16 @@ if __name__ == "__main__":
                 assert "truncated" in str(e), e
             else:
                 raise AssertionError("expected GooglevideoTruncatedBody")
+            # Second assertion: a full Content-Length must NOT trigger the guard.
+            # If the guard ever silently regresses (e.g. moves below the call site),
+            # this case would also raise GooglevideoTruncatedBody and fail loudly.
+            fake.headers = {"Content-Length": str(999999 + 1)}
+            try:
+                _fetch_googlevideo_range_once(
+                    "https://rr1---sn-fooglevideo/key", (0, 999999), None, _dest
+                )
+            except GooglevideoTruncatedBody as e:
+                raise AssertionError(
+                    f"full CL must not raise GooglevideoTruncatedBody: {e}"
+                )
     print("cobalt-halfchunk: ok")

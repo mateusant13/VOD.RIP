@@ -640,13 +640,20 @@ def _gql_persisted(operation_name: str, sha256_hash: str, variables: Dict[str, A
         raise RuntimeError(msg)
     return body.get("data") or {}
 
-def _gql_persisted_with_fallback(op, primary_hash, fallback_hash, variables):
+
+def _gql_persisted_with_fallback(
+    op: str,
+    primary_hash: str,
+    fallback_hash: str,
+    variables: Dict[str, Any],
+) -> Dict[str, Any]:
     try:
         return _gql_persisted(op, primary_hash, variables)
     except RuntimeError as e:
         if fallback_hash and "PersistedQueryNotFound" in str(e):
             return _gql_persisted(op, fallback_hash, variables)
         raise
+
 
 
 def list_channel_videos_sync(

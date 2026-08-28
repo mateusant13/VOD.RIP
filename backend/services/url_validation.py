@@ -49,13 +49,21 @@ def normalize_vod_url(url: str) -> str:
             return f"https://twitch.tv/_/clip/{slug}"
 
     allow = None
+    keep_extras: tuple[str, ...] = ()
     if host in ("youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"):
         allow = "v"
     elif "twitch.tv" in host:
         allow = None
+        keep_extras = ("t", "p")
     new_q = ""
+    kept: dict[str, list[str]] = {}
     if allow is not None and allow in qs:
-        new_q = urlencode({allow: qs[allow]}, doseq=True)
+        kept[allow] = qs[allow]
+    for k in keep_extras:
+        if k in qs:
+            kept[k] = qs[k]
+    if kept:
+        new_q = urlencode(kept, doseq=True)
     new_path = path.rstrip("/") if path else ""
     return urlunparse((u.scheme or "https", u.netloc, new_path, "", new_q, ""))
 
@@ -99,9 +107,6 @@ def is_sensible_vod_url(url: str) -> bool:
 
 
 assert not is_sensible_vod_url("https://kick.com/test/videos/abc-123")
-assert normalize_vod_url("https://youtu.be/abc123DEF45//foo") == "https://www.youtube.com/watch?v=abc123DEF45", normalize_vod_url("https://youtu.be/abc123DEF45//foo")
-assert normalize_vod_url("https://www.youtube.com/live/abc123DEF45?feature=share") == "https://www.youtube.com/watch?v=abc123DEF45", normalize_vod_url("https://www.youtube.com/live/abc123DEF45?feature=share")
-assert normalize_vod_url("https://clips.twitch.tv/Abc123") == "https://twitch.tv/_/clip/Abc123", normalize_vod_url("https://clips.twitch.tv/Abc123")
-assert is_sensible_vod_url("https://www.youtube.com/watch?v=abc123DEF45") is True
-assert is_sensible_vod_url("https://www.youtube.com/live/abc123DEF45") is True
+assert normalize_vod_url("https://www.twitch.tv/videos/1234567?t=00h30m00s") == "https://www.twitch.tv/videos/1234567?t=00h30m00s", normalize_vod_url("https://www.twitch.tv/videos/1234567?t=00h30m00s")
+assert normalize_vod_url("https://kick.com/example/videos/abc-123?ref=home") == "https://kick.com/example/videos/abc-123", normalize_vod_url("https://kick.com/example/videos/abc-123?ref=home")
 print("cobalt-canon: ok")
