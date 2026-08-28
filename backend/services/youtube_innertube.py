@@ -641,8 +641,8 @@ def _player_body(
                 "html5Preference": "HTML5_PREF_WANTS",
                 "signatureTimestamp": 0,
             },
+        },
     }
-}
     _pid_raw = (os.environ.get("YOUTUBE_INNERTUBE_PLAYER_ID") or "").strip()
     if _pid_raw:
         _pid = _pid_raw.split(",")[0].strip()
