@@ -45,6 +45,7 @@ class TwitchVodUnavailable(RuntimeError):
 
 CLIPS_CARDS_USER_HASH = "90c33f5e6465122fba8f9371e2a97076f9ed06c6fed3788d002ab9eba8f91d88"
 CLIP_ACCESS_TOKEN_HASH = "993d9a5131f15a37bd16f32342c44ed1e0b1a9b968c6afdb662d2cddd595f6c5"
+CLIP_ACCESS_TOKEN_HASH_COBALT = "36b89d2507fce29e5ca551df756d27c1cfe079e2609642b4390aa4c35796eb11"  # cobalt twitch.js — fallback for PersistedQueryNotFound
 VOD_PLAYBACK_TOKEN_HASH = "ed230aa1e33e07eebb8928504583da78a5173989fadfb1ac94be06a04f3cdbe9"
 
 # Deep-paging ceilings for the anonymous GQL channel lists.
@@ -316,9 +317,10 @@ def get_clip_signed_variants_sync(url_or_slug: str) -> List[Dict[str, Any]]:
     slug = _extract_clip_slug(url_or_slug)
     if not slug:
         raise ValueError(f"Not a Twitch clip URL or slug: {url_or_slug}")
-    data = _gql_persisted(
+    data = _gql_persisted_with_fallback(
         "VideoAccessToken_Clip",
         CLIP_ACCESS_TOKEN_HASH,
+        CLIP_ACCESS_TOKEN_HASH_COBALT,
         {"slug": slug, "platform": "web"},
     )
     clip = data.get("clip")
@@ -637,6 +639,14 @@ def _gql_persisted(operation_name: str, sha256_hash: str, variables: Dict[str, A
         msg = body["errors"][0].get("message", "Unknown GQL error")
         raise RuntimeError(msg)
     return body.get("data") or {}
+
+def _gql_persisted_with_fallback(op, primary_hash, fallback_hash, variables):
+    try:
+        return _gql_persisted(op, primary_hash, variables)
+    except RuntimeError as e:
+        if fallback_hash and "PersistedQueryNotFound" in str(e):
+            return _gql_persisted(op, fallback_hash, variables)
+        raise
 
 
 def list_channel_videos_sync(
@@ -1055,3 +1065,23 @@ def is_vod_previous_broadcast(
 
 assert "type: ARCHIVE" not in CHANNEL_VIDEOS_QUERY
 assert TWITCH_CLIPS_RANGE_FILTER == "ALL_TIME"
+# cobalt self-check: fallback on PersistedQueryNotFound (run: python backend/services/twitch_gql_service.py)
+if __name__ == "__main__":
+    import unittest.mock as _um
+
+    with _um.patch(
+        f"{__name__}._gql_persisted",
+        side_effect=[
+            RuntimeError("PersistedQueryNotFound"),
+            {
+                "clip": {
+                    "playbackAccessToken": {"signature": "sig", "value": "tok"},
+                    "videoQualities": [{"quality": 720, "sourceURL": "https://example.com/vid.mp4"}],
+                }
+            },
+        ],
+    ) as _m:
+        out = get_clip_signed_variants_sync("fakeslug")
+    assert _m.call_count == 2, f"fallback not invoked: {(_m.call_count,)}"
+    assert out and out[0].get("url", "").endswith("sig=sig&token=tok"), out
+    print("cobalt-hash: ok")

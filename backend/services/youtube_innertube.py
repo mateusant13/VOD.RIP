@@ -15,6 +15,9 @@ from services.youtube_fingerprint import youtube_http_headers
 
 logger = logging.getLogger(__name__)
 
+import os as _os
+_YT_PLAYER_ID = (_os.environ.get("YOUTUBE_INNERTUBE_PLAYER_ID") or "").strip()
+
 _INNERTUBE_PLAYER_URL = (
     "https://www.youtube.com/youtubei/v1/player"
     "?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
@@ -640,6 +643,12 @@ def _player_body(
             },
         },
     }
+    if _YT_PLAYER_ID:
+        pid = _YT_PLAYER_ID.split(",")[0].strip()
+        if pid:
+            body.setdefault("playbackContext", {}).setdefault("contentPlaybackContext", {})[
+                "signatureTimestamp"
+            ] = int(pid) if pid.isdigit() else pid
     if session and session.po_token:
         body["serviceIntegrityDimensions"] = {"poToken": session.po_token}
     return body
@@ -1540,3 +1549,35 @@ assert _original_language_from_player({"captions": {"playerCaptionsTracklistRend
 ]}}}) == "en", "missing source indices fall back to the first track"
 assert _original_language_from_player({}) is None
 assert _original_language_from_player(None) is None
+# cobalt-playerid self-check: env var overrides signatureTimestamp; patch reload-safe.
+# ponytail: guarded by __name__ == "__main__" would be cleaner, but file is import-time
+# executed via `python file.py` in CI; inline assert is the minimal ladder rung.
+if __name__ == "__main__":
+    # Direct test without module reload: exercise the override logic in-place.
+    _probe_prof = _PROFILE_BY_NAME["TVHTML5"]
+    _body_default = _player_body("dQw4w9WgXcQ", _probe_prof, None)
+    assert isinstance(_body_default, dict)
+    assert _body_default.get("playbackContext", {}).get("contentPlaybackContext", {}).get(
+        "signatureTimestamp"
+    ) == 0, _body_default
+    # Simulate env-set by temporarily patching the module-level constant.
+    _saved_pid = _YT_PLAYER_ID  # noqa: SLF001
+    globals()["_YT_PLAYER_ID"] = "12345"
+    _body_env = _player_body("dQw4w9WgXcQ", _probe_prof, None)
+    assert _body_env.get("playbackContext", {}).get("contentPlaybackContext", {}).get(
+        "signatureTimestamp"
+    ) == 12345, _body_env
+    # Non-digit value should be stored as string.
+    globals()["_YT_PLAYER_ID"] = "12abc"
+    _body_str = _player_body("dQw4w9WgXcQ", _probe_prof, None)
+    assert _body_str.get("playbackContext", {}).get("contentPlaybackContext", {}).get(
+        "signatureTimestamp"
+    ) == "12abc", _body_str
+    # Comma-separated list: only first pid used.
+    globals()["_YT_PLAYER_ID"] = "999, 888"
+    _body_multi = _player_body("dQw4w9WgXcQ", _probe_prof, None)
+    assert _body_multi.get("playbackContext", {}).get("contentPlaybackContext", {}).get(
+        "signatureTimestamp"
+    ) == 999, _body_multi
+    globals()["_YT_PLAYER_ID"] = _saved_pid
+    print("cobalt-playerid: ok")
