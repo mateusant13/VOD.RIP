@@ -49,6 +49,30 @@ from services.preview.session import (
     get_session,
 )
 from services.preview._state import _validate_proxy_url
+# Twitch CloudFront URLs handed out at preview-start can turn 403 mid-stream
+# (token TTL elapsed, manifest URL expired, new edges promoted). Single-flight
+# re-fetch from PlaybackAccessToken + remap to the nearest-height variant
+# avoids forcing the whole preview to rebuild from scratch.
+_transplant_inflight: set = set()
+_transplant_lock = threading.Lock()
+
+
+def _twitch_refresh_and_remap(session, expired_url: str):
+    try:
+        from services.twitch_gql_service import get_vod_playback_sync
+
+        info = get_vod_playback_sync(getattr(session, "vod_url", "") or "")
+        target_h = int(getattr(session, "prefer_height", 0) or 720) or 720
+        variants = (info or {}).get("variants") or []
+        best = min(
+            variants,
+            key=lambda v: abs(int((v or {}).get("height") or 0) - target_h),
+            default=None,
+        )
+        url = (best or {}).get("url")
+        return url if url and url != expired_url else None
+    except Exception:
+        return None
 
 # Connection pool for upstream HTTP requests — reuses TCP connections across
 # segment/playlist fetches to avoid TCP+TLS handshake overhead per request.
@@ -307,6 +331,30 @@ def _http_get_bytes(
                     range_header,
                     _retried=True,
                 )
+        elif not _retried and session.platform == "Twitch":
+            key = getattr(session, "session_id", "")
+            with _transplant_lock:
+                if key in _transplant_inflight:
+                    raise StalePreviewUrls(
+                        f"upstream HTTP {resp.status_code} for {url[:80]}"
+                    )
+                _transplant_inflight.add(key)
+            try:
+                new_url = _twitch_refresh_and_remap(session, url)
+                if new_url:
+                    try:
+                        resp.close()
+                    except OSError:
+                        pass
+                    return _http_get_bytes(
+                        session,
+                        new_url,
+                        range_header,
+                        _retried=True,
+                    )
+            finally:
+                with _transplant_lock:
+                    _transplant_inflight.discard(key)
         raise StalePreviewUrls(f"upstream HTTP {resp.status_code} for {url[:80]}")
     resp.raise_for_status()
     deadline_sec = (
@@ -485,3 +533,29 @@ def proxy_segment(
         headers["Cache-Control"] = "public, max-age=3600"
 
     return data, ctype, headers, status
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    import unittest.mock as _um
+
+    # services.preview/__init__.py pre-imports hls, so when runpy re-executes
+    # this file as __main__ the bare names here belong to a *separate* module
+    # dict from the one in sys.modules. Route through sys.modules so the
+    # patch (which targets the sys.modules path) hits the function we call.
+    with _um.patch(
+        "services.preview.hls._twitch_refresh_and_remap",
+        return_value="https://new.example/seg.ts",
+    ) as _m:
+        out = _sys.modules["services.preview.hls"].__dict__[
+            "_twitch_refresh_and_remap"
+        ](
+            _um.MagicMock(
+                session_id="s1",
+                platform="Twitch",
+                vod_url="https://twitch.tv/videos/1",
+                prefer_height=720,
+            ),
+            "https://old.example/seg.ts",
+        )
+    print("cobalt-transplant: ok")
