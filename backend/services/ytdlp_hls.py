@@ -2637,6 +2637,15 @@ def _fetch_googlevideo_range_once(
             f"googlevideo URL expired HTTP {resp.status_code} for {url[:80]}",
         )
     resp.raise_for_status()
+    # Half-chunk guard: Content-Length shorter than half the requested range
+    # means the CDN closed the body early (throttled). Detect on the header
+    # so we fail before writing a silently short file to disk.
+    cl = int(resp.headers.get("Content-Length") or 0)
+    expected_min = b1 - b0 + 1
+    if cl and cl < expected_min // 2:
+        raise GooglevideoTruncatedBody(
+            f"truncated Range {b0}-{b1}: got {cl} expected {expected_min}",
+        )
     expected = None
     cr = resp.headers.get("content-range") or ""
     try:
@@ -4054,3 +4063,25 @@ if __name__ == "__main__":
     if os.name == "nt":
         assert _is_broken_pipe_error(OSError(22, "Invalid argument"))
         assert _is_broken_pipe_error(OSError(0, "pipe ended", None, 233))
+    import unittest.mock as _um
+    import tempfile
+    fake = _um.MagicMock()
+    fake.headers = {"Content-Length": "100"}
+    fake.status_code = 206
+    fake.close = lambda: None
+    fake.__enter__ = lambda self: self
+    fake.__exit__ = lambda self, *a: None
+    with tempfile.TemporaryDirectory() as _td:
+        _dest = os.path.join(_td, "halfchunk_check.bin")
+        with _um.patch("curl_cffi.requests.get", return_value=fake), _um.patch(
+            "requests.get", return_value=fake
+        ):
+            try:
+                _fetch_googlevideo_range_once(
+                    "https://rr1---sn-fooglevideo/key", (0, 999999), None, _dest
+                )
+            except GooglevideoTruncatedBody as e:
+                assert "truncated" in str(e), e
+            else:
+                raise AssertionError("expected GooglevideoTruncatedBody")
+    print("cobalt-halfchunk: ok")
