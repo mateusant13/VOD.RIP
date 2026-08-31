@@ -402,6 +402,19 @@ export function channelHasCachedContent(
   return false;
 }
 
+/** Order channels for the one-shot incremental sync so channels that never
+ * loaded (just added, or a prior fetch errored — `updatedAt` empty) run first,
+ * ahead of fully-cached channels. Within each group the saved order is
+ * preserved (stable), so the rest of the list is untouched. */
+export function orderChannelsForSync(channels: SavedChannel[]): SavedChannel[] {
+  return [...channels].sort((a, b) => {
+    const aFresh = !(a.updatedAt ?? '');
+    const bFresh = !(b.updatedAt ?? '');
+    if (aFresh !== bFresh) return aFresh ? -1 : 1;
+    return 0;
+  });
+}
+
 function clipPlatformFetchDone(
   platform: 'Kick' | 'Twitch' | 'YouTube',
   incoming: ChannelVideo[],

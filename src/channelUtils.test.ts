@@ -36,6 +36,7 @@ import {
   syncDurationFromPreviewSession,
   videoInfoDurationSec,
   displayTitle,
+  orderChannelsForSync,
   shouldDropChannelFromLivePoll,
 } from './channelUtils';
 import type { ChannelVideo, SavedChannel, VideoInfo } from './types';
@@ -785,5 +786,41 @@ describe('shouldDropChannelFromLivePoll', () => {
 
   it('drops an id when the saved list is empty', () => {
     expect(shouldDropChannelFromLivePoll('x', [])).toBe(true);
+  });
+});
+
+describe('orderChannelsForSync', () => {
+  const mkCh = (id: string, updatedAt: string): SavedChannel => ({
+    id,
+    displayName: id,
+    kickSlug: '',
+    twitchSlug: '',
+    youtubeSlug: '',
+    vodVideos: [],
+    clipVideos: [],
+    updatedAt,
+  });
+
+  it('sorts never-loaded channels (updatedAt empty) before cached channels', () => {
+    const cached = mkCh('cached', '2024-06-01T00:00:00Z');
+    const fresh = mkCh('fresh', '');
+    const out = orderChannelsForSync([cached, fresh]);
+    expect(out.map((c) => c.id)).toEqual(['fresh', 'cached']);
+  });
+
+  it('preserves saved order within each group (stable)', () => {
+    const a = mkCh('cached-a', '2024-06-01T00:00:00Z');
+    const b = mkCh('fresh-b', '');
+    const c = mkCh('cached-c', '2024-01-01T00:00:00Z');
+    const d = mkCh('fresh-d', '');
+    const out = orderChannelsForSync([a, b, c, d]);
+    expect(out.map((ch) => ch.id)).toEqual(['fresh-b', 'fresh-d', 'cached-a', 'cached-c']);
+  });
+
+  it('treats undefined updatedAt as never-loaded', () => {
+    const cached = mkCh('cached', '2024-06-01T00:00:00Z');
+    const fresh = { ...mkCh('fresh', ''), updatedAt: undefined as unknown as string };
+    const out = orderChannelsForSync([cached, fresh]);
+    expect(out.map((c) => c.id)).toEqual(['fresh', 'cached']);
   });
 });

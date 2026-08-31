@@ -96,7 +96,7 @@ import { createFullscreenGate, type FullscreenGate } from './utils/fullscreenGat
 import { actionBtnHover, platformPreviewCtrlBtn, platformCardShadow, platformVodPanelBtn, platformWatchPreviewBtn, platformBulkDownloadBtn, type PlatformStyleKey } from './platformStyles';
 import { fmtDuration, formatClipDurationHuman, fmtDateAndAgo, fmtViews, parseVideoTs, formatBytes, basename, sourceQualityOptionLabel } from './formatters';
 import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout, PreviewSessionResponse, PanelPos } from './types';
-import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, isMembersOnlyVideo, isPublicVideo, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, effectivePlatformFlags, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, displayTitle, loadSavedChannels, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, isSyntheticArchiveId, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_CLIP_FETCH_LIMIT, CHANNEL_UI_STORAGE_KEY, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, channelShowMoreNeedsFetch, nextChannelPage, stalePageResponse, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft, loadStoredChannelLiveStatuses, persistChannelLiveStatuses, shouldDropChannelFromLivePoll, type StoredChannelLiveStatus } from './channelUtils';
+import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, isMembersOnlyVideo, isPublicVideo, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, effectivePlatformFlags, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, displayTitle, loadSavedChannels, orderChannelsForSync, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, isSyntheticArchiveId, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_CLIP_FETCH_LIMIT, CHANNEL_UI_STORAGE_KEY, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, channelShowMoreNeedsFetch, nextChannelPage, stalePageResponse, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft, loadStoredChannelLiveStatuses, persistChannelLiveStatuses, shouldDropChannelFromLivePoll, type StoredChannelLiveStatus } from './channelUtils';
 import ChannelLinkCard from './components/ChannelLinkCard';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, zoomWindowFromView, fracToSec, secToFrac, zoomTrimViewAround, resolveTimestampSeek, TRIM_ZOOM_STEP, type TrimRangeOpts, type TrimViewWindow } from './trimUtils';
@@ -5200,6 +5200,12 @@ export default function App() {
           ? channelStreamsMissing(ch, effectiveYoutubeEnabled)
           : channelVodsMissing(ch, effectiveKickEnabled, effectiveTwitchEnabled, effectiveYoutubeEnabled);
     if (!needsFetch) return;
+    // A just-added channel is fetched explicitly by addChannelFromSlugs on the
+    // same commit. Re-fetching here (force:!hasCache) would clear that in-flight
+    // fetch and launch a duplicate channel-list request — doubling the backend
+    // yt-dlp work and lock wait for a brand-new channel. The add path sets
+    // loading:true and clears it once its fetch lands.
+    if (ch.loading) return;
 
     const hasCache = channelHasCachedContent(ch, mode, effectiveKickEnabled, effectiveTwitchEnabled, effectiveYoutubeEnabled);
     void refreshChannelRef.current(selectedChannelId, undefined, mode, {
@@ -5246,7 +5252,10 @@ export default function App() {
   useEffect(() => {
     if (tab !== 'channels' || incrementalSyncDoneRef.current) return;
     incrementalSyncDoneRef.current = true;
-    const channels = loadSavedChannels();
+    // Never-loaded (just-added) channels first so a newly added channel's
+    // VODs/clips/streams fetch ahead of the older backlog — the same priority
+    // the archive scheduler applies to new channels.
+    const channels = orderChannelsForSync(loadSavedChannels());
     const tasks: Array<() => Promise<unknown>> = [];
     channels.forEach((c) => {
       tasks.push(() => refreshChannelRef.current(c.id, c, 'vods', { silent: true, incremental: true }));
