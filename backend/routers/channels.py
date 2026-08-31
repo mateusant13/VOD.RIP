@@ -683,41 +683,48 @@ async def channel_videos(
             # they were invisible in the panel. Merge both tabs — best
             # effort: a streams-tab failure degrades to the /videos list
             # alone, and the whole fetch must not fail on it.
+            #
+            # The innertube language probe is a plain HTTP call (it does not
+            # take the yt-dlp channel lock), so it is independent of the
+            # /streams extract. Run both concurrently so the critical path
+            # is videos + max(streams, probe) instead of videos + streams
+            # + probe.
             try:
-                fetched_s = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        CHANNEL_EXECUTOR,
-                        functools.partial(
-                            youtube_list_channel_videos_sync,
-                            ref,
-                            fetch_limit,
-                            playlist="streams",
-                            enrich=True,
-                            return_has_more=True,
+                fetched_s, clue = await asyncio.wait_for(
+                    asyncio.gather(
+                        loop.run_in_executor(
+                            CHANNEL_EXECUTOR,
+                            functools.partial(
+                                youtube_list_channel_videos_sync,
+                                ref,
+                                fetch_limit,
+                                playlist="streams",
+                                enrich=True,
+                                return_has_more=True,
+                            ),
                         ),
+                        loop.run_in_executor(
+                            CHANNEL_EXECUTOR,
+                            innertube_channel_language,
+                            [str(v.get("id") or "") for v in vids],
+                        ),
+                        return_exceptions=True,
                     ),
                     timeout=YOUTUBE_CHANNEL_FETCH_TIMEOUT_SEC,
                 )
-                if isinstance(fetched_s, tuple):
+            except Exception:
+                streams = []
+                clue = None
+            else:
+                if isinstance(fetched_s, BaseException):
+                    streams = []
+                elif isinstance(fetched_s, tuple):
                     streams, sat_streams = fetched_s
                 else:
                     streams = fetched_s
-            except Exception:
-                streams = []
+                if isinstance(clue, BaseException):
+                    clue = None
             items = merge_youtube_playlists(vids, streams)
-            # YouTube clue: audio language of the newest videos (innertube,
-            # no API key); a failed probe yields no clue.
-            try:
-                clue = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        CHANNEL_EXECUTOR,
-                        innertube_channel_language,
-                        [str(v.get("id") or "") for v in items],
-                    ),
-                    timeout=YOUTUBE_CHANNEL_FETCH_TIMEOUT_SEC,
-                )
-            except Exception:
-                clue = None
             return items, clue, bool(sat_videos or sat_streams)
 
         def _persist_platform(label: str, items: list, clue: Any = None) -> None:
