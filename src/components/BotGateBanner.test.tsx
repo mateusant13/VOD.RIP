@@ -15,7 +15,7 @@ function mockFetch(overrides: Record<string, unknown> = {}) {
     const url = String(input);
     calls.push(url);
     if (url.includes('/api/session/cookies/auto-install')) {
-      const body = overrides.autoInstall ?? { ok: true, started: true };
+      const body = (overrides.autoInstall ?? { ok: true, started: true }) as Record<string, unknown>;
       if (body.ok) installStarted = true;
       return new Response(JSON.stringify(body), { status: 200 });
     }

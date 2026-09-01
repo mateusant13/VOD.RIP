@@ -1285,7 +1285,7 @@ describe('ArchiveSearchPopup USER filter', () => {
   });
 
   it('author filter disables the source chips (backend coerces chat-only)', async () => {
-    const fetchMock = mockFetch([]);
+    mockFetch([]);
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const user = screen.getByLabelText('Chat author');
     fireEvent.change(user, { target: { value: 'Scriptingkata' } });
