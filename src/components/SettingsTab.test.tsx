@@ -197,7 +197,7 @@ describe("SettingsTab", () => {
     render(<Harness />);
     expandCard("Cookie Bridge");
     await screen.findByText(/not paired/);
-    const sections = [...document.querySelectorAll("section")];
+    const sections = [...document.querySelectorAll("section")].filter((section) => section.querySelector("[aria-expanded]"));
     expect(sections[0].textContent).toContain("Cookie Bridge");
     expect(sections[0].textContent).not.toContain("General");
   });
@@ -207,7 +207,7 @@ describe("SettingsTab", () => {
     render(<Harness />);
     expandCard("Cookie Bridge");
     await screen.findByText(/paired/);
-    const sections = [...document.querySelectorAll("section")];
+    const sections = [...document.querySelectorAll("section")].filter((section) => section.querySelector("[aria-expanded]"));
     expect(sections[0].textContent).toContain("Cookie Bridge");
   });
 
@@ -216,10 +216,9 @@ describe("SettingsTab", () => {
     render(<Harness />);
     expandCard("Cookie Bridge");
     await screen.findByText(/paired/);
-    const sections = [...document.querySelectorAll("section")];
-    // Danger Zone renders directly above the Save row (user request);
-    // Cookie Bridge stays among the last cards (Features + Experimental
-    // now sit between Cookie Bridge and Danger Zone).
+    const sections = [...document.querySelectorAll("section")].filter((section) => section.querySelector("[aria-expanded]"));
+    // Danger Zone remains immediately above Save; Updates is a static section
+    // after Save and is intentionally excluded from accordion ordering.
     const last = sections[sections.length - 1];
     expect(last.textContent).toContain("Danger Zone");
     expect(last.textContent).not.toContain("Cookie Bridge");
@@ -231,7 +230,6 @@ describe("SettingsTab", () => {
     expect(thirdToLast.textContent).not.toContain("Cookie Bridge");
     const fourthToLast = sections[sections.length - 4];
     expect(fourthToLast.textContent).toContain("Cookie Bridge");
-    // The Save button must come AFTER the Danger Zone card in the DOM.
     const saveBtn = screen.getByText("Save Settings");
     expect(last.compareDocumentPosition(saveBtn) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     // i18n: a Language card now sits at the top, before General.

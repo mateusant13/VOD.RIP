@@ -915,6 +915,28 @@ def test_auto_install_worker_folds_result_into_state(monkeypatch):
         assert cb._AUTO_INSTALL_STATE["error"] is None
         assert cb._AUTO_INSTALL_STATE["finished_at"] is not None
 
+def test_auto_install_worker_installs_both_extensions(monkeypatch, tmp_path):
+    """The explicit combined flow runs the UIA driver for both sources."""
+    from routers import cookie_bridge as cb
+
+    overlay = tmp_path / "kick-overlay"
+    overlay.mkdir()
+    (overlay / "manifest.json").write_text("{}", encoding="utf-8")
+    calls = []
+
+    def run(browser, ext_dir):
+        calls.append((browser, ext_dir))
+        return {"ok": True, "installed": True, "extension_id": ext_dir.name}
+
+    monkeypatch.setattr(cb, "_run_auto_install_script", run)
+    monkeypatch.setattr(cb, "_kick_overlay_src", lambda: overlay)
+    monkeypatch.setattr(cb, "_wake_extension_browser", lambda: None)
+    cb._auto_install_worker("chrome", Path("C:/cookies"), True)
+
+    assert calls == [("chrome", Path("C:/cookies")), ("chrome", overlay)]
+    with cb._AUTO_INSTALL_LOCK:
+        assert set(cb._AUTO_INSTALL_STATE["extensions"]) == {"cookie", "kick_overlay"}
+
 
 def test_auto_install_worker_reports_failure(monkeypatch):
     """Worker maps a failing script result to error state."""

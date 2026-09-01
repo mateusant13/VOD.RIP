@@ -6,15 +6,25 @@
 export default async function getAllCookies(details) {
   details.storeId ??= await getCurrentCookieStoreId();
   const { partitionKey, ...detailsWithoutPartitionKey } = details;
-  // Error handling for browsers that do not support partitionKey, such as chrome < 119.
-  // `chrome.cookies.getAll()` returns Promise but cannot directly catch() chain.
-  const cookiesWithPartitionKey = partitionKey
-    ? await Promise.resolve()
-        .then(() => chrome.cookies.getAll(details))
-        .catch(() => [])
-    : [];
+  let cookiesWithPartitionKey = [];
+  if (partitionKey) {
+    try {
+      cookiesWithPartitionKey = await chrome.cookies.getAll(details);
+    } catch (err) {
+      const message = String(err?.message || err);
+      if (!/partition[\s_-]*key/i.test(message) || !/(unsupported|not supported|unknown|invalid)/i.test(message)) {
+        throw err;
+      }
+    }
+  }
   const cookies = await chrome.cookies.getAll(detailsWithoutPartitionKey);
-  return [...cookies, ...cookiesWithPartitionKey];
+  const unique = new Map();
+  for (const cookie of [...cookies, ...cookiesWithPartitionKey]) {
+    const partition = JSON.stringify(cookie.partitionKey || null);
+    const key = [cookie.name, cookie.domain, cookie.path, cookie.storeId, partition].join('\u0000');
+    if (!unique.has(key)) unique.set(key, cookie);
+  }
+  return [...unique.values()];
 }
 
 /**

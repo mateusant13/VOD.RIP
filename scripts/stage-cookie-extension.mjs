@@ -3,19 +3,19 @@
  * Stage the vendored VOD.RIP Cookie Bridge extension into the packaged app.
  *
  * The bridge is a modified fork of Get cookies.txt LOCALLY (MIT, kairi003),
- * vendored at vendor/cookie-extension/src. Manual install = "Load unpacked"
- * that folder in Chrome/Edge — the only silent-install path on unmanaged
- * machines is the Chrome Web Store, so the release ships the source next to
- * the exe and the README walks users through the 30-second manual step.
+ * vendored at vendor/cookie-extension/src. The same build stages vendor/kick-overlay
+ * beside it so the silent installer can load both extensions in one browser
+ * profile. Manual install remains available as "Load unpacked".
  *
- * Output: <dist>/VOD-RIP/cookie-extension/src  (the PyInstaller onedir that
- * the installer and the zip both package from), or the directory given as
- * argv[2]. Graceful: warns and exits 0 when the vendor tree is missing, so
- * a dev build without the fork still packages.
+ * Output: <dist>/VOD-RIP/cookie-extension/src and <dist>/VOD-RIP/kick-overlay
+ * (the PyInstaller onedir that the installer and the zip package), or the
+ * cookie source directory given as argv[2]. Graceful: warns and exits 0 when
+ * the cookie vendor tree is missing, so a dev build without the fork still
+ * packages.
  *
  * Usage: node scripts/stage-cookie-extension.mjs [outDir]
  */
-import { cpSync, existsSync, readFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -62,4 +62,21 @@ for (let attempt = 0; attempt < 3; attempt += 1) {
   }
 }
 if (lastErr) throw lastErr;
+
+// The silent installer also loads the Kick Overlay, so ship both unpacked
+// sources beside the frozen executable.
+const isPackagedLayout = path.basename(out) === 'src' && path.basename(path.dirname(out)) === 'cookie-extension';
+const appOut = isPackagedLayout ? path.resolve(out, '..', '..') : out;
+const installScript = path.join(root, 'backend', 'scripts', 'cookie_extension_auto_install.ps1');
+const installOut = path.join(appOut, 'scripts', 'cookie_extension_auto_install.ps1');
+if (existsSync(installScript)) {
+  mkdirSync(path.dirname(installOut), { recursive: true });
+  cpSync(installScript, installOut, { force: true });
+}
+const overlaySrc = path.join(root, 'vendor', 'kick-overlay');
+const overlayOut = path.join(appOut, 'kick-overlay');
+if (existsSync(path.join(overlaySrc, 'manifest.json')) && existsSync(path.join(overlaySrc, 'content.js'))) {
+  cpSync(overlaySrc, overlayOut, { recursive: true, force: true });
+  console.log(`[kick-overlay] staged ${path.relative(root, overlaySrc)} -> ${path.relative(root, overlayOut)}`);
+}
 console.log(`[cookie-extension] staged ${path.relative(root, src)} -> ${path.relative(root, out)}`);

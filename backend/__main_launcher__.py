@@ -130,6 +130,25 @@ def _materialize_cookie_extension() -> None:
             "Cookie extension materialize failed: %s", exc
         )
 
+def _materialize_kick_overlay() -> None:
+    """Copy the bundled Kick Overlay beside a onefile executable."""
+    try:
+        meipass = getattr(sys, "_MEIPASS", None)
+        if not meipass:
+            return
+        src = Path(meipass) / "kick-overlay"
+        if not (src / "manifest.json").is_file():
+            return
+        dest = _get_install_dir() / "kick-overlay"
+        if dest.is_dir():
+            return
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(src, dest)
+        logging.getLogger("VOD.RIP").info("Materialized Kick Overlay next to exe: %s", dest)
+    except Exception as exc:
+        # ponytail: best-effort — a failed copy must never block startup
+        logging.getLogger("VOD.RIP").warning("Kick Overlay materialize failed: %s", exc)
+
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -778,6 +797,7 @@ def main():
         # onefile: bundle the cookie bridge extension out of the temp
         # extract dir so it sits next to the exe for manual install.
         _materialize_cookie_extension()
+        _materialize_kick_overlay()
 
         # Hard process-level singleton. The file lock is held for the
         # lifetime of the first process; a second VOD-RIP.exe cannot

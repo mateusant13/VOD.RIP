@@ -251,7 +251,8 @@ a = Analysis(
     ] + ([(
         str(_ICON_ICNS), ".",
     )] if _IS_MAC and _ICON_ICNS.is_file() else [])
-      + _bundled_bgutil_datas() + _silero_vad_datas(),
+      + _bundled_bgutil_datas() + _silero_vad_datas()
+      + [(str(_BACKEND_DIR / "scripts" / "cookie_extension_auto_install.ps1"), "scripts")],
     hiddenimports=_hidden_imports(),
     hookspath=[str(_hooks)] if _hooks.is_dir() else [],
     runtime_hooks=[],

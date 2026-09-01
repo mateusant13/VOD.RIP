@@ -3,10 +3,10 @@
 VOD.RIP — PyInstaller ONE-FILE spec (Windows).
 
 Produces a single self-extracting ``VOD-RIP.exe``: the whole app payload
-(including ffmpeg, the Node runtime, the bgutil POT server and the cookie
-bridge extension) is embedded in the EXE and extracted to a temp dir at
-launch. Built alongside the onedir ``vod-rip.spec`` — the zip ships the
-onedir folder layout, this exe is the single download-and-run option.
+(including ffmpeg, the Node runtime, the bgutil POT server, both browser
+extensions and the UIA installer script) is embedded in the EXE and extracted
+to a temp dir at launch. Built alongside the onedir ``vod-rip.spec`` — the zip
+ships the onedir folder layout, this exe is the single download-and-run option.
 
     npm run build-dist          # onedir (unchanged)
     .venv/Scripts/python.exe -m PyInstaller vod-rip-onefile.spec --clean --noconfirm
@@ -161,6 +161,13 @@ def _cookie_extension_datas():
         return []
     return [(str(src), "cookie-extension/src")]
 
+def _kick_overlay_datas():
+    """Bundle the unpacked Kick Overlay for the onefile installer."""
+    src = _VENDOR_DIR / "kick-overlay"
+    if not (src / "manifest.json").is_file() or not (src / "content.js").is_file():
+        return []
+    return [(str(src), "kick-overlay")]
+
 
 def _hidden_imports():
     imports = [
@@ -238,6 +245,8 @@ a = Analysis(
     ]
     + _bundled_bgutil_datas()
     + _cookie_extension_datas()
+    + _kick_overlay_datas()
+    + [(str(_BACKEND_DIR / "scripts" / "cookie_extension_auto_install.ps1"), "scripts")]
     + _silero_vad_datas(),
     hiddenimports=_hidden_imports(),
     hookspath=[str(_hooks)] if _hooks.is_dir() else [],

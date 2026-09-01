@@ -82,6 +82,9 @@ export function FrameOverlay({
         display: 'grid',
         gap: 8,
         padding: 8,
+        // Tiling guide appears only mid-drag (mirrors tmux tiling: zones
+        // reveal at drag time, not on toggle) and is click-through until a
+        // drag starts so the base channel cards stay grabbable underneath.
         // ponytail: upgrade to IntersectionObserver-driven visibility for smoother UX
         pointerEvents: dragging ? 'auto' : 'none',
         opacity: dragging ? 1 : 0,

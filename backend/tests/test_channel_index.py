@@ -111,6 +111,21 @@ def _videos_url(limit, **extra):
     }
     params.update(extra)
     return "/api/channel/videos?" + "&".join(f"{k}={v}" for k, v in params.items())
+async def _drain_youtube_warm(expected: int) -> None:
+    """Let the fire-and-forget background warm persist its rows.
+
+    The cold-YouTube path returns the (empty) index immediately and fills it
+    from a background crawl, so tests must wait for that crawl to land before
+    asserting the merged index. YouTube rows are upserted by the bg warm."""
+    deadline = asyncio.get_event_loop().time() + 30.0
+    while True:
+        n = get_conn().execute(
+            "SELECT COUNT(*) AS n FROM videos WHERE platform='youtube'"
+        ).fetchone()["n"]
+        if n >= expected:
+            return
+        assert asyncio.get_event_loop().time() < deadline, "background warm never completed"
+        await asyncio.sleep(0.25)
 
 
 @pytest.mark.asyncio
@@ -120,8 +135,11 @@ async def test_first_fetch_persists_and_second_is_served_from_disk(client, _fake
     first = await client.get(_videos_url(100))
     assert first.status_code == 200
     body = first.json()
-    assert len(body["videos"]) == 6
-    assert body["refreshing"] is False
+    # Cold YouTube never blocks the browse: the first response carries the
+    # Kick/Twitch items plus refreshing=True while the crawl runs in the bg.
+    assert len(body["videos"]) == 3
+    assert body["refreshing"] is True
+    await _drain_youtube_warm(3)
     assert calls == ["Kick", "Twitch", "YouTube", "YouTube"]
 
     # Different limit = different L1 cache key; the index must serve it
@@ -145,6 +163,9 @@ async def test_force_refetches_even_when_index_exists(client, _fake_platform_ser
     calls = _fake_platform_services
 
     await client.get(_videos_url(100))
+    # Cold YouTube is backgrounded on the first fetch; let it land so the
+    # forced fetch sees a warm index and re-fetches all three platforms.
+    await _drain_youtube_warm(3)
     forced = await client.get(_videos_url(100, force="1"))
     assert forced.status_code == 200
     body = forced.json()
@@ -158,6 +179,9 @@ async def test_stale_snapshot_serves_index_and_refreshes_in_background(client, _
     calls = _fake_platform_services
 
     await client.get(_videos_url(100))
+    # Cold YouTube is backgrounded; drain it so the youtube snapshot is fresh
+    # before we age everything below (else the bg revisit re-freshens it).
+    await _drain_youtube_warm(3)
     assert calls == ["Kick", "Twitch", "YouTube", "YouTube"]
 
     # Age the snapshots so the next request sees them stale.
@@ -283,7 +307,15 @@ async def test_vods_fetch_merges_streams_tab_and_persists_stream_kind(
     resp = await client.get(_videos_url(100, platforms="YouTube"))
     assert resp.status_code == 200
     body = resp.json()
-    kinds = {v["id"]: v["content_kind"] for v in body["videos"]}
+    # YouTube is cold → the /videos + /streams crawl runs in the background;
+    # the first response is the empty index + refreshing=True.
+    assert body["videos"] == []
+    assert body["refreshing"] is True
+    await _drain_youtube_warm(2)
+    # A warm (indexed) fetch now serves the merged /videos + /streams list.
+    warm = await client.get(_videos_url(50, platforms="YouTube"))
+    assert warm.status_code == 200
+    kinds = {v["id"]: v["content_kind"] for v in warm.json()["videos"]}
     assert kinds == {"u1": "vod", "s1": "stream"}
 
     row = get_conn().execute(

@@ -1,8 +1,15 @@
 import { apiGet, apiPost } from '../hooks/useApiClient';
 
+export interface AutoInstallExtensionStatus {
+  ok: boolean;
+  installed: boolean;
+  extension_id: string;
+}
+
 export interface AutoInstallStatus {
   state: 'idle' | 'running' | 'done' | 'error';
   installed: boolean;
+  extensions?: Record<string, AutoInstallExtensionStatus>;
   error: string | null;
 }
 
@@ -27,7 +34,9 @@ export async function runSilentCookieExtensionInstall(): Promise<{
   alreadyInstalled?: boolean;
   error?: string;
 }> {
-  const res = await apiPost<AutoInstallResult>('/api/session/cookies/auto-install', {});
+  const res = await apiPost<AutoInstallResult>('/api/session/cookies/auto-install', {
+    include_kick_overlay: true,
+  });
   if (!res.ok) {
     return { ok: false, error: res.error ?? 'install failed' };
   }

@@ -13,6 +13,7 @@ const badgeTexts = []; // chrome.action.setBadgeText recorder (clipping check)
 const runtimeMsgListeners = []; // chrome.runtime.onMessage recorders
 const moInstances = []; // MutationObserver instances (tw-delete re-apply)
 const storage = { ko: undefined };
+let storageChangedListener = null;
 const framePosts = []; // postMessage sent to the fake yt frame
 const appends = []; // elements appended to document.head
 const fakeVideos = []; // page-world <video> population (twitch player)
@@ -97,7 +98,7 @@ const chromeStub = {
       get: (k, cb) => { void k; setTimeout(() => cb && cb({}), 0); },
       set: (o, cb) => { storage.ko = o['ko.v2']; cb && cb(); },
     },
-    onChanged: { addListener() {} },
+    onChanged: { addListener: (l) => { storageChangedListener = l; } },
   },
   action: {
     setBadgeText(o) { badgeTexts.push(o && o.text); },
@@ -124,9 +125,10 @@ global.MutationObserver = class {
 global.fetch = () => Promise.reject(new Error('stub-fetch'));
 
 const src = fs.readFileSync('content.js', 'utf8');
+const bridgeSrc = fs.readFileSync('player-bridge.js', 'utf8');
 // Run in a Function scope so top-level consts/functions are accessible.
 const scope = {};
-const fn = new Function('window', 'document', 'location', 'navigator', src + '\n;return {KO, probe, apply, ensureYtHls, injectStyles, teardown, setPlayer, rectTick, mount, updateKickBar};');
+const fn = new Function('window', 'document', 'location', 'navigator', src + '\n;return {KO, probe, apply, ensureYtHls, injectStyles, teardown, setPlayer, saveState, rectTick, mount, updateKickBar};');
 const api = fn(global, doc, global.location, global.navigator);
 const KO = api.KO;
 
@@ -142,10 +144,17 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
   assert.ok(styleEl.textContent.includes('#ko-wrap{position:fixed'), 'CSS body present');
   assert.ok(styleEl.textContent.includes('#ko-wrap.ko-yt #ko-top{display:none;}'), 'stale LIVE pill hidden in yt mode');
   assert.ok(styleEl.textContent.includes('#ko-bar{position:absolute;left:0;right:0;bottom:0;pointer-events:auto;opacity:1;'), 'control bar defaults visible');
-  assert.ok(styleEl.textContent.includes('#ko-wrap:not(.ko-hot) #ko-bar{opacity:0;}'), 'bar fades when not hot');
+  assert.ok(styleEl.textContent.includes('#ko-wrap:not(.ko-hot) #ko-bar{opacity:1;}'), 'bar stays visible after inactivity');
   assert.ok(styleEl.textContent.includes('#ko-wrap.ko-offline #ko-top{display:none;}'), 'offline LIVE pill hidden');
+  assert.ok(styleEl.textContent.includes('#ko-quality-menu{display:none;'), 'quality menu CSS present');
+  assert.ok(styleEl.textContent.includes('#ko-top{display:none;'), 'persistent top-left LIVE label disabled');
   assert.ok(styleEl.textContent.includes('#ko-seekbar{position:absolute;top:6px;'), 'seek bar contained inside bar');
   assert.ok(!styleEl.textContent.includes('top:-28px'), 'seek bar no longer extends above bar');
+  assert.ok(src.includes("document.addEventListener('keydown', onOverlayKeydown, true)"), 'F key capture listener present');
+  assert.ok(src.includes('e.stopImmediatePropagation()'), 'overlay F handler wins over Twitch fullscreen');
+  assert.ok(src.includes('iframe.allowFullscreen = true') && src.includes('fr.allowFullscreen = true'), 'both iframe fullscreen permissions present');
+  assert.ok(src.includes('if (!v.paused)') && src.includes('v.pause();'), 'native Twitch video is paused under overlay');
+  assert.ok(bridgeSrc.includes("case 'quality':") && bridgeSrc.includes('setAutoQualityMode'), 'quality command reaches both player engines');
   console.log('A injectStyles: style appended, bar/seek/offline CSS — OK');
 
   // ---- C: ensureYtHls TTL + backoff -----------------------------------------
@@ -188,6 +197,7 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
     offsetWidth: 100, offsetHeight: 60,
   };
   fakeFrame = { ...el('iframe'), contentWindow: { postMessage: (m) => framePosts.push(m) } };
+  fakeFrame.dataset.koToken = 'test-token';
   KO.wrap = wrap;
   KO.player = 'youtube';
   KO.kickSlug = 'rodil';
@@ -203,6 +213,7 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
   await api.probe();
   const loadMsg = framePosts.find((m) => m.__koKick && m.__koKick.t === 'load');
   assert.ok(loadMsg, 'probe must hand the refreshed url to the frame');
+  assert.strictEqual(loadMsg.__koKick._koToken, 'test-token', 'player commands must carry the frame token');
   assert.strictEqual(loadMsg.__koKick.url, 'https://hls.example/u1', 'load carries the NEW url');
   assert.strictEqual(KO.ytLoadedUrl, 'https://hls.example/u1', 'ytLoadedUrl tracks the handed url');
   assert.strictEqual(wrap.style.display, 'block', 'ready+loaded layer must be shown (transition grace)');
@@ -291,6 +302,22 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
   assert.ok(KO.wrap, 'youtube branch mounts the wrap');
   assert.strictEqual(KO.wrap.style.display, 'none', 'failed mint hides the wrap');
   assert.ok(!(storage.ko && storage.ko.player === 'kick'), 'no persisted handover');
+  KO.playerPreference = 'youtube';
+  KO.player = 'kick';
+  await api.saveState();
+  assert.strictEqual(storage.ko.player, 'youtube', 'session fallback must not leak into persisted player choice');
+  KO.player = 'kick';
+  KO.playerPreference = 'youtube';
+  const currentMappings = KO.mappings;
+  assert.ok(storageChangedListener, 'storage listener must be registered');
+  storageChangedListener({
+    'ko.v2': {
+      oldValue: { enabled: true, player: 'youtube', mappings: currentMappings },
+      newValue: { enabled: true, player: 'youtube', mappings: currentMappings },
+    },
+  }, 'local');
+  assert.strictEqual(KO.player, 'kick', 'preferred-player self-writes must not undo a session fallback');
+  KO.player = 'youtube';
   const playsAfterFail = swCalls.filter((m) => m && m.type === 'ko-yt-play').length;
   assert.strictEqual(playsAfterFail, playsBefore, 'backoff must prevent a mint hit during the gate probe');
   // The reported failure case: wrap hidden, but the chip still reports state.
@@ -331,6 +358,7 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
   assert.strictEqual(KO.statusChip.style.color, '#fbbf24', 'chip amber while kick connecting');
   // KICK failed/offline -> gray KICK ✕
   KO.activeUrl = null;
+  assert.ok(kickSrc.includes('ev.origin !== location.origin'), 'kick messages must be page-origin restricted');
   KO.kickUrlT = 0;
   KO.kickState = null;
   KO.kickEverPlayed = false;
@@ -539,7 +567,7 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
 
   const styleEl2 = appends.find((e) => e.id === 'ko-style');
   assert.ok(styleEl2.textContent.includes('opacity:1'), 'bar visible-by-default CSS present');
-  console.log('N bar visibility: default opacity:1 + :not(.ko-hot) fade — OK');
+  console.log('N bar visibility: controls stay visible after inactivity — OK');
 
   const badgeWrap = {
     style: { display: 'block' },

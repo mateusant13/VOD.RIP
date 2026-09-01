@@ -70,7 +70,56 @@ def _prioritize_new_channels(old: list, new: list) -> None:
 
 @router.get("/api/settings", response_model=AppSettings)
 async def get_settings():
-    return _redact_ai_key(settings_mgr.get())
+    settings = settings_mgr.get()
+    # Reconcile saved_channels with the browse index: every channel that ever
+    # had a successful fetch lives in channel_snapshots, so a channel the user
+    # browsed or downloaded (e.g. via the explore popup) surfaces in the
+    # CANAIS list even when it was never explicitly added. The merge is
+    # PERSISTED so live-status, the archive scheduler and the boot warm —
+    # which all read settings_mgr, not this response — see the same list.
+    # Entries already present (by id or by any platform slug) are never
+    # touched, so user-pinned channels keep their cached rows and order.
+    try:
+        from services.archive_db import list_indexed_channels
+
+        saved = settings.saved_channels or []
+        known = {str(c.get("id") or "") for c in saved}
+        # Slug-collision guard: an indexed identity that matches an existing
+        # entry on any platform slug is already represented — skip it instead
+        # of rendering a duplicate row for the same channel.
+        known_slugs = {
+            slug
+            for c in saved
+            for slug in (
+                str(c.get("kickSlug") or "").strip().lower(),
+                str(c.get("twitchSlug") or "").strip().lower(),
+                str(c.get("youtubeSlug") or "").strip().lower(),
+            )
+            if slug
+        }
+        def _collides(ch: dict) -> bool:
+            return any(
+                str(ch.get(k) or "").strip().lower() in known_slugs
+                for k in ("kickSlug", "twitchSlug", "youtubeSlug")
+            )
+        missing = [ch for ch in list_indexed_channels() if ch["id"] not in known and not _collides(ch)]
+        if missing:
+            settings = settings.model_copy(update={
+                "saved_channels": saved + missing,
+            })
+            settings_mgr.save(settings)
+            # New channels: kick live detection so LIVE badges show within
+            # seconds instead of waiting for the frontend poll cycle.
+            try:
+                from routers.live import trigger_live_detection
+
+                for ch in missing:
+                    trigger_live_detection(str(ch["id"]))
+            except Exception:  # noqa: BLE001
+                logger.debug("live detection trigger skipped", exc_info=True)
+    except Exception:  # noqa: BLE001 — reconcile must never fail the read
+        logger.debug("channel index reconcile skipped", exc_info=True)
+    return _redact_ai_key(settings)
 
 
 @router.get("/api/settings/youtube-auth")
@@ -164,6 +213,25 @@ async def update_settings(update: SettingsUpdate):
         except Exception:  # noqa: BLE001 — cleanup must never fail the save
             logger.debug("instant preview cleanup skipped", exc_info=True)
         current.saved_channels = update.saved_channels
+        # Forgetting an indexed channel: removing an idx_* entry from the
+        # saved list must stick — delete its channel_snapshots rows so the
+        # GET reconcile does not immediately re-add it. Re-browsing the
+        # channel re-creates the snapshot (and thus the entry), which is the
+        # intended lifecycle.
+        try:
+            from services.archive_db import forget_channel_snapshots
+
+            new_ids = {str(c.get("id") or "") for c in (update.saved_channels or [])}
+            dropped = [
+                str(c.get("id") or "")
+                for c in (current.saved_channels or [])
+                if str(c.get("id") or "").startswith("idx_")
+                and str(c.get("id") or "") not in new_ids
+            ]
+            for cid in dropped:
+                forget_channel_snapshots(cid)
+        except Exception:  # noqa: BLE001 — forget must never fail the save
+            logger.debug("indexed channel forget skipped", exc_info=True)
         # A channel was added/edited/removed — wake the archive scheduler
         # so indexing for the new channel starts immediately instead of
         # waiting for the next periodic pass.

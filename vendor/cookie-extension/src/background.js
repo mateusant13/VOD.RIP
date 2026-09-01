@@ -198,20 +198,16 @@ checkReloadDirective();
 
 // TODO: use offscreen API to integrate implementation in chrome and firefox
 // Save file message listener for firefox
-chrome.runtime.onMessage.addListener(async (message, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const { type, target, data } = message || {};
-  if (target !== 'background') return;
-  if (type === 'save') {
-    const { text, name, format, saveAs } = data || {};
-    try {
-      await saveToFile(text, name, format, saveAs);
-      sendResponse('done');
-    } catch (err) {
+  if (target !== 'background' || type !== 'save') return undefined;
+  const { text, name, format, saveAs } = data || {};
+  saveToFile(text, name, format, saveAs)
+    .then(() => sendResponse('done'))
+    .catch((err) => {
       console.warn('[vodrip] save failed:', err);
       sendResponse('error');
-    }
-    return true;
-  }
+    });
   return true;
 });
 
@@ -500,8 +496,17 @@ chrome.runtime.onMessage.addListener((message, sender) => {
   if (message && message.type === 'vodrip-close-tab') {
     const tabId = sender && sender.tab && sender.tab.id;
     if (tabId == null) return;
-    const u = sender && sender.url;
-    if (!u || !/^https:\/\/(clips\.twitch\.tv|www\.twitch\.tv\/videos)/.test(u)) return;
+    let u;
+    try {
+      u = new URL(sender && sender.url);
+    } catch {
+      return;
+    }
+    const validOrigin =
+      u.protocol === 'https:' &&
+      ((u.hostname === 'clips.twitch.tv' && u.pathname.length > 1) ||
+        (u.hostname === 'www.twitch.tv' && u.pathname.startsWith('/videos/')));
+    if (!validOrigin) return;
     const delayMs = Number.isFinite(message.delayMs)
       ? Math.min(Math.max(message.delayMs, 0), 10000)
       : 1200;

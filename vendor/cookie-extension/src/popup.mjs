@@ -4,10 +4,30 @@ import _saveToFile from './modules/save_to_file.mjs';
 import { getApiBase, getToken } from './modules/cookie_bridge.mjs';
 
 /** Promise to get URL of Active Tab */
-const getUrlPromise = chrome.tabs
-  .query({ active: true, currentWindow: true })
-  .then(([{ url }]) => new URL(url));
+const getUrlPromise = chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+  if (!tab?.url) throw new Error('The active tab URL is unavailable');
+  try {
+    return new URL(tab.url);
+  } catch {
+    throw new Error('The active tab URL is invalid');
+  }
+});
 
+const showUrlError = (err) => {
+  const message = err instanceof Error ? err.message : 'The active tab URL is unavailable';
+  const location = document.querySelector('#location');
+  location.textContent = message;
+  location.removeAttribute('href');
+};
+
+const getActiveUrl = async () => {
+  try {
+    return await getUrlPromise;
+  } catch (err) {
+    showUrlError(err);
+    return null;
+  }
+};
 // ----------------------------------------------
 // Functions
 // ----------------------------------------------
@@ -67,10 +87,12 @@ const setClipboard = async (text) => {
 // ----------------------------------------------
 
 /** Set URL in the header */
-getUrlPromise.then((url) => {
-  const location = document.querySelector('#location');
-  location.textContent = location.href = url.href;
-});
+getUrlPromise
+  .then((url) => {
+    const location = document.querySelector('#location');
+    location.textContent = location.href = url.href;
+  })
+  .catch(showUrlError);
 
 /** Set Cookies data to the table */
 getUrlPromise
@@ -94,28 +116,32 @@ getUrlPromise
       return tr;
     });
     document.querySelector('table tbody').replaceChildren(...tableRows);
-  });
+  })
+  .catch(showUrlError);
 
 // ----------------------------------------------
 // Event Listeners
 // ----------------------------------------------
 
 document.querySelector('#export').addEventListener('click', async () => {
-  const url = await getUrlPromise;
+  const url = await getActiveUrl();
+  if (!url) return;
   const details = { url: url.href, partitionKey: { topLevelSite: url.origin } };
   const { text, format } = await getCookieText(details);
   saveToFile(text, `${url.hostname}_cookies`, format);
 });
 
 document.querySelector('#exportAs').addEventListener('click', async () => {
-  const url = await getUrlPromise;
+  const url = await getActiveUrl();
+  if (!url) return;
   const details = { url: url.href, partitionKey: { topLevelSite: url.origin } };
   const { text, format } = await getCookieText(details);
   saveToFile(text, `${url.hostname}_cookies`, format, true);
 });
 
 document.querySelector('#copy').addEventListener('click', async () => {
-  const url = await getUrlPromise;
+  const url = await getActiveUrl();
+  if (!url) return;
   const details = { url: url.href, partitionKey: { topLevelSite: url.origin } };
   const { text } = await getCookieText(details);
   setClipboard(text);

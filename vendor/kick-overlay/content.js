@@ -4,10 +4,9 @@
 // streamer's Kick or YouTube stream onto the Twitch player page; kick.com
 // and youtube.com themselves are not modified by this content script.
 //
-// While enabled and the streamer is live on Kick or YouTube too, overlays
-// the streamer's REAL Kick or YouTube stream over the Twitch player so
-// Twitch ads become invisible and inaudible (Twitch keeps playing
-// underneath, muted + PAUSED — never rendering while covered).
+// While enabled and the streamer is live on Kick or YouTube too, overlays the
+// streamer's REAL Kick or YouTube stream over the Twitch player. The native
+// Twitch player is paused and muted while either overlay player is active.
 //
 // Sources: Kick = the SAME engine kick.com uses (Amazon IVS web player,
 // amazon-ivs-player) playing the same playback_url the VOD.RIP downloader
@@ -40,11 +39,8 @@ const SPA_MS = 900;      // Twitch SPA pathname poll (no reload on channel nav)
 const HIDE_TICKS = 3;    // consecutive ticks without a Twitch player before hiding
 const MAX_RECONNECT = 3; // kick fatal retries (fresh playback_url each time)
 
-// Diagnostics: the [ko] console lines are ALSO mirrored to a local listener
-// (127.0.0.1:9234) so the extension's real-browser state can be read without
-// F12. The content script forwards through the SW, which beacons with a
-// no-cors fetch (neither CORS- nor CSP-blocked, no host_permission needed).
-// ponytail: debug-only channel; remove once YT validation is done.
+// Diagnostics stay inside the extension's service-worker console. Only the
+// event name is logged there; payloads are intentionally not forwarded.
 function diag(ev, data) {
   try {
     chrome.runtime.sendMessage({ __koDiag: { ev, data: data || {} } }, () => void chrome.runtime.lastError);
@@ -78,6 +74,7 @@ const NOT_CHANNEL = new Set([
 // (content scripts of pre-reload tabs survive extension reloads).
 const KO_VER = '0.8.0';
 const KO = {
+  playerPreference: 'kick',
   enabled: false,
   player: 'kick', // 'kick' | 'youtube' | 'twitch' — switching never rebuilds players
   mappings: {},   // twitchSlug -> kickSlug (string) | {kick, yt, ytId}
@@ -108,7 +105,7 @@ const KO = {
   twDeleted: false, // user deleted the Twitch player (popup) — restored on reload
   lastRect: null,   // last Twitch player rect (keeps the overlay pinned when deleted)
   dvrFetchedFor: null, // playback_url the DVR source was fetched for (once per url)
-  ytVol: 100,       // user's youtube volume (persisted, applied on show)
+  ytVol: 1,         // user's YouTube volume in the player bridge's 0..1 range
   ytState: { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, error: 0 },
   ytHlsUrl: null,   // last minted HLS manifest url (refreshed under the background cache TTL)
   ytHlsAt: 0,       // epoch ms of the successful mint
@@ -137,9 +134,12 @@ function applyVols(vols) {
   vols = vols || {};
   const kv = vols.kick || {};
   const yv = vols.yt || {};
-  if (typeof kv.v === 'number') KO.kickVol = kv.v;
+  if (typeof kv.v === 'number') KO.kickVol = Math.max(0, Math.min(1, kv.v));
   if (typeof kv.m === 'boolean') KO.kickMuted = kv.m;
-  if (typeof yv.v === 'number') KO.ytVol = yv.v;
+  if (typeof yv.v === 'number') {
+    const volume = yv.v > 1 ? yv.v / 100 : yv.v;
+    KO.ytVol = Math.max(0, Math.min(1, volume));
+  }
 }
 
 function loadState() {
@@ -149,6 +149,7 @@ function loadState() {
       const s = (o && o[KEY]) || {};
       KO.enabled = s.enabled === undefined ? true : !!s.enabled;
       KO.player = s.player === 'twitch' ? 'twitch' : s.player === 'youtube' ? 'youtube' : 'kick';
+      KO.playerPreference = KO.player;
       KO.mappings = s.mappings && typeof s.mappings === 'object' ? s.mappings : {};
       applyVols(s.vols);
       res();
@@ -156,17 +157,19 @@ function loadState() {
   });
 }
 
-function saveState() {
+function saveState(persistPlayer = false) {
   return new Promise((res) => {
+    if (persistPlayer) KO.playerPreference = KO.player;
     chrome.storage.local.set(
       {
         [KEY]: {
           enabled: KO.enabled,
           mappings: KO.mappings,
-          player: KO.player,
+          // The YouTube fallback changes KO.player for this session only.
+          player: KO.playerPreference,
           vols: {
             kick: { v: KO.kickVol, m: KO.kickMuted },
-            yt: { v: KO.ytVol },
+            yt: { v: KO.ytVol, m: KO.ytMuted },
           },
         },
       },
@@ -187,7 +190,12 @@ chrome.storage.onChanged.addListener((changes, area) => {
     (s.player || 'kick') !== (prev.player || 'kick') ||
     JSON.stringify(s.mappings || {}) !== JSON.stringify(prev.mappings || {});
   KO.enabled = !!s.enabled;
-  KO.player = s.player === 'twitch' ? 'twitch' : s.player === 'youtube' ? 'youtube' : 'kick';
+  const nextPlayer = s.player === 'twitch' ? 'twitch' : s.player === 'youtube' ? 'youtube' : 'kick';
+  // A volume/mapping write during the session-only fallback carries the
+  // preferred player back to storage; do not let that self-write undo the
+  // active fallback. A different incoming player is a real popup switch.
+  if (KO.player === KO.playerPreference || nextPlayer !== KO.playerPreference) KO.player = nextPlayer;
+  KO.playerPreference = nextPlayer;
   KO.mappings = s.mappings && typeof s.mappings === 'object' ? s.mappings : {};
   applyVols(s.vols);
   if (pChanged) fire(apply); // hot toggle / remap / player switch — no page reload
@@ -326,11 +334,14 @@ function setBadge(text, color) {
 // never issues an innertube request, so no pot in the URL can fix it. The
 // background mints the stream via an anonymous MWEB player API call (the
 // yt-dlp recipe) and the HLS frame speaks the same __koKick protocol as IVS.
+const PLAYER_ORIGIN = new URL(chrome.runtime.getURL('player.html')).origin;
+
 function ytSend(o) {
   const f = document.getElementById('ko-yt');
-  if (!f || !f.contentWindow) return;
+  const token = f && f.dataset.koToken;
+  if (!f || !f.contentWindow || !token) return;
   try {
-    f.contentWindow.postMessage({ __koKick: o }, '*');
+    f.contentWindow.postMessage({ __koKick: { ...o, _koToken: token } }, PLAYER_ORIGIN);
   } catch {
     /* frame gone */
   }
@@ -340,7 +351,7 @@ function ytCmd(cmd, arg) {
   switch (cmd) {
     case 'play': return ytSend({ t: 'play' });
     case 'pause': return ytSend({ t: 'pause' });
-    case 'mute': return ytSend({ t: 'mute', m: true });
+    case 'mute': return ytSend({ t: 'mute', m: arg === undefined ? true : !!arg });
     case 'unmute': return ytSend({ t: 'mute', m: false });
     case 'setVolume': return ytSend({ t: 'volume', v: arg });
     case 'seekToLive': return ytSend({ t: 'seekToLive' });
@@ -415,15 +426,18 @@ async function ensureYtHls() {
 
 function ensureYtIframe() {
   if (document.getElementById('ko-yt')) return;
-  if (!KO.wrap) mount(); // youtube-only path never mounted the wrap (kick paths did)
-  if (!KO.ytHlsUrl) return; // manifest still pending — probe retries
+  if (!KO.wrap) mount();
+  if (!KO.ytHlsUrl) return;
   const iframe = document.createElement('iframe');
   iframe.id = 'ko-yt';
-  iframe.src = chrome.runtime.getURL('player.html?m=hls');
+  const token = crypto.randomUUID();
+  iframe.dataset.koToken = token;
+  iframe.src = chrome.runtime.getURL(`player.html?m=hls&token=${encodeURIComponent(token)}`);
   iframe.setAttribute('allow', 'autoplay; fullscreen; encrypted-media');
+  iframe.allowFullscreen = true;
   KO.wrap.appendChild(iframe);
-  KO.pendingYtUrl = KO.ytHlsUrl; // handed to the frame on its 'ready'
-  KO.ytEmbedAt = Date.now(); // fallback clock: hls must init within YT_EMBED_GRACE
+  KO.pendingYtUrl = KO.ytHlsUrl;
+  KO.ytEmbedAt = Date.now();
   diag('yt_embed', { id: KO.ytId.slice(0, 8), hls: !!KO.ytHlsUrl });
 }
 
@@ -444,9 +458,9 @@ let lastYtProbe = 0;
 let ytFirstInfo = false;
 window.addEventListener('message', (ev) => {
   const d = ev.data;
-  if (!d || !d.__koKick) return;
+  if (!d || !d.__koKick || ev.origin !== location.origin) return;
   const f = document.getElementById('ko-yt');
-  if (!f || ev.source !== f.contentWindow) return; // the yt (hls) frame only
+  if (!f || ev.source !== f.contentWindow || d.__koKick._koToken !== f.dataset.koToken) return; // the yt (hls) frame only
   const m = d.__koKick;
   if (m.t === 'ready') {
     KO.ytWin = ev.source;
@@ -474,6 +488,10 @@ window.addEventListener('message', (ev) => {
     KO.ytState.dur = st.dur || 0;
     KO.ytState.ct = st.pos || 0;
     KO.ytState.vq = (st.q && st.q.name) || '';
+    KO.ytState.qualities = Array.isArray(st.qualities) ? st.qualities : [];
+    updatePlayUI();
+    updateKickVolUI();
+    renderQualityMenu();
     if (typeof st.volume === 'number' && st.volume >= 0 && !st.muted && KO.ytVol !== st.volume) {
       KO.ytVol = st.volume; // remember the user's yt volume slider
       saveState();
@@ -506,9 +524,11 @@ function throttledYtProbe() {
 // ---- Kick frame bridge (IVS — the engine kick.com uses) ---------------------
 
 function kickSend(o) {
-  if (!KO.kickWin) return;
+  const f = KO.kickFrame;
+  const token = f && f.dataset.koToken;
+  if (!KO.kickWin || !token) return;
   try {
-    KO.kickWin.postMessage({ __koKick: o }, '*');
+    KO.kickWin.postMessage({ __koKick: { ...o, _koToken: token } }, PLAYER_ORIGIN);
   } catch {
     /* frame gone */
   }
@@ -518,10 +538,12 @@ function kickFrame() {
   if (KO.kickFrame && KO.kickFrame.isConnected) return KO.kickFrame;
   if (!KO.wrap) mount();
   const fr = document.createElement('iframe');
+  const token = crypto.randomUUID();
   fr.id = 'ko-ivs';
-  fr.src = chrome.runtime.getURL('player.html');
+  fr.dataset.koToken = token;
+  fr.src = chrome.runtime.getURL(`player.html?token=${encodeURIComponent(token)}`);
   fr.setAttribute('allow', 'autoplay; fullscreen');
-  KO.wrap.appendChild(fr);
+  fr.allowFullscreen = true;
   KO.kickFrame = fr;
   KO.kickWin = null;
   KO.kickReady = false;
@@ -534,10 +556,10 @@ function kickFrame() {
 
 window.addEventListener('message', (ev) => {
   const d = ev.data;
-  if (!d || !d.__koKick) return;
+  if (!d || !d.__koKick || ev.origin !== location.origin) return;
   const ytf = document.getElementById('ko-yt');
   if (ytf && ev.source === ytf.contentWindow) return; // the yt (hls) frame — handled by the yt listener
-  if (KO.kickWin && ev.source !== KO.kickWin) return;
+  if (!KO.kickFrame || ev.source !== KO.kickFrame.contentWindow) return;
   const m = d.__koKick;
   if (m.t === 'ready') {
     // Only the actual player frame may declare ready — before the first
@@ -688,20 +710,23 @@ function kickBackToLive() {
   updateKickBar();
 }
 
-// ---- mute/pause model -------------------------------------------------------
-// One player renders at a time: the OVERLAY players (kick frame + yt iframe)
-// pause when hidden. The native Twitch player is different (user mandate
-// 2026-08-14): it KEEPS RUNNING, muted, while covered — so a Twitch ad plays
-// out inaudibly and switching back lands on live content, not on a paused ad.
-// syncMute() is what keeps it inaudible; nothing pauses it for the overlay.
-
+// ---- playback ownership -----------------------------------------------------
+// Exactly one player may run at a time. When Kick or YouTube owns the overlay,
+// pause and mute every native Twitch video; resume only a Twitch video that
+// this overlay paused when the user explicitly switches back to Twitch.
 function syncMute() {
-  const overlayShown = KO.player !== 'twitch' && !!KO.wrap && KO.wrap.style.display !== 'none';
+  const overlaySelected = KO.player !== 'twitch' && !!KO.wrap;
   for (const v of document.querySelectorAll('video')) {
-    if (overlayShown && !v.muted) {
-      v.muted = true;
-      KO.muted.add(v);
-    } else if (!overlayShown && KO.muted.has(v) && v.muted) {
+    if (overlaySelected) {
+      if (!v.paused) {
+        v.pause();
+        KO.twWasPlaying = true;
+      }
+      if (!v.muted) {
+        v.muted = true;
+        KO.muted.add(v);
+      }
+    } else if (KO.muted.has(v) && v.muted) {
       v.muted = false;
       KO.muted.delete(v);
     }
@@ -719,14 +744,11 @@ function unmuteAll() {
   KO.muted.clear();
 }
 
-// The Twitch player runs through the overlay (muted) so ads play out in the
-// background; nothing to do here — syncMute() handles the audio.
-function pauseTwitchForOverlay() {
-  /* no-op: Twitch keeps playing, muted, under the overlay (ad-through) */
-}
-
 function resumeTwitchIfOurs() {
-  /* no-op: the native player was never paused; syncMute() unmutes on switch */
+  if (!KO.twWasPlaying) return;
+  KO.twWasPlaying = false;
+  const v = twitchVideo();
+  if (v) v.play().catch(() => { /* autoplay policy */ });
 }
 
 // The overlay must sit ABOVE the Twitch player but BELOW page UI that
@@ -787,7 +809,8 @@ const KO_SVG = {
   pause: '<svg viewBox="0 0 20 20" fill="currentColor"><path d="M7.66 1H4.15v18h3.51zm8.19 0h-3.51v18h3.51z"/></svg>',
   sound: '<svg viewBox="0 0 20 20" fill="currentColor"><path d="M14.5 10A4.5 4.5 0 0 0 10 5.5v2.25A2.257 2.257 0 0 1 12.25 10 2.257 2.257 0 0 1 10 12.25v2.25a4.5 4.5 0 0 0 4.5-4.5"/><path d="M10 1v2.25A6.755 6.755 0 0 1 16.75 10 6.755 6.755 0 0 1 10 16.75V19c4.973 0 9-4.027 9-9s-4.027-9-9-9M1 5.5v9h2.25l4.5 4.5V1l-4.5 4.5z"/></svg>',
   muted: '<svg viewBox="0 0 20 20" fill="currentColor"><path d="M10 14.503c2.486 0 4.5-2.013 4.5-4.497v-.102l-4.489 3.53v1.069zm7.346-9.68L19 3.518l-1.384-1.753-1.777 1.394A9 9 0 0 0 10 1v2.249a6.73 6.73 0 0 1 4.016 1.338l-1.879 1.472A4.45 4.45 0 0 0 10 5.497v2.249L7.75 9.51v-8.5l-4.5 4.497H1v9.32l1.395 1.755zM7.75 19v-3.789l-2.126 1.664z"/><path d="M16.514 8.32c.146.539.236 1.101.236 1.686 0 3.721-3.026 6.745-6.75 6.745V19c4.973 0 9-4.025 9-8.994a8.7 8.7 0 0 0-.608-3.17l-1.878 1.472z"/></svg>',
-  fs: '<svg viewBox="0 0 20 20" fill="currentColor"><path d="M16.188 12.25v3.938H12.25V19H19v-6.75zM7.75 16.188H3.813V12.25H1V19h6.75zM3.813 7.75V3.813H7.75V1H1v6.75zm8.437-3.937h3.938V7.75H19V1h-6.75z"/></svg>'
+  fs: '<svg viewBox="0 0 20 20" fill="currentColor"><path d="M16.188 12.25v3.938H12.25V19H19v-6.75zM7.75 16.188H3.813V12.25H1V19h6.75zM3.813 7.75V3.813H7.75V1H1v6.75zm8.437-3.937h3.938V7.75H19V1h-6.75z"/></svg>',
+  settings: '<svg viewBox="0 0 20 20" fill="currentColor"><path d="m8.1 1-.4 2a7 7 0 0 0-1.6.9L4.2 2.8 2.8 4.2l1.1 1.9a7 7 0 0 0-.9 1.6l-2 .4v2l2 .4a7 7 0 0 0 .9 1.6l-1.1 1.9 1.4 1.4 1.9-1.1a7 7 0 0 0 1.6.9l.4 2h2l.4-2a7 7 0 0 0 1.6-.9l1.9 1.1 1.4-1.4-1.1-1.9a7 7 0 0 0 .9-1.6l2-.4v-2l-2-.4a7 7 0 0 0-.9-1.6l1.1-1.9-1.4-1.4-1.9 1.1a7 7 0 0 0-1.6-.9l-.4-2zM9.1 7a3 3 0 1 1 0 6 3 3 0 0 1 0-6"/></svg>',
 };
 function fmtDur(sec, incH) {
   // kick's formatVideoDuration: [HH if ≥1h]+[MM]+[SS], 0-padded
@@ -808,7 +831,9 @@ function setKickFill(frac) {
 }
 function updateKickVolUI() {
   if (!KO.wrap) return;
-  const v = KO.kickMuted || KO.kickVol === 0 ? 0 : KO.kickVol;
+  const isYt = KO.player === 'youtube';
+  const muted = isYt ? (KO.ytState.muted || KO.ytVol === 0) : (KO.kickMuted || KO.kickVol === 0);
+  const v = muted ? 0 : (isYt ? KO.ytVol : KO.kickVol);
   const fillEl = KO.wrap.querySelector('#ko-volfill');
   const thumbEl = KO.wrap.querySelector('#ko-volthumb');
   const muteBtn = KO.wrap.querySelector('#ko-mute');
@@ -823,7 +848,51 @@ function updateKickVolUI() {
   }
 }
 
-// Control bar auto-hide: visible on mount, fades after inactivity, returns on pointer activity.
+function updatePlayUI() {
+  if (!KO.wrap) return;
+  const playing = KO.player === 'youtube'
+    ? KO.ytState.playing
+    : !!(KO.kickState && KO.kickState.state === 'Playing');
+  const playBtn = KO.wrap.querySelector('#ko-play');
+  if (!playBtn) return;
+  const want = playing ? 'pause' : 'play';
+  if (playBtn.dataset.st !== want) {
+    playBtn.dataset.st = want;
+    playBtn.innerHTML = want === 'pause' ? KO_SVG.pause : KO_SVG.play;
+  }
+}
+
+function renderQualityMenu() {
+  const menu = KO.wrap && KO.wrap.querySelector('#ko-quality-menu');
+  if (!menu) return;
+  const state = KO.player === 'youtube' ? KO.ytState : KO.kickState;
+  const qualities = Array.isArray(state && state.qualities) ? state.qualities : [];
+  menu.textContent = '';
+  const add = (label, value, selected) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.role = 'menuitemradio';
+    button.textContent = label;
+    button.setAttribute('aria-checked', String(selected));
+    button.dataset.quality = value === 'auto' ? 'auto' : String(value);
+    button.addEventListener('click', () => {
+      const q = button.dataset.quality;
+      const numeric = q === 'auto' ? 'auto' : Number(q);
+      const message = { t: 'quality', q: numeric };
+      if (KO.player === 'youtube') ytSend(message);
+      else kickSend(message);
+      menu.style.display = 'none';
+    });
+    menu.appendChild(button);
+  };
+  add('Auto', 'auto', !state || !state.q);
+  qualities.forEach((quality, id) => {
+    const label = quality.name || (quality.h ? `${quality.h}p` : `${quality.w || ''}w`);
+    add(label, Number.isInteger(quality.id) ? quality.id : id, !!state && state.q && state.q.name === label);
+  });
+}
+
+// Track recent pointer activity for diagnostics; controls remain visible.
 function setupHotBar(wrap) {
   teardownHotBar();
   KO.hotWrap = wrap;
@@ -873,7 +942,7 @@ function mount() {
     '<span class="ko-t ko-sep">/</span>' +
     '<span id="ko-total" class="ko-t"></span>' +
     '</div>' +
-    '<div id="ko-g2" class="ko-g"><button id="ko-fs" class="ko-icn" title="Fullscreen"></button></div>' +
+    '<div id="ko-g2" class="ko-g"><div id="ko-quality-wrap"><button id="ko-settings" class="ko-icn" title="Quality" aria-label="Quality"></button><div id="ko-quality-menu" role="menu"></div></div><button id="ko-fs" class="ko-icn" title="Fullscreen" aria-label="Fullscreen"></button></div>' +
     '<div id="ko-seekbar">' +
     '<span id="ko-hov" class="ko-hov"></span>' +
     '<div id="ko-loaded" class="ko-prog"></div>' +
@@ -901,20 +970,37 @@ function mount() {
   const play = bar.querySelector('#ko-play');
   play.innerHTML = KO_SVG.play;
   play.addEventListener('click', () => {
-    const playing = KO.kickState && KO.kickState.state === 'Playing';
-    kickSend(playing ? { t: 'pause' } : { t: 'play' });
+    const playing = KO.player === 'youtube'
+      ? KO.ytState.playing
+      : !!(KO.kickState && KO.kickState.state === 'Playing');
+    if (KO.player === 'youtube') ytCmd(playing ? 'pause' : 'play');
+    else kickSend(playing ? { t: 'pause' } : { t: 'play' });
   });
   const muteBtn = bar.querySelector('#ko-mute');
   muteBtn.innerHTML = KO_SVG.sound;
   const fsBtn = bar.querySelector('#ko-fs');
   fsBtn.innerHTML = KO_SVG.fs;
+  const qualityBtn = bar.querySelector('#ko-settings');
+  const qualityMenu = bar.querySelector('#ko-quality-menu');
+  qualityBtn.innerHTML = KO_SVG.settings;
+  qualityBtn.addEventListener('click', () => {
+    renderQualityMenu();
+    qualityMenu.style.display = qualityMenu.style.display === 'flex' ? 'none' : 'flex';
+  });
   muteBtn.addEventListener('click', () => {
-    KO.kickMuted = !KO.kickMuted;
-    if (!KO.kickMuted && KO.kickVol === 0) KO.kickVol = 1;
-    kickSend({ t: 'mute', m: KO.kickMuted });
-    if (!KO.kickMuted) kickSend({ t: 'volume', v: KO.kickVol });
+    if (KO.player === 'youtube') {
+      const muted = !KO.ytState.muted;
+      if (!muted && KO.ytVol === 0) KO.ytVol = 1;
+      ytCmd('mute', muted);
+      if (!muted) ytCmd('setVolume', KO.ytVol);
+    } else {
+      KO.kickMuted = !KO.kickMuted;
+      if (!KO.kickMuted && KO.kickVol === 0) KO.kickVol = 1;
+      kickSend({ t: 'mute', m: KO.kickMuted });
+      if (!KO.kickMuted) kickSend({ t: 'volume', v: KO.kickVol });
+    }
     updateKickVolUI();
-    saveState(); // remember the user's kick mute choice
+    saveState(); // remember the user's player mute choice
   });
   const volwrap = bar.querySelector('#ko-volwrap');
   const volTrack = bar.querySelector('#ko-voltrack');
@@ -925,10 +1011,16 @@ function mount() {
   let volDrag = false;
   const setVolFrom = (e) => {
     const v = volFrac(e);
-    KO.kickVol = v;
-    KO.kickMuted = v === 0;
-    kickSend({ t: 'volume', v: KO.kickVol });
-    kickSend({ t: 'mute', m: KO.kickMuted });
+    if (KO.player === 'youtube') {
+      KO.ytVol = v;
+      ytCmd('setVolume', v);
+      ytCmd('mute', v === 0);
+    } else {
+      KO.kickVol = v;
+      KO.kickMuted = v === 0;
+      kickSend({ t: 'volume', v: KO.kickVol });
+      kickSend({ t: 'mute', m: KO.kickMuted });
+    }
     updateKickVolUI();
   };
   volwrap.addEventListener('pointerdown', (e) => {
@@ -1026,10 +1118,7 @@ function mount() {
   badge.addEventListener('click', () => {
     if (KO.kickOnDvr) kickBackToLive();
   });
-  bar.querySelector('#ko-fs').addEventListener('click', () => {
-    if (document.fullscreenElement === KO.wrap) document.exitFullscreen().catch(() => {});
-    else if (KO.wrap) KO.wrap.requestFullscreen().catch(() => {});
-  });
+  bar.querySelector('#ko-fs').addEventListener('click', toggleOverlayFullscreen);
   startRectLoop();
   setupHotBar(wrap);
 }
@@ -1192,6 +1281,7 @@ function updateKickBar() {
   const st = KO.kickState;
   const liveVisible = !!(st && (st.state === 'Playing' || st.state === 'Buffering' || KO.kickOnDvr));
   KO.wrap.classList.toggle('ko-offline', !liveVisible);
+  renderQualityMenu();
   if (!st) return;
   const pos = st.pos || 0;
   const lat = st.lat;
@@ -1225,9 +1315,8 @@ function updateKickBar() {
   const total = KO.wrap.querySelector('#ko-total');
   if (cur) cur.textContent = fmtDur(head, max >= 3600);
   if (total) total.textContent = fmtDur(max, max >= 3600);
-  // Top-left: LIVE badge (green dot + "LIVE") or the clickable
-  // "Voltar ao vivo" while replaying (kick's Status button); the live
-  // elapsed ticks next to it.
+  // Keep the hidden status state coherent for diagnostics. The persistent
+  // top-left LIVE label is intentionally not rendered.
   const dot = KO.wrap.querySelector('#ko-live-dot');
   const btxt = KO.wrap.querySelector('#ko-live-txt');
   const badge = KO.wrap.querySelector('#ko-livebadge');
@@ -1243,21 +1332,14 @@ function updateKickBar() {
     if (badge) badge.style.cursor = 'default';
     if (elapsed && Number.isFinite(KO.kickStreamStart)) elapsed.textContent = fmtDur((Date.now() - KO.kickStreamStart) / 1000, max >= 3600);
   }
-  const playBtn = KO.wrap.querySelector('#ko-play');
-  if (playBtn) {
-    const want = st.state === 'Playing' ? 'pause' : 'play';
-    if (playBtn.dataset.st !== want) {
-      playBtn.dataset.st = want;
-      playBtn.innerHTML = want === 'pause' ? KO_SVG.pause : KO_SVG.play;
-    }
-  }
+  updatePlayUI();
   updateKickVolUI();
 }
 
 function setPlayer(p) {
   if (p === KO.player) return;
   KO.player = p;
-  saveState().then(() => apply()); // apply() only toggles layers/pause/mute
+  saveState(true).then(() => apply()); // apply() only toggles layers/pause/mute
 }
 
 // ---- decision loop ----------------------------------------------------------
@@ -1452,6 +1534,22 @@ async function apply() {
   await probe();
 }
 
+function toggleOverlayFullscreen() {
+  if (!KO.wrap || KO.player === 'twitch' || KO.wrap.style.display === 'none') return;
+  if (document.fullscreenElement === KO.wrap) document.exitFullscreen().catch(() => {});
+  else KO.wrap.requestFullscreen().catch((err) => diag('fullscreen', { err: String(err).slice(0, 100) }));
+}
+
+function onOverlayKeydown(e) {
+  if (String(e.key).toLowerCase() !== 'f' || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+  const target = e.target;
+  if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return;
+  if (!KO.wrap || KO.player === 'twitch' || KO.wrap.style.display === 'none') return;
+  e.preventDefault();
+  e.stopImmediatePropagation();
+  toggleOverlayFullscreen();
+}
+
 function startWatchers() {
   KO.spaTimer = setInterval(() => {
     if (location.pathname !== KO.lastPath) {
@@ -1477,6 +1575,7 @@ function startWatchers() {
     },
     true,
   );
+  document.addEventListener('keydown', onOverlayKeydown, true);
 }
 
 function startRectLoop() {
@@ -1524,7 +1623,8 @@ function rectTick() {
     ensureAttached(KO.wrap); // Twitch may re-render main — re-parent if dropped
     const tv = twitchVideo();
     updateTwLiveSticky(tv);
-    const overlayShown = KO.player !== 'twitch' && KO.wrap.style.display !== 'none';
+    const overlaySelected = KO.player !== 'twitch' && !!KO.wrap;
+    const overlayShown = overlaySelected && KO.wrap.style.display !== 'none';
     if (overlayShown) {
       if (tv) {
         const prev = KO.lastRect;
@@ -1665,8 +1765,9 @@ function rectTick() {
         KO.lastYtSt = 0;
         fire(probe); // recreate now instead of waiting for the 20s poll
       }
+    } else if (overlaySelected) {
+      syncMute();
     } else {
-      // twitch mode: overlay players stay paused; resume Twitch if ours.
       if (KO.kickFrame && KO.kickState && KO.kickState.state === 'Playing') {
         kickSend({ t: 'pause' });
         kickSend({ t: 'mute', m: true });
@@ -1701,13 +1802,19 @@ function injectStyles() {
     'display:flex;flex-direction:row;align-items:center;justify-content:space-between;padding:22px 10px 6px;color:#fff;' +
     'background:linear-gradient(0deg,rgba(0,0,0,.8),rgba(0,0,0,0));' +
     'font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}' +
-    '#ko-wrap:not(.ko-hot) #ko-bar{opacity:0;}' +
-    '#ko-wrap.ko-yt #ko-bar{display:none;}' + // YT has native controls incl. LIVE chip
+    '#ko-wrap:not(.ko-hot) #ko-bar{opacity:1;}' +
+    '#ko-wrap.ko-yt #ko-bar{display:flex;}' +
     '#ko-wrap.ko-yt #ko-top{display:none;}' + // stale LIVE pill in yt mode
     '#ko-wrap.ko-offline #ko-top{display:none;}' + // hide LIVE pill when kick is offline/not playing
     '#ko-reconnecting{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;' +
     'background:rgba(0,0,0,.82);color:#fff;font:700 15px system-ui,sans-serif;letter-spacing:.04em;pointer-events:none;}' +
     '.ko-g{display:flex;flex-direction:row;align-items:center;}' +
+    '#ko-quality-wrap{position:relative;display:flex;align-items:center;}' +
+    '#ko-quality-menu{display:none;position:absolute;right:0;bottom:42px;min-width:110px;padding:4px;' +
+    'background:rgba(17,17,17,.96);border:1px solid rgba(255,255,255,.2);border-radius:6px;z-index:3;}' +
+    '#ko-quality-menu button{display:block;width:100%;padding:7px 10px;border:0;background:transparent;color:#fff;' +
+    'font:600 12px system-ui,sans-serif;text-align:left;cursor:pointer;border-radius:4px;}' +
+    '#ko-quality-menu button:hover{background:rgba(255,255,255,.12);}' +
     '#ko-g1{gap:2px;}' +
     '.ko-icn{background:transparent;border:0;color:#fff;cursor:pointer;display:flex;align-items:center;' +
     'justify-content:center;width:40px;height:40px;border-radius:8px;padding:0;}' +
@@ -1737,7 +1844,7 @@ function injectStyles() {
     '#ko-hov{position:absolute;top:-20px;left:0;transform:translateX(-50%);background:rgba(0,0,0,.78);' +
     'border-radius:6px;padding:4px 6px;font-size:12px;font-weight:700;color:#fff;' +
     'font-variant-numeric:tabular-nums;white-space:nowrap;display:none;pointer-events:none;z-index:2;}' +
-    '#ko-top{position:absolute;top:0;left:0;right:0;pointer-events:none;display:flex;flex-direction:row;' +
+    '#ko-top{display:none;position:absolute;top:0;left:0;right:0;pointer-events:none;flex-direction:row;' +
     'align-items:center;gap:12px;padding:10px 14px;color:#fff;' +
     'background:linear-gradient(180deg,rgba(0,0,0,.7),rgba(0,0,0,0));' +
     'font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}' +
@@ -1815,7 +1922,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     // hidden and the click would look dead. Force an overlay player on.
     if (KO.player === 'twitch') {
       KO.player = 'kick';
-      saveState();
+      saveState(true);
     }
     // Youtube layer not shown (mint pending/failed)? Keep the wrap visible
     // in its loading state instead of hiding — the chip shows YT…/YT ✕ and
@@ -1838,7 +1945,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 });
 
 // ---- test / automation hook -------------------------------------------------
-// The page world can dispatch CustomEvent('kick-overlay:set', {detail:{...}})
 // to flip the toggle or remap the current channel (used by smoke tests).
 window.addEventListener('kick-overlay:set', (e) => {
   const d = e.detail || {};
@@ -1913,7 +2019,7 @@ window.addEventListener('kick-overlay:status', () => {
       KO.ytId = null;
     }
     if (qPlayer && ['kick', 'youtube', 'twitch'].includes(qPlayer)) KO.player = qPlayer;
-    saveState().then(() => fire(apply));
+    saveState(Boolean(qPlayer)).then(() => fire(apply));
   }
   // Persist the resolved defaults (enabled: true) so the popup's toggle
   // always agrees with the content script.

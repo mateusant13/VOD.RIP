@@ -8,8 +8,7 @@
  },
  "permissions": [
   "storage",
-  "activeTab",
-  "declarativeNetRequest"
+  "activeTab"
  ],
  "host_permissions": [
   "https://www.twitch.tv/*",
@@ -31,15 +30,6 @@
    ]
   }
  ],
- "declarative_net_request": {
-  "rule_resources": [
-   {
-    "id": "ko-aca",
-    "enabled": true,
-    "path": "rules.json"
-   }
-  ]
- },
  "content_scripts": [
   {
    "matches": [
