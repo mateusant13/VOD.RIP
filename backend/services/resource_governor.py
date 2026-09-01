@@ -203,43 +203,92 @@ def _probe_vram() -> Tuple[int,int]:
             pass
     except Exception:
         pass
-    # fallback: nvidia-smi CLI
-    try:
-        import subprocess as sp
-        out = sp.run(["nvidia-smi","--query-gpu=memory.total,memory.free","--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5.0)
-        if out.returncode==0 and out.stdout.strip():
-            # pick largest GPU
-            best = (0,0)
-            for line in out.stdout.strip().splitlines():
-                parts = [p.strip() for p in line.split(",")]
-                if len(parts)>=2:
-                    try:
-                        total_mib = float(parts[0]); free_mib = float(parts[1])
-                        total = int(total_mib * 1024**2); free = int(free_mib * 1024**2)
-                        if total>best[0]:
-                            best=(total,free)
-                    except Exception:
-                        continue
-            if best[0]>0:
-                return best
-    except Exception:
-        pass
+    # fallback: nvidia-smi CLI — reuse the shared cached snapshot so the
+    # every-5th-tick VRAM probe does not spawn its own subprocess on top of
+    # the per-tick util probe.
+    snap = _nvidia_smi_snapshot()
+    if snap is not None and snap["vram"] is not None:
+        return snap["vram"]
     return 0,0
 
 def _probe_gpu_util() -> float:
+    snap = _nvidia_smi_snapshot()
+    if snap is not None:
+        return snap["util"]
+    return 0.0
+
+
+# nvidia-smi spawns a subprocess (several ms + a GPU driver query). The
+# governor ticks every 1 s and _probe_gpu_util runs every tick; the VRAM
+# CLI fallback runs every 5th tick. Without a floor these collide with each
+# other AND with archive_transcribe's own cached probes (its _gpu_util is
+# cached 5 s, _gpu_held_by_other 10 s). Cache a single shared nvidia-smi read
+# for _NVIDIA_SMI_TTL_S so both probes reuse one probe path.
+_NVIDIA_SMI_TTL_S = 5.0
+_nvidia_smi_at = 0.0
+_nvidia_smi_util: Optional[float] = None
+_nvidia_smi_vram: Optional[Tuple[int, int]] = None
+_nvidia_smi_ready = False  # True once a probe (success or failure) is cached
+_nvidia_smi_lock = threading.Lock()
+
+
+def _nvidia_smi_snapshot() -> Optional[dict]:
+    """One nvidia-smi read, cached _NVIDIA_SMI_TTL_S, shared by the util and
+    VRAM CLI probes. Returns {'util': float, 'vram': (total_bytes, free_bytes)}
+    or None when nvidia-smi is absent / the parse fails; on a cache hit it
+    returns the previous result without re-spawning a subprocess.
+    Picks the largest-total-VRAM GPU so util and VRAM agree, matching
+    archive_transcribe's own `_smi_gpu_index` choice."""
+    global _nvidia_smi_at, _nvidia_smi_util, _nvidia_smi_vram, _nvidia_smi_ready
+    now = time.monotonic()
+    with _nvidia_smi_lock:
+        if _nvidia_smi_ready and now - _nvidia_smi_at < _NVIDIA_SMI_TTL_S:
+            return {"util": _nvidia_smi_util, "vram": _nvidia_smi_vram}
     try:
         import subprocess as sp
-        out = sp.run(["nvidia-smi","--query-gpu=utilization.gpu","--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=3.0)
-        if out.returncode==0 and out.stdout.strip():
-            for line in out.stdout.strip().splitlines():
-                try:
-                    v=float(line.strip())
-                    return max(0.0, min(1.0, v/100.0))
-                except Exception:
-                    continue
+        out = sp.run(
+            ["nvidia-smi",
+             "--query-gpu=utilization.gpu,memory.total,memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3.0,
+        )
     except Exception:
-        pass
-    return 0.0
+        with _nvidia_smi_lock:
+            _nvidia_smi_util = None
+            _nvidia_smi_vram = None
+            _nvidia_smi_at = now
+            _nvidia_smi_ready = True
+        return None
+    if out.returncode != 0 or not (out.stdout or "").strip():
+        with _nvidia_smi_lock:
+            _nvidia_smi_util = None
+            _nvidia_smi_vram = None
+            _nvidia_smi_at = now
+            _nvidia_smi_ready = True
+        return None
+    best_util = 0.0
+    best_vram: Optional[Tuple[int, int]] = None
+    for line in (out.stdout or "").strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 3:
+            continue
+        try:
+            util = max(0.0, min(1.0, float(parts[0]) / 100.0))
+            total = int(float(parts[1]) * 1024 ** 2)
+            free = int(float(parts[2]) * 1024 ** 2)
+        except Exception:
+            continue
+        if best_vram is None or total > best_vram[0]:
+            best_vram = (total, free)
+            best_util = util
+    with _nvidia_smi_lock:
+        _nvidia_smi_util = best_util
+        _nvidia_smi_vram = best_vram
+        _nvidia_smi_at = now
+        _nvidia_smi_ready = True
+    if best_vram is None:
+        return None
+    return {"util": best_util, "vram": best_vram}
 
 def _probe_power_limited() -> bool:
     # battery
