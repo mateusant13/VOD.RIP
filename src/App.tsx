@@ -7759,6 +7759,7 @@ export default function App() {
                 const cellIdx = frameCellContents.indexOf(entry.id);
                 return cellIdx >= 0 ? getFrameCellRect(cellIdx) : null;
               })()}
+              onUnsnap={() => setFrameCellContents((prev) => prev.map((cell) => (cell === entry.id ? null : cell)))}
               onClose={() => closeExplorePopup(entry.id)}
               onHandoffToMain={(vod: ExplorePopupVod, timeSec: number, trim?: { start: number; end: number } | null, chat?: ChatMarkers | null) => carryExploreToUrl(vod, timeSec, trim, chat)}
               onRegisterPause={registerExplorePause}

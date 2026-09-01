@@ -141,6 +141,8 @@ interface ChannelExplorePopupProps {
   /** When set, popup is snapped into a frame grid cell (frame mode). */
   frameSnapRect?: FrameRect | null;
   frameMode?: boolean;
+  /** Release the popup from its frame cell so a drag can move it freely. */
+  onUnsnap?: () => void;
 }
 
 
@@ -170,6 +172,7 @@ export default function ChannelExplorePopup({
   onOpenHit,
   frameSnapRect = null,
   frameMode = false,
+  onUnsnap,
 }: ChannelExplorePopupProps) {
   const { t } = useI18n();
   const [playback, setPlayback] = useState<{
@@ -302,6 +305,7 @@ export default function ChannelExplorePopup({
   const posRef = useRef<PanelPos | null>(null);
   const chromeHRef = useRef(EXPLORE_PANEL_CHROME_H_EST);
   const videoWrapRef = useRef<HTMLDivElement>(null);
+  const videoPointerRef = useRef<{ x: number; y: number; moved: boolean } | null>(null);
   /** Player column (video + chrome + optional archive-search dock). Its
    *  content height bounds the row, so the self-stretching chat column can
    *  never inflate the popup to the unbounded chat list height (~112k px). */
@@ -1085,9 +1089,12 @@ export default function ChannelExplorePopup({
   }, [chatTotal, frameSnapRect]);
 
   const onPopupDrag = useCallback((e: ReactPointerEvent<HTMLElement>) => {
-    if (fullscreen || frameSnapRect) return;
+    if (fullscreen) return;
+    // Dragging the body of a popup snapped into a frame cell releases it from
+    // the cell so the same gesture can move it freely (a snapped popup would
+    // otherwise be re-pinned to the cell by the layout effect).
+    if (frameSnapRect) onUnsnap?.();
     const t = e.target as HTMLElement;
-    if (t.tagName === 'VIDEO') return;
     if (t.closest('button, input, select, textarea, a, [role="slider"], [data-player-menu], [data-preview-chat-panel]')) return;
     const el = containerRef.current;
     if (!el) return;
@@ -1096,7 +1103,7 @@ export default function ChannelExplorePopup({
       setPos(posRef.current);
     }
     startFloatingPanelDrag(e, posRef, setPos, el);
-  }, [fullscreen, stackIndex, frameSnapRect]);
+  }, [fullscreen, stackIndex, frameSnapRect, onUnsnap]);
 
   const fsGateRef = useRef<FullscreenGate | null>(null);
   if (fsGateRef.current === null) {
@@ -1754,8 +1761,38 @@ export default function ChannelExplorePopup({
       role="application"
       aria-label={vod.isClip ? t('Channel clip explore player') : t('Channel VOD explore player')}
       onKeyDown={handleKeyDown}
-      onPointerDownCapture={onBringToFront}
-      onClick={focusPlayer}
+      onPointerDownCapture={(e) => {
+        onBringToFront();
+        if (!fullscreen && frameMode && videoWrapRef.current?.contains(e.target as Node)) {
+          videoPointerRef.current = { x: e.clientX, y: e.clientY, moved: false };
+        } else {
+          videoPointerRef.current = null;
+        }
+      }}
+      onClick={(e) => {
+        const videoPointer = videoPointerRef.current;
+        videoPointerRef.current = null;
+        if (
+          frameMode
+          && !fullscreen
+          && videoPointer
+          && !videoPointer.moved
+          && videoWrapRef.current?.contains(e.target as Node)
+        ) {
+          if (ready) {
+            const video = videoRef.current;
+            if (video) unlockPreviewAudioFromGesture(video, setMuted, volumeRef.current);
+            togglePlay();
+          }
+        }
+        focusPlayer();
+      }}
+      onPointerMove={frameMode && !fullscreen ? (e) => {
+        const videoPointer = videoPointerRef.current;
+        if (videoPointer && Math.hypot(e.clientX - videoPointer.x, e.clientY - videoPointer.y) > 4) {
+          videoPointer.moved = true;
+        }
+      } : undefined}
       className={`explore-frame-popup group outline-none focus:ring-2 focus:ring-white/25 flex flex-col overflow-visible bg-zinc-950 ${
         fullscreen
           ? 'explore-fs-host min-h-0 p-0 gap-0 border-0 shadow-none'
@@ -1978,8 +2015,8 @@ export default function ChannelExplorePopup({
             fullscreen ? 'absolute inset-0 z-0 border-0' : 'border-2 border-zinc-700 shrink-0'
           }`}
           style={fullscreen ? undefined : { aspectRatio: videoAspect, maxHeight: videoAspect < 1 ? '80vh' : undefined, transition: 'max-height 0.3s ease' }}
-          onPointerDown={(e) => e.stopPropagation()}
-          onClick={() => {
+          onPointerDown={frameMode && !fullscreen ? undefined : (e) => e.stopPropagation()}
+          onClick={frameMode && !fullscreen ? undefined : () => {
             if (!ready) return;
             const video = videoRef.current;
             if (video) unlockPreviewAudioFromGesture(video, setMuted, volumeRef.current);
