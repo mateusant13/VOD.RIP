@@ -17,7 +17,7 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -1109,6 +1109,11 @@ async def _ask_rate_limit_middleware(request: Request, call_next):
     return await call_next(request)
 
 # Mount static files
+# Memoized root-UI bundle: (mtime_ns, size) key -> content + SHA1 ETag, so a
+# "/" hit costs one stat() instead of a read + hash of the ~1MB bundle.
+_INDEX_CACHE: Dict[str, Any] = {"key": None, "etag": "", "html": ""}
+
+
 static_dir = Path(__file__).parent / "static"
 if static_dir.exists():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
@@ -1173,13 +1178,27 @@ Run <code>npm run dev</code> for API + UI, or set <code>KICK_SERVE_UI=1</code> a
         )
     index_file = static_dir / "index.html"
     if index_file.exists():
-        content = index_file.read_text(encoding="utf-8")
+        # Stat-keyed memo (audit: re-reading + SHA1 of the ~1MB bundle per
+        # request is wasted work; the bundle is immutable between builds).
+        # ponytail: unlocked module dict — worst case under a race is two
+        # threads computing the same value; upgrade path: threading.Lock.
+        global _INDEX_CACHE
+        st = index_file.stat()
+        key = (st.st_mtime_ns, st.st_size)
+        if _INDEX_CACHE["key"] != key:
+            content = index_file.read_text(encoding="utf-8")
+            etag = '"%s"' % hashlib.sha1(content.encode("utf-8")).hexdigest()
+            _INDEX_CACHE.update(key=key, etag=etag, html=content)
+        etag = _INDEX_CACHE["etag"]
         # no-cache + ETag: browser keeps the 1MB single-file bundle, revalidates
         # with a cheap 304 instead of re-downloading it on every cold open.
-        etag = '"%s"' % hashlib.sha1(content.encode("utf-8")).hexdigest()
         if request.headers.get("if-none-match") == etag:
-            return Response(status_code=304, headers={"Cache-Control": "no-cache", "ETag": etag})
-        return HTMLResponse(content, headers={"Cache-Control": "no-cache", "ETag": etag})
+            return Response(
+                status_code=304, headers={"Cache-Control": "no-cache", "ETag": etag}
+            )
+        return HTMLResponse(
+            _INDEX_CACHE["html"], headers={"Cache-Control": "no-cache", "ETag": etag}
+        )
     return HTMLResponse(
         "<h1>Kick & Twitch Downloader</h1>"
         "<p>Frontend not found. Run <code>npm run build-copy</code> then set <code>KICK_SERVE_UI=1</code>, "

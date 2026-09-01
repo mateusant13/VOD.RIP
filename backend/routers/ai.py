@@ -5,13 +5,14 @@ the channel's archived chat + transcripts via the same machinery the archive
 search UI uses (services.archive_db.search), (2) assemble the top matching
 segments as context, each tagged with video title/date, (3) one call to an
 OpenAI-compatible chat-completions endpoint with the user's own API key
-(Settings > Experimental, write-only).
+(Settings > Experimental, write-only; VODRIP_AI_API_KEY env overrides).
 
 The system prompt restricts the model to the provided context (no prompt
 injection surface beyond the archive content itself) and requires citations.
 """
 
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -25,9 +26,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["ai"])
 
 # OpenAI-compatible chat-completions base. Overridable for local providers
-# (Ollama/LM Studio etc.) via env — the frontend stays unchanged.
-AI_BASE_URL = "https://api.openai.com/v1"
-AI_MODEL = "gpt-4o-mini"
+# (Ollama/LM Studio etc.) via env (VODRIP_AI_BASE_URL / VODRIP_AI_MODEL /
+# VODRIP_AI_API_KEY) — the frontend stays unchanged.
+AI_BASE_URL = os.environ.get("VODRIP_AI_BASE_URL", "").strip() or "https://api.openai.com/v1"
+AI_MODEL = os.environ.get("VODRIP_AI_MODEL", "").strip() or "gpt-4o-mini"
 AI_TIMEOUT_S = 30.0
 # Guard rails: bounded question + bounded context, so the prompt can never
 # grow unbounded and the LLM bill stays predictable.
@@ -113,7 +115,12 @@ async def ai_ask(body: AiAskRequest):
             status_code=403,
             detail="Experimental AI is disabled — enable it in Settings (Experimental) and add an API key.",
         )
-    api_key = (getattr(settings, "ai_api_key", "") or "").strip()
+    # VODRIP_AI_API_KEY overrides (headless/portable deploys); env wins per
+    # the project's cache/env convention, else the write-only settings key.
+    api_key = (
+        os.environ.get("VODRIP_AI_API_KEY", "").strip()
+        or (getattr(settings, "ai_api_key", "") or "").strip()
+    )
     if not api_key:
         # Defensive: the settings toggle cannot turn on without a key.
         raise HTTPException(
