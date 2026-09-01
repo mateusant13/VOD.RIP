@@ -4,7 +4,7 @@
  * macOS:   VOD.RIP.app
  * Linux:   VOD-RIP + _internal/
  */
-import { chmodSync, cpSync, existsSync, rmSync } from 'fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, rmSync } from 'fs';
 import { dirname, join } from 'path';
 import { platform } from 'os';
 import { fileURLToPath } from 'url';
@@ -85,6 +85,22 @@ if (os === 'darwin' && existsSync(macApp)) {
     rmSync(internalDest, { recursive: true, force: true });
     cpSync(internalSrc, internalDest, { recursive: true });
     console.log('Deployed _internal/ to project root');
+  }
+  // The frozen backend resolves these assets beside the executable. Keep the
+  // root deployment equivalent to the onedir install layout.
+  const autoInstallSrc = join(root, 'backend', 'scripts', 'cookie_extension_auto_install.ps1');
+  if (existsSync(autoInstallSrc)) {
+    const autoInstallDest = join(root, 'scripts', 'cookie_extension_auto_install.ps1');
+    mkdirSync(dirname(autoInstallDest), { recursive: true });
+    cpSync(autoInstallSrc, autoInstallDest, { force: true });
+    console.log('Deployed cookie auto-install driver');
+  }
+  const overlaySrc = join(root, 'vendor', 'kick-overlay');
+  const overlayDest = join(root, 'kick-overlay');
+  if (existsSync(join(overlaySrc, 'manifest.json'))) {
+    rmSync(overlayDest, { recursive: true, force: true });
+    cpSync(overlaySrc, overlayDest, { recursive: true, force: true });
+    console.log('Deployed Kick Overlay package');
   }
 
   copyIcon();

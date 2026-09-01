@@ -12,6 +12,8 @@
  ],
  "host_permissions": [
   "https://www.twitch.tv/*",
+  "https://kick.com/*",
+  "https://*.kick.com/*",
   "https://live-video.net/*",
   "https://*.live-video.net/*",
   "https://*.youtube.com/*",

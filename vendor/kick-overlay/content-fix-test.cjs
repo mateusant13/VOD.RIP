@@ -8,6 +8,8 @@
 const fs = require('fs');
 const assert = require('assert');
 
+const manifest = JSON.parse(fs.readFileSync('manifest.json', 'utf8'));
+assert.ok(manifest.host_permissions.includes('https://kick.com/*'), 'manifest permits Kick API fetches');
 const swCalls = []; // chrome.runtime.sendMessage recorder
 const badgeTexts = []; // chrome.action.setBadgeText recorder (clipping check)
 const runtimeMsgListeners = []; // chrome.runtime.onMessage recorders
@@ -55,6 +57,7 @@ const videoEl = (id) => ({
   getClientRects: () => [{}],
   getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 60 }),
   pause() { this.paused = true; },
+  play() { this.paused = false; return Promise.resolve(); },
   remove() {
     this.removed = (this.removed || 0) + 1;
     this.isConnected = false;
@@ -358,7 +361,7 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
   assert.strictEqual(KO.statusChip.style.color, '#fbbf24', 'chip amber while kick connecting');
   // KICK failed/offline -> gray KICK ✕
   KO.activeUrl = null;
-  assert.ok(kickSrc.includes('ev.origin !== location.origin'), 'kick messages must be page-origin restricted');
+  assert.ok(kickSrc.includes('ev.origin !== PLAYER_ORIGIN'), 'kick messages must use the extension-frame origin');
   KO.kickUrlT = 0;
   KO.kickState = null;
   KO.kickEverPlayed = false;
@@ -553,7 +556,7 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
     addEventListener() {},
     removeEventListener() {},
   };
-  const mountApi = new Function('window', 'document', 'location', 'navigator', src + '\n;return {KO, mount, updateKickBar, teardown, injectStyles};')(
+  const mountApi = new Function('window', 'document', 'location', 'navigator', src + '\n;return {KO, mount, updateKickBar, teardown, injectStyles, rectTick, syncMute};')(
     global, mountDoc, global.location, global.navigator,
   );
   const mKO = mountApi.KO;
@@ -563,6 +566,28 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
   const fsNode = mKO.wrap.querySelector('#ko-fs');
   assert.ok(fsNode && fsNode.innerHTML.includes('viewBox'), 'fullscreen button receives the fs SVG icon');
   assert.ok(mKO.wrap.classList.contains('ko-hot'), 'wrap starts hot so the control bar is visible');
+  fakeFrame = { contentWindow: { postMessage() {} }, dataset: { koToken: 'message-token' } };
+  mountDoc.getElementById = (id) => (id === 'ko-yt' ? fakeFrame : null);
+  msgListeners.forEach((listener) => listener({
+    source: fakeFrame.contentWindow,
+    origin: new URL(chromeStub.runtime.getURL('player.html')).origin,
+    data: { __koKick: { t: 'ready', _koToken: 'message-token' } },
+  }));
+  fakeVideos.length = 0;
+  const nativeVideo = { ...videoEl('native'), play() { this.paused = false; return Promise.resolve(); } };
+  fakeVideos.push(nativeVideo);
+  nativeVideo.paused = false;
+  nativeVideo.muted = false;
+  mKO.player = 'youtube';
+  mKO.wrap.style.display = 'block';
+  mountApi.syncMute();
+  assert.strictEqual(nativeVideo.paused, true, 'overlay pauses Twitch playback');
+  assert.strictEqual(nativeVideo.muted, true, 'overlay mutes Twitch playback');
+  mKO.wrap.style.display = 'none';
+  mountApi.rectTick();
+  assert.strictEqual(nativeVideo.paused, false, 'hidden failed overlay resumes Twitch playback');
+  assert.strictEqual(nativeVideo.muted, false, 'hidden failed overlay unmutes Twitch playback');
+  fakeVideos.length = 0;
   console.log('M fs icon: mount assigns KO_SVG.fs to #ko-fs — OK');
 
   const styleEl2 = appends.find((e) => e.id === 'ko-style');

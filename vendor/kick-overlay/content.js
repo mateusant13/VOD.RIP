@@ -106,6 +106,7 @@ const KO = {
   lastRect: null,   // last Twitch player rect (keeps the overlay pinned when deleted)
   dvrFetchedFor: null, // playback_url the DVR source was fetched for (once per url)
   ytVol: 1,         // user's YouTube volume in the player bridge's 0..1 range
+  ytMuted: false,   // user's YouTube mute choice (persisted)
   ytState: { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, error: 0 },
   ytHlsUrl: null,   // last minted HLS manifest url (refreshed under the background cache TTL)
   ytHlsAt: 0,       // epoch ms of the successful mint
@@ -140,6 +141,7 @@ function applyVols(vols) {
     const volume = yv.v > 1 ? yv.v / 100 : yv.v;
     KO.ytVol = Math.max(0, Math.min(1, volume));
   }
+  if (typeof yv.m === 'boolean') KO.ytMuted = yv.m;
 }
 
 function loadState() {
@@ -458,7 +460,7 @@ let lastYtProbe = 0;
 let ytFirstInfo = false;
 window.addEventListener('message', (ev) => {
   const d = ev.data;
-  if (!d || !d.__koKick || ev.origin !== location.origin) return;
+  if (!d || !d.__koKick || ev.origin !== PLAYER_ORIGIN) return;
   const f = document.getElementById('ko-yt');
   if (!f || ev.source !== f.contentWindow || d.__koKick._koToken !== f.dataset.koToken) return; // the yt (hls) frame only
   const m = d.__koKick;
@@ -556,7 +558,7 @@ function kickFrame() {
 
 window.addEventListener('message', (ev) => {
   const d = ev.data;
-  if (!d || !d.__koKick || ev.origin !== location.origin) return;
+  if (!d || !d.__koKick || ev.origin !== PLAYER_ORIGIN) return;
   const ytf = document.getElementById('ko-yt');
   if (ytf && ev.source === ytf.contentWindow) return; // the yt (hls) frame — handled by the yt listener
   if (!KO.kickFrame || ev.source !== KO.kickFrame.contentWindow) return;
@@ -711,11 +713,12 @@ function kickBackToLive() {
 }
 
 // ---- playback ownership -----------------------------------------------------
-// Exactly one player may run at a time. When Kick or YouTube owns the overlay,
-// pause and mute every native Twitch video; resume only a Twitch video that
-// this overlay paused when the user explicitly switches back to Twitch.
+// Exactly one player may run at a time. When a visible Kick or YouTube layer
+// owns the overlay, pause and mute every native Twitch video; resume only a
+// Twitch video that this overlay paused when the layer is hidden or removed.
 function syncMute() {
-  const overlaySelected = KO.player !== 'twitch' && !!KO.wrap;
+  const overlaySelected = KO.player !== 'twitch' && !!KO.wrap
+    && (KO.wrap.style.display !== 'none' || KO.twDeleted);
   for (const v of document.querySelectorAll('video')) {
     if (overlaySelected) {
       if (!v.paused) {
@@ -990,6 +993,7 @@ function mount() {
   muteBtn.addEventListener('click', () => {
     if (KO.player === 'youtube') {
       const muted = !KO.ytState.muted;
+      KO.ytMuted = muted;
       if (!muted && KO.ytVol === 0) KO.ytVol = 1;
       ytCmd('mute', muted);
       if (!muted) ytCmd('setVolume', KO.ytVol);
@@ -1013,8 +1017,9 @@ function mount() {
     const v = volFrac(e);
     if (KO.player === 'youtube') {
       KO.ytVol = v;
+      KO.ytMuted = v === 0;
       ytCmd('setVolume', v);
-      ytCmd('mute', v === 0);
+      ytCmd('mute', KO.ytMuted);
     } else {
       KO.kickVol = v;
       KO.kickMuted = v === 0;
@@ -1233,7 +1238,7 @@ function showYtLayer() {
   }
   ytCmd('play');
   ytCmd('setVolume', KO.ytVol); // the user's last yt volume follows the player switch
-  ytCmd('unmute');
+  ytCmd('mute', KO.ytMuted);
   setTimeout(() => {
     // Muted autoplay fallback: unmute on the first user gesture.
     if (KO.player === 'youtube' && KO.ytState.muted) enableYtUnlock();
@@ -1767,6 +1772,7 @@ function rectTick() {
       }
     } else if (overlaySelected) {
       syncMute();
+      if (!KO.twDeleted && KO.wrap.style.display === 'none') resumeTwitchIfOurs();
     } else {
       if (KO.kickFrame && KO.kickState && KO.kickState.state === 'Playing') {
         kickSend({ t: 'pause' });

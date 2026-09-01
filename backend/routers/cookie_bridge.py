@@ -364,10 +364,9 @@ def _materialize_ext_src() -> Path:
 def _firefox_ext_src(src: Path) -> Path:
     """Materialize a Firefox-compatible variant of the unpacked extension.
 
-    Firefox MV3 supports neither module service workers nor Chromium-style
-    drag-and-drop: the variant flips background.service_worker to a classic
-    background.scripts array and pins a stable addon id so cookies survive
-    extension updates. Idempotent: returns the variant dir once patched.
+    Firefox uses the bundled background page because its ``background.scripts``
+    entries are classic scripts while this extension's background.js is ESM.
+    The page already loads that module via ``background.html``.
     """
     try:
         manifest = json.loads((src / "manifest.json").read_text(encoding="utf-8"))
@@ -383,7 +382,7 @@ def _firefox_ext_src(src: Path) -> Path:
     shutil.copytree(src, dest, dirs_exist_ok=True)
     try:
         m2 = json.loads(out_manifest.read_text(encoding="utf-8"))
-        m2["background"] = {"scripts": [sw]}
+        m2["background"] = {"page": "background.html"}
         m2["browser_specific_settings"] = {"gecko": {"id": "vodrip-cookies@vod.rip"}}
         out_manifest.write_text(json.dumps(m2, indent=2, ensure_ascii=False), encoding="utf-8")
     except (OSError, ValueError):
@@ -832,7 +831,7 @@ def _auto_install_worker(
     results: dict[str, dict] = {}
     try:
         results["cookie"] = _run_auto_install_script(browser, extension_dir)
-        if results["cookie"].get("ok") and include_kick_overlay:
+        if include_kick_overlay:
             overlay = _kick_overlay_src()
             results["kick_overlay"] = (
                 _run_auto_install_script(browser, overlay)
@@ -1034,6 +1033,8 @@ async def session_cookies_status(request: Request):
             and (time.time() - _AUTO_INSTALL_STATE["started_at"]) > 300
         ):
             _AUTO_INSTALL_STATE["state"] = "error"
+            _AUTO_INSTALL_STATE["installed"] = False
+            _AUTO_INSTALL_STATE["extensions"] = {}
             _AUTO_INSTALL_STATE["error"] = (
                 "auto-install thread died (no update for >5 min) — retry from Settings"
             )

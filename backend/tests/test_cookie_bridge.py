@@ -938,6 +938,32 @@ def test_auto_install_worker_installs_both_extensions(monkeypatch, tmp_path):
         assert set(cb._AUTO_INSTALL_STATE["extensions"]) == {"cookie", "kick_overlay"}
 
 
+def test_auto_install_worker_reports_both_results_when_cookie_fails(monkeypatch, tmp_path):
+    """A cookie failure must not hide the requested Kick Overlay attempt."""
+    from routers import cookie_bridge as cb
+
+    overlay = tmp_path / "kick-overlay"
+    overlay.mkdir()
+    (overlay / "manifest.json").write_text("{}", encoding="utf-8")
+    calls = []
+
+    def run(browser, ext_dir):
+        calls.append(ext_dir)
+        return (
+            {"ok": False, "installed": False, "error": "cookie failed"}
+            if ext_dir.name == "cookies"
+            else {"ok": True, "installed": True, "extension_id": "kick123"}
+        )
+
+    monkeypatch.setattr(cb, "_run_auto_install_script", run)
+    monkeypatch.setattr(cb, "_kick_overlay_src", lambda: overlay)
+    cb._auto_install_worker("chrome", tmp_path / "cookies", True)
+
+    assert calls == [tmp_path / "cookies", overlay]
+    with cb._AUTO_INSTALL_LOCK:
+        assert set(cb._AUTO_INSTALL_STATE["extensions"]) == {"cookie", "kick_overlay"}
+
+
 def test_auto_install_worker_reports_failure(monkeypatch):
     """Worker maps a failing script result to error state."""
     from routers import cookie_bridge as cb
