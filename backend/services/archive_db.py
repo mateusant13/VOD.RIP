@@ -296,105 +296,187 @@ def _migrate_db_to_data_dir(target: Path) -> None:
         shutil.copytree(src_manifest, target.parent / "whisper_manifest", dirs_exist_ok=True)
 
 
-# RLock: query()/execute() hold the lock while calling get_conn(), which
-# re-acquires it — a plain Lock would self-deadlock on first read.
+# Write-path lock: guards every WRITE transaction (execute, insert_messages,
+# dedupe_messages, the *_embeddings/stamp paths) AND the brief schema-ready
+# check. RLock (not Lock) because query()/execute() call get_conn() from inside
+# locked regions, which re-enters the lock. Reads do NOT hold this lock across
+# a query — each thread owns a private READ connection (see _get_read_conn).
 _lock = threading.RLock()
-_conn: Optional[sqlite3.Connection] = None
+# INIT-ONLY lock: serializes the one-time executescript(SCHEMA),
+# _migrate_fts_contentless, _migrate_db_to_data_dir so concurrent reader and
+# writer threads never race `_schema_ready`. Acquired ONLY inside
+# _ensure_schema_ready, which already holds _lock — lock order is always
+# _lock -> _init_lock, never inverted (both acquire _lock first).
+_init_lock = threading.Lock()
+_conn: Optional[sqlite3.Connection] = None   # shared WRITE connection
 _conn_path: Optional[str] = None
 _schema_ready = False
 # worker_heartbeats gained a pid column for daemon take-over detection
 # (ALTER applied lazily on first heartbeat with a pid).
 _HB_PID_COL = False
+# Per-thread READ connections. query() uses one connection per thread so a long
+# read (search, _phrase_span_rows full-table scan, chat_window) neither
+# serializes against other readers nor blocks on the write path's _lock. The
+# shared _conn above is NEVER handed to a reader.
+_local = threading.local()
+
+
+def _open_conn(path: Path) -> sqlite3.Connection:
+    """Open a fresh WAL connection, re-applying PER-CONNECTION pragmas.
+
+    busy_timeout / synchronous are per-connection settings (only journal_mode
+    is persisted in the file), so every new connection — the shared write conn
+    and each per-thread read conn — must re-assert them."""
+    # check_same_thread=False: workers (archive_transcribe, chat backfill,
+    # chat sinks) call into this module from pool threads. Read connections
+    # are thread-local (one per thread); the shared write connection is
+    # serialized by _lock.
+    conn = sqlite3.connect(str(path), timeout=10.0, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+def _init_schema() -> None:
+    """One-time DDL + migrations on the shared WRITE connection.
+
+    Call with _lock AND _init_lock both held (via _ensure_schema_ready).
+    Idempotent: the executescript uses CREATE IF NOT EXISTS and every _ensure_*
+    migration guards on PRAGMA table_info, so re-running is a no-op.
+
+    The path-rebind logic lives here (tests repoint VODRIP_ARCHIVE_DB at fresh
+    scratch DBs per suite): when the resolved path differs from the cached one,
+    the old connection is dropped and migrations re-run against the new DB."""
+    global _conn, _conn_path, _schema_ready
+    path = _db_path()
+    if _conn is not None and _conn_path != str(path):
+        try:
+            _conn.close()
+        except sqlite3.Error:
+            pass
+        _conn = None
+        _schema_ready = False
+    if _conn is None:
+        _conn_path = str(path)
+        _migrate_db_to_data_dir(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _conn = _open_conn(path)
+        _conn.executescript(SCHEMA)
+        _conn.commit()
+        # Disk hygiene (fresh open only): checkpoint a stale -wal left by a
+        # killed process, then VACUUM when the freelist outgrows 10% of the
+        # file (heavy insert/delete churn). Both are best-effort — a
+        # busy/locked DB fails and is retried next start.
+        try:
+            _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
+        try:
+            page_count = _conn.execute("PRAGMA page_count").fetchone()[0]
+            freelist = _conn.execute("PRAGMA freelist_count").fetchone()[0]
+            if page_count > 0 and freelist > page_count // 10:
+                _conn.execute("VACUUM")
+                # In WAL mode VACUUM rewrites through the -wal, so the main
+                # file only shrinks once the new frames are checkpointed back.
+                _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
+    if not _schema_ready:
+        _conn.executescript(SCHEMA)
+        _ensure_kind_column(_conn)
+        _ensure_kind_check_includes_stream(_conn)
+        _ensure_channel_columns(_conn)
+        _ensure_content_sha_column(_conn)
+        _ensure_channel_language_column(_conn)
+        _ensure_original_columns(_conn)
+        _ensure_captions_unavailable_column(_conn)
+        _ensure_transcript_kind_column(_conn)
+        _ensure_original_failed_column(_conn)
+        _ensure_lang_column(_conn)
+        _ensure_spam_column(_conn)
+        _ensure_message_color_column(_conn)
+        _ensure_message_display_name_column(_conn)
+        _ensure_jobs_kind_events(_conn)
+        _ensure_jobs_priority(_conn)
+        _ensure_jobs_kind_chat(_conn)
+        _ensure_jobs_heartbeat_column(_conn)
+        _ensure_jobs_retry_columns(_conn)
+        rebuilt = _migrate_fts_contentless(_conn)
+        # One-time data migrations on transcripts (entity + lang backfill).
+        # Runs after the FTS rebuild so the current trigger set re-indexes.
+        _migrate_transcript_data(_conn)
+        _conn.commit()
+        if rebuilt:
+            # Legacy index rebuilds leave the old FTS shadow-table pages on
+            # the freelist; VACUUM + checkpoint so the file actually shrinks
+            # (same pattern as the fresh-open hygiene above).
+            try:
+                _conn.execute("VACUUM")
+                _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
+        _schema_ready = True
+
+
+def _ensure_schema_ready() -> None:
+    """Guarantee the shared write connection is open and schema-migrated.
+
+    Lock order _lock -> _init_lock (never inverted): readers and writers both
+    funnel through here, so the one-time migration ALTERs never run twice and
+    a reader never observes a half-migrated DB."""
+    with _lock:
+        with _init_lock:
+            _init_schema()
 
 
 def get_conn() -> sqlite3.Connection:
-    """Return the shared WAL connection, initializing schema on first use.
+    """Return the shared WRITE WAL connection, schema-ready.
 
     The cache is keyed on the resolved DB path: if VODRIP_ARCHIVE_DB (or the
     appdata dir) changes at runtime — test modules rebind it per suite — the
     old connection is dropped and a fresh one for the new path is opened.
-    In production the path never changes, so this is a no-op there."""
-    global _conn, _conn_path, _schema_ready
-    with _lock:
-        path = _db_path()
-        if _conn is not None and _conn_path != str(path):
-            try:
-                _conn.close()
-            except sqlite3.Error:
-                pass
-            _conn = None
-            _schema_ready = False
-        if _conn is None:
-            _conn_path = str(path)
-            _migrate_db_to_data_dir(path)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            # check_same_thread=False: workers (archive_transcribe, chat
-            # backfill, chat sinks) call into this module from pool threads;
-            # the module RLock serializes every access, so the C-level safety
-            # check is redundant paranoia here.
-            conn = sqlite3.connect(str(path), timeout=10.0, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=10000")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.executescript(SCHEMA)
-            conn.commit()
-            # Disk hygiene (fresh open only): checkpoint a stale -wal left by
-            # a killed process, then VACUUM when the freelist outgrows 10% of
-            # the file (heavy insert/delete churn). Both are best-effort — a
-            # busy/locked DB fails and is retried next start.
-            try:
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except sqlite3.Error:
-                pass
-            try:
-                page_count = conn.execute("PRAGMA page_count").fetchone()[0]
-                freelist = conn.execute("PRAGMA freelist_count").fetchone()[0]
-                if page_count > 0 and freelist > page_count // 10:
-                    conn.execute("VACUUM")
-                    # In WAL mode VACUUM rewrites through the -wal, so the
-                    # main file only shrinks once the new frames are
-                    # checkpointed back in.
-                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except sqlite3.Error:
-                pass
-            _conn = conn
-        if not _schema_ready:
-            _conn.executescript(SCHEMA)
-            _ensure_kind_column(_conn)
-            _ensure_kind_check_includes_stream(_conn)
-            _ensure_channel_columns(_conn)
-            _ensure_content_sha_column(_conn)
-            _ensure_channel_language_column(_conn)
-            _ensure_original_columns(_conn)
-            _ensure_captions_unavailable_column(_conn)
-            _ensure_transcript_kind_column(_conn)
-            _ensure_original_failed_column(_conn)
-            _ensure_lang_column(_conn)
-            _ensure_spam_column(_conn)
-            _ensure_message_color_column(_conn)
-            _ensure_message_display_name_column(_conn)
-            _ensure_jobs_kind_events(_conn)
-            _ensure_jobs_priority(_conn)
-            _ensure_jobs_kind_chat(_conn)
-            _ensure_jobs_heartbeat_column(_conn)
-            _ensure_jobs_retry_columns(_conn)
-            rebuilt = _migrate_fts_contentless(_conn)
-            # One-time data migrations on transcripts (entity + lang backfill).
-            # Runs after the FTS rebuild so the current trigger set re-indexes.
-            _migrate_transcript_data(_conn)
-            _conn.commit()
-            if rebuilt:
-                # Legacy index rebuilds leave the old FTS shadow-table pages
-                # on the freelist; VACUUM + checkpoint so the file actually
-                # shrinks (same pattern as the fresh-open hygiene above).
-                try:
-                    _conn.execute("VACUUM")
-                    _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                except sqlite3.Error:
-                    pass
-            _schema_ready = True
-        return _conn
+    In production the path never changes, so this is a no-op there.
+
+    Callers holding _lock (execute, insert_messages, ...) call this directly;
+    it re-enters _lock via _ensure_schema_ready (RLock). Callers MUST hold
+    _lock before issuing a write on the returned connection. Long reads go
+    through query(), which uses a per-thread read connection instead."""
+    _ensure_schema_ready()
+    return _conn
+
+
+def _get_read_conn() -> sqlite3.Connection:
+    """Per-thread READ connection (WAL), schema-ready.
+
+    Each thread gets its own connection so concurrent reads never serialize on
+    _lock and a long read (search, _phrase_span_rows LIKE scan, chat_window)
+    never blocks the write path. Cached in threading.local keyed on the
+    resolved DB path, so a test rebinding VODRIP_ARCHIVE_DB reopens against the
+    new DB.
+
+    The schema-ready check runs ONCE per thread per DB path (the fast path
+    below returns the cached connection without touching any lock), so steady-
+    state reads are lock-free. busy_timeout/synchronous are re-applied on every
+    fresh connection (_open_conn)."""
+    path = str(_db_path())
+    conn = getattr(_local, "read_conn", None)
+    conn_path = getattr(_local, "read_conn_path", None)
+    if conn is not None and conn_path == path:
+        return conn
+    _ensure_schema_ready()  # slow path: rebind/reopen — serialize schema init
+    if conn is not None:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    conn = _open_conn(p)
+    _local.read_conn = conn
+    _local.read_conn_path = path
+    return conn
 
 
 def _ensure_kind_column(conn: sqlite3.Connection) -> None:
@@ -976,8 +1058,9 @@ def _migrate_fts_contentless(conn: sqlite3.Connection) -> bool:
     return changed
 
 
-# ponytail: single global lock + connection; upgrade path is per-thread
-# connections (threading.local) or aiosqlite if the app ever goes async.
+# ponytail: reads use per-thread connections (threading.local); the WRITE path
+# still uses a single global lock + shared write connection. Upgrade path for
+# writes is per-thread write connections, or aiosqlite if the app goes async.
 def _bind(params: Any) -> Any:
     # Named :placeholders need the dict itself — tuple() on a dict would bind
     # its KEYS as positional values and silently corrupt every row.
@@ -986,14 +1069,17 @@ def _bind(params: Any) -> Any:
 
 def execute(sql: str, params: Any = ()) -> sqlite3.Cursor:
     with _lock:
-        cur = get_conn().execute(sql, _bind(params))
-        get_conn().commit()
+        conn = get_conn()
+        cur = conn.execute(sql, _bind(params))
+        conn.commit()
         return cur
 
 
 def query(sql: str, params: Any = ()) -> list[sqlite3.Row]:
-    with _lock:
-        return get_conn().execute(sql, _bind(params)).fetchall()
+    # Per-thread READ connection: no _lock, so a long read (search,
+    # _phrase_span_rows full-table scan, chat_window) neither serializes
+    # against other readers nor blocks the write path.
+    return _get_read_conn().execute(sql, _bind(params)).fetchall()
 
 
 # --- videos ---------------------------------------------------------------
@@ -2502,12 +2588,15 @@ def upsert_watched_entity(
             (aliases_json, 1 if enabled else 0, source_channel, eid),
         )
         return eid
-    execute(
+    cur = execute(
         """INSERT INTO watched_entities (text, kind, source_channel, aliases, enabled, created_at)
            VALUES (?, ?, ?, ?, ?, ?)""",
         (text, kind, source_channel, aliases_json, 1 if enabled else 0, now),
     )
-    return query("SELECT last_insert_rowid() AS id")[0]["id"]
+    # Rowid of the just-inserted row, taken from the write cursor: with
+    # per-thread read connections the SELECT above would run on a DIFFERENT
+    # connection and last_insert_rowid() would return 0.
+    return cur.lastrowid
 
 
 def set_watched_entity(entity_id: int, *, aliases: Optional[list[str]] = None,
