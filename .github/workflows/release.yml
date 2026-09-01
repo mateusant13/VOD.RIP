@@ -78,3 +78,95 @@ jobs:
         run: |
           npx playwright install chromium --with-deps
           npm run test:e2e:frame-live
+  release-build:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install -r backend/requirements.txt
+          python -m pip install pyinstaller pywebview pystray Pillow
+          npm ci
+
+      - name: Build frontend and frozen bundle
+        shell: pwsh
+        run: |
+          npm run build-copy
+          python scripts/generate-icon.py
+          pyinstaller vod-rip.spec --clean --noconfirm
+          node scripts/deploy-dist.mjs
+          node scripts/stage-cookie-extension.mjs
+
+      - name: Download Microsoft WebView2 bootstrapper
+        shell: pwsh
+        run: |
+          Invoke-WebRequest `
+            -Uri "https://go.microsoft.com/fwlink/?linkid=2124703" `
+            -OutFile installer\MicrosoftEdgeWebview2Setup.exe
+
+      - name: Package Windows zip
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}".TrimStart('v')
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Compress-Archive -Path dist\VOD-RIP\* `
+            -DestinationPath "release\VOD.RIP-$ver-win-x64.zip" -Force
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}".TrimStart('v')
+          Remove-Item -Recurse -Force installer\staging -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path installer\staging | Out-Null
+          Copy-Item -Path dist\VOD-RIP\* -Destination installer\staging -Recurse -Force
+          choco install innosetup -y --no-progress
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
+            /DAppVersion=$ver installer\installer.iss
+
+      - name: Write checksums
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem release -File | Sort-Object Name
+          $lines = $files | ForEach-Object {
+            "$(Get-FileHash $_.FullName -Algorithm SHA256 | Select-Object -ExpandProperty Hash)  $($_.Name)"
+          }
+          $lines | Set-Content release\SHA256SUMS.txt
+
+      - name: Upload Windows release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: vod-rip-Windows-x64
+          path: |
+            release/*.zip
+            release/*-Setup.exe
+            release/SHA256SUMS.txt
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [release-build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: vod-rip-Windows-x64
+          path: release
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
