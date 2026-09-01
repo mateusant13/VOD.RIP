@@ -233,8 +233,9 @@ async def test_captioner_loop_blocks_in_order_and_seen_set_skips_redownloads(mon
         "twitch", "srdogg", loop, window_sec=1.5, poll_sec=0.02,
     )
     captioner.acquire()
+    queue = captioner.subscribe()
     try:
-        ev1, block1 = await _wait_event(captioner.events)
+        ev1, block1 = await _wait_event(queue)
         assert ev1 == "caption"
         assert block1["text"] == "window-1"
         # window start/end are stream-relative (no PDT in the fixture playlists)
@@ -243,7 +244,7 @@ async def test_captioner_loop_blocks_in_order_and_seen_set_skips_redownloads(mon
         # no PDT anchor -> no wall-clock latency measurement (key omitted)
         assert "latency_ms" not in block1
 
-        ev2, block2 = await _wait_event(captioner.events)
+        ev2, block2 = await _wait_event(queue)
         assert ev2 == "caption"
         assert block2["text"] == "window-2"
         # monotonic: the second window begins where the first ended
@@ -280,8 +281,9 @@ async def test_captioner_offline_event_after_consecutive_strikes(monkeypatch):
         "kick", "srdoglol", loop, window_sec=1.5, poll_sec=0.02,
     )
     captioner.acquire()
+    queue = captioner.subscribe()
     try:
-        ev, data = await _wait_event(captioner.events)
+        ev, data = await _wait_event(queue)
         assert ev == "offline"
     finally:
         captioner.release()
@@ -313,8 +315,9 @@ async def test_captioner_surfaces_repeated_asr_failures_as_offline(monkeypatch):
         "twitch", "srdogg", loop, window_sec=1.5, poll_sec=0.02,
     )
     captioner.acquire()
+    queue = captioner.subscribe()
     try:
-        ev, data = await _wait_event(captioner.events)
+        ev, data = await _wait_event(queue)
         assert ev == "offline"
         assert "asr failure" in (data.get("reason") or "")
     finally:
@@ -349,7 +352,8 @@ async def test_captioner_refcount_starts_and_stops_worker(monkeypatch):
     # Second subscriber cycle reuses the same instance with a new thread.
     captioner.acquire()
     assert captioner._thread is not None and captioner._thread.is_alive()
-    ev, block = await _wait_event(captioner.events)
+    queue = captioner.subscribe()
+    ev, block = await _wait_event(queue)
     assert ev == "caption"
     captioner.release()
     captioner._thread.join(timeout=3.0)
@@ -394,6 +398,7 @@ async def test_release_stops_worker_mid_ingest_without_transcribing(monkeypatch)
         "twitch", "srdogg", loop, window_sec=1.5, poll_sec=0.02,
     )
     captioner.acquire()
+    queue = captioner.subscribe()
     try:
         # The worker ingested seg1 (1s buffered, one short of the 1.5s
         # window) and is now blocked mid-ingest on seg2's fetch.
@@ -409,7 +414,7 @@ async def test_release_stops_worker_mid_ingest_without_transcribing(monkeypatch)
         # old stream, no caption emitted after the release.
         assert "https://edge/seg2.ts" in pipeline.segment_fetches
         assert pipeline.transcribe_calls == 0
-        assert captioner.events.empty()
+        assert queue.empty()
     finally:
         released.set()
         captioner.release()
@@ -488,8 +493,9 @@ async def test_captioner_recovers_from_transient_fetch_failures(monkeypatch):
         "twitch", "srdogg", loop, window_sec=1.5, poll_sec=0.02,
     )
     captioner.acquire()
+    queue = captioner.subscribe()
     try:
-        ev, block = await _wait_event(captioner.events)
+        ev, block = await _wait_event(queue)
         assert ev == "caption"
         assert block["text"] == "window-1"
     finally:
@@ -516,9 +522,10 @@ async def test_captioner_drops_stale_backlog_and_resyncs_to_live_edge(monkeypatc
         max_backlog_sec=5.0,
     )
     captioner.acquire()
+    queue = captioner.subscribe()
     try:
-        ev1, block1 = await _wait_event(captioner.events)
-        ev2, block2 = await _wait_event(captioner.events)
+        ev1, block1 = await _wait_event(queue)
+        ev2, block2 = await _wait_event(queue)
         assert ev1 == "caption" and ev2 == "caption"
         # The events are queued by the flush; the worker still ingests the
         # remaining tail segments after the last flush (and a segment's fetch
@@ -611,8 +618,9 @@ async def test_captioner_pdt_flush_carries_latency_ms(monkeypatch):
         "twitch", "srdogg", loop, window_sec=1.5, poll_sec=0.02,
     )
     captioner.acquire()
+    queue = captioner.subscribe()
     try:
-        ev, block = await _wait_event(captioner.events)
+        ev, block = await _wait_event(queue)
         assert ev == "caption"
         assert block["text"] == "window-1"
         # window start anchors to the playlist PDT (wall epoch)
@@ -657,8 +665,9 @@ async def test_captioner_pdt_with_zone_offset_parses_to_utc_epoch(monkeypatch):
         "twitch", "srdogg", loop, window_sec=1.5, poll_sec=0.02,
     )
     captioner.acquire()
+    queue = captioner.subscribe()
     try:
-        ev, block = await _wait_event(captioner.events)
+        ev, block = await _wait_event(queue)
         assert ev == "caption"
         assert block["text"] == "window-1"
         expected = datetime(2024, 1, 1, tzinfo=timezone.utc).timestamp()
@@ -740,17 +749,22 @@ async def test_captions_stream_lang_param_reaches_captioner(monkeypatch):
     acquired: list = []
 
     class _StubCaptioner:
-        events = None
 
         def acquire(self, lang=None):
             acquired.append(lang)
+
+        def subscribe(self):
+            return asyncio.Queue()
+
+        def unsubscribe(self, queue):
+            pass
 
         def release(self):
             pass
 
     monkeypatch.setattr(live_captions, "get_captioner", lambda p, c, loop: _StubCaptioner())
 
-    async def _fake_gen(request, captioner):
+    async def _fake_gen(request, captioner, queue):
         return
         yield  # pragma: no cover — keeps this an async generator
 
@@ -860,11 +874,16 @@ class _FakeRequest:
 
 
 class _FakeCaptioner:
-    """Queue + release stub for the SSE generator (mirrors _FakeSink)."""
+    """Subscribe + release stub for the SSE generator (mirrors _ChatFanout)."""
 
     def __init__(self):
-        self.events = asyncio.Queue()
         self.released = 0
+
+    def subscribe(self):
+        return asyncio.Queue()
+
+    def unsubscribe(self, queue):
+        pass
 
     def release(self):
         self.released += 1
@@ -877,11 +896,12 @@ async def test_captions_sse_gen_forwards_blocks_and_releases():
     from routers import live as live_router
 
     fake = _FakeCaptioner()
-    fake.events.put_nowait(("caption", {"text": "olá pessoal", "start": 10.0, "end": 13.0, "latency_ms": 812}))
-    fake.events.put_nowait(("offline", {}))
+    queue = fake.subscribe()
+    queue.put_nowait(("caption", {"text": "olá pessoal", "start": 10.0, "end": 13.0, "latency_ms": 812}))
+    queue.put_nowait(("offline", {}))
 
     frames: list[str] = []
-    async for frame in live_router._captions_sse_gen(_FakeRequest(), fake):
+    async for frame in live_router._captions_sse_gen(_FakeRequest(), fake, queue):
         frames.append(frame)
 
     # the full block — text/start/end AND latency_ms — is forwarded verbatim
@@ -905,7 +925,8 @@ async def test_captions_sse_gen_releases_on_disconnect():
         async def is_disconnected(self):
             return True
 
-    frames = [f async for f in live_router._captions_sse_gen(_Disconnected(), fake)]
+    queue = fake.subscribe()
+    frames = [f async for f in live_router._captions_sse_gen(_Disconnected(), fake, queue)]
     assert frames == []
     assert fake.released == 1
 
@@ -1030,11 +1051,12 @@ async def test_parallel_warm_vs_hls_poll(monkeypatch):
         "twitch", "paratest", loop, window_sec=1.5, poll_sec=0.02,
     )
     captioner.acquire()
+    queue = captioner.subscribe()
     try:
         # The fetch should have happened even though warm is still blocked
         assert warm_started.wait(timeout=2.0), "warm should have started"
         # Wait for the caption event — proves HLS poll ran in parallel
-        ev, block = await _wait_event(captioner.events, timeout=5.0)
+        ev, block = await _wait_event(queue, timeout=5.0)
         assert ev == "caption"
         assert block["text"] == "w1"
     finally:
@@ -1251,8 +1273,11 @@ async def test_captions_stream_accepts_youtube_platform(monkeypatch):
     monkeypatch.setattr(live_captions, "captions_available", lambda plat: (True, ""))
 
     class _StubCaptioner:
-        events = None
         def acquire(self, lang=None):
+            pass
+        def subscribe(self):
+            return asyncio.Queue()
+        def unsubscribe(self, queue):
             pass
         def release(self):
             pass
@@ -1260,7 +1285,7 @@ async def test_captions_stream_accepts_youtube_platform(monkeypatch):
     monkeypatch.setattr(live_captions, "get_captioner", lambda p, c, loop: _StubCaptioner())
     from routers import live as live_router
 
-    async def _fake_gen(request, captioner):
+    async def _fake_gen(request, captioner, queue):
         return
         yield
 

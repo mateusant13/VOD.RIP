@@ -64,6 +64,11 @@ class SettingsManager:
         self._settings_file = self._settings_dir / "settings.json"
         self._lock = threading.RLock()  # get() → _autofill_ffmpeg_if_needed → save() re-enters
         self._settings = self._load()
+        # ponytail: negative-cache for the ffmpeg probe — get() runs on every
+        # request; when _find_ffmpeg() fails (no ffmpeg installed), re-probing
+        # per call is a syscall ladder for nothing. Reset by save() so a
+        # settings change re-arms one probe (upgrade path: settings field).
+        self._ffmpeg_probe_failed = False
         # Auto-create file with defaults if it doesn't exist
         if not self._settings_file.exists():
             self.save(self._settings)
@@ -91,12 +96,13 @@ class SettingsManager:
 
     def _autofill_ffmpeg_if_needed(self) -> None:
         """Detect ffmpeg once under lock; persist via atomic save."""
-        if (self._settings.ffmpeg_path or "").strip():
+        if self._ffmpeg_probe_failed:
             return
         from services.ytdlp_ffmpeg import _find_ffmpeg
 
         found = _find_ffmpeg()
         if not found:
+            self._ffmpeg_probe_failed = True
             return
         updated = self._settings.model_copy(update={"ffmpeg_path": found})
         self.save(updated)
@@ -129,6 +135,19 @@ class SettingsManager:
                     except Exception:
                     # ponytail: best-effort — I/O errors only
                         pass
+            # Feature-gate consumers (routers, captioner, etc.) read the
+            # memoized map on every request; any save re-arms it. Lazy import
+            # — module-level would be a cycle (feature_registry -> deps ->
+            # SettingsManager).
+            try:
+                from services.feature_registry import invalidate_enabled_cache
+
+                invalidate_enabled_cache()
+            except Exception:
+            # ponytail: best-effort — invalidation must never break a save
+                pass
+            # One fresh ffmpeg probe re-armed per explicit save.
+            self._ffmpeg_probe_failed = False
 
 
 # --- recommended resource defaults (Settings > Recommended) -----------------

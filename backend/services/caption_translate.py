@@ -85,36 +85,22 @@ def _resolve_translate_dir(override: str) -> Path:
     and queries free space). The env value is the cache key, so an override
     change (tests, runtime) invalidates naturally; the presence checks in
     nllb_dir()/slid_dir() stay LIVE (cheap is_file stats), so models that
-    appear mid-process are picked up on the next flush."""
+    appear mid-process are picked up on the next flush. No drive-letter
+    fallback scan: models resolve from VODRIP_TRANSLATE_MODEL_DIR or the
+    Settings models folder only — the configured dir wins over stale copies
+    on other drives."""
     if override:
         return Path(override)
     from services.disk_hygiene import whisper_cache_dir  # lazy: keeps import light
 
+    # ponytail: mkdir on resolve is benign (download_models()/hf local_dir
+    # create it anyway) but keeps translate_dir() an existing-dir contract;
+    # upgrade path: defer creation to download_models() and make
+    # translate_dir() a pure resolver.
     primary = whisper_cache_dir() / "translate"
-    # If the primary path already has both model subdirs, use it.
-    if (
-        (primary / NLLB_SUBDIR).is_dir()
-        and (primary / SLID_SUBDIR).is_dir()
-    ):
-        return primary
-    # ponytail: scan common drive letters for a better candidate when the
-    # auto-detected models folder (e.g. H:) doesn't hold translate models
-    # but another drive (G:) does.  Upgrade: a config-driven list or a
-    # manifest file in each models folder.
-    for drive in "CDEFGH":  # covers typical Windows drive letters
-        candidate = Path(f"{drive}:/VOD.RIP-models/translate")
-        if (
-            candidate.is_dir()
-            and (candidate / NLLB_SUBDIR).is_dir()
-            and (candidate / SLID_SUBDIR).is_dir()
-        ):
-            logger.info(
-                "translate models found on %s (primary %s was empty)",
-                candidate,
-                primary,
-            )
-            return candidate
+    primary.mkdir(parents=True, exist_ok=True)
     return primary
+
 
 
 def translate_dir() -> Path:

@@ -1406,7 +1406,15 @@ def prewarm_parakeet() -> bool:
     if _parakeet_resolve_dir() is None:
         return False
     try:
-        keep_parakeet_resident(True)
+        # The resident pin is a LIVE-CAPTIONS contract: it must persist only
+        # while a caption session is live so later windows skip a cold CUDA
+        # reload. The archive-only prewarm (app startup, transcribe-vod feature)
+        # must NOT pin — that would leave ~2 GB RSS + ~0.7 GB VRAM resident
+        # forever with no matched clear (live_captions clears the pin via
+        # keep_parakeet_resident(False) on _session_end). Archive jobs get
+        # their lifecycle from _parakeet_last_used / idle-close, which
+        # prewarm_parakeet's lazy _parakeet_model() load keeps fresh.
+        keep_parakeet_resident(caption_session_active())
         _parakeet_model()
         _get_vad()
         # Prime CUDA EP (swallow errors — the real first caption will retry).

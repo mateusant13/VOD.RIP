@@ -5,8 +5,7 @@ backend/services/feature_manifest.json is NOT needed — the two files
 are the canonical source; a future codegen could emit one from the other.
 """
 from __future__ import annotations
-
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 MANIFEST: List[Dict] = [
     {
@@ -45,6 +44,18 @@ _DEFAULTS: Dict[str, bool] = {f["id"]: bool(f["defaultEnabled"]) for f in MANIFE
 _HEAVY_IDS = {f["id"] for f in MANIFEST if f["cost"] == "heavy"}
 _ALL_IDS = set(_DEFAULTS)
 
+# Memoized merged view (P2-x audit: get_enabled_map() is called on every
+# download/list request; each call re-reads settings.json from disk).
+# Invalidated by invalidate_enabled_cache() from SettingsManager.save() and
+# from set_feature/set_features_bulk. ponytail: module global, not a
+# threading lock — worst case under a race is one extra recompute.
+_ENABLED_CACHE: Optional[Dict[str, bool]] = None
+
+
+def invalidate_enabled_cache() -> None:
+    global _ENABLED_CACHE
+    _ENABLED_CACHE = None
+
 # ponytail: future optimization could lazy-load manifest from a shared JSON;
 # upgrade path: generate src/lib/featureManifest.ts from this file at build.
 
@@ -71,11 +82,18 @@ def get_defaults() -> Dict[str, bool]:
 
 
 def get_enabled_map() -> Dict[str, bool]:
-    """Merged view: stored overrides + defaults for missing keys."""
+    """Merged view: stored overrides + defaults for missing keys.
+
+    Memoized; call invalidate_enabled_cache() after any direct mutation of
+    the stored features map (SettingsManager.save() already does this)."""
+    global _ENABLED_CACHE
+    if _ENABLED_CACHE is not None:
+        return _ENABLED_CACHE
     stored = _get_stored_features()
-    out: Dict[str, bool] = {}
-    for fid, d in _DEFAULTS.items():
-        out[fid] = stored.get(fid, d)
+    out: Dict[str, bool] = {
+        fid: stored.get(fid, d) for fid, d in _DEFAULTS.items()
+    }
+    _ENABLED_CACHE = out
     return out
 
 
@@ -105,6 +123,7 @@ def set_feature(feature_id: str, enabled: bool) -> Dict[str, bool]:
     # persist via settings manager (atomic JSON write)
     updated = s.model_copy(update={"features": current})
     settings_mgr.save(updated)
+    invalidate_enabled_cache()
     return get_enabled_map()
 
 
@@ -120,4 +139,5 @@ def set_features_bulk(updates: Dict[str, bool]) -> Dict[str, bool]:
         current[fid] = bool(val)
     updated = s.model_copy(update={"features": current})
     settings_mgr.save(updated)
+    invalidate_enabled_cache()
     return get_enabled_map()

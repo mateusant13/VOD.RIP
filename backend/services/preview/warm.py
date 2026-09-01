@@ -297,10 +297,14 @@ def _youtube_preflight_mux(
     prefer_height: int = 360,
 ) -> bool:
     """Mux [0, INITIAL_CHUNK) to preflight cache — no session required."""
+    # ponytail: preflight/hover warm mux runs WITHOUT a per-session download
+    # context, so its ffmpeg children land in the process-global set and are
+    # only killed at shutdown or on natural exit (never on session cleanup).
+    # These warm jobs are keyed by video_id, not session_id — migrate to
+    # set_download_context(video_id) only if preflight pids ever need scoped
+    # cancellation.
     from services.youtube_innertube import extract_video_id
     from services.ytdlp_hls import _mux_dash_window_to_hls
-    from services.preview.session import resolve_stream_info
-    from services.preview.session import _resolve_youtube_preview_audio
     from services.preview.session import _youtube_needs_dash_window_hls, _pick_variant_by_height, _merge_youtube_session_cookies, WINDOW_HLS_INITIAL_CHUNK_SEC
 
     vid = extract_video_id((url or "").strip())

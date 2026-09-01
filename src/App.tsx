@@ -99,7 +99,10 @@ import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, Channel
 import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, isMembersOnlyVideo, isPublicVideo, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, effectivePlatformFlags, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, displayTitle, loadSavedChannels, orderChannelsForSync, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, isSyntheticArchiveId, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_CLIP_FETCH_LIMIT, CHANNEL_UI_STORAGE_KEY, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, channelShowMoreNeedsFetch, nextChannelPage, stalePageResponse, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft, loadStoredChannelLiveStatuses, persistChannelLiveStatuses, shouldDropChannelFromLivePoll, type StoredChannelLiveStatus } from './channelUtils';
 import ChannelLinkCard from './components/ChannelLinkCard';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
-import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, zoomWindowFromView, fracToSec, secToFrac, zoomTrimViewAround, resolveTimestampSeek, TRIM_ZOOM_STEP, type TrimRangeOpts, type TrimViewWindow } from './trimUtils';
+import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, zoomWindowFromView, fracToSec, zoomTrimViewAround, resolveTimestampSeek, TRIM_ZOOM_STEP, type TrimRangeOpts, type TrimViewWindow } from './trimUtils';
+import { setPreviewTime, resetPreviewTime, getPreviewTime } from './hooks/usePreviewTime';
+import PreviewTimelineBar from './components/PreviewTimelineBar';
+import PreviewChatPanelTime from './components/PreviewChatPanelTime';
 import { panelMaxW, layoutMaxPanelHeight, layoutMaxPanelWidthAtSiblingMins, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, previewContainerHeight, previewPlayerColumnWidth, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, layoutRowHasMultiplePanels as layoutHasMultiplePanels, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, sanitizeStoredPanelSize, effectiveLayoutFromPreferred, userOwnedWidthsFrom, healSqueezedPanelLayout, repairInconsistentPanelLayout, rowPanelHeightFromPreview, ownedPanelHeightSeed, type EffectivePanelLayout, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, PANEL_MIN, EXPLORE_POPUP_Z, SEARCH_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
 import ChannelPlatformLabel from './components/ChannelPlatformLabel';
@@ -112,7 +115,6 @@ import SettingsTab from './components/SettingsTab';
 import BotGateBanner from './components/BotGateBanner';
 import CookieInstallOffer from './components/CookieInstallOffer';
 import { isFirstTime as isFirstTimeFlag } from './lib/firstTime';
-import PreviewChatPanel from './components/PreviewChatPanel';
 import { PanelResizeHandles, type ResizeEdge } from './explorePopupUtils';
 import { shouldIgnorePlayerKeyEvent } from './keyboardUtils';
 import { applyDownloadSseEvent, useDownloadStreams } from './hooks/useDownloadStreams';import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
@@ -489,7 +491,6 @@ export default function App() {
   const previewVideoReadyRef = useRef(false);
   /** Hard bound for the 'Starting…' phase — see PreviewStartTimeout. */
   const previewStartTimeoutRef = useRef<PreviewStartTimeout | null>(null);
-  const [previewTimeUi, setPreviewTimeUi] = useState(0);
   const [previewPlaying, setPreviewPlaying] = useState(false);
   const [previewMuted, setPreviewMuted] = useState(false);
   const [previewVolume, setPreviewVolume] = useState(PREVIEW_DEFAULT_VOLUME);
@@ -1299,7 +1300,7 @@ export default function App() {
     const quant = Math.round(t * 4) / 4;
     if (force || quant !== previewTimeUiRef.current) {
       previewTimeUiRef.current = quant;
-      setPreviewTimeUi(quant);
+      setPreviewTime(quant);
     }
   }, []);
 
@@ -1406,7 +1407,7 @@ export default function App() {
     setPreviewVideoReady(false);
     previewCurrentTimeRef.current = 0;
     previewTimeUiRef.current = 0;
-    setPreviewTimeUi(0);
+    resetPreviewTime();
     setPreviewPlaying(false);
     setPreviewFullscreen(false);
     setPreviewChatOpen(false);
@@ -6548,7 +6549,7 @@ export default function App() {
       url: url.trim(),
       broadcasterLogin: login,
       vodId,
-      playheadSec: previewTimeUi,
+      playheadSec: getPreviewTime(),
       vodDurationSec,
       anchorRange: previewTrimEnd > previewTrimStart
         ? { start: previewTrimStart, end: previewTrimEnd }
@@ -6561,155 +6562,29 @@ export default function App() {
     // shared ladder — a fixed offset would eventually lose to the
     // monotonic rank counter.
     bringPopupToFront(TWITCH_CLIP_POPUP_ID);
-  }, [videoInfo?.channel, isLive, url, previewTimeUi, vodDurationSec, previewTrimStart, previewTrimEnd, showClipOpenNotice, bringPopupToFront]);
-
-  const previewClipPct = vodDurationSec > 0
-    ? {
-        start: secToFrac(previewTrimStart, previewTrimView) * 100,
-        end: secToFrac(previewTrimEnd, previewTrimView) * 100,
-        play: secToFrac(previewTimeUi, previewTrimView) * 100,
-      }
-    : { start: 0, end: 100, play: 0 };
+  }, [videoInfo?.channel, isLive, url, vodDurationSec, previewTrimStart, previewTrimEnd, showClipOpenNotice, bringPopupToFront]);
 
   const previewTimelineUi = (
-    <div className="flex flex-col gap-0.5 w-full"
-      style={trimPanelHeight > 0 ? { height: trimPanelHeight + 'px' } : undefined}>
-      {vodDurationSec > 0 && (
-        <div className="flex items-stretch gap-2 flex-1 min-h-0">
-          <span className={`text-[8px] font-mono uppercase w-11 shrink-0 tracking-wider self-center ${
-            previewFullscreen ? 'text-zinc-400' : 'text-zinc-600'
-          }`}>
-            Clip
-            {previewTrimZoom > 1 && (
-              <span
-                className="block text-[7px] text-zinc-500"
-                title={t('Scroll on the rail to zoom')}
-              >
-                ×{previewTrimZoom >= 10 ? Math.round(previewTrimZoom) : previewTrimZoom.toFixed(1)}
-              </span>
-            )}
-          </span>
-          <div
-            ref={previewNeedleRailRef}
-            className={`preview-needle-rail relative flex-1 ${
-              previewFullscreen ? 'bg-white/10' : 'bg-zinc-800/80'
-            }`}
-            title={t('Drag needles to set preview clip range')}
-            onClick={(e) => {
-              if (e.target !== e.currentTarget) return;
-              const rail = previewNeedleRailRef.current;
-              if (!rail || vodDurationSec <= 0) return;
-              const rect = rail.getBoundingClientRect();
-              const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-              seekPreviewVideo(fracToSec(frac, previewTrimView));
-            }}
-          >
-            <div
-              className="preview-needle-region absolute top-1/2 -translate-y-1/2 h-1 pointer-events-none"
-              style={{
-                left: `${previewClipPct.start}%`,
-                width: `${Math.max(0, previewClipPct.end - previewClipPct.start)}%`,
-              }}
-            />
-            <div
-              ref={previewPlayheadRef}
-              className="preview-needle-playhead absolute top-0 bottom-0 w-px bg-white/50 -translate-x-1/2 pointer-events-none z-[1]"
-              style={{ left: `${previewClipPct.play}%` }}
-            />
-            <div
-              role="slider"
-              aria-label={t('Clip in')}
-              aria-valuemin={0}
-              aria-valuemax={vodDurationSec}
-              aria-valuenow={previewTrimStart}
-              className="preview-needle preview-needle-in absolute top-0 bottom-0 -translate-x-1/2 z-[2] touch-none cursor-ew-resize"
-              style={{ left: `${previewClipPct.start}%` }}
-              onPointerDown={(e) => beginPreviewNeedleDrag(e, 'in')}
-            />
-            <div
-              role="slider"
-              aria-label={t('Clip out')}
-              aria-valuemin={0}
-              aria-valuemax={vodDurationSec}
-              aria-valuenow={previewTrimEnd}
-              className="preview-needle preview-needle-out absolute top-0 bottom-0 -translate-x-1/2 z-[2] touch-none cursor-ew-resize"
-              style={{ left: `${previewClipPct.end}%` }}
-              onPointerDown={(e) => beginPreviewNeedleDrag(e, 'out')}
-            />
-        </div>
-          <ClipDurationAdjustButtons
-            compact
-            onAdjust={adjustPreviewClipDuration}
-            activeEndpoint={lastPreviewTrimEndpoint}
-            disabled={vodDurationSec <= 0 || previewTrimEnd <= previewTrimStart}
-          />
-          <span
-            className={`text-[8px] font-mono w-11 shrink-0 text-right ${
-              previewFullscreen ? 'text-zinc-300/90' : 'text-zinc-500'
-            }`}
-            title={t('Selected clip length')}
-          >
-            {formatHmsFull(previewClipLengthSec)}
-          </span>
-        </div>
-      )}
-      {vodDurationSec > 0 && (
-        <div
-          className="h-2 cursor-ns-resize flex items-center justify-center gap-1 select-none shrink-0 hover:bg-zinc-800/50 rounded"
-          onMouseMove={previewFullscreen ? bumpPreviewFsControls : undefined}
-          onPointerDown={(e) => {
-            e.preventDefault();
-            e.currentTarget.setPointerCapture(e.pointerId);
-            trimPanelResizeRef.current = { startY: e.clientY, startHeight: trimPanelHeight };
-            trimDragActiveRef.current = true;
-            bumpPreviewFsControls();
-          }}
-          onPointerMove={(e) => {
-            if (!trimPanelResizeRef.current) return;
-            const startY = trimPanelResizeRef.current.startY;
-            const startH = trimPanelResizeRef.current.startHeight;
-            const delta = e.clientY - startY;
-            const minH = previewFullscreen ? 60 : 40;
-            const maxH = previewFullscreen ? Math.floor(window.innerHeight * 0.5) : Infinity;
-            const h = Math.min(maxH, Math.max(minH, startH - delta));
-            setTrimPanelHeight(h);
-          }}
-          onPointerUp={(e) => {
-            trimPanelResizeRef.current = null;
-            trimDragActiveRef.current = false;
-            try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
-          }}
-          onPointerCancel={(e) => {
-            trimPanelResizeRef.current = null;
-            trimDragActiveRef.current = false;
-            try { e.currentTarget.releasePointerCapture(e.pointerId); } catch {}
-          }}
-        >
-          <span className="w-8 h-0.5 rounded-full bg-zinc-600" />
-        </div>
-      )}
-      <div className="flex items-center gap-2">
-        <span className={`text-[9px] font-mono w-11 shrink-0 ${previewFullscreen ? 'text-zinc-300/90' : 'text-zinc-400'}`}>
-          {formatHmsFull(Math.max(0, previewTimeUi - previewTrimStart))}
-        </span>
-        <input
-          type="range"
-          min={previewTrimStart}
-          max={previewTrimEnd}
-          step={0.25}
-          value={Math.min(Math.max(previewTimeUi, previewTrimStart), previewTrimEnd)}
-          disabled={!previewVideoReady || previewClipLengthSec <= 0}
-          onChange={(e) => seekPreviewVideo(parseFloat(e.target.value))}
-          className="flex-1 accent-white disabled:opacity-40"
-        />
-        <span
-          className={`text-[9px] font-mono w-11 shrink-0 text-right ${previewFullscreen ? 'text-zinc-400/80' : 'text-zinc-500'}`}
-          title={t('Selected clip length')}
-        >
-          {formatHmsFull(previewClipLengthSec)}
-        </span>
-      </div>
-    </div>
+    <PreviewTimelineBar
+      trimView={previewTrimView}
+      trimStart={previewTrimStart}
+      trimEnd={previewTrimEnd}
+      vodDurationSec={vodDurationSec}
+      clipLengthSec={previewClipLengthSec}
+      zoom={previewTrimZoom}
+      fullscreen={previewFullscreen}
+      videoReady={previewVideoReady}
+      panelHeight={trimPanelHeight}
+      adjustEndpoint={lastPreviewTrimEndpoint}
+      needleEndpoints={{ rail: previewNeedleRailRef, playhead: previewPlayheadRef }}
+      panelResizeRef={trimPanelResizeRef}
+      panelDragRef={trimDragActiveRef}
+      onSeek={seekPreviewVideo}
+      onAdjust={adjustPreviewClipDuration}
+      onNeedleDrag={beginPreviewNeedleDrag}
+      setPanelHeight={setTrimPanelHeight}
+      bumpPreviewFsControls={bumpPreviewFsControls}
+    />
   );
 
   const previewTransportUi = (opts: { fsCornerExit?: boolean }) => (
@@ -7089,10 +6964,9 @@ export default function App() {
                   // (fullscreen) keeps the panel mounted so its state survives.
                   className="absolute top-0 right-0 bottom-0 z-20 flex max-w-full"
                 >
-                  <PreviewChatPanel
+                  <PreviewChatPanelTime
                     platform={activePlatform}
                     videoId={previewArchiveVideoId}
-                    currentTime={previewTimeUi}
                     open={previewChatOpen}
                     onOpenChange={setPreviewChatOpen}
                     // Channel-scoped custom emotes (BTTV/FFZ/7TV) for twitch rows.

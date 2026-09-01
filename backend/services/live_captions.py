@@ -150,6 +150,7 @@ _TRANSIENT_STRIKE_LIMIT = 6  # consecutive generic errors (404, network) -> offl
 _BACKOFF_INITIAL_SEC = 1.0
 _BACKOFF_MAX_SEC = 15.0
 _QUEUE_MAX = 8  # bounded subscriber queue — slow consumers drop blocks
+_TRANSLATE_QUEUE_MAX = 8  # bounded FIFO translate queue — drop-oldest on overflow
 _HTTP_TIMEOUT = 10.0
 
 class _Offline(RuntimeError):
@@ -624,9 +625,14 @@ class LiveCaptioner:
         self.platform = platform
         self.channel = channel
         self.loop = loop
-        # (event, data) tuples — consumed by the SSE generator. Bounded so a
-        # slow subscriber drops blocks instead of stalling the worker.
-        self.events: asyncio.Queue = asyncio.Queue(maxsize=_QUEUE_MAX)
+        # Every SSE subscriber gets its OWN bounded queue (asyncio.Queue
+        # created on the running loop at subscribe time). The worker fan-outs
+        # every caption/offline event to each queue so one slow or dropped
+        # viewer NEVER steals caption blocks from another (the old single
+        # shared `events` queue). _subscriber_lock guards the set against
+        # concurrent subscribe/unsubscribe from the asyncio loop.
+        self._subscribers: "set[asyncio.Queue]" = set()
+        self._subscriber_lock = threading.Lock()
         # Read from settings first, fall back to env var for backward compat.
         try:
             from deps import settings_mgr
@@ -659,6 +665,17 @@ class LiveCaptioner:
         self._asr_window_ready = threading.Event()
         self._asr_queue: deque = deque(maxlen=3)  # FIFO, max 2-3 windows, drop oldest
         self._asr_lock = threading.Lock()  # protects _asr_queue popleft/append
+        # Translate thread: a SINGLE dedicated FIFO worker off the ASR
+        # critical path. _maybe_translate can spend ~0.9s on NLLB CPU per
+        # window; running it inline in _asr_worker would block the next ASR
+        # window AND the SSE emit. One ordered worker preserves caption
+        # order + the latency target (see #3). Drop-oldest on overflow so a
+        # saturated NLLB never accumulates stale windows.
+        self._translate_thread: Optional[threading.Thread] = None
+        self._translate_stop = threading.Event()
+        self._translate_window_ready = threading.Event()
+        self._translate_queue: deque = deque(maxlen=_TRANSLATE_QUEUE_MAX)
+        self._translate_lock = threading.Lock()  # protects _translate_queue popleft/append
         self._buffer_lock = threading.Lock()
         # Worker-owned state (touched only by the worker thread).
         self._seen: set[str] = set()
@@ -728,6 +745,10 @@ class LiveCaptioner:
                 self._asr_queue.clear()
                 self._asr_stop.clear()
                 self._asr_window_ready.clear()
+                with self._translate_lock:
+                    self._translate_queue.clear()
+                self._translate_stop.clear()
+                self._translate_window_ready.clear()
                 self._target_family = lang  # fresh session: explicit selection or app-language default
                 self._stop.clear()
                 self._thread = threading.Thread(
@@ -753,6 +774,8 @@ class LiveCaptioner:
                 self._stop.set()
                 self._asr_stop.set()
                 self._asr_window_ready.set()  # unblock ASR thread so it sees stop
+                self._translate_stop.set()
+                self._translate_window_ready.set()  # unblock translate worker
                 _session_end()
 
     # --- ASR thread --------------------------------------------------------
@@ -774,6 +797,102 @@ class LiveCaptioner:
         if th is not None:
             th.join(timeout=3.0)
         self._asr_thread = None
+
+    # --- translate thread --------------------------------------------------
+
+    def _start_translate_thread(self) -> None:
+        """Start the single dedicated FIFO translate worker."""
+        self._translate_stop.clear()
+        self._translate_thread = threading.Thread(
+            target=self._translate_worker, daemon=True,
+            name=f"live-captions-xlate-{self.platform}-{self.channel}",
+        )
+        self._translate_thread.start()
+
+    def _stop_translate_thread(self) -> None:
+        """Stop the translate worker (called on release or crash)."""
+        self._translate_stop.set()
+        self._translate_window_ready.set()  # unblock wait
+        th = self._translate_thread
+        if th is not None:
+            th.join(timeout=3.0)
+        self._translate_thread = None
+
+    def _enqueue_translate(
+        self, text, audio, buffer_sec, win_start_off, origin, lang
+    ) -> None:
+        """Push a transcribed window onto the ordered translate queue.
+
+        start/end are computed HERE (at ingest/offload time) so the
+        translate worker's scheduling jitter never shifts captions on the
+        timeline — same invariant the ASR queue already keeps.
+        """
+        start = win_start_off + (origin or 0.0)
+        end = start + buffer_sec
+        with self._translate_lock:
+            if len(self._translate_queue) >= _TRANSLATE_QUEUE_MAX:
+                dropped = self._translate_queue.popleft()
+                logger.warning(
+                    "live captions %s/%s translate queue full — dropped oldest window (%s)",
+                    self.platform, self.channel, dropped[0] if dropped else "?",
+                )
+            self._translate_queue.append(
+                (text, audio, round(start, 3), round(end, 3), origin, lang)
+            )
+        self._translate_window_ready.set()
+
+    def _translate_get_item(self):
+        """Block until a window is queued or stop is set."""
+        while not self._translate_stop.is_set():
+            with self._translate_lock:
+                if self._translate_queue:
+                    return self._translate_queue.popleft()
+            self._translate_window_ready.clear()
+            self._translate_window_ready.wait(timeout=0.5)
+        return None
+
+    def _translate_worker(self) -> None:
+        """Single FIFO translate worker (off the ASR critical path).
+
+        Dequeues windows in order and runs _maybe_translate on each, so
+        NLLB CPU work is serialized on ONE thread and caption ordering is
+        preserved. The ASR thread now only transcribes and enqueues — it
+        never blocks on translation. _maybe_translate never raises (it
+        returns (text, False) on error), but we guard anyway so a worker
+        bug can't silently kill caption delivery.
+        """
+        while not self._translate_stop.is_set():
+            item = self._translate_get_item()
+            if item is None or self._translate_stop.is_set():
+                return
+            text, audio, start, end, origin, lang = item
+            if self._translate_stop.is_set():
+                return
+            try:
+                text, translated = _maybe_translate(self, text, audio, lang=lang)
+                if not text:
+                    continue
+                logger.info(
+                    "live captions %s/%s translated %.3f-%.3fs via %s: %s",
+                    self.platform, self.channel, start, end,
+                    "NLLB" if translated else "pass-through", text[:80],
+                )
+                payload = {
+                    "text": text,
+                    "start": start,
+                    "end": end,
+                }
+                if translated:
+                    payload["translated"] = True
+                if origin is not None:
+                    payload["latency_ms"] = round((time.time() - end) * 1000)
+            except Exception:
+                logger.exception(
+                    "live captions %s/%s translate worker error — dropping window",
+                    self.platform, self.channel,
+                )
+                continue
+            self._emit("caption", payload)
 
     def _asr_get_window(self) -> Optional[tuple[Any, float]]:
         """Block until a window is available or stop is set. Returns
@@ -825,26 +944,12 @@ class LiveCaptioner:
             self._flush_failures = 0
             if not text:
                 continue
-            text, translated = _maybe_translate(self, text, audio, lang=lang)
-            if not text:
-                continue
-            logger.info(
-                "live captions %s/%s transcribed %.1fs window via parakeet%s: %s",
-                self.platform, self.channel, buffer_sec,
-                " + translate" if translated else "", text[:80],
-            )
-            start = win_start_off + (origin or 0.0)
-            end = start + buffer_sec
-            payload = {
-                "text": text,
-                "start": round(start, 3),
-                "end": round(end, 3),
-            }
-            if translated:
-                payload["translated"] = True
-            if origin is not None:
-                payload["latency_ms"] = round((time.time() - end) * 1000)
-            self._emit("caption", payload)
+            # Offload translation to the single dedicated FIFO translate
+            # worker so NLLB CPU (~0.9s/window) never blocks the next ASR
+            # window or the SSE emit. _maybe_translate is no longer called
+            # on the ASR critical path — order + latency preserved by the
+            # ordered translate queue (see _translate_worker).
+            self._enqueue_translate(text, audio, buffer_sec, win_start_off, origin, lang)
 
     # --- worker --------------------------------------------------------------
 
@@ -863,6 +968,7 @@ class LiveCaptioner:
             ).start()
             _warm_translate(self._evidence_family, self._target_family)
             self._start_asr_thread()
+            self._start_translate_thread()
             self._run_loop()
         except Exception:
             logger.exception(
@@ -871,6 +977,7 @@ class LiveCaptioner:
             self._emit("offline", {})
         finally:
             self._stop_asr_thread()
+            self._stop_translate_thread()
             _unregister(self)
 
     def _run_loop(self) -> None:
@@ -1080,13 +1187,51 @@ class LiveCaptioner:
                 self._asr_window_ready.set()
 
     def _emit(self, event: str, data: dict) -> None:
+        """Fan the (event, data) tuple out to every subscriber queue.
+
+        Runs on a worker thread (ASR or translate); the asyncio loop is
+        touched only via call_soon_threadsafe. A queue that is full (slow
+        viewer) silently drops this block rather than stalling the worker
+        or stealing another viewer's captions — captions are lossy-known,
+        keepalive/offline still get through because the window is small.
+        """
+        with self._subscriber_lock:
+            targets = tuple(self._subscribers)
+        if not targets:
+            return
+
         def _put(q: asyncio.Queue, ev: str, payload: dict) -> None:
             try:
                 q.put_nowait((ev, payload))
             except asyncio.QueueFull:
                 pass  # slow subscriber — drop rather than stall the worker
 
-        self.loop.call_soon_threadsafe(_put, self.events, event, data)
+        self.loop.call_soon_threadsafe(
+            lambda: [_put(q, event, data) for q in targets]
+        )
+
+    # --- per-subscriber subscription ---------------------------------
+
+    def subscribe(self) -> asyncio.Queue:
+        """Register a viewer and return its own bounded caption queue.
+
+        The SSE generator drains THIS queue via queue.get(). Every event the
+        worker emits is fan-out to every subscribed queue, so one slow or
+        disconnected viewer can neither stall the worker nor swallow blocks
+        meant for another viewer. The queue is bounded so a viewer that
+        stops reading triggers drops, not worker back-pressure.
+        """
+        q: asyncio.Queue = asyncio.Queue(maxsize=_QUEUE_MAX)  # created on the loop
+        with self._subscriber_lock:
+            self._subscribers.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        """Stop delivering events to this viewer's queue."""
+        with self._subscriber_lock:
+            self._subscribers.discard(q)
+
+    # --- worker lifecycle -------------------------------------------
 
 
 # --- helpers -----------------------------------------------------------------
