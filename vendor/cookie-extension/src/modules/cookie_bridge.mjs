@@ -109,9 +109,9 @@ export const getToken = async () => {
 /** POST a payload list to the bridge endpoint; throws on non-2xx. */
 export const postCookies = async (cookies) => {
   let token = await getToken();
-  // Adopt the backend's paired token if it already has one: a locally minted
-  // UUID would 403 forever once the bridge is paired (backend re-pairs on
-  // mismatch, but converging here keeps the pair stable across re-installs).
+  // Adopt the backend's paired token when the status endpoint exposes one.
+  // A 403 still requires an explicit re-pair; this path cannot authenticate
+  // against a backend that has retained a different token.
   try {
     const res = await fetch(`${await getApiBase()}/api/session/cookies/token`);
     if (res.ok) {
@@ -139,11 +139,13 @@ export const postCookies = async (cookies) => {
 export const createDebouncedPush = ({ collect, post, delayMs = 300 }) => {
   let timer = null;
   let inFlight = false;
+  let pending = false;
 
   const fire = async () => {
     timer = null;
     if (inFlight) return;
     inFlight = true;
+    pending = false;
     try {
       const payload = filterCookies(await collect());
       if (payload.length > 0) await post(payload);
@@ -151,11 +153,13 @@ export const createDebouncedPush = ({ collect, post, delayMs = 300 }) => {
       console.warn('[vodrip-bridge] push failed (backend offline?)', err);
     } finally {
       inFlight = false;
+      if (pending) schedule();
     }
   };
 
   const schedule = () => {
-    if (timer !== null) clearTimeout(timer);
+    pending = true;
+    clearTimeout(timer);
     timer = setTimeout(fire, delayMs);
   };
   return schedule;

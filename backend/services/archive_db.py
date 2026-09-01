@@ -1260,6 +1260,58 @@ def expire_channel_priorities() -> int:
     return cur.rowcount
 
 
+
+def list_indexed_channels() -> list[dict]:
+    """Minimal channel identities known to the browse index.
+
+    channel_snapshots holds one row per (platform, channel_key) that ever had
+    a successful fetch. Rows are grouped by lowercase key across platforms —
+    the same handle on Twitch/Kick/YouTube joins into one identity; a channel
+    with a different YouTube handle surfaces as its own identity (the index
+    stores no canonical cross-platform id). Returns dicts shaped like sparse
+    saved-channel entries: id, displayName, kickSlug, twitchSlug, youtubeSlug.
+    """
+    rows = query(
+        "SELECT platform, channel_key FROM channel_snapshots ORDER BY channel_key"
+    )
+    grouped: dict[str, dict[str, str]] = {}
+    for r in rows:
+        key = (r["channel_key"] or "").strip()
+        if not key:
+            continue
+        g = grouped.setdefault(key.lower(), {})
+        if not g.get(r["platform"]):
+            g[r["platform"]] = key
+    out: list[dict] = []
+    for key, g in grouped.items():
+        display = g.get("twitch") or g.get("kick") or g.get("youtube") or key
+        out.append(
+            {
+                "id": f"idx_{key}",
+                "displayName": display,
+                "kickSlug": g.get("kick", ""),
+                "twitchSlug": g.get("twitch", ""),
+                "youtubeSlug": g.get("youtube", ""),
+            }
+        )
+    return out
+
+
+def forget_channel_snapshots(index_id: str) -> None:
+    """Drop every channel_snapshots row for an idx_* channel identity.
+
+    The id is 'idx_' + the lowercase grouped key; rows may store the key in
+    any case, so match case-insensitively. Called when the user removes an
+    indexed channel from the saved list — without this the next GET /settings
+    reconcile would instantly re-add it."""
+    key = (index_id or "").strip()
+    if not key.startswith("idx_"):
+        return
+    execute(
+        "DELETE FROM channel_snapshots WHERE LOWER(channel_key) = ?",
+        (key[4:],),
+    )
+
 def list_videos(platform: Optional[str] = None, channel: Optional[str] = None) -> list[dict]:
     sql = "SELECT * FROM videos WHERE 1=1"
     params: list[Any] = []

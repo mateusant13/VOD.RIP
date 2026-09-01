@@ -28,6 +28,15 @@ test.describe('Frame mode', () => {
   test.beforeEach(async ({ page }) => {
     await mockSettingsRoute(page);
     await page.addInitScript(() => {
+      // Suppress first-run overlays that intercept the frame toggle:
+      // FirstRunWizard (z-9999) and CookieInstallOffer (z-21000) both render
+      // full-screen `fixed inset-0` modals that swallow clicks on anything
+      // beneath them, including the bottom-right frame checkbox. The wizard
+      // is gated on `vodrip.onboardingDone`; the cookie offer on the unseen
+      // `vodrip.firstTime.cookieInstall` tutorial flag. Seeding both keeps
+      // the frame-mode surface reachable.
+      localStorage.setItem('vodrip.onboardingDone', '1');
+      localStorage.setItem('vodrip.firstTime.cookieInstall', '1');
       localStorage.removeItem('vodrip.ui.frameMode');
     });
   });
@@ -44,6 +53,7 @@ test.describe('Frame mode', () => {
 
     const overlay = page.locator('[data-frame-overlay]');
     await expect(overlay).toBeVisible();
+    // Tiling guide is hidden while idle and reveals only mid-drag.
     await expect(overlay).toHaveCSS('opacity', '0');
     await expect(overlay).toHaveCSS('pointer-events', 'none');
     await expect(page.locator('[data-frame-cell="0"]')).toBeVisible();
@@ -52,8 +62,7 @@ test.describe('Frame mode', () => {
     const stored = await page.evaluate(() => localStorage.getItem('vodrip.ui.frameMode'));
     expect(stored).toBe('1');
   });
-
-  test('overlay becomes visible during an HTML5 drag', async ({ page }) => {
+  test('frame mode grid appears mid-drag and is click-through when idle', async ({ page }) => {
     await page.addInitScript(() => {
       localStorage.setItem('vodrip.ui.frameMode', '1');
     });
@@ -61,12 +70,16 @@ test.describe('Frame mode', () => {
     await page.goto(UI_URL);
     const overlay = page.locator('[data-frame-overlay]');
     await expect(overlay).toBeVisible({ timeout: 15_000 });
+    // Tiling guide is hidden while idle so the base channel grid is unblocked.
     await expect(overlay).toHaveCSS('opacity', '0');
+    // Click-through when idle so the base channel cards stay grabbable.
+    await expect(overlay).toHaveCSS('pointer-events', 'none');
 
     await page.evaluate(() => {
       document.dispatchEvent(new DragEvent('dragstart', { bubbles: true, cancelable: true }));
     });
 
+    // Guide appears + becomes drop-capable mid-drag.
     await expect(overlay).toHaveCSS('opacity', '1');
     await expect(overlay).toHaveCSS('pointer-events', 'auto');
 
@@ -77,7 +90,6 @@ test.describe('Frame mode', () => {
     await expect(overlay).toHaveCSS('opacity', '0');
     await expect(overlay).toHaveCSS('pointer-events', 'none');
   });
-
   test('restores frame mode from localStorage on reload', async ({ page }) => {
     await page.addInitScript(() => {
       localStorage.setItem('vodrip.ui.frameMode', '1');

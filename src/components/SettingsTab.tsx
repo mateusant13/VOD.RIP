@@ -403,52 +403,6 @@ export default function SettingsTab({
         <DiskSection settings={settings} setSettings={setSettings} />
       </SettingsCard>
 
-      {/* ── Updates ─────────────────────────────────────────────── */}
-      <SettingsCard
-        icon={RefreshCw}
-        title={t('Updates')}
-        right={<span className="text-[11px] font-mono text-zinc-400 tabular-nums">v{appVersion ?? '…'}</span>}
-        open={!!openCards.updates}
-        onToggle={() => toggleCard('updates')}
-      >
-        <div className="flex items-center gap-2 flex-wrap">
-          {updateInfo ? (
-            <>
-              <span className="text-[11px] font-mono text-emerald-400">{t('v{version} available', { version: updateInfo.version })}</span>
-              {updateInfo.release_url ? (
-                <a
-                  href={updateInfo.release_url}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-zinc-400 hover:text-zinc-200 underline-offset-2 hover:underline text-[11px] font-mono"
-                >
-                  {t('release')}
-                </a>
-              ) : null}
-              <button
-                type="button"
-                onClick={() => void onApplyUpdate()}
-                disabled={updateApplying}
-                className="text-emerald-500 hover:text-emerald-300 underline-offset-2 hover:underline disabled:opacity-40 p-0 bg-transparent border-0 font-mono text-[11px] inline-flex items-center gap-1"
-              >
-                {updateApplying ? <Loader2 size={12} className="animate-spin" /> : null}
-                {updateApplying ? t('installing') : t('install')}
-              </button>
-            </>
-          ) : updateMessage ? (
-            <span className="text-[11px] font-mono text-zinc-400">{updateMessage}</span>
-          ) : null}
-        </div>
-        <button
-          type="button"
-          onClick={() => void onCheckUpdate()}
-          disabled={updateChecking}
-          className="bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-[11px] border-2 border-zinc-600 hover:border-white hover:text-white disabled:opacity-50 flex items-center justify-center gap-1.5"
-        >
-          {updateChecking ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
-          {updateChecking ? t('Checking…') : t('Check for Updates')}
-        </button>
-      </SettingsCard>
 
       {/* ── Cookie Bridge (detected → above Save) ── */}
       {needsCookieSetup ? null : cookieCard}
@@ -559,6 +513,55 @@ export default function SettingsTab({
           </span>
         ) : null}
       </div>
+      {/* ── Updates (always visible at the bottom) ───────────────── */}
+      <section className="border-2 border-zinc-800 bg-zinc-950/60">
+        <div className="flex items-center justify-between gap-2 px-3 py-2 border-b-2 border-zinc-800">
+          <span className="flex items-center gap-2 min-w-0 text-[11px] font-bold uppercase tracking-wide text-zinc-300">
+            <RefreshCw size={14} className="shrink-0" />
+            <span className="truncate">{t('Updates')}</span>
+          </span>
+          <span className="text-[11px] font-mono text-zinc-400 tabular-nums">v{appVersion ?? '…'}</span>
+        </div>
+        <div className="p-3 flex flex-col gap-3">
+          <div className="flex items-center gap-2 flex-wrap">
+            {updateInfo ? (
+              <>
+                <span className="text-[11px] font-mono text-emerald-400">{t('v{version} available', { version: updateInfo.version })}</span>
+                {updateInfo.release_url ? (
+                  <a
+                    href={updateInfo.release_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-zinc-400 hover:text-zinc-200 underline-offset-2 hover:underline text-[11px] font-mono"
+                  >
+                    {t('release')}
+                  </a>
+                ) : null}
+                <button
+                  type="button"
+                  onClick={() => void onApplyUpdate()}
+                  disabled={updateApplying}
+                  className="text-emerald-500 hover:text-emerald-300 underline-offset-2 hover:underline disabled:opacity-40 p-0 bg-transparent border-0 font-mono text-[11px] inline-flex items-center gap-1"
+                >
+                  {updateApplying ? <Loader2 size={12} className="animate-spin" /> : null}
+                  {updateApplying ? t('installing') : t('install')}
+                </button>
+              </>
+            ) : updateMessage ? (
+              <span className="text-[11px] font-mono text-zinc-400">{updateMessage}</span>
+            ) : null}
+          </div>
+          <button
+            type="button"
+            onClick={() => void onCheckUpdate()}
+            disabled={updateChecking}
+            className="bg-zinc-900 text-zinc-200 font-black uppercase px-3 py-2 text-[11px] border-2 border-zinc-600 hover:border-white hover:text-white disabled:opacity-50 flex items-center justify-center gap-1.5"
+          >
+            {updateChecking ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
+            {updateChecking ? t('Checking…') : t('Check for Updates')}
+          </button>
+        </div>
+      </section>
 
     </div>
   );

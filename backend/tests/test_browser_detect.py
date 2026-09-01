@@ -66,8 +66,9 @@ def test_firefox_ext_src_patches_manifest(tmp_path):
         encoding="utf-8",
     )
     (src / "background.js").write_text("void 0;", encoding="utf-8")
+    (src / "background.html").write_text('<script type="module" src="background.js"></script>', encoding="utf-8")
     dest = _firefox_ext_src(src)
     import json
     man = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
-    assert man["background"]["scripts"] == ["background.js"]
+    assert man["background"]["page"] == "background.html"
     assert man["browser_specific_settings"]["gecko"]["id"] == "vodrip-cookies@vod.rip"

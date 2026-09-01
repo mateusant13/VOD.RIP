@@ -2610,6 +2610,11 @@ export default function App() {
       });
       video.addEventListener('canplay', onCanPlay, { once: true });
       hls.on(Hls.Events.ERROR, (_event, data) => {
+        const status = data?.response?.code;
+        if ((status === 404 || status === 410) && sid === previewSessionIdRef.current) {
+          markSessionGone(`hls ${status}`);
+          return;
+        }
         if (!data.fatal) return;
         switch (data.type) {
           case Hls.ErrorTypes.NETWORK_ERROR:
@@ -5740,14 +5745,30 @@ export default function App() {
     if (channelsHydratedRef.current) return;
     channelsHydratedRef.current = true;
     const local = loadSavedChannels();
-    if (local.length === 0 && apiChannels && apiChannels.length > 0) {
-      const restored = apiChannels.map((ch) => normalizeSavedChannel(ch));
-      setSavedChannels(restored);
-      persistChannels(restored);
+    if (!apiChannels || apiChannels.length === 0) {
+      if (local.length > 0) setSavedChannels(local);
+      channelsPersistReadyRef.current = true;
+      return;
+    }
+    // Reconcile: the API list already carries the DB-indexed channels merged
+    // into saved_channels (see backend get_settings). Local entries win — they
+    // hold cached VOD/clips rows and the user's manual ordering — and missing
+    // indexed channels are appended. Local-only channels the index does not
+    // know (never fetched) are kept too: removing them would discard a
+    // channel the user explicitly pinned.
+    const byId = new Map(local.map((ch) => [ch.id, ch]));
+    const merged: SavedChannel[] = [...local];
+    for (const ch of apiChannels) {
+      if (byId.has(ch.id)) continue;
+      byId.set(ch.id, ch);
+      merged.push(ch);
+    }
+    setSavedChannels(merged);
+    if (merged.some((ch) => !local.some((l) => l.id === ch.id))) {
+      persistChannels(merged);
     }
     channelsPersistReadyRef.current = true;
   }, []);
-
   const loadSettings = useCallback(async () => {
     try {
       const s = await apiGet<AppSettings>('/api/settings');

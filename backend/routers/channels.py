@@ -878,6 +878,12 @@ async def channel_videos(
         fetch_plan: Dict[str, int] = {}
         for label in wanted:
             have = len(_idx(label))
+            if have == 0 and label == "YouTube":
+                # Cold YouTube: a live crawl is slow + bot-gated (tens of
+                # seconds up to a hard timeout), so never block the browse on
+                # it. Serve the (empty) index now and let the background warm
+                # fill it — the frontend re-pulls once data.refreshing flips.
+                continue
             if force_refresh or have == 0:
                 fetch_plan[label] = CHANNEL_DELTA_LIMIT if have else limit
             elif page_norm > 1 and need > have and have < _PLATFORM_CEILINGS[label]:
@@ -930,7 +936,7 @@ async def channel_videos(
             per_platform_errors[k] = user_visible_platform_error(normalize_err(v))
             if not per_platform_errors[k]:
                 del per_platform_errors[k]
-        refreshing = bool(bg_set) and not force_refresh
+        refreshing = bool(bg_set)
         payload = {
             "videos": page_slice,
             "channel": channel,
@@ -968,19 +974,31 @@ async def channel_videos(
                     async def _bg_refresh() -> None:
                         try:
                             bg_errors: Dict[str, str] = {}
-                            items, clues, _more = await _fetch_platforms(
-                                bg_set, CHANNEL_DELTA_LIMIT, bg_errors
-                            )
+                            bg_items: list[dict] = []
+                            bg_clues: dict = {}
+                            # Cold (never-indexed) platforms need a full-depth
+                            # warm so the whole list becomes reachable; indexed
+                            # but stale ones only need the delta. Both run
+                            # outside the request so the browse never blocks.
+                            for grp, depth in (
+                                ([l for l in bg_set if not _idx(l)], max(limit, CHANNEL_DELTA_LIMIT)),
+                                ([l for l in bg_set if _idx(l)], CHANNEL_DELTA_LIMIT),
+                            ):
+                                if not grp:
+                                    continue
+                                it, cl, _more = await _fetch_platforms(grp, depth, bg_errors)
+                                bg_items.extend(it)
+                                bg_clues.update(cl)
                             for label in bg_set:
                                 _persist_platform(
                                     label,
-                                    [v for v in items if v.get("platform") == label],
-                                    clues.get(label),
+                                    [v for v in bg_items if v.get("platform") == label],
+                                    bg_clues.get(label),
                                 )
                             asyncio.create_task(_warm_youtube_previews(
-                                [v for v in items if v.get("platform") == "YouTube"]
+                                [v for v in bg_items if v.get("platform") == "YouTube"]
                             ))
-                            if any(v.get("platform") == "YouTube" for v in items):
+                            if any(v.get("platform") == "YouTube" for v in bg_items):
                                 asyncio.create_task(_run_original_backfill(channel))
                         except Exception:
                             logger.debug(

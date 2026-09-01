@@ -8,12 +8,6 @@
 </style>
 </head>
 <body>
-<!-- pre.js must load FIRST, before the vendored engines: MV3 extension_pages
-     CSP (script-src 'self') forbids inline scripts, so the console silencing
-     that used to live in an inline <script> never ran — dead code AND a CSP
-     violation (its refusal error hit the very badge it was meant to keep
-     clean). The HLS-mode native-controls flag moved into player-bridge.js. -->
-<script src="pre.js"></script>
 <video id="v" autoplay playsinline></video>
 <script src="ivs/index.js"></script>
 <script src="hls/hls.min.js"></script>

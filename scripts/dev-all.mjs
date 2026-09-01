@@ -84,8 +84,10 @@ function getWinPortPids(port) {
 function killWinPid(pid) {
   if (!pid || pid === process.pid) return;
   for (const [cmd, args] of [
-    ["taskkill", ["/F", "/PID", String(pid)]],
+    // Kill the whole tree first; killing the parent first loses the handle
+    // needed to terminate orphaned Vite/API children.
     ["taskkill", ["/F", "/T", "/PID", String(pid)]],
+    ["taskkill", ["/F", "/PID", String(pid)]],
     ["powershell", ["-NoProfile", "-Command", `Stop-Process -Id ${pid} -Force -ErrorAction SilentlyContinue`]],
   ]) {
     spawnSync(cmd, args, { stdio: "ignore", windowsHide: true, timeout: 5000 });
@@ -239,6 +241,23 @@ function viteHealthy(port) {
     });
   });
 }
+async function waitForDevAllHealthy(timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const [apiOk, viteOk] = await Promise.all([apiHealthy(apiPort), viteHealthy(vitePort)]);
+    if (apiOk && viteOk) return true;
+    await sleep(1000);
+  }
+  return false;
+}
+function devAllStartupWaitMs(lock) {
+  const startedAt = Date.parse(lock.startedAt || "");
+  if (!Number.isFinite(startedAt)) return 15000;
+  // A lock written during a cold API boot is valid even while one child is
+  // still starting. Give recent owners the same 120s budget as main boot;
+  // stale owners older than that are checked quickly and replaced.
+  return Math.max(15000, 120000 - Math.max(0, Date.now() - startedAt));
+}
 
 function truncateIfLarge(filePath) {
   try {
@@ -333,12 +352,29 @@ async function tailLog(name) {
 }
 
 async function attachToDevAll(lock) {
-  console.log(`[dev] dev-all already running (pid ${lock.pid}) — attaching to its logs.`);
-  console.log(`[dev] Ctrl+C detaches. Run \`npm run dev -- --kill\` to stop it and take over.\n`);
-  // Attach has no children and no lock — a plain exit, never shutdown().
-  process.on("SIGINT", () => process.exit(0));
-  process.on("SIGTERM", () => process.exit(0));
-  await Promise.all([tailLog("api"), tailLog("web")]);
+  if (await waitForDevAllHealthy(devAllStartupWaitMs(lock))) {
+    console.log(`[dev] dev-all already running (pid ${lock.pid}) — attaching to its logs.`);
+    console.log(`[dev] Ctrl+C detaches. Run \`npm run dev -- --kill\` to stop it and take over.\n`);
+    // Attach has no children and no lock — a plain exit, never shutdown().
+    process.on("SIGINT", () => process.exit(0));
+    process.on("SIGTERM", () => process.exit(0));
+    await Promise.all([tailLog("api"), tailLog("web")]);
+    return true;
+  }
+
+  console.warn(
+    `[dev] existing dev-all (pid ${lock.pid}) is unhealthy — replacing its stale lock and children`,
+  );
+  await gracefulApiExit(3000);
+  if (process.platform === "win32") {
+    killWinPid(lock.pid);
+  } else {
+    try { process.kill(lock.pid, "SIGTERM"); } catch { /* owner already gone */ }
+  }
+  removeLock();
+  await waitPortFree(apiPort, 15000);
+  await waitPortFree(vitePort, 15000);
+  return false;
 }
 
 /**
@@ -791,14 +827,16 @@ async function main() {
       // downloads; force-kill of the owner's tree is the fallback.
       await gracefulApiExit();
       await waitPortFree(apiPort, 8000);
-      killWinPid(lock.pid); // /F then /T — kills the owner's whole tree
+      killWinPid(lock.pid); // tree-first kill prevents orphaned Vite/API children
       await waitPortFree(apiPort, 15000);
     }
     removeLock(); // stale or just-killed owner
     await ensurePortFree(apiPort, "API");
   } else if (lock) {
-    await attachToDevAll(lock);
-    return;
+    const attached = await attachToDevAll(lock);
+    if (attached) return;
+    await ensurePortFree(apiPort, "API");
+    await ensurePortFree(vitePort, "Vite");
   } else {
     removeLock(); // stale lock (owner died without cleanup)
     await ensurePortFree(apiPort, "API");
@@ -808,9 +846,11 @@ async function main() {
     // of fighting over the port.
     const winner = readLock();
     if (winner) {
-      await attachToDevAll(winner);
-      return;
+      const attached = await attachToDevAll(winner);
+      if (attached) return;
     }
+    await ensurePortFree(apiPort, "API");
+    await ensurePortFree(vitePort, "Vite");
   }
   ownsLock = true;
 
@@ -820,12 +860,35 @@ async function main() {
     );
     console.log("        Best for shorts/simple VODs; 6h titiltei streams need npm run dev\n");
   }
-
-  // Vite's cold start is the long pole (~60s cold OS cache + AV scanning) —
-  // start it FIRST so it gets uncontended CPU while the API boots. Prewarm
-  // source files in parallel (see prewarmSourceFiles) and only announce the
-  // URL once the first browser load would be fast.
+  // Vite's cold source reads overlap FastAPI imports, but the browser remains
+  // gated until the API is healthy.
   const prewarm = prewarmSourceFiles();
+
+  // Start the API before exposing Vite to a browser. The UI requests /api
+  // immediately on load; starting both children concurrently creates a burst
+  // of ECONNREFUSED responses while FastAPI imports and binds port 7897.
+  console.log(`Starting API  -> http://localhost:${apiPort}  (/api only)`);
+  start("api", pyCmd, [...pyArgsPrefix, "run.py"], pyDir, {
+    VODRIP_SKIP_PORT_RELEASE: "1",
+    ...previewFastEnv,
+    ...(serveBuiltUi ? { KICK_SERVE_UI: "1" } : {}),
+  });
+  let apiReady = false;
+  for (let i = 0; i < 240 && !shuttingDown; i++) {
+    if (await apiHealthy(apiPort)) {
+      apiReady = true;
+      break;
+    }
+    if (apiProcess && apiProcess.exitCode !== null) break;
+    await sleep(500);
+  }
+  if (!apiReady) {
+    console.error(`[dev] API did not become ready on :${apiPort}; refusing to expose the UI`);
+    await shutdown(1);
+    return;
+  }
+
+  // Vite starts only after the API is healthy, preventing startup proxy races.
   if (await viteHealthy(vitePort)) {
     console.log(`[dev] Vite already running on :${vitePort} — reusing\n`);
     console.log("(Ctrl+C stops API only; existing Vite keeps running)\n");
@@ -841,13 +904,6 @@ async function main() {
     }
     start("web", process.execPath, [viteBin, "--port", String(vitePort), "--strictPort"], root);
   }
-
-  console.log(`Starting API  -> http://localhost:${apiPort}  (/api only)`);
-  start("api", pyCmd, [...pyArgsPrefix, "run.py"], pyDir, {
-    VODRIP_SKIP_PORT_RELEASE: "1",
-    ...previewFastEnv,
-    ...(serveBuiltUi ? { KICK_SERVE_UI: "1" } : {}),
-  });
 
   await prewarm;
 
@@ -885,19 +941,6 @@ async function main() {
 
   if (serveBuiltUi) {
     console.log(`Fast UI at   -> http://localhost:${apiPort}  (built bundle, instant — npm run build-copy to refresh)`);
-  }
-
-  // Safety net only: the lifespan now yields quickly (fast yield), so the API
-  // usually responds within ~2-3s. 120s covers post-reboot / dirty-volume
-  // worst cases without leaving a hung process when the warm itself hangs.
-  for (let i = 0; i < 240; i++) {
-    await sleep(500);
-    if (await apiHealthy(apiPort)) break;
-    if (i === 239) {
-      console.error(`[api] did not become ready on :${apiPort} within 120s`);
-      shutdown(1);
-      return;
-    }
   }
 
   await reportHealth("health");

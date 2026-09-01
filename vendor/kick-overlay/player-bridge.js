@@ -5,7 +5,10 @@
 // fetches ride on the extension's host_permissions. Controls are driven
 // over postMessage by the content script; state is reported back ~1/s.
 const V = document.getElementById('v');
-const HLS_MODE = new URLSearchParams(location.search).get('m') === 'hls';
+const params = new URLSearchParams(location.search);
+const HLS_MODE = params.get('m') === 'hls';
+const PLAYER_TOKEN = params.get('token');
+const PARENT_ORIGIN = 'https://www.twitch.tv';
 const beacon = (ev, data) => {
   try {
     chrome.runtime.sendMessage({ __koDiag: { ev, data } }, () => void chrome.runtime.lastError);
@@ -16,8 +19,9 @@ const beacon = (ev, data) => {
 window.addEventListener('error', (e) => beacon('ivs_page_err', { msg: String((e && e.message) || e).slice(0, 150), src: (e && e.filename ? e.filename.slice(-40) : '') }));
 window.addEventListener('unhandledrejection', (e) => beacon('ivs_page_err', { rej: String((e && e.reason) || '').slice(0, 150) }));
 const post = (m) => {
+  if (!PLAYER_TOKEN) return;
   try {
-    parent.postMessage({ __koKick: m }, '*');
+    parent.postMessage({ __koKick: { ...m, _koToken: PLAYER_TOKEN } }, PARENT_ORIGIN);
   } catch {
     /* parent gone */
   }
@@ -43,20 +47,37 @@ if (HLS_MODE) {
       if (V.seekable && V.seekable.length) lat = V.seekable.end(V.seekable.length - 1) - pos;
     } catch { /* not ready */ }
     if (!isFinite(lat) || lat < 0) lat = 0;
-    let q = null;
     const levels = h.levels || [];
+    let q = null;
     if (h.currentLevel >= 0 && levels[h.currentLevel]) {
       const l = levels[h.currentLevel];
-      q = { name: l.height ? l.height + 'p' : String(l.width || ''), w: l.width, h: l.height };
+      q = { name: l.height ? `${l.height}p` : `${l.width || ''}w`, w: l.width, h: l.height };
     }
+    const qualities = levels.map((l, i) => ({
+      id: i,
+      name: l.height ? `${l.height}p` : `${l.width || ''}w`,
+      w: l.width,
+      h: l.height,
+    }));
     const state = V.paused ? (V.readyState === 0 ? 'Idle' : 'Paused') : 'Playing';
-    return { state, paused: V.paused, muted: V.muted, volume: V.volume, pos, lat, dur, q, qcount: levels.length };
+    return {
+      state,
+      paused: V.paused,
+      muted: V.muted,
+      volume: V.volume,
+      pos,
+      lat,
+      dur,
+      q,
+      qcount: qualities.length,
+      qualities,
+    };
   };
   const sendSt = () => post({ t: 'st', st: st() });
   window.addEventListener('message', (ev) => {
-    if (ev.source !== window.parent) return;
+    if (ev.source !== window.parent || ev.origin !== PARENT_ORIGIN) return;
     const m = ev.data && ev.data.__koKick;
-    if (!m) return;
+    if (!m || m._koToken !== PLAYER_TOKEN) return;
     switch (m.t) {
       case 'load':
         try {
@@ -88,6 +109,10 @@ if (HLS_MODE) {
         try {
           if (V.seekable && V.seekable.length) V.currentTime = V.seekable.end(V.seekable.length - 1);
         } catch { /* ignore */ }
+        break;
+      case 'quality':
+        if (m.q === 'auto') h.currentLevel = -1;
+        else if (Number.isInteger(m.q) && m.q >= 0 && m.q < h.levels.length) h.currentLevel = m.q;
         break;
       case 'getState':
         sendSt();
@@ -139,9 +164,14 @@ function sendSt() {
   } catch {
     /* not ready */
   }
-  let qcount = 0;
+  let qualities = [];
   try {
-    qcount = p.getQualities().length;
+    qualities = p.getQualities().map((quality, id) => ({
+      id,
+      name: quality.name,
+      w: quality.width,
+      h: quality.height,
+    }));
   } catch {
     /* not ready */
   }
@@ -191,14 +221,25 @@ function sendSt() {
   }
   post({
     t: 'st',
-    st: { state: p.getState(), paused: p.isPaused(), muted: p.isMuted(), volume: p.getVolume(), pos, lat, dur, q, qcount },
+    st: {
+      state: p.getState(),
+      paused: p.isPaused(),
+      muted: p.isMuted(),
+      volume: p.getVolume(),
+      pos,
+      lat,
+      dur,
+      q,
+      qcount: qualities.length,
+      qualities,
+    },
   });
 }
 
 window.addEventListener('message', (ev) => {
-  if (ev.source !== window.parent) return;
+  if (ev.source !== window.parent || ev.origin !== PARENT_ORIGIN) return;
   const m = ev.data && ev.data.__koKick;
-  if (!m) return;
+  if (!m || m._koToken !== PLAYER_TOKEN) return;
   switch (m.t) {
     case 'load':
       try {
@@ -234,6 +275,20 @@ window.addEventListener('message', (ev) => {
         if (isFinite(lat) && lat > 0) p.seekTo(p.getPosition() + lat);
         else p.play(); // already at the edge — no MAX-hack (that poisoned pos)
       } catch (e) { /* ignore */ }
+      break;
+    case 'quality':
+      try {
+        if (m.q === 'auto') {
+          p.setAutoQualityMode(true);
+        } else if (Number.isInteger(m.q)) {
+          const qualities = p.getQualities();
+          const selected = qualities[m.q];
+          if (selected) {
+            p.setAutoQualityMode(false);
+            p.setQuality(selected);
+          }
+        }
+      } catch (e) { /* quality menu is best-effort */ }
       break;
     case 'getState':
       sendSt();

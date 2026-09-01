@@ -20,7 +20,7 @@ export default async function saveToFile(
 
   /** @param {chrome.downloads.DownloadDelta} delta  */
   const onChange = (delta) => {
-    if (delta.id === id && delta.state?.current !== 'in_progress') {
+    if (delta.id === id && delta.state && delta.state.current !== 'in_progress') {
       chrome.downloads.onChanged.removeListener(onChange);
       URL.revokeObjectURL(url);
     }

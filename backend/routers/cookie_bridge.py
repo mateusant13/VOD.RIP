@@ -364,10 +364,9 @@ def _materialize_ext_src() -> Path:
 def _firefox_ext_src(src: Path) -> Path:
     """Materialize a Firefox-compatible variant of the unpacked extension.
 
-    Firefox MV3 supports neither module service workers nor Chromium-style
-    drag-and-drop: the variant flips background.service_worker to a classic
-    background.scripts array and pins a stable addon id so cookies survive
-    extension updates. Idempotent: returns the variant dir once patched.
+    Firefox uses the bundled background page because its ``background.scripts``
+    entries are classic scripts while this extension's background.js is ESM.
+    The page already loads that module via ``background.html``.
     """
     try:
         manifest = json.loads((src / "manifest.json").read_text(encoding="utf-8"))
@@ -383,7 +382,7 @@ def _firefox_ext_src(src: Path) -> Path:
     shutil.copytree(src, dest, dirs_exist_ok=True)
     try:
         m2 = json.loads(out_manifest.read_text(encoding="utf-8"))
-        m2["background"] = {"scripts": [sw]}
+        m2["background"] = {"page": "background.html"}
         m2["browser_specific_settings"] = {"gecko": {"id": "vodrip-cookies@vod.rip"}}
         out_manifest.write_text(json.dumps(m2, indent=2, ensure_ascii=False), encoding="utf-8")
     except (OSError, ValueError):
@@ -735,6 +734,7 @@ _AUTO_INSTALL_STATE = {
     "state": "idle",
     "installed": False,
     "extension_id": "",
+    "extensions": {},
     "error": None,
     "started_at": None,
     "finished_at": None,
@@ -745,9 +745,31 @@ def _ext_src_override() -> Optional[Path]:
     override = os.environ.get("VODRIP_EXT_SRC", "").strip()
     return Path(override) if override else None
 
+def _kick_overlay_src() -> Optional[Path]:
+    """Locate the unpacked Kick Overlay shipped beside the application."""
+    override = os.environ.get("VODRIP_KICK_OVERLAY_SRC", "").strip()
+    candidates = [Path(override)] if override else []
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            candidates.append(Path(meipass) / "kick-overlay")
+        candidates.append(Path(sys.executable).resolve().parent / "kick-overlay")
+    candidates.append(Path(__file__).resolve().parents[2] / "vendor" / "kick-overlay")
+    for src in candidates:
+        if src and (src / "manifest.json").is_file():
+            return src
+    return None
+
 
 def _auto_install_script() -> Path:
     # Silent UIA driver (alpha-0 on-screen window, no focus steal, no visible typing).
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            candidate = Path(meipass) / "scripts" / "cookie_extension_auto_install.ps1"
+            if candidate.is_file():
+                return candidate
+        return Path(sys.executable).resolve().parent / "scripts" / "cookie_extension_auto_install.ps1"
     return Path(__file__).resolve().parent.parent / "scripts" / "cookie_extension_auto_install.ps1"
 
 
@@ -802,51 +824,74 @@ def _run_auto_install_script(browser: str, extension_dir: Path, port: int = 7897
     return result
 
 
-def _auto_install_worker(browser: str, extension_dir: Path) -> None:
-    """Background thread body — runs the ps1 and folds its result into state."""
+def _auto_install_worker(
+    browser: str, extension_dir: Path, include_kick_overlay: bool = False
+) -> None:
+    """Install the cookie bridge and optionally the shipped Kick Overlay."""
+    results: dict[str, dict] = {}
     try:
-        res = _run_auto_install_script(browser, extension_dir)
+        results["cookie"] = _run_auto_install_script(browser, extension_dir)
+        if include_kick_overlay:
+            overlay = _kick_overlay_src()
+            results["kick_overlay"] = (
+                _run_auto_install_script(browser, overlay)
+                if overlay
+                else {"ok": False, "installed": False, "error": "Kick Overlay package missing"}
+            )
     except Exception as exc:  # never let the thread die silently
-        logger.exception("cookie auto-install crashed")
-        res = {"ok": False, "installed": False, "error": f"install crashed: {exc}"}
+        logger.exception("extension auto-install crashed")
+        results.setdefault("cookie", {"ok": False, "installed": False})
+        results["error"] = {"ok": False, "installed": False, "error": f"install crashed: {exc}"}
+    failures = [res for res in results.values() if not res.get("ok")]
+    ok = not failures and bool(results)
+    error = next((res.get("error") for res in failures if res.get("error")), None)
     with _AUTO_INSTALL_LOCK:
-        _AUTO_INSTALL_STATE["state"] = "done" if res.get("ok") else "error"
-        _AUTO_INSTALL_STATE["installed"] = bool(res.get("installed"))
-        _AUTO_INSTALL_STATE["extension_id"] = str(res.get("extension_id") or _ext_id() or "")
-        _AUTO_INSTALL_STATE["error"] = res.get("error")
+        _AUTO_INSTALL_STATE["state"] = "done" if ok else "error"
+        _AUTO_INSTALL_STATE["installed"] = ok and all(
+            bool(res.get("installed")) for res in results.values()
+        )
+        _AUTO_INSTALL_STATE["extension_id"] = str(
+            results.get("cookie", {}).get("extension_id") or _ext_id() or ""
+        )
+        _AUTO_INSTALL_STATE["extensions"] = {
+            name: {
+                "ok": bool(res.get("ok")),
+                "installed": bool(res.get("installed")),
+                "extension_id": str(res.get("extension_id") or ""),
+            }
+            for name, res in results.items()
+            if name != "error"
+        }
+        _AUTO_INSTALL_STATE["error"] = error
         _AUTO_INSTALL_STATE["finished_at"] = time.time()
-        logger.info("cookie auto-install finished: %s", _AUTO_INSTALL_STATE["state"])
-    # Success: open a platform page in background to wake the extension's
-    # service worker — the 30s alarm may not fire immediately after fresh
-    # install, so a page load on a supported platform (Twitch/YouTube/Kick)
-    # triggers the content script which delivers the first message that
-    # wakes the SW and pushes cookies to the backend.
-    if res.get("ok"):
+        logger.info("extension auto-install finished: %s", _AUTO_INSTALL_STATE["state"])
+    # Success: wake the cookie bridge service worker immediately; its alarm is
+    # a fallback for browsers that do not wake the worker on a page load.
+    if ok:
         try:
             _wake_extension_browser()
         except Exception:
             pass
         # ponytail: upgrade path is native push notification or CDP wake-up.
-        # Reset to idle so the frontend can re-trigger auto-install if
-        # needed (e.g. the user wants a different browser profile).
         with _AUTO_INSTALL_LOCK:
             _AUTO_INSTALL_STATE["state"] = "idle"
 
 
-def _start_auto_install(browser: str, extension_dir: Path) -> bool:
-    """Mark running + spawn the worker. Lock only guards state transitions —
-    the worker holds no lock while the ps1 runs, so a second POST can detect
-    'running' instead of blocking behind the install."""
+def _start_auto_install(
+    browser: str, extension_dir: Path, include_kick_overlay: bool = False
+) -> bool:
+    """Mark running + spawn the requested extension installs."""
     with _AUTO_INSTALL_LOCK:
         if _AUTO_INSTALL_STATE["state"] == "running":
             return False
         _AUTO_INSTALL_STATE.update(
-            state="running", installed=False, extension_id="", error=None,
+            state="running", installed=False, extension_id="", extensions={}, error=None,
             started_at=time.time(), finished_at=None,
         )
+    args = (browser, extension_dir, True) if include_kick_overlay else (browser, extension_dir)
     threading.Thread(
         target=_auto_install_worker,
-        args=(browser, extension_dir),
+        args=args,
         daemon=True,
         name="cookie-auto-install",
     ).start()
@@ -932,16 +977,10 @@ async def session_cookies_enable(request: Request):
 
 
 @router.post("/api/session/cookies/auto-install")
-async def session_cookies_auto_install():
-    """One-click cookie-extension install (productized proven flow).
-
-    Already paired -> short-circuit without touching the browser. Otherwise
-    spawn the automation (scripts/cookie_extension_auto_install.ps1) in a background
-    thread and return immediately — progress/result are mirrored by
-    GET /api/session/cookies/status -> auto_install while the frontend
-    shows a spinner. Never blocks the event loop: the ps1 runs in a thread.
-    """
-    if _paired_token():
+async def session_cookies_auto_install(body: Optional[dict] = None):
+    """Install the cookie bridge and, when requested, the Kick Overlay."""
+    include_kick_overlay = bool(body and body.get("include_kick_overlay"))
+    if _paired_token() and not include_kick_overlay:
         return {"ok": True, "installed": True, "alreadyInstalled": True, "state": "done"}
     # Extension running but bridge de-paired (token emptied while the extension
     # kept pushing): the extension re-pairs on its next cookie push (10-minute
@@ -957,7 +996,7 @@ async def session_cookies_auto_install():
                 age = time.time() - datetime.fromisoformat(last_grab.replace("Z", "+00:00")).timestamp()
             except (ValueError, TypeError):
                 age = float("inf")
-            if age < 11 * 60:
+            if age < 11 * 60 and not include_kick_overlay:
                 return {"ok": True, "installed": True, "alreadyInstalled": True, "state": "done"}
     except Exception:
         pass
@@ -974,7 +1013,7 @@ async def session_cookies_auto_install():
     browser = next((n for n in ("chrome", "msedge", "brave") if _find_browser(n)), None)
     if not browser:
         return {"ok": False, "state": "error", "error": "no Chromium browser found"}
-    if not _start_auto_install(browser, src):
+    if not _start_auto_install(browser, src, include_kick_overlay):
         return {"ok": True, "started": False, "alreadyRunning": True, "state": "running"}
     return {"ok": True, "started": True, "state": "running"}
 
@@ -994,6 +1033,8 @@ async def session_cookies_status(request: Request):
             and (time.time() - _AUTO_INSTALL_STATE["started_at"]) > 300
         ):
             _AUTO_INSTALL_STATE["state"] = "error"
+            _AUTO_INSTALL_STATE["installed"] = False
+            _AUTO_INSTALL_STATE["extensions"] = {}
             _AUTO_INSTALL_STATE["error"] = (
                 "auto-install thread died (no update for >5 min) — retry from Settings"
             )
@@ -1017,6 +1058,7 @@ async def session_cookies_status(request: Request):
             "error": ai["error"],
             "started_at": ai["started_at"],
             "finished_at": ai["finished_at"],
+            "extensions": ai["extensions"],
         },
     }
 
