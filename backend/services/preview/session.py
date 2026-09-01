@@ -51,6 +51,25 @@ SESSION_TTL_SEC = 1800  # 30 min — long browsing rarely exceeds 30 min; channe
 LRU_SIZE_HARD_LIMIT = 12
 _SESSION_DELETE_GRACE_SEC = 3.0
 PLAYLIST_REWRITE_TTL_SEC = 2
+def _run_ffmpeg_in_session_ctx(session_id: str, fn: Callable[[], None]) -> None:
+    """Run *fn* with the ffmpeg child-pid download context scoped to *session_id*.
+
+    ``ytdlp_ffmpeg._track_ffmpeg_proc`` registers each spawned ffmpeg PID under
+    the active download context (in addition to the process-global set used at
+    shutdown). Running the session's mux threads under the session id means
+    session cleanup can kill ONLY that session's ffmpeg children instead of
+    every session's mux via the process-global ``kill_child_processes``.
+    """
+    from services.ytdlp_ffmpeg import (
+        reset_download_context,
+        set_download_context,
+    )
+
+    token = set_download_context(session_id)
+    try:
+        fn()
+    finally:
+        reset_download_context(token)
 # Live sessions refetch media playlists far more often than VODs — a 2s cache
 # adds ~2s of latency to an already ~3-5s live pipeline. Media playlists get
 # this short TTL; the master keeps PLAYLIST_REWRITE_TTL_SEC (see proxy_playlist).
@@ -483,9 +502,12 @@ class PreviewManager:
         _PREVIEW_MUX_LOCKS.pop(session_id, None)
         if not session:
             return
-        from services.os_services import kill_child_processes
+        # Kill ONLY this session's ffmpeg children (registered under the
+        # session download-context by the mux threads). The process-global
+        # kill_child_processes() would tear down every session's active mux.
+        from services.ytdlp_ffmpeg import kill_download_ffmpeg_pids
 
-        kill_child_processes()
+        kill_download_ffmpeg_pids(session_id)
         try:
             import shutil
 
@@ -506,8 +528,8 @@ class PreviewManager:
             session.closed = True
             session.closed_at = time.time()
         _PREVIEW_MUX_LOCKS.pop(session_id, None)
-        from services.os_services import kill_child_processes
-
+        # The scoped ffmpeg kill happens in _finalize_delete after the grace
+        # window, so in-flight window-HLS segment writes finish first.
         timer = threading.Timer(
             _SESSION_DELETE_GRACE_SEC,
             self._finalize_delete,
@@ -1755,6 +1777,10 @@ def preview_session_mux_status(session_id: str) -> Dict[str, object]:
         "window_hls_mux_end": float(getattr(session, "window_hls_mux_end", 0) or 0),
     }
 def _run_youtube_mux_job(session_id: str) -> None:
+    _run_ffmpeg_in_session_ctx(session_id, lambda: _run_youtube_mux_job_body(session_id))
+
+
+def _run_youtube_mux_job_body(session_id: str) -> None:
     session = get_session(session_id)
     if not session or not _youtube_entry_needs_mux(session):
         return
@@ -1944,6 +1970,11 @@ def _mux_job_from_session(session: PreviewSession) -> Optional[MuxJob]:
         job_kind="clip",
     )
 def _run_background_full_mux(session_id: str) -> None:
+    """Background: mux the session's crop window to MP4 and persist to cache."""
+    _run_ffmpeg_in_session_ctx(session_id, lambda: _run_background_full_mux_body(session_id))
+
+
+def _run_background_full_mux_body(session_id: str) -> None:
     """Background: mux the session's crop window to MP4 and persist to cache."""
     session = get_session(session_id)
     if not session:
@@ -2192,6 +2223,22 @@ def _open_memory_bytes_proxy(
         yield slice_data
 
     return _once, content_type, hdrs, status, lambda: None
+
+def _range_satisfiable(data: bytes, range_header: Optional[str]) -> bool:
+    """True when *range_header* (bytes=START-END) can be served from *data*.
+
+    The prefetch cache holds only the first ~8s of a VOD (a few MB). A seek
+    past the cached window must NOT be served truncated bytes — fall through
+    to the upstream proxy. Open-ended or absent ranges are always servable.
+    """
+    if not range_header:
+        return True
+    m = re.match(r"bytes=(\d+)-(\d*)", range_header.strip())
+    if not m:
+        return False
+    start = int(m.group(1))
+    return start < len(data)
+
 def _bytes_response_for_range(
     data: bytes,
     range_header: Optional[str],
@@ -2361,6 +2408,23 @@ def open_segment_proxy(
     session = get_session(session_id)
     if not session:
         raise ValueError("Preview session not found or expired")
+
+    # Instant-preview prefetch: the first ~8s segments of the 5 newest VODs
+    # per (channel, platform) are stored byte-identical to upstream in the
+    # cross-session prefetch cache. Serve them here (the segment-proxy path is
+    # the one the browser actually hits for rangeable CDN media). Only when the
+    # requested byte range is satisfiable from the cached bytes; a seek past the
+    # cached window falls through to the normal upstream proxy so a mid-VOD seek
+    # never serves truncated/wrong bytes.
+    from services.prefetch_cache import lookup_prefetched_segment
+
+    prefetched = lookup_prefetched_segment(session, upstream_url)
+    if prefetched is not None and _range_satisfiable(prefetched, range_header):
+        return _open_memory_bytes_proxy(
+            prefetched,
+            _guess_content_type(upstream_url),
+            range_header,
+        )
 
     cached = _read_cache(session, upstream_url)
     if cached is not None:
@@ -3472,7 +3536,7 @@ def schedule_youtube_window_hls_mux(session_id: str) -> None:
                 _WINDOW_HLS_RUNNING.discard(session_id)
 
     threading.Thread(
-        target=_job,
+        target=lambda: _run_ffmpeg_in_session_ctx(session_id, _job),
         daemon=True,
         name=f"yt-window-hls-{session_id[:8]}",
     ).start()
