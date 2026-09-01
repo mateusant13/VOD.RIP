@@ -129,9 +129,10 @@ async def _run() -> None:
             max_backlog_sec=5.0,
         )
         captioner.acquire()
+        queue = captioner.subscribe()
         try:
             async def next_event(timeout=20.0):
-                ev, data = await asyncio.wait_for(captioner.events.get(), timeout)
+                ev, data = await asyncio.wait_for(queue.get(), timeout)
                 assert ev == "caption", f"expected caption, got {ev}: {data}"
                 return data
 

@@ -106,14 +106,18 @@ async def live_captions_stream(
     captioner = get_captioner(plat, chan, asyncio.get_running_loop())
     if captioner is None:
         raise HTTPException(status_code=429, detail="too many active caption streams — try again later")
+    queue = None
     captioner.acquire(lang)
     try:
+        queue = captioner.subscribe()
         return StreamingResponse(
-            _captions_sse_gen(request, captioner),
+            _captions_sse_gen(request, captioner, queue),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
     except Exception:
+        if queue is not None:
+            captioner.unsubscribe(queue)
         captioner.release()
         raise
 
@@ -158,16 +162,21 @@ def live_captions_errors(limit: int = Query(20, ge=1, le=50)) -> dict:
     # ponytail: unauthenticated but bounded (50 entries, no secrets); gate behind auth when app auth lands.
     return {"errors": get_error_ring(limit)}
 
-async def _captions_sse_gen(request: Request, captioner) -> "AsyncGenerator[str, None]":
+async def _captions_sse_gen(request: Request, captioner, queue: asyncio.Queue) -> "AsyncGenerator[str, None]":
     """SSE body generator: forward caption blocks, keepalive comments, and
     release the captioner refcount when the connection closes. Extracted so
-    tests can drive it directly (ASGITransport buffers the whole body)."""
+    tests can drive it directly (ASGITransport buffers the whole body).
+
+    ``queue`` is this connection's own subscriber queue (from
+    captioner.subscribe()) — the worker fan-outs every event to all live
+    subscriber queues, so one viewer's disconnect never steals blocks from
+    another. On teardown we unsubscribe and release the refcount."""
     try:
         while True:
             if await request.is_disconnected():
                 break
             try:
-                event, data = await asyncio.wait_for(captioner.events.get(), timeout=15)
+                event, data = await asyncio.wait_for(queue.get(), timeout=15)
             except asyncio.TimeoutError:
                 yield ": keepalive\n\n"
                 continue
@@ -176,6 +185,7 @@ async def _captions_sse_gen(request: Request, captioner) -> "AsyncGenerator[str,
                 break
             yield f"event: caption\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
     finally:
+        captioner.unsubscribe(queue)
         captioner.release()
 # ---------------------------------------------------------------------------
 # Endpoints
@@ -776,46 +786,115 @@ def _build_viewer_chat_sink(platform: str, slug: str, push) -> "object":
     return cls(**kwargs)
 
 
+# One shared upstream ChatSink per (platform, slug), ref-counted by every
+# live SSE viewer of that channel. Without fanout each viewer spawned its
+# own upstream socket + two daemon threads; with it, one sink + one socket
+# serves all viewers, torn down when the last one disconnects. Rows flush
+# on the SINK's flush cadence and are broadcast to every subscriber queue.
+_CHAT_FANOUT_LOCK = threading.Lock()
+_CHAT_FANOUT: "dict[tuple[str, str], _ChatFanout]" = {}
+
+
+class _ChatFanout:
+    """Ref-counted fan-out of one shared ChatSink to many viewer queues.
+
+    First subscriber builds the sink (via _build_viewer_chat_sink) and
+    starts it; each flush broadcasts the row batch to every subscribed
+    queue. Last unsubscribe stops the shared sink and the fanout drops out
+    of the registry, so no upstream socket or daemon thread outlives the
+    viewers."""
+
+    def __init__(self, platform: str, slug: str, loop: asyncio.AbstractEventLoop):
+        self.loop = loop
+        self._refcount = 0
+        self._subscribers: "set[asyncio.Queue]" = set()
+        self._sink = None  # built lazily on first subscriber
+        self._sink_lock = threading.Lock()
+
+        def _broadcast(rows) -> int:
+            # Runs on the sink's flush thread — hop to the loop, then fan
+            # the batch out to every subscriber queue. Returning len(rows)
+            # keeps the ChatSink base flush accounting correct.
+            with self._sink_lock:
+                targets = tuple(self._subscribers)
+            if targets:
+                self.loop.call_soon_threadsafe(
+                    lambda: [q.put_nowait(rows) for q in targets]
+                )
+            return len(rows)
+
+        self._broadcast = _broadcast
+        self._platform = platform
+        self._slug = slug
+
+    def start(self) -> None:
+        """Bump the refcount; start the shared sink on the first viewer."""
+        if self._refcount == 0:
+            self._sink = _build_viewer_chat_sink(self._platform, self._slug, self._broadcast)
+            self._sink.start()
+        self._refcount += 1
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue()
+        with self._sink_lock:
+            self._subscribers.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        """Drop a viewer; stop + unregister the shared sink on the last one."""
+        with self._sink_lock:
+            self._subscribers.discard(q)
+            self._refcount -= 1
+            last = self._refcount <= 0
+            sink = self._sink
+            self._sink = None
+        if last and sink is not None:
+            sink.stop()
+            with _CHAT_FANOUT_LOCK:
+                _CHAT_FANOUT.pop((self._platform, self._slug), None)
+
+
 @router.get("/live/chat/stream")
 async def live_chat_stream(
     request: Request,
     platform: str = Query(..., description="twitch | kick | youtube"),
     slug: str = Query(..., description="chat room slug (login / slug / @handle)"),
 ):
-    """SSE stream of LIVE chat rows for one channel (per-viewer capture).
+    """SSE stream of LIVE chat rows for one channel (shared fanout).
 
-    Each connection owns a ChatSink; rows flush every ~1s and are forwarded
-    as ``data: {…}`` frames. Same keepalive/disconnect contract as the
-    download stream endpoint. The sink dies with the connection.
+    All viewers of a channel subscribe to ONE shared _ChatFanout (one
+    upstream ChatSink + socket + two daemon threads), flushed every ~1s;
+    rows are broadcast to every viewer queue and forwarded as ``data: {…}``
+    frames. Same keepalive/disconnect contract as the download stream
+    endpoint. The shared sink dies when the last viewer disconnects.
     """
     plat = (platform or "").lower()
     if plat not in _CHAT_PLATFORM_KWARG or not slug:
         raise HTTPException(status_code=400, detail="platform must be one of twitch/kick/youtube and slug is required")
 
-    queue: asyncio.Queue = asyncio.Queue()
-    loop = asyncio.get_running_loop()
+    key = (plat, slug)
+    with _CHAT_FANOUT_LOCK:
+        fanout = _CHAT_FANOUT.get(key)
+        if fanout is None:
+            fanout = _ChatFanout(plat, slug, asyncio.get_running_loop())
+            _CHAT_FANOUT[key] = fanout
 
-    def _push(rows) -> int:
-        # ChatSink base sums the returned count into rows_flushed — returning
-        # None (bare call_soon_threadsafe) makes every flush raise TypeError.
-        loop.call_soon_threadsafe(queue.put_nowait, rows)
-        return len(rows)
-
-    sink = _build_viewer_chat_sink(plat, slug, _push)
-
+    queue = fanout.subscribe()
     return StreamingResponse(
-        _chat_sse_gen(request, queue, sink),
+        _chat_sse_gen(request, queue, fanout),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
 
 
-async def _chat_sse_gen(request: Request, queue: asyncio.Queue, sink) -> "AsyncGenerator[str, None]":
-    """SSE body generator: start the sink, forward flushed row batches, and
-    keep the connection alive with comment frames. Extracted so tests can
-    drive it directly (ASGITransport buffers the whole infinite body)."""
+async def _chat_sse_gen(request: Request, queue: asyncio.Queue, fanout) -> "AsyncGenerator[str, None]":
+    """SSE body generator: start the shared fanout, forward flushed row
+    batches, and keep the connection alive with comment frames. Extracted
+    so tests can drive it directly (ASGITransport buffers the whole
+    infinite body). On teardown we unsubscribe this viewer's queue; the
+    fanout stops the shared sink when the LAST viewer leaves."""
     try:
-        sink.start()
+        fanout.start()
         while True:
             if await request.is_disconnected():
                 break
@@ -826,7 +905,7 @@ async def _chat_sse_gen(request: Request, queue: asyncio.Queue, sink) -> "AsyncG
             except asyncio.TimeoutError:
                 yield ": keepalive\n\n"
     finally:
-        sink.stop()
+        fanout.unsubscribe(queue)
 
 
 

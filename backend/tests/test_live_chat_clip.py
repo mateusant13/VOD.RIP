@@ -99,8 +99,9 @@ async def test_chat_stream_validates_platform(monkeypatch):
 
 
 class _FakeSink:
-    """Patched sink: start() flushes one row into the queue, stop() records the
-    call (no thread, no network — the SSE body is the only thing under test)."""
+    """Patched fanout: start() flushes one row into the queue, unsubscribe()
+    records the call (no thread, no network — the SSE body is the only thing
+    under test). """
 
     def __init__(self, push):
         self._push = push
@@ -109,13 +110,13 @@ class _FakeSink:
     def start(self):
         self._push([{"username": "viewer", "text": "hello live"}])
 
-    def stop(self):
+    def unsubscribe(self, queue):
         self.stopped = True
 
 
 class _FakeRequest:
     """Request whose disconnect never fires — the generator is closed by the
-    test instead (aclose() runs the finally → sink.stop())."""
+    test instead (aclose() runs the finally → fanout.unsubscribe())."""
 
     async def is_disconnected(self):
         return False
@@ -123,8 +124,8 @@ class _FakeRequest:
 
 @pytest.mark.anyio
 async def test_chat_stream_sse_forwarding():
-    """The SSE generator starts the sink, forwards a flushed row batch as a
-    data: frame, and stops the sink when the connection closes."""
+    """The SSE generator starts the fanout, forwards a flushed row batch as a
+    data: frame, and unsubscribes when the connection closes."""
     import asyncio
 
     from routers import live as live_router
