@@ -275,7 +275,7 @@ describe('ArchiveSearchPopup', () => {
     expect(screen.getByLabelText('YouTube')).toBeInTheDocument();
   });
 
-  it('kind badges: transcript → speech, message → chat; title stays as-is', async () => {
+  it('kind badges: transcript → transcription, message → chat; title stays as-is', async () => {
     const fetchMock = mockFetch([
       { ...HIT, kind: 'transcript' as const },
       { ...HIT, kind: 'message' as const, video_id: 'v2', text: 'zebra message row' },
@@ -285,8 +285,8 @@ describe('ArchiveSearchPopup', () => {
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
     fireEvent.change(input, { target: { value: 'zebra' } });
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
-    const speechRow = await screen.findByRole('button', { name: /zebra stripes/i });
-    expect(within(speechRow).getByText('speech')).toBeInTheDocument();
+    const transcriptionRow = await screen.findByRole('button', { name: /zebra stripes/i });
+    expect(within(transcriptionRow).getByText('transcription')).toBeInTheDocument();
     const messageRow = await screen.findByRole('button', { name: /zebra message row/i });
     expect(within(messageRow).getByText('chat')).toBeInTheDocument();
     const titleRow = await screen.findByRole('button', { name: /zebra title row/i });
@@ -363,11 +363,11 @@ describe('ArchiveSearchPopup', () => {
     expect(targetsArg[0].video).toMatchObject({ video_id: 'v1' });
   });
 
-  it('source filter + kind badges translate (pt-BR fala, es habla)', async () => {
+  it('source filter + kind badges translate (pt-BR transcrição, es transcripción)', async () => {
     const fetchMock = mockFetch([HIT]);
     setLanguage('pt-BR');
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
-    expect(screen.getByRole('button', { name: 'fala' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'transcrição' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'chat' })).toBeInTheDocument();
     // No 'ambos'/'both' chip anymore — every source is a real toggle, all ON.
     expect(screen.queryByRole('button', { name: 'ambos' })).toBeNull();
@@ -375,12 +375,12 @@ describe('ArchiveSearchPopup', () => {
     fireEvent.change(input, { target: { value: 'zebra' } });
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     const row = await screen.findByRole('button', { name: /zebra stripes/i });
-    expect(within(row).getByText('fala')).toBeInTheDocument();
+    expect(within(row).getByText('transcrição')).toBeInTheDocument();
     // Live language switch re-renders the same popup.
     setLanguage('es');
-    await waitFor(() => expect(screen.getByRole('button', { name: 'habla' })).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole('button', { name: 'transcripción' })).toBeInTheDocument());
     expect(screen.getByRole('button', { name: 'chat' })).toBeInTheDocument();
-    expect(within(row).getByText('habla')).toBeInTheDocument();
+    expect(within(row).getByText('transcripción')).toBeInTheDocument();
   });
 
   it('source filter: all on sends no source, deselecting one sends the CSV subset', async () => {
@@ -391,9 +391,9 @@ describe('ArchiveSearchPopup', () => {
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     expect(searchUrlWith(fetchMock, 'q=zebra')).not.toContain('source=');
 
-    // Deselect speech → chat alone goes as a single source
+    // Deselect transcription → chat alone goes as a single source
     // (URLSearchParams percent-encodes nothing here — one value).
-    fireEvent.click(screen.getByRole('button', { name: 'speech' }));
+    fireEvent.click(screen.getByRole('button', { name: 'transcription' }));
     await waitFor(() =>
       expect(searchUrlWith(fetchMock, 'q=zebra&source=chat')).toBeTruthy(),
     );
@@ -407,7 +407,7 @@ describe('ArchiveSearchPopup', () => {
     });
 
     // Re-select both — back to all, the param disappears again.
-    fireEvent.click(screen.getByRole('button', { name: 'speech' }));
+    fireEvent.click(screen.getByRole('button', { name: 'transcription' }));
     fireEvent.click(screen.getByRole('button', { name: 'chat' }));
     await waitFor(() => {
       const urls = searchUrls(fetchMock).filter((u) => u.includes('q=zebra'));
@@ -415,7 +415,7 @@ describe('ArchiveSearchPopup', () => {
     });
   });
 
-  it('semantic toggle: off by default, on sends semantic=1, disabled without speech', async () => {
+  it('semantic toggle: off by default, on sends semantic=1, disabled without transcription', async () => {
     const fetchMock = mockFetch();
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
@@ -430,13 +430,13 @@ describe('ArchiveSearchPopup', () => {
     // mode always rides along; it precedes semantic in the query string.
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra&mode=semantic&semantic=1')).toBeTruthy());
 
-    // Concept search covers transcripts only — deselecting speech disables it.
-    fireEvent.click(screen.getByRole('button', { name: 'speech' }));
+    // Concept search covers transcripts only — deselecting transcription disables it.
+    fireEvent.click(screen.getByRole('button', { name: 'transcription' }));
     await waitFor(() => expect(screen.getByRole('button', { name: 'CONTEXT' })).toBeDisabled());
     expect(searchUrlWith(fetchMock, 'q=zebra&source=chat')).not.toContain('semantic=');
 
-    // Re-selecting speech re-enables it (state preserved).
-    fireEvent.click(screen.getByRole('button', { name: 'speech' }));
+    // Re-selecting transcription re-enables it (state preserved).
+    fireEvent.click(screen.getByRole('button', { name: 'transcription' }));
     await waitFor(() => expect(screen.getByRole('button', { name: 'CONTEXT' })).not.toBeDisabled());
     await waitFor(() =>
       expect(searchUrlWith(fetchMock, 'q=zebra&mode=semantic&semantic=1')).toBeTruthy(),
@@ -669,7 +669,7 @@ describe('ArchiveSearchPopup', () => {
     expect(screen.queryByLabelText('Channel')).toBeNull();
     expect(screen.queryByText('Platform')).toBeNull();
     // Orthogonal filters stay active.
-    expect(screen.getByRole('button', { name: 'speech' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'transcription' })).toBeInTheDocument();
 
     const input = screen.getByPlaceholderText('SEARCH THIS VIDEO...');
     fireEvent.change(input, { target: { value: 'zebra' } });
@@ -1289,7 +1289,7 @@ describe('ArchiveSearchPopup USER filter', () => {
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const user = screen.getByLabelText('Chat author');
     fireEvent.change(user, { target: { value: 'Scriptingkata' } });
-    for (const name of ['speech', 'chat']) {
+    for (const name of ['transcription', 'chat']) {
       expect(screen.getByRole('button', { name })).toBeDisabled();
       expect(screen.getByRole('button', { name })).toHaveAttribute(
         'title',
@@ -1298,7 +1298,7 @@ describe('ArchiveSearchPopup USER filter', () => {
     }
     // Clearing the author re-enables the chips.
     fireEvent.click(screen.getByTitle('Clear user filter'));
-    await waitFor(() => expect(screen.getByRole('button', { name: 'speech' })).not.toBeDisabled());
+    await waitFor(() => expect(screen.getByRole('button', { name: 'transcription' })).not.toBeDisabled());
   });
 
   it('empty query + user filter shows the author-only empty state', async () => {
@@ -1324,16 +1324,16 @@ describe('ArchiveSearchPopup batch-3', () => {
     channel: 'srdogg',
   };
 
-  it('source chips: 2 chips, deselecting speech leaves chat only, disables CONTEXT', async () => {
+  it('source chips: 2 chips, deselecting transcription leaves chat only, disables CONTEXT', async () => {
     const fetchMock = mockFetch([]);
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     // All source chips are ON by default (aria-pressed) — no 'video' chip.
-    for (const name of ['speech', 'chat']) {
+    for (const name of ['transcription', 'chat']) {
       expect(screen.getByRole('button', { name })).toHaveAttribute('aria-pressed', 'true');
     }
     expect(screen.queryByRole('button', { name: 'video' })).toBeNull();
-    // Deselect speech → chat-only subset.
-    fireEvent.click(screen.getByRole('button', { name: 'speech' }));
+    // Deselect transcription → chat-only subset.
+    fireEvent.click(screen.getByRole('button', { name: 'transcription' }));
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
     fireEvent.change(input, { target: { value: 'zebra' } });
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra&source=chat')).toBeTruthy());

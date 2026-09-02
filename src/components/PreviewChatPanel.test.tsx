@@ -121,6 +121,14 @@ describe('PreviewChatPanel', () => {
     expect(screen.queryByText('×1')).toBeNull();
   });
 
+  it('opens on transcription tab by default and preserves an explicit chat selection', async () => {
+    mockPanelFetch(PAYLOAD);
+    render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByText('hello world')).toBeTruthy());
+    expect(screen.getByRole('button', { name: 'Transcript' })).toHaveAttribute('aria-pressed', 'true');
+    fireEvent.click(screen.getByRole('button', { name: 'Chat' }));
+    expect(screen.getByRole('button', { name: 'Chat' })).toHaveAttribute('aria-pressed', 'true');
+  });
   it('fetches the panel payload at session-create, before the video starts', async () => {
     const fetchMock = mockPanelFetch(PAYLOAD);
     render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);

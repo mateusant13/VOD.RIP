@@ -92,11 +92,10 @@ export const ARCHIVE_KIND_LABELS: Record<ArchiveKind, string> = {
 };
 
 /** i18n keys for the source-filter labels. The query PARAM values stay
- *  stable (video|transcript|chat — buildSearchUrl joins them comma-separated
- *  when a proper subset is selected; all-three is omitted = backend 'both');
- *  only the display words changed (STREAMER → speech). */
+ * stable (video|transcript|chat — buildSearchUrl joins them comma-separated
+ * when a proper subset is selected; all-three is omitted = backend 'both'). */
 export const ARCHIVE_SOURCE_LABELS: Record<ArchiveSource, string> = {
-  transcript: 'speech',
+  transcript: 'transcription',
   chat: 'chat',
 };
 
