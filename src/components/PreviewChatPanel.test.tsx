@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render as rtlRender, screen, waitFor } from '@testing-library/react';
 import { useState } from 'react';
 import PreviewChatPanel, { type PreviewPanelPayload } from './PreviewChatPanel';
 
@@ -77,6 +77,14 @@ function mockPanelFetch(
   vi.stubGlobal('fetch', fn);
   return fn;
 }
+/** Existing panel tests target chat; explicitly opt those fixtures into it
+ * while the product default remains the transcription tab. */
+function render(...args: Parameters<typeof rtlRender>) {
+  const result = rtlRender(...args);
+  const chat = screen.queryByRole('button', { name: 'Chat' });
+  if (chat?.getAttribute('aria-pressed') === 'false') fireEvent.click(chat);
+  return result;
+}
 
 function activeRowText(): string {
   const el = document.querySelector('[data-panel-row][aria-current="true"]');
@@ -123,7 +131,7 @@ describe('PreviewChatPanel', () => {
 
   it('opens on transcription tab by default and preserves an explicit chat selection', async () => {
     mockPanelFetch(PAYLOAD);
-    render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+    rtlRender(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
     await waitFor(() => expect(screen.getByText('hello world')).toBeTruthy());
     expect(screen.getByRole('button', { name: 'Transcript' })).toHaveAttribute('aria-pressed', 'true');
     fireEvent.click(screen.getByRole('button', { name: 'Chat' }));
