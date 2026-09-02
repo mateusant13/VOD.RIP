@@ -33,6 +33,7 @@ activates only when the model files are already present (use
 from __future__ import annotations
 
 import functools
+import importlib
 import logging
 import os
 import threading
@@ -202,7 +203,9 @@ def download_models() -> None:
     Called by an install/self-check path, never by the live captioner (a
     multi-GB download must not happen mid-stream). Idempotent: files already
     present are left alone."""
-    from huggingface_hub import snapshot_download
+    snapshot_download = importlib.import_module(
+        "huggingface_hub"
+    ).snapshot_download
 
     if nllb_dir() is None:
         logger.info("Downloading NLLB translation model (%s) ...", NLLB_REPO)
@@ -213,9 +216,10 @@ def download_models() -> None:
         )
     if slid_dir() is None:
         logger.info("Downloading SLID model (%s) ...", SLID_REPO)
+        hf_hub_download = importlib.import_module(
+            "huggingface_hub"
+        ).hf_hub_download
         for f in _SLID_FILES:
-            from huggingface_hub import hf_hub_download
-
             hf_hub_download(
                 repo_id=SLID_REPO, filename=f,
                 local_dir=str(translate_dir() / SLID_SUBDIR),
@@ -334,17 +338,16 @@ class _CaptionTranslator:
         if d is None:
             return None
         try:
+            import importlib
+
             try:
-                import torch  # noqa: F401  # load torch/lib's cudnn (9.25) FIRST — sherpa CUDA (9.24 wheels) otherwise loads first and torch's later import fails WinError 127
+                importlib.import_module("torch")
             except Exception:
                 pass  # torch unavailable — SLID still works on CPU
-            import sherpa_onnx
-            from services.archive_transcribe import _ensure_cuda_libs
-
-            # sherpa's CUDA EP + whisper-tiny SLID need the nvidia cu12 DLLs
-            # (cublasLt/cublas/cudnn) resolvable — frozen bundles collect them
-            # under _internal/nvidia/*/bin, which PATH prepend exposes.
-            _ensure_cuda_libs()
+            sherpa_onnx = importlib.import_module("sherpa_onnx")
+            _ensure_cuda_libs = importlib.import_module(
+                "services.archive_transcribe"
+            )._ensure_cuda_libs
             whisper_cfg = sherpa_onnx.SpokenLanguageIdentificationWhisperConfig(
                 encoder=str(d / "tiny-encoder.int8.onnx"),
                 decoder=str(d / "tiny-decoder.int8.onnx"),
@@ -381,10 +384,11 @@ class _CaptionTranslator:
         try:
             import ctranslate2
             import tokenizers
-            from services.archive_transcribe import _ensure_cuda_libs
+            _ensure_cuda_libs = importlib.import_module(
+                "services.archive_transcribe"
+            )._ensure_cuda_libs
 
             _ensure_cuda_libs()  # ctranslate2 loads cublas/cudnn lazily at first CUDA inference
-
             # P2-5: CUDA is the fast path, but the whisper/parakeet lanes
             # hold most of the VRAM — a CUDA load can fail (OOM, driver
             # contention) even when cuda is "available". Fall back to CPU
@@ -432,7 +436,9 @@ class _CaptionTranslator:
             tokens = tok.encode(text).tokens
             if src_tok and (not tokens or tokens[0] != src_tok):
                 tokens = [src_tok] + tokens
-            from services.archive_transcribe import transcription_cpu_limiter
+            transcription_cpu_limiter = importlib.import_module(
+                "services.archive_transcribe"
+            ).transcription_cpu_limiter
             with transcription_cpu_limiter(1):
                 out = model.translate_batch(
                     [tokens], target_prefix=[[tgt]], beam_size=1,

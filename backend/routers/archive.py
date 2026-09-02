@@ -8,6 +8,7 @@ import asyncio
 import logging
 import re
 import sqlite3
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,18 @@ from services import archive_db, archive_twitch
 from services.archive_scheduler import TRANSCRIBE_PRIORITY_HIGH, _chat_job_guard
 
 logger = logging.getLogger(__name__)
+
+
+def _start_frozen_archive_worker() -> None:
+    """Start the optional worker after a job is queued in the frozen app."""
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        from services.asr_runtime import start_archive_worker
+
+        start_archive_worker()
+    except Exception:
+        logger.warning("could not start optional archive worker", exc_info=True)
 router = APIRouter(tags=["archive"])
 
 
@@ -404,8 +417,9 @@ def _transcribe_candidates(
 
     Gates: global 30s throttle (own clock), per-video 600s cooldown, file
     still on disk, not covered by captions, no queued/running transcribe
-    job, latest job not failed-within-1h, and a live worker — without a
-    worker the jobs would sit queued forever for users who never opted in."""
+    job, and latest job not failed-within-1h. A frozen app starts the optional
+    worker immediately after enqueueing the job.
+    """
     if platform:
         plats = {p.strip().lower() for p in platform.split(",") if p.strip()}
         if plats and not plats.intersection({"youtube", "twitch", "kick"}):
@@ -414,8 +428,6 @@ def _transcribe_candidates(
     with _transcribe_lock:
         if now - _last_transcribe_kick < _TRANSCRIBE_MIN_GAP_S:
             return []
-    if not archive_db.worker_live():
-        return []
     sql = (
         "SELECT v.platform, v.video_id, v.channel, v.title, v.duration_sec, v.archive_path "
         "FROM videos v WHERE v.platform IN ('youtube','twitch','kick') AND v.status='ready' "
@@ -752,6 +764,12 @@ async def archive_search(
             q=q,
             video_id=video_id or None,
         )
+    if enriching:
+        threading.Thread(
+            target=_start_frozen_archive_worker,
+            daemon=True,
+            name="archive-worker-kick",
+        ).start()
     resp: dict[str, Any] = {"hits": hits, "enriching": enriching}
     if channel_hint:
         resp["channel_hint"] = channel_hint
@@ -1005,6 +1023,11 @@ async def archive_jobs_enqueue(job: dict):
         archive_db.enqueue_job(job_id, kind, platform, video_id, priority=0)
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=409, detail=f"job {job_id} already exists") from None
+    threading.Thread(
+        target=_start_frozen_archive_worker,
+        daemon=True,
+        name="archive-worker-kick",
+    ).start()
     return {"ok": True, "id": job_id}
 
 

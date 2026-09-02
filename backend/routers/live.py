@@ -49,13 +49,10 @@ class LiveDownloadRequest(BaseModel):
 # Live captions (real-time ASR captions for the livestream popup)
 # ---------------------------------------------------------------------------
 #
-# The popup's CC overlay subscribes here. One refcounted LiveCaptioner per
 # (platform, channel) polls the live audio-only HLS rendition, buffers ~2s
-# windows and transcribes them with the parakeet engine OFF the asyncio loop
-# (the captioner runs in its own worker thread; caption blocks arrive through
-# the same per-connection queue pattern as the chat SSE). The parakeet gate
-# (sherpa-onnx importable AND model files present) 503s the stream endpoint
-# and the /available probe reports it so the frontend hides the CC toggle.
+# windows and sends each decoded window to the optional ASR runtime over
+# loopback. The runtime download is triggered only when the user opens the
+# stream; the /available probe reports whether it is already installed.
 _CAPTION_PLATFORMS = ("twitch", "kick", "youtube")
 
 
@@ -72,12 +69,9 @@ async def live_captions_stream(
     """SSE stream of live caption blocks for one channel.
 
     Emits ``event: caption`` frames (``{text, start, end}``) plus keepalive
-    comments; a confirmed ``event: offline`` ends the stream (the frontend
-    retries with backoff — a fresh connection restarts the captioner, so a
-    recovered ASR/translate pipeline resumes captions without user action).
-    503 when the parakeet engine is unavailable — the frontend probes
-    /available first and never opens the stream then. The captioner's
-    refcount drops when the connection closes (generator finally).
+    comments; a confirmed ``event: offline`` ends the stream. The optional ASR
+    runtime is installed on this explicit stream request when missing. The
+    captioner's refcount drops when the connection closes (generator finally).
 
     ``lang`` overrides the translate target per session (the captioner is
     shared per (platform, channel), so the LAST explicit selection wins for
@@ -99,6 +93,13 @@ async def live_captions_stream(
         raise
     except Exception:
         raise HTTPException(status_code=503, detail="live-captions feature is disabled")
+    from services.asr_runtime import ensure_runtime
+    try:
+        # Runtime download is tied to an explicit caption-stream request, not
+        # app startup or the cheap /available probe.
+        await asyncio.to_thread(ensure_runtime)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     from services.live_captions import captions_available, get_captioner
     ok, reason = await asyncio.to_thread(captions_available, plat)
     if not ok:
@@ -127,8 +128,8 @@ async def live_captions_available(
     platform: str = Query(..., description="twitch | kick | youtube"),
     channel: str = Query(..., description="channel slug / login"),
 ) -> dict:
-    """Parakeet-gate probe: ``{available, reason}`` — the popup renders the
-    CC toggle only when available is true (and never opens the stream 503)."""
+    """Runtime gate probe: ``{available, reason}`` — the popup renders the
+    CC toggle only when the optional ASR runtime is already installed."""
     plat = (platform or "").lower()
     chan = (channel or "").strip().lower()
     if plat not in _CAPTION_PLATFORMS or not chan:

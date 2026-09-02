@@ -7,13 +7,12 @@ the same root that hosts parakeet/embed/translate weights, so a user who points
 Settings > Disk "AI Models Folder" at a fast drive gets both. **Downloads happen
 only in ``ensure_runtime()``** — never at import, never at app startup.
 
-Delivery is a single zip described by a JSON manifest fetched from
-``VODRIP_ASR_RUNTIME_MANIFEST_URL``. The manifest must name the in-archive
-``executable``, an ``archive_sha256``, and a per-file ``files`` sha256 map, so
-nothing is invented: a missing manifest URL or a missing/malformed manifest field
-is a clear error. Extraction is atomic (staging dir -> single rename) and
-path-traversal-safe, so a partial or malicious install never appears as the live
-runtime dir.
+Delivery is a single zip described by a JSON manifest fetched from the official
+release URL (or ``VODRIP_ASR_RUNTIME_MANIFEST_URL`` for a private mirror). The
+manifest must name the in-archive ``executable``, an ``archive_sha256``, and a
+per-file ``files`` sha256 map, so nothing is invented: malformed or incomplete
+metadata is a clear error. Extraction is atomic and path-traversal-safe, so a
+partial or malicious install never appears as the live runtime dir.
 
 Exported contract: ``runtime_status() -> dict``,
 ``ensure_runtime(progress=None) -> Path``, ``runtime_available() -> bool``,
@@ -28,7 +27,10 @@ import logging
 import os
 import secrets
 import shutil
+import socket
+import subprocess
 import threading
+import time
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -36,9 +38,11 @@ from typing import Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-# --- knobs -----------------------------------------------------------------
-# Manifest URL: set to an explicit URL; a missing value is a hard error, never a
-# guessed fallback.
+# Official release manifest; deployments can override it for a private mirror.
+_DEFAULT_MANIFEST_URL = (
+    "https://github.com/mateusant13/VOD.RIP/releases/latest/download/"
+    "VOD-RIP-ASR-manifest.json"
+)
 MANIFEST_URL_ENV = "VODRIP_ASR_RUNTIME_MANIFEST_URL"
 # Runtime payload root override (tests/portable installs pin scratch dirs).
 RUNTIME_DIR_ENV = "VODRIP_ASR_RUNTIME_DIR"
@@ -50,7 +54,7 @@ _SUBDIR = "asr-runtime"
 # Pre-install placeholder for the executable path. The manifest's ``executable``
 # field is authoritative once installed; this constant only makes
 # runtime_executable() deterministic before the first ensure_runtime().
-_DEFAULT_EXECUTABLE = "whisper.exe"
+_DEFAULT_EXECUTABLE = "VOD-RIP-ASR.exe"
 _MARKER = ".runtime.json"
 _CHUNK = 1024 * 1024
 _HTTP_TIMEOUT = 30.0  # socket timeout — a stuck download fails instead of hanging
@@ -58,9 +62,9 @@ _HTTP_TIMEOUT = 30.0  # socket timeout — a stuck download fails instead of han
 # ponytail: a runtime is < a few GB; the cap just needs to be generous, upgrade
 # path is manifest-declared per-file sizes enforced before extracting.
 _MAX_EXTRACTED_BYTES = 16 * 1024 ** 3
-
 _install_lock = threading.Lock()
-
+_archive_worker_lock = threading.Lock()
+_archive_worker_process: Optional[subprocess.Popen] = None
 
 def runtime_dir() -> Path:
     """Root for the ASR runtime payload (support resolver, not API contract).
@@ -144,12 +148,9 @@ def ensure_runtime(
         if _is_complete(runtime_dir()):
             return runtime_dir()
 
-        manifest_url = os.environ.get(MANIFEST_URL_ENV, "").strip()
-        if not manifest_url:
-            raise RuntimeError(
-                "ASR runtime manifest URL is not configured: set "
-                f"{MANIFEST_URL_ENV} to an explicit URL — no fallback is invented."
-            )
+        manifest_url = (
+            os.environ.get(MANIFEST_URL_ENV, "").strip() or _DEFAULT_MANIFEST_URL
+        )
         manifest = _fetch_json(manifest_url, progress)
         version = manifest.get("version")
         executable = manifest.get("executable")
@@ -197,6 +198,122 @@ def ensure_runtime(
             # Never leave download/staging debris behind, even on failure.
             for leftover in (archive_path, staging):
                 _rmtree_quiet(leftover)
+
+
+# --- optional worker process -----------------------------------------------
+
+_server_lock = threading.RLock()
+_server_process: Optional[subprocess.Popen] = None
+_server_port: Optional[int] = None
+
+
+def _free_loopback_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _server_ready(port: int) -> bool:
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/health", timeout=1.0
+        ) as response:
+            return response.status == 200
+    except Exception:
+        return False
+
+
+def ensure_server() -> int:
+    """Install and start the loopback ASR server on first ASR use."""
+    global _server_process, _server_port
+    ensure_runtime()
+    with _server_lock:
+        if (
+            _server_process is not None
+            and _server_process.poll() is None
+            and _server_port is not None
+            and _server_ready(_server_port)
+        ):
+            return _server_port
+        if _server_process is not None:
+            try:
+                _server_process.terminate()
+            except OSError:
+                pass
+        port = _free_loopback_port()
+        flags = 0
+        if os.name == "nt":
+            flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        _server_process = subprocess.Popen(
+            [str(runtime_executable()), "--serve", "--port", str(port)],
+            cwd=str(runtime_dir()),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags,
+        )
+        _server_port = port
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline:
+            if _server_process.poll() is not None:
+                raise RuntimeError("ASR runtime server exited during startup")
+            if _server_ready(port):
+                return port
+            time.sleep(0.1)
+        raise RuntimeError("ASR runtime server did not become ready")
+
+
+def transcribe_window(audio: bytes) -> tuple[str, Optional[str]]:
+    """Transcribe a float32/16 kHz audio window through the ASR worker."""
+    port = ensure_server()
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/transcribe",
+        data=audio,
+        method="POST",
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120.0) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"ASR runtime request failed: {exc}") from exc
+    if not isinstance(body, dict) or "error" in body:
+        raise RuntimeError(str(body.get("error", "invalid ASR response")))
+    return str(body.get("text", "")), body.get("lang")
+
+
+def start_archive_worker() -> int:
+    """Start one detached archive worker from the optional runtime."""
+    global _archive_worker_process
+    with _archive_worker_lock:
+        if _archive_worker_process is not None:
+            if _archive_worker_process.poll() is None:
+                return int(_archive_worker_process.pid)
+            _archive_worker_process = None
+        ensure_runtime()
+        flags = 0
+        if os.name == "nt":
+            flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        _archive_worker_process = subprocess.Popen(
+            [str(runtime_executable()), "--archive-worker"],
+            cwd=str(runtime_dir()),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags,
+        )
+        return int(_archive_worker_process.pid)
+
+def stop_server() -> None:
+    global _server_process, _server_port
+    with _server_lock:
+        process, _server_process = _server_process, None
+        _server_port = None
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
 
 
 # --- install-state helpers -------------------------------------------------
@@ -324,7 +441,7 @@ def _extract_zip_safe(
     files: Dict[str, str],
     progress: Optional[Callable[[float, str], None]],
 ) -> None:
-    """Extract every member, hashing as we write and refusing unsigned files.
+    """Extract every member, hashing as we write and refusing unverified files.
 
     Directory entries get created but are not part of the declared ``files`` map;
     every *file* must be declared with its sha256 (extra archive files and bytes
@@ -404,8 +521,7 @@ def _selfcheck() -> None:
     """Focused offline check: traversal rejection, checksum verify, atomic swap.
 
     Never touches the network — the manifest/archive are synthesized in a scratch
-    temp dir and the only ``ensure_runtime()`` call is the missing-manifest-URL
-    failure (which raises before any fetch).
+    temp dir and the only ``ensure_runtime()`` call is given an invalid URL.
     """
     import tempfile
 
@@ -414,15 +530,15 @@ def _selfcheck() -> None:
     try:
         rt_dir = scratch / "rt"
         os.environ[RUNTIME_DIR_ENV] = str(rt_dir)
-        os.environ.pop(MANIFEST_URL_ENV, None)
+        os.environ[MANIFEST_URL_ENV] = "not-a-url"
 
-        # 1. Missing manifest URL fails clearly (no invented fallback).
+        # 1. An invalid manifest URL fails before any download.
         try:
             ensure_runtime()
-        except RuntimeError as exc:
-            assert "manifest URL" in str(exc), str(exc)
+        except Exception as exc:
+            assert "url" in str(exc).lower() or "unknown url" in str(exc).lower(), str(exc)
         else:
-            raise AssertionError("ensure_runtime() should fail without a manifest URL")
+            raise AssertionError("ensure_runtime() should reject an invalid manifest URL")
 
         # 2. Zip-slip / absolute paths are rejected.
         for bad in ("../evil.exe", "C:/evil.exe", "/abs.exe", "a/../../evil.exe"):

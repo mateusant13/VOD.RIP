@@ -11,9 +11,12 @@ Modes (argv, first match wins):
 
   ``--health``
       Probe the ASR stack + CUDA and print one JSON line on stdout, then
-      exit 0 when usable / 1 when a required engine is missing. The base
-      app runs this before launching a transcription job to decide whether
-      the runtime is present and healthy.
+      exit 0 when usable / 1 when a required engine is missing. This is a
+      diagnostic mode for support and release smoke checks.
+
+  ``--serve --port <port>``
+      Run a small loopback HTTP service for live-caption windows. The base
+      app starts this only after the optional runtime has been installed.
 
   ``--archive-worker``
       Run the existing supervised archive worker (``worker_server.main``) —
@@ -35,13 +38,7 @@ import sys
 
 
 def _health() -> int:
-    """Probe the ASR stack and print one JSON status line.
-
-    Imports are deliberately lazy and individually guarded so a missing
-    engine (e.g. a CPU-only build without the CUDA wheel) degrades the
-    report instead of crashing the probe. Output shape is stable for the
-    base app to parse: ``{"status": "ok"|"degraded", "cuda": bool, "modules": {...}}``.
-    """
+    """Probe the ASR stack and print one JSON status line."""
     import importlib
     import json
 
@@ -71,16 +68,80 @@ def _health() -> int:
         cuda = False
 
     ok = all(not isinstance(v, str) or not v.startswith("missing:") for v in modules.values())
-    status = "ok" if ok else "degraded"
     print(
         json.dumps(
-            {"status": status, "cuda": cuda, "modules": modules},
+            {"status": "ok" if ok else "degraded", "cuda": cuda, "modules": modules},
             ensure_ascii=False,
             sort_keys=True,
         ),
         flush=True,
     )
     return 0 if ok else 1
+
+
+def _transcribe_window_server(port: int) -> int:
+    """Serve float32 16 kHz windows over loopback for live captions."""
+    import json
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path != "/health":
+                self.send_error(404)
+                return
+            self._json({"ok": True})
+
+        def do_POST(self) -> None:  # noqa: N802
+            if self.path != "/transcribe":
+                self.send_error(404)
+                return
+            try:
+                import numpy as np
+                from services import archive_transcribe as at
+
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > 64 * 1024 * 1024:
+                    raise ValueError("invalid audio payload size")
+                audio = np.frombuffer(self.rfile.read(length), dtype=np.float32)
+                speech = at.vad_speech_seconds(audio)
+                if not speech:
+                    self._json({"text": "", "lang": None})
+                    return
+                results = at._transcribe_batch_parakeet(
+                    at._parakeet_model(), audio, speech, None
+                )
+                texts: list[str] = []
+                detected_lang = None
+                for items, lang in results:
+                    if detected_lang is None and lang:
+                        detected_lang = lang
+                    for item in items:
+                        text = (item.get("text") or "").strip()
+                        if text:
+                            texts.append(text)
+                self._json({"text": " ".join(texts), "lang": detected_lang})
+            except Exception as exc:  # worker errors must not kill the server
+                self._json({"error": str(exc)[:500]}, status=503)
+
+        def _json(self, body: dict, status: int = 200) -> None:
+            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server.daemon_threads = True
+    print(json.dumps({"port": server.server_port}), flush=True)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+    return 0
 
 
 def _archive_worker() -> int:
@@ -112,14 +173,22 @@ def _transcribe_once() -> int:
 def main() -> int:
     if "--health" in sys.argv:
         return _health()
+    if "--serve" in sys.argv:
+        try:
+            index = sys.argv.index("--port")
+            port = int(sys.argv[index + 1])
+        except (ValueError, IndexError):
+            print("--serve requires --port", file=sys.stderr)
+            return 2
+        if not 0 < port < 65536:
+            print("--port must be between 1 and 65535", file=sys.stderr)
+            return 2
+        return _transcribe_window_server(port)
     if "--archive-worker" in sys.argv:
         return _archive_worker()
     if "--transcribe-once" in sys.argv:
         return _transcribe_once()
-    print(
-        "VOD-RIP-ASR: usage: --health | --archive-worker | --transcribe-once",
-        file=sys.stderr,
-    )
+    print("usage: VOD-RIP-ASR.exe --health | --serve --port PORT | --archive-worker | --transcribe-once")
     return 2
 
 

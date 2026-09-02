@@ -5,22 +5,18 @@ audio. One ``LiveCaptioner`` per (platform, channel) polls the channel's live
 HLS media playlist (audio-only rendition — a fraction of the bandwidth),
 downloads NEW segments (a seen-set skips re-downloads), decodes them to mono
 16 kHz PCM via ffmpeg, buffers a ~2s caption window, VAD-splits the window
-and transcribes the speech with the parakeet engine — reusing
-``archive_transcribe``'s recognizer (``_parakeet_model`` +
-``_transcribe_batch_parakeet``) so the model cache/download logic is shared
-with the archive worker. When the app language differs from the stream's
-language the caption text is translated by ``caption_translate`` (NLLB ct2
-int8 + SLID gating) — every failure degrades to the raw ASR text. The whole
-loop runs in its own worker thread (SSE / HTTP stay responsive); caption
-blocks are pushed into a bounded asyncio queue via ``call_soon_threadsafe``
-— the same per-connection queue pattern as the live chat SSE.
+and sends the float32 window to the optional ASR runtime over loopback. The
+runtime owns VAD/model loading and downloads missing model files on first use.
+translated by ``caption_translate`` (NLLB ct2 int8 + SLID gating) — every
+failure degrades to the raw ASR text. The whole loop runs in its own worker
+thread (SSE / HTTP stay responsive); caption blocks are pushed into a bounded
+asyncio queue via ``call_soon_threadsafe`` — the same per-connection queue
+pattern as the live chat SSE.
 
 Lifecycle: refcounted by active SSE subscribers — the first ``acquire()``
-starts the worker thread, the last ``release()`` stops it. Transcription
-imports ``archive_transcribe`` LAZILY inside the worker thread, so network
-I/O never holds the model lock and the archive transcribe worker can run
-concurrently (VAD serializes on its own lock; parakeet inference is lock-free
-per recognizer owner).
+starts the worker thread, the last ``release()`` stops it. ASR requests use
+the loopback runtime client, keeping native model imports and memory in the
+separate worker process.
 
 Failures: transient (playlist fetch error, decode error) back off and retry,
 keeping the loop alive; a channel confirmed offline (resolver returns None
@@ -290,25 +286,22 @@ def _fetch(url: str, headers: dict) -> bytes:
 def _decode_audio_bytes(data: bytes) -> "Any":
     """Decode one HLS segment (TS / fMP4 / ADTS AAC) to mono 16 kHz float32.
 
-    Same output contract as ``archive_transcribe.decode_audio`` (16k mono
-    float32 numpy array) but feeds the raw bytes through ffmpeg's stdin — no
-    temp files, one subprocess per segment (~100ms).
+    The decoder returns 16 kHz mono float32 samples and feeds raw segment
+    bytes through ffmpeg's stdin — no temp files, one subprocess per segment.
     """
     import numpy as np
-    from services import archive_transcribe as at
 
     cmd = [
         _resolve_ffmpeg_exe(), "-v", "error", "-threads", "1",
         "-i", "pipe:0", "-threads", "1",
         "-f", "f32le", "-ac", "1", "-ar", "16000", "-",
     ]
-    with at.transcription_cpu_limiter(1):
-        proc = sp.run(cmd, input=data, capture_output=True, timeout=60)
+    proc = sp.run(cmd, input=data, capture_output=True, timeout=60)
     if proc.returncode != 0:
         stderr = (proc.stderr or b"").decode("utf-8", "replace")[-300:]
         raise RuntimeError(f"ffmpeg segment decode failed: {stderr}")
     samples = np.frombuffer(proc.stdout, dtype=np.float32)
-    return samples.copy()  # writable copy, mirrors archive_transcribe.decode_audio
+    return samples.copy()  # writable copy for the runtime request
 
 
 def _resolve_live_master(platform: str, channel: str) -> Optional[dict]:
@@ -356,42 +349,25 @@ def _resolve_live_master(platform: str, channel: str) -> Optional[dict]:
 
 
 def _transcribe_window(audio: "Any", duration: float) -> tuple[str, Optional[str]]:
-    """VAD-split one decoded window and transcribe the speech with parakeet.
+    """Transcribe one decoded float32/16 kHz window through the ASR worker.
 
-    archive_transcribe is imported HERE, inside the worker thread (never on
-    the asyncio loop): the import is heavy (torch/numpy) and the model lock
-    must not be held during network I/O. Returns (text, lang) — text is
-    empty when no speech (dead air / music); lang is the ASR-detected
-    language family (from parakeet batch), or None.
+    The base process deliberately does not import the native ASR stack. The
+    optional worker owns VAD/model loading and downloads missing model files on
+    this first real caption request.
     """
-    from services import archive_transcribe as at
+    del duration  # the worker receives the complete fixed-rate audio window
+    from services.asr_runtime import transcribe_window
 
-    speech = at.vad_speech_seconds(audio)
-    if not speech:
-        return "", None
-    rec = at._parakeet_model()
-    results = at._transcribe_batch_parakeet(rec, audio, speech, None)
-    texts: list[str] = []
-    detected_lang: Optional[str] = None
-    for items, lang in results:
-        if detected_lang is None and lang:
-            detected_lang = lang
-        for item in items:
-            text = (item.get("text") or "").strip()
-            if text:
-                texts.append(text)
-    return " ".join(texts), detected_lang
+    return transcribe_window(audio.tobytes())
 
 
 def _warm_asr() -> bool:
-    """Pre-load the parakeet engine + Silero VAD once per worker start so the
-    FIRST flush is not a 2-6s cold model load. Runs in a daemon thread
-    (never blocks API bind or the HLS poll loop). Failure is non-fatal — the
-    first flush retries the same calls through the normal path, and the flush
-    failure counter still surfaces a persistently broken engine."""
+    """Start the optional ASR worker without loading the model."""
     try:
-        from services import archive_transcribe as at
-        return at.prewarm_parakeet()
+        from services.asr_runtime import ensure_server
+
+        ensure_server()
+        return True
     except Exception as exc:
         logger.debug(
             "live captions ASR pre-warm failed (first flush loads lazily): %s", exc
@@ -399,15 +375,25 @@ def _warm_asr() -> bool:
         return False
 
 
+def captions_available(platform: str) -> tuple[bool, str]:
+    """Report whether the optional ASR runtime can serve captions.
+
+    The model itself is intentionally not required here: it is downloaded by
+    the ASR worker on the first actual caption request.
+    """
+    plat = (platform or "").lower()
+    if plat not in SUPPORTED_PLATFORMS:
+        return False, "captions support twitch, kick and youtube"
+    from services.asr_runtime import runtime_available
+
+    if not runtime_available():
+        return False, "speech runtime is not installed — start a caption stream to download it"
+    return True, ""
+
+
 def _resolve_evidence(platform: str, channel: str) -> Optional[str]:
-    """Best-effort channel-language family (platform clue / transcript tally).
-
-    None when unknown or the archive DB is unavailable — the per-window SLID
-    gate then decides (see caption_translate). Never raises.
-
-    Cached for 24 hours per (platform, channel) to avoid repeated DB queries
-    during long-running caption sessions while still refreshing stale data."""
-    _EVIDENCE_TTL_SEC = 24 * 3600  # ponytail: env knob if per-site tuning needed
+    """Best-effort channel-language family for the caption translation gate."""
+    _EVIDENCE_TTL_SEC = 24 * 3600
     now = time.monotonic()
     cache_key = (platform, channel)
     cached = _evidence_cache.get(cache_key)
@@ -415,6 +401,7 @@ def _resolve_evidence(platform: str, channel: str) -> Optional[str]:
         return cached[0]
     try:
         from services.channel_language import aggregate_channel_language
+
         result = aggregate_channel_language(platform, channel).get("language")
         _evidence_cache[cache_key] = (result, now)
         return result
@@ -520,41 +507,6 @@ _CAPTIONERS: dict[tuple[str, str], "LiveCaptioner"] = {}
 _REGISTRY_LOCK = threading.Lock()
 _MAX_CONCURRENT_CAPTIONERS = 10  # ponytail: env knob if needed; prevents anon resource exhaustion
 
-# Live-caption session count across ALL captioners. While >= 1 the archive
-# worker's GPU lane is paused (services.archive_transcribe holds the flag;
-# the counter makes set/unset correct when several channels are captioned
-# concurrently — the last release clears the reservation).
-_session_count = 0
-_session_lock = threading.Lock()
-
-
-def _session_begin() -> None:
-    """Declare a live-caption session (first subscriber across all captioners)."""
-    global _session_count
-    with _session_lock:
-        _session_count += 1
-        if _session_count == 1:
-            try:
-                from services import archive_transcribe as at
-
-                at.set_caption_session_active(True)
-            except Exception:
-                pass  # best-effort reservation — never break the SSE path
-
-
-def _session_end() -> None:
-    """Clear the live-caption session when the last subscriber leaves."""
-    global _session_count
-    with _session_lock:
-        _session_count = max(0, _session_count - 1)
-        if _session_count == 0:
-            try:
-                from services import archive_transcribe as at
-
-                at.set_caption_session_active(False)
-                at.keep_parakeet_resident(False)
-            except Exception:
-                pass
 
 
 def get_captioner(
@@ -582,29 +534,6 @@ def _unregister(captioner: "LiveCaptioner") -> None:
             _CAPTIONERS.pop(key, None)
 
 
-def captions_available(platform: str) -> tuple[bool, str]:
-    """(available, reason) gate — captions need the parakeet MODEL files
-    present locally (a live captioner must not trigger a multi-GB download
-    mid-stream).
-
-    Deliberately checks ONLY the model dir (stdlib file probe) and never
-    imports sherpa_onnx in the API process: the +cuda wheel's onnxruntime
-    DLL import can crash the HTTP listener natively on boxes where CUDA is
-    broken (frozen-bundle repro: the first /available request killed the
-    server). Engine importability is probed lazily in the worker thread at
-    transcribe time; repeated flush failures surface as an 'offline' event
-    instead of a silent keepalive stream. Runs off-loop via
-    asyncio.to_thread."""
-    plat = (platform or "").lower()
-    if plat not in SUPPORTED_PLATFORMS:
-        return False, "captions support twitch, kick and youtube"
-    try:
-        from services import archive_transcribe as at
-    except Exception as exc:  # pragma: no cover - env-specific
-        return False, f"transcription engine unavailable: {exc}"
-    if at._parakeet_resolve_dir() is None:
-        return False, "parakeet model not downloaded yet — run a transcription job to fetch it"
-    return True, ""
 
 
 # --- the captioner -----------------------------------------------------------
@@ -711,15 +640,11 @@ class LiveCaptioner:
 
         ``lang`` (pt | en | es) overrides the caption translate-target for
         the session; None on a fresh session resets to the app-language
-        default and None on an active session keeps the current target.
-        The worker's session-active toggle stays keyed on the 0->1 refcount
-        transition regardless of the lang arg."""
+        The worker starts on the first subscriber and stops when the last
+        subscriber releases it."""
         with self._life_lock:
             self._refcount += 1
             if self._refcount == 1:
-                # First subscriber anywhere: the archive worker must yield the
-                # GPU/CPU to the real-time captioner for the session's life.
-                _session_begin()
                 th = self._thread
                 if th is not None and th.is_alive():
                     # The last release set _stop; wait for the old thread so a
@@ -744,7 +669,6 @@ class LiveCaptioner:
                 self._session_family = None  # sticky language lock: reset on session start
                 self._asr_queue.clear()
                 self._asr_stop.clear()
-                self._asr_window_ready.clear()
                 with self._translate_lock:
                     self._translate_queue.clear()
                 self._translate_stop.clear()
@@ -764,8 +688,7 @@ class LiveCaptioner:
     def release(self) -> None:
         """Refcount-- — stops the worker thread when the last subscriber
         leaves. Idempotent-safe: a second release on an already-released
-        captioner is a no-op (refcount never goes negative, the archive
-        session reservation is only cleared on the real 1->0 transition)."""
+        captioner is a no-op."""
         with self._life_lock:
             if self._refcount == 0:
                 return  # already released — nothing to stop or un-reserve
@@ -776,7 +699,6 @@ class LiveCaptioner:
                 self._asr_window_ready.set()  # unblock ASR thread so it sees stop
                 self._translate_stop.set()
                 self._translate_window_ready.set()  # unblock translate worker
-                _session_end()
 
     # --- ASR thread --------------------------------------------------------
 
@@ -911,11 +833,6 @@ class LiveCaptioner:
         Window timing (start/end) is computed at INGEST time and passed in
         the queue, so the ASR thread's scheduling jitter never shifts
         captions on the timeline."""
-        from services import archive_transcribe as at
-        try:
-            at.prewarm_parakeet()
-        except Exception:
-            pass  # non-fatal — first real flush will retry
         while not self._asr_stop.is_set():
             item = self._asr_get_window()
             if item is None or self._asr_stop.is_set():

@@ -6,8 +6,8 @@ backfill, transcribe enqueue), live-chat capture, entity
 scanning, and periodic disk hygiene + VOD retention all continue, paced
 by VODRIP_BACKGROUND=1 (6-min passes, budget-1 enqueues, 2.5x chat
 gaps) so the machine stays quiet no matter how long the app stays
-closed. The transcribe queue keeps its own detached consumer
-(worker_server.py), spawned here on demand whenever jobs exist.
+closed. The transcribe queue keeps its own detached consumer, spawned
+from the optional ASR runtime when jobs exist.
 
 Ownership handoff is heartbeat-based, mirroring worker_server.py:
   - The app stamps 'app-activity' every 30s while it lives. As long as
@@ -73,22 +73,23 @@ def _maybe_spawn_worker() -> None:
     # that marker is fresh (the 33%-CPU respawn treadmill).
     if archive_db.worker_live(age_s=900, tag="worker-gave-up"):
         return
-    if getattr(sys, "frozen", False):
-        cmd = [sys.executable, "--archive-worker-launch"]
-    else:
-        cmd = [sys.executable, str(BACKEND_DIR / "worker_server.py")]
     try:
-        subprocess.Popen(
-            cmd,
-            cwd=str(BACKEND_DIR),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=(
-                subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
-                if os.name == "nt" else 0
-            ),
-        )
+        if getattr(sys, "frozen", False):
+            from services.asr_runtime import start_archive_worker
+
+            start_archive_worker()
+        else:
+            subprocess.Popen(
+                [sys.executable, str(BACKEND_DIR / "worker_server.py")],
+                cwd=str(BACKEND_DIR),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=(
+                    subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+                    if os.name == "nt" else 0
+                ),
+            )
         _log.info("spawned archive worker (queue has pending jobs)")
     except Exception:
         _log.debug("archive worker spawn failed", exc_info=True)

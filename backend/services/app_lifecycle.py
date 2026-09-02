@@ -300,9 +300,10 @@ def request_app_exit() -> None:
         except Exception as exc:
             _logger.debug("archive watchdog stop failed: %s", exc)
         try:
-            from services.archive_transcribe import stop_worker
-
-            stop_worker(timeout=6.0)
+            _stop_worker = __import__(
+                "services.archive_transcribe", fromlist=["stop_worker"]
+            ).stop_worker
+            _stop_worker(timeout=6.0)
         except Exception as exc:
             _logger.debug("transcription worker stop failed: %s", exc)
 

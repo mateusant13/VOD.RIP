@@ -8,10 +8,12 @@ extensions and the UIA installer script) is embedded in the EXE and extracted
 to a temp dir at launch. Built alongside the onedir ``vod-rip.spec`` — the zip
 ships the onedir folder layout, this exe is the single download-and-run option.
 
-The optional on-device ASR stack (torch / sherpa-onnx / ctranslate2 /
-onnxruntime / panns-inference / silero-vad) is NOT bundled here — it ships in
-``backend/asr_worker.py`` + ``vod-rip-asr.spec`` as the separate
-``VOD-RIP-ASR.exe`` runtime.
+The heavy on-device ASR stack and optional AI runtimes (torch / torchaudio /
+sherpa-onnx / panns-inference / silero-vad / ctranslate2 / onnxruntime /
+tokenizers) are deliberately NOT bundled here. The base app falls back to raw
+captions and lexical archive search until the separate ``VOD-RIP-ASR.exe``
+runtime is installed on first use. That worker ships in
+``backend/asr_worker.py`` + ``vod-rip-asr.spec``.
 
     npm run build-dist          # onedir (unchanged)
     .venv/Scripts/python.exe -m PyInstaller vod-rip-onefile.spec --clean --noconfirm
@@ -25,7 +27,7 @@ import os
 import sys
 from pathlib import Path
 
-_SPEC_DIR = Path(__file__).resolve().parent
+_SPEC_DIR = Path.cwd()
 if str(_SPEC_DIR) not in sys.path:
     sys.path.insert(0, str(_SPEC_DIR))
 
@@ -96,20 +98,18 @@ a = Analysis(
         "botocore",
         "matplotlib",
         "scipy",
-        # numpy deliberately NOT excluded: archive_embed (onnxruntime int8
-        # embedder) and live_captions use it at runtime, even though the base
-        # app no longer ships the on-device ASR stack (see vod-rip-asr.spec).
-        "pandas",
-        # Heavy on-device ASR stack — excluded so modulegraph cannot pull it in
-        # through the guarded (function-local) imports in app.py / live_captions /
-        # caption_translate / resource_governor. The base app boots without ever
-        # importing torch/sherpa; the ASR runtime owns these (vod-rip-asr.spec).
+        # numpy remains for live audio decoding; semantic search is optional
+        # and degrades to lexical ranking when its external model is absent.
+        # Heavy on-device ASR and optional AI stacks. They live in the
+        # separately downloaded worker so the base installer stays small.
         "torch",
         "torchaudio",
         "sherpa_onnx",
-        "ctranslate2",
         "panns_inference",
         "silero_vad",
+        "ctranslate2",
+        "onnxruntime",
+        "tokenizers",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

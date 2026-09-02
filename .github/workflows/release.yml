@@ -151,6 +151,12 @@ jobs:
             Write-Warning "No ASR runtime at $runtime — skipping ASR zip (base still built)"
           }
 
+      - name: Write ASR runtime manifest
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}".TrimStart('v')
+          node scripts/write-asr-runtime-manifest.mjs $ver
+
       - name: Build Windows installer
         shell: pwsh
         run: |
@@ -178,8 +184,10 @@ jobs:
           path: |
             release/*.zip
             release/*-Setup.exe
+            release/*-manifest.json
             release/SHA256SUMS.txt
           if-no-files-found: error
+
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

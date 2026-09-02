@@ -215,6 +215,8 @@ def base_hidden_imports() -> list[str]:
         "services.autostart",
         "services.youtube_pot_service",
         "models.schemas",
+        # Semantic search is optional; its ONNX model and runtime are installed
+        # separately only when that feature is used.
         "webview",
         "PIL",
         "PIL.Image",

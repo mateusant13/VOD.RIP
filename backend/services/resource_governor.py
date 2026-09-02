@@ -165,8 +165,10 @@ def _probe_vram() -> Tuple[int,int]:
     """(total, free) bytes, 0,0 if unknown"""
     # primary: torch.cuda
     try:
-        import torch
-        if torch.cuda.is_available() and torch.cuda.device_count()>0:
+        import importlib
+
+        torch = importlib.import_module("torch")
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
             free_b, total_b = torch.cuda.mem_get_info()
             return int(total_b), int(free_b)
     except Exception:

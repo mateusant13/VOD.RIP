@@ -746,38 +746,15 @@ def main():
     """Application entry point."""
     multiprocessing.freeze_support()
 
-    # Headless dispatches — used by the detached background daemon and
-    # archive worker when running from the frozen EXE (the EXE cannot run
-    # `python -c`/`python -m` children). Each flag runs the same code the
-    # dev tree runs directly, BEFORE the GUI and the singleton lock, so
-    # the app can spawn and orphan its own background processes without
-    # relaunching the UI.
+    # Headless dispatch for the detached background daemon, before the GUI
+    # and singleton lock. The optional ASR runtime owns archive-worker and
+    # transcription dispatches; the base EXE does not import that stack.
     if "--background-server-launch" in sys.argv:
         _detach_child(["--background-server"])
     if "--background-server" in sys.argv:
         from background_server import main as _background_main
 
         sys.exit(_background_main())
-    if "--archive-worker-launch" in sys.argv:
-        _detach_child(["--archive-worker"])
-    if "--archive-worker" in sys.argv:
-        from worker_server import main as _worker_main
-
-        sys.exit(_worker_main())
-    if "--transcribe-once" in sys.argv:
-        logging.basicConfig(
-            level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-        )
-        from services import archive_db
-
-        if archive_db.worker_live(age_s=45):
-            sys.exit(0)
-        from services.archive_transcribe import _set_worker_low_priority, run_worker
-
-        _set_worker_low_priority()  # background work — don't stutter the box
-        run_worker(once=True, poll_interval=2.0)
-        sys.exit(0)
-
     port = int(os.environ.get("PORT", 7897))
 
     # Dev UI mode: point the app window at the Vite dev server and use the

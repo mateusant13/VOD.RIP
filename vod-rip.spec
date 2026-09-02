@@ -2,12 +2,12 @@
 """
 VOD.RIP — PyInstaller spec (Windows / macOS / Linux) — BASE app.
 
-The optional on-device ASR runtime (torch / sherpa-onnx / ctranslate2 /
-onnxruntime / panns-inference / silero-vad) is deliberately NOT bundled here:
-the ASR stack ships in ``backend/asr_worker.py`` + ``vod-rip-asr.spec`` as a
-separate ``VOD-RIP-ASR.exe`` runtime. The base app thus boots without importing
-any of the heavy ASR stack; when transcription is needed the main app spawns
-``VOD-RIP-ASR.exe`` from the versioned runtime directory.
+The heavy on-device ASR stack and optional AI runtimes (torch / torchaudio /
+sherpa-onnx / panns-inference / silero-vad / ctranslate2 / onnxruntime /
+tokenizers) are deliberately NOT bundled here. The base app falls back to raw
+captions and lexical archive search until the separate
+``VOD-RIP-ASR.exe`` runtime is installed on first use. The ASR stack ships in
+``backend/asr_worker.py`` + ``vod-rip-asr.spec`` as that separate runtime.
 
 From project root::
 
@@ -18,7 +18,7 @@ import os
 import sys
 from pathlib import Path
 
-_SPEC_DIR = Path(__file__).resolve().parent
+_SPEC_DIR = Path.cwd()
 if str(_SPEC_DIR) not in sys.path:
     sys.path.insert(0, str(_SPEC_DIR))
 
@@ -66,20 +66,18 @@ a = Analysis(
         "botocore",
         "matplotlib",
         "scipy",
-        # numpy deliberately NOT excluded: archive_embed (onnxruntime int8
-        # embedder) and live_captions use it at runtime, even though the base
-        # app no longer ships the on-device ASR stack (see vod-rip-asr.spec).
-        "pandas",
-        # Heavy on-device ASR stack — excluded so modulegraph cannot pull it in
-        # through the guarded (function-local) imports in app.py / live_captions /
-        # caption_translate / resource_governor. The base app boots without ever
-        # importing torch/sherpa; the ASR runtime owns these (vod-rip-asr.spec).
+        # numpy remains for live audio decoding; semantic search is optional
+        # and degrades to lexical ranking when its external model is absent.
+        # Heavy on-device ASR and optional AI stacks. They live in the
+        # separately downloaded worker so the base installer stays small.
         "torch",
         "torchaudio",
         "sherpa_onnx",
-        "ctranslate2",
         "panns_inference",
         "silero_vad",
+        "ctranslate2",
+        "onnxruntime",
+        "tokenizers",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

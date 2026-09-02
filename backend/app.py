@@ -102,16 +102,18 @@ def _spawn_detached_worker() -> Optional[int]:
         return None  # tests: never leak orphaned daemons on a user's box
     backend_dir = Path(__file__).resolve().parent
     if getattr(sys, "frozen", False):
-        # Packaged app: sys.executable is VOD-RIP.EXE, which cannot run
-        # `-c`/worker_server.py as a child. The launcher dispatches
-        # --archive-worker-launch (detach a second EXE running
-        # worker_server.main(), no GUI and no singleton lock — the launcher
-        # dispatches before either) so the frozen bundle gets the same
-        # detached worker the dev tree has.
+        # The base executable no longer contains the ASR worker. The optional
+        # versioned runtime is installed on first ASR use and owns its process
+        # tree independently from the GUI/API process.
         try:
+            from services.asr_runtime import runtime_executable, runtime_available
+
+            if not runtime_available():
+                return None
+            worker_exe = runtime_executable()
             proc = subprocess.Popen(
-                [sys.executable, "--archive-worker-launch"],
-                cwd=str(backend_dir),
+                [str(worker_exe), "--archive-worker"],
+                cwd=str(worker_exe.parent),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -120,7 +122,7 @@ def _spawn_detached_worker() -> Optional[int]:
                 ),
             )
         except Exception:
-            logger.debug("detached worker spawn failed", exc_info=True)
+            logger.debug("detached ASR worker spawn failed", exc_info=True)
             return None
         return proc.pid
     if os.name == "nt":
@@ -213,60 +215,10 @@ def _spawn_detached_background() -> Optional[int]:
     return proc.pid
 
 
-def _preload_sherpa_onnx_ort() -> None:
-    """Load sherpa-onnx's bundled onnxruntime.dll + providers_shared BEFORE
-    anything imports the pip onnxruntime (archive_embed warm).
-
-    Both onnxruntime.dll share the basename — whichever loads first wins for
-    the whole process. If the pip ORT wins, sherpa's CUDA EP (built against
-    the bundled ORT, 14.4 MB, not the pip 16 MB build) binds to the wrong
-    providers_shared and fail-fasts on first inference (0xc0000409).
-    Importing sherpa first and preloading its providers_shared by absolute
-    path makes every later loader (pip pybind included) reuse the sherpa's
-    copies — both lanes work. Verified: CUDA decode + pip embed session over
-    the sherpa DLLs.
-    """
-    try:
-        import ctypes
-        from pathlib import Path
-
-        import sherpa_onnx  # noqa: F401  (loads onnxruntime.dll of sherpa)
-
-        lib_dir = Path(sherpa_onnx.__file__).parent / "lib"
-        shared = lib_dir / "onnxruntime_providers_shared.dll"
-        if shared.exists():
-            ctypes.WinDLL(str(shared))
-    except Exception:
-        logger.debug("sherpa-onnx ORT preload skipped", exc_info=True)
 
 
 @asynccontextmanager
 async def _app_lifespan(_app: FastAPI):
-    # Preload sherpa-onnx's bundled ORT before any thread can import the pip
-    # onnxruntime — see _preload_sherpa_onnx_ort.
-    _preload_sherpa_onnx_ort()
-
-    # Pre-warm parakeet for live captions (never blocks API bind) — gated by live-captions / transcribe-vod.
-    def _prewarm_parakeet_bg() -> None:
-        try:
-            from services.archive_transcribe import prewarm_parakeet
-            if prewarm_parakeet():
-                logger.info("Parakeet pre-warmed for live captions")
-            else:
-                logger.debug("Parakeet pre-warm skipped (model files absent)")
-        except Exception:
-            logger.debug("Parakeet pre-warm failed", exc_info=True)
-
-    def _should_prewarm_parakeet() -> bool:
-        try:
-            from services.feature_registry import is_enabled as _fe
-            return _fe("live-captions") or _fe("transcribe-vod")
-        except Exception:
-            return False
-    if _should_prewarm_parakeet():
-        threading.Thread(target=_prewarm_parakeet_bg, daemon=True, name="parakeet-prewarm").start()
-    else:
-        import logging as _lg; _lg.getLogger(__name__).info("Parakeet pre-warm skipped (heavy features disabled)")
 
     # Boot maintenance — disk hygiene (orphaned temp/preview/selfcheck
     # sweeps), archive retention, chat dedupe, FTS optimize, and the
@@ -395,16 +347,15 @@ async def _app_lifespan(_app: FastAPI):
         finally:
             _lifespan_ready.set()
 
-        # Background warm-ups (POT, session, yt-dlp)
+        # ASR stays out of the base process.  The optional worker downloads
+        # and preloads its runtime only when an AI feature is used.
         if _warm_shutdown.is_set():
             return
         from services.youtube_pot_service import schedule_pot_service_warm
         from services.youtube_ytdlp_update import schedule_ytdlp_update_check
-        from services.archive_transcribe import schedule_gpu_sherpa_ensure
 
         schedule_pot_service_warm()
         schedule_ytdlp_update_check()
-        schedule_gpu_sherpa_ensure()
         from services.youtube_session import warm_youtube_session
 
         warm_youtube_session()
@@ -892,14 +843,9 @@ async def _app_lifespan(_app: FastAPI):
     except Exception:
         logger.debug("background daemon spawn skipped", exc_info=True)
 
-    # Archive transcribe worker. When the queue has pending work we spawn
-    # the DETACHED supervised worker (worker_server.py): it drains
-    # transcribe/events/chat jobs, survives app close + crashes, and skips
-    # the in-process thread so the whisper model is never double-loaded.
-    # Spawn failure (or an idle queue) falls back to the in-process worker.
-    # Boots on a daemon thread after the warm grace: the ASR stack import
-    # happens only in the fallback branch, so the parent process never pays
-    # the ~38s torch/ASR import when the detached path succeeds.
+    # Archive jobs use the optional ASR runtime in frozen builds. It is
+    # downloaded only when queued work exists (or when a user explicitly
+    # opens a caption stream); source builds retain the in-process fallback.
     def _boot_archive_worker() -> None:
         if _warm_shutdown.wait(_BOOT_WARM_GRACE_SEC):
             return
@@ -908,6 +854,10 @@ async def _app_lifespan(_app: FastAPI):
             from services import archive_db
 
             pending = archive_db.has_pending_jobs()
+            if pending and getattr(sys, "frozen", False):
+                from services.asr_runtime import ensure_runtime
+
+                ensure_runtime()
             spawned_pid = _spawn_detached_worker() if pending else None
             if spawned_pid is not None:
                 logger.info(
@@ -940,29 +890,45 @@ async def _app_lifespan(_app: FastAPI):
                         time.sleep(5)
                     if _warm_shutdown.is_set():
                         return
-                    try:
-                        from services.archive_transcribe import start_worker as _start_inprocess_worker
-
-                        _start_inprocess_worker()
-                        logger.info(
-                            "Detached worker exited — in-process archive worker started"
-                        )
-                    except Exception:
-                        logger.debug("in-process worker start failed", exc_info=True)
+                    if getattr(sys, "frozen", False):
+                        restarted = _spawn_detached_worker()
+                        if restarted is not None:
+                            logger.info(
+                                "Detached ASR worker exited — restarted (pid %s)",
+                                restarted,
+                            )
+                    else:
+                        try:
+                            _start_inprocess_worker = __import__(
+                                "services.archive_transcribe", fromlist=["start_worker"]
+                            ).start_worker
+                            _start_inprocess_worker()
+                            logger.info(
+                                "Detached worker exited — in-process archive worker started"
+                            )
+                        except Exception:
+                            logger.debug("in-process worker start failed", exc_info=True)
 
                 threading.Thread(
                     target=_watch_detached_worker, daemon=True, name="worker-watchdog"
                 ).start()
                 _archive_worker_started = True
             else:
-                from services.archive_transcribe import start_worker as _start_inprocess_worker
-
-                _start_inprocess_worker()
-                logger.info(
-                    "Archive transcribe worker started in-process (%s)",
-                    "no pending jobs — nothing to detach" if not pending else "detached spawn failed — fallback",
-                )
-                _archive_worker_started = True
+                if getattr(sys, "frozen", False):
+                    logger.info(
+                        "ASR runtime unavailable; archive jobs remain queued until "
+                        "the runtime is installed"
+                    )
+                else:
+                    _start_inprocess_worker = __import__(
+                        "services.archive_transcribe", fromlist=["start_worker"]
+                    ).start_worker
+                    _start_inprocess_worker()
+                    logger.info(
+                        "Archive transcribe worker started in-process (%s)",
+                        "no pending jobs — nothing to detach" if not pending else "detached spawn failed — fallback",
+                    )
+                    _archive_worker_started = True
         except Exception:
             logger.debug("archive worker boot skipped", exc_info=True)
 
@@ -990,6 +956,12 @@ async def _app_lifespan(_app: FastAPI):
     yield
     _warm_shutdown.set()
     try:
+        from services.asr_runtime import stop_server
+
+        stop_server()
+    except Exception:
+        logger.debug("ASR runtime server stop failed", exc_info=True)
+    try:
         from services.entity_watch import stop_entity_watcher
 
         stop_entity_watcher(timeout=5.0)
@@ -1002,10 +974,11 @@ async def _app_lifespan(_app: FastAPI):
     except Exception:
         logger.debug("Archive chat watchdog stop failed", exc_info=True)
     try:
-        if _archive_worker_started:
-            from services.archive_transcribe import stop_worker
-
-            stop_worker(timeout=6.0)
+        if _archive_worker_started and not getattr(sys, "frozen", False):
+            _stop_inprocess_worker = __import__(
+                "services.archive_transcribe", fromlist=["stop_worker"]
+            ).stop_worker
+            _stop_inprocess_worker(timeout=6.0)
     except Exception:
         logger.debug("Archive transcribe worker stop failed", exc_info=True)
     try:

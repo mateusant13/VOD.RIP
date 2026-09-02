@@ -81,6 +81,27 @@ async def server_info():
     }
 
 
+@router.get("/api/asr/runtime")
+async def asr_runtime_status() -> dict:
+    """Report whether the optional speech runtime is installed."""
+    from services.asr_runtime import runtime_status
+
+    return runtime_status()
+
+
+@router.post("/api/asr/runtime")
+async def install_asr_runtime() -> dict:
+    """Download and install the optional speech runtime on explicit request."""
+    from services.asr_runtime import ensure_runtime, runtime_status
+
+    try:
+        await asyncio.to_thread(ensure_runtime)
+    except Exception as exc:
+        logger.warning("ASR runtime installation failed: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return runtime_status()
+
+
 @router.get("/api/health")
 async def health():
     """Aggregate liveness for external supervisors (dev-all, launcher watchdog).
