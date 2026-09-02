@@ -3007,6 +3007,7 @@ def _span_query_has_signal(
     tokens: list[str],
     frequencies: dict[str, int],
     variants: dict[str, list[str]],
+    exact_tokens: set[str] | None = None,
 ) -> bool:
     """Avoid a full transcript scan when a split phrase cannot match.
 
@@ -3014,8 +3015,9 @@ def _span_query_has_signal(
     recall pass enabled. An absent short token or an isolated typo has no
     plausible split match and should not scan every transcript row.
     """
+    exact_tokens = exact_tokens or set()
     for token in tokens:
-        if frequencies.get(token, 0) > 0:
+        if frequencies.get(token, 0) > 0 or token in exact_tokens:
             continue
         if len(token) >= 4 and any(term != token for term in variants.get(token, ())):
             continue
@@ -3235,6 +3237,7 @@ def search(
     # "phrase" never meaningfully spans two segments).
     span_tokens = q_tokens_all
     span_variants: dict[str, list[str]] = {}
+    span_exact_tokens: set[str] = set()
     if len(span_tokens) >= 2 and len(span_tokens) <= _SPAN_MAX_TOKENS:
         # The span pass's LIKE prefilter (see _phrase_span_rows) gates on
         # the literal long tokens, so a segment holding a dist-1 ASR
@@ -3256,6 +3259,23 @@ def search(
             for t in span_tokens
             if len(t) >= 4
         }
+        # The vocabulary may intentionally be stale while a rebuild runs.
+        # Probe absent exact tokens through FTS so newly ingested rows still
+        # keep the split-phrase recall path without scanning for typos.
+        span_exact_tokens: set[str] = set()
+        for token in span_tokens:
+            if q_freq.get(token, 0) > 0 or any(
+                term != token for term in span_variants.get(token, ())
+            ):
+                continue
+            try:
+                if query(
+                    "SELECT 1 FROM transcripts_fts WHERE transcripts_fts MATCH ? LIMIT 1",
+                    (_fts_phrase(token),),
+                ):
+                    span_exact_tokens.add(token)
+            except sqlite3.Error:
+                pass
         # Floor coverage for vocab-absent tokens: their rows only surface
         # through fuzzy expansions ('estranheza' → 'estranha'), so the
         # keep set must admit those variants — otherwise the floor drops
@@ -3350,7 +3370,7 @@ def search(
             hit_kind == "transcript"
             and len(span_tokens) >= 2
             and not phrase_rows
-            and _span_query_has_signal(span_tokens, q_freq, span_variants)
+            and _span_query_has_signal(span_tokens, q_freq, span_variants, span_exact_tokens)
         ):
             try:
                 span_rows = _phrase_span_rows(
