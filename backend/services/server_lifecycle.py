@@ -470,9 +470,15 @@ def stop_api_server(
     timeout: float = 4.0,
     *,
     wait_for_port: bool = True,
+    restart: bool = False,
 ) -> None:
-    """Signal uvicorn to exit and optionally wait until *port* is no longer listening."""
-    _shutdown_event.set()
+    """Signal uvicorn to exit and optionally wait until *port* is no longer listening.
+
+    ``restart=True`` stops the current listener without permanently stopping the
+    supervisor; normal application shutdown keeps the supervisor stop event set.
+    """
+    if not restart:
+        _shutdown_event.set()
     with _server_lock:
         server = _uvicorn_server
     if server is not None:
