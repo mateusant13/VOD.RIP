@@ -2116,3 +2116,69 @@ describe('LivePlayerPopup live session prefetch', () => {
     }
   });
 });
+
+
+describe('LivePlayerPopup not-found channel', () => {
+  it('renders a centered channel-name input on a Kick master 404 and submits to App', async () => {
+    mockFetchWithLiveSrc();
+    const onNotFoundChannel = vi.fn();
+    render(
+      <LivePlayerPopup
+        entry={{ ...ENTRY, platform: 'kick' }}
+        channelName="srdoglol"
+        onClose={vi.fn()}
+        channelSlug="srdoglol"
+        onOpenHit={vi.fn()}
+        savedChannels={[]}
+        onNotFoundChannel={onNotFoundChannel}
+      />,
+    );
+    await waitFor(() => expect((window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls).toBeTruthy());
+    const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
+
+    // A live master 404 = the Kick/YouTube channel is missing — not a
+    // transient blip and not a fallback hop: swap the player for the input.
+    act(() => {
+      hls.trigger(FakeHls.Events.ERROR, {
+        type: FakeHls.ErrorTypes.NETWORK_ERROR,
+        details: 'manifestLoadError',
+        response: { code: 404 },
+      });
+    });
+
+    const input = await screen.findByPlaceholderText('Kick or YouTube name');
+    expect(input).toBeTruthy();
+    fireEvent.change(input, { target: { value: 'the-real-channel' } });
+    fireEvent.submit(input.closest('form') as HTMLFormElement);
+    expect(onNotFoundChannel).toHaveBeenCalledWith('the-real-channel');
+  });
+
+  it('leaves a transient 404-free NETWORK_ERROR on the retry path (no not-found input)', async () => {
+    mockFetchWithLiveSrc();
+    const onNotFoundChannel = vi.fn();
+    render(
+      <LivePlayerPopup
+        entry={{ ...ENTRY, platform: 'kick' }}
+        channelName="srdoglol"
+        onClose={vi.fn()}
+        channelSlug="srdoglol"
+        onOpenHit={vi.fn()}
+        savedChannels={[]}
+        onNotFoundChannel={onNotFoundChannel}
+      />,
+    );
+    await waitFor(() => expect((window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls).toBeTruthy());
+    const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
+
+    act(() => {
+      hls.trigger(FakeHls.Events.ERROR, {
+        type: FakeHls.ErrorTypes.NETWORK_ERROR,
+        details: 'fragLoadError',
+        response: { code: 200 },
+      });
+    });
+
+    expect(screen.queryByPlaceholderText('Kick or YouTube name')).toBeNull();
+    expect(onNotFoundChannel).not.toHaveBeenCalled();
+  });
+});

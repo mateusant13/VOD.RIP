@@ -593,6 +593,9 @@ export default function App() {
     url: string;
     session: PreviewSessionResponse;
   } | null>(null);
+  /** URL currently being warmed by prefetchLiveSession — an in-flight guard so
+   *  a hover storm on one channel issues one POST, not N. */
+  const livePrefetchInFlightRef = useRef<string | null>(null);
   /** URL of the last VOD clicked in a list — auto-opens the main preview once its info loads. */
   const autoOpenPreviewPendingRef = useRef<string | null>(null);
   /** Bumped on every list-VOD click so re-clicking the already-active VOD re-fires the auto-open effect. */
@@ -5440,6 +5443,19 @@ export default function App() {
     setAddChannelInput('');
   }, [addChannelInput]);
 
+  // A confirmed-missing Kick/YouTube live channel hands its name up from the
+  // player popup's not-found input; open the SAME add-channel editor the top
+  // input uses so the user can correct/complete the channel (existing
+  // channel-input convention).
+  const openChannelFromName = useCallback((name: string) => {
+    const raw = name.trim();
+    if (!raw) return;
+    const parsed = parseChannelInput(raw);
+    if (!parsed.kickSlug && !parsed.twitchSlug && !parsed.youtubeSlug && !parsed.displayName) return;
+    setAddChannelInput(raw);
+    setPendingAddChannel(channelLinkDraftFromParsed(parsed, raw));
+  }, []);
+
   const toggleChannelSelection = useCallback((channelId: string) => {
     setSelectedChannelId((prev) => {
       if (prev === channelId) return null;
@@ -7838,6 +7854,10 @@ export default function App() {
             onOpenHit={openArchiveHit}
             savedChannels={savedChannels}
             liveSessionPrefetchRef={liveSessionPrefetchRef}
+            onNotFoundChannel={(name) => {
+              openChannelFromName(name);
+              closeLivePopup(popup.id);
+            }}
           />
         );
       })}
