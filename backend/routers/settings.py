@@ -30,11 +30,15 @@ _DANGEROUS_DOWNLOAD_FOLDERS: set[str] = {
 
 
 def _redact_ai_key(settings: AppSettings) -> AppSettings:
-    """Never serialize the write-only AI key: GET/POST settings responses
-    report ai_api_key_set (bool) instead of the key itself."""
+    """Never serialize write-only AI or bridge secrets in settings responses.
+
+    The UI obtains bridge authentication only through its authenticated
+    diagnostics endpoint; the broad settings payload must not echo it.
+    """
     return settings.model_copy(update={
         "ai_api_key": "",
         "ai_api_key_set": bool(settings.ai_api_key),
+        "cookie_bridge_token": "",
     })
 
 

@@ -231,7 +231,7 @@ export function buildSearchUrl(p: ArchiveSearchFilterParams): string {
   if (username) params.set('username', username);
   if (p.hint === false) params.set('hint', '0');
   if (p.semantic) params.set('semantic', '1');
-  if (p.mode) params.set('mode', p.mode);
+  params.set('mode', p.mode ?? 'exact');
   params.set('limit', String(p.limit ?? 30));
   return `/api/archive/search?${params.toString()}`;
 }

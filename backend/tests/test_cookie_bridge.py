@@ -746,6 +746,11 @@ async def test_settings_roundtrip_auto_install_flag(client):
     resp = await client.get("/api/settings")
     assert resp.json()["auto_install_extension"] is False
 
+async def test_settings_does_not_return_bridge_token(client):
+    await _pair_with_token(client, "tok-secret")
+    resp = await client.get("/api/settings")
+    assert resp.status_code == 200
+    assert resp.json()["cookie_bridge_token"] == ""
 
 async def test_auto_install_short_circuits_when_paired(client, monkeypatch):
     """Already-paired -> {alreadyInstalled:true} and NO automation thread."""

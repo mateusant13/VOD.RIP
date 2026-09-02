@@ -1602,7 +1602,7 @@ describe('LivePlayerPopup replay rail (wheel zoom + arrow seek)', () => {
     mockFetchWithLiveSrc();
     renderPopup();
     // The session resolved a live master URL → the FakeHls instance exists;
-    // MANIFEST_PARSED clears loading so the transport renders.
+    // MANIFEST_PARSED exposes transport, then loadeddata clears loading.
     await waitFor(() => expect((window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls).toBeTruthy());
     const hls = (window as unknown as { __livePopupHls?: InstanceType<typeof FakeHls> }).__livePopupHls!;
     await act(async () => { hls.trigger(FakeHls.Events.MANIFEST_PARSED); });
