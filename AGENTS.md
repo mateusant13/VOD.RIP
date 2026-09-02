@@ -176,6 +176,54 @@ Same payload on disk: `I:\!watcher\status\now.json`
 - Skill: `.omp/skills/steady-watcher/SKILL.md`
 <!-- /STEADY-WATCHER -->
 
+## How To: Split-Runtime Release (FUTURE releases)
+
+> **This is the release process for FUTURE releases — it is a documented target, NOT something to implement in this task.** No code, installer, or build changes are made to realize it here. Use the steps below when publishing the next release.
+
+### Model
+
+Ship the frozen app as a **small CPU-only base** plus a **separate, versioned GPU-ASR runtime archive** that the app installs/downloads on demand (optional, per the user's hardware).
+
+- **Base installer** — small CPU build (no bundled NVIDIA stack): the web UI, orchestration, and CPU ASR paths (parakeet/sherpa-onnx CPU wheel) with NO GPU runtime/DLLs.
+- **GPU-ASR runtime archive** — versioned `.7z`/`.zip` containing only the GPU runtime: the `sherpa-onnx==1.13.4+cuda12.cudnn9` CUDA wheel (bundled CUDA-enabled onnxruntime), the `nvidia-*cu12` DLLs from `backend/requirements-gpu.txt`, and the parakeet model — NOT pip-installed at runtime. Pinned to the app build.
+- **Inno Setup** — optional component: a downloader/installer entry that fetches and extracts the GPU-ASR runtime in-app when the user opts in; absent from the base, never bundled.
+- **CPU ASR stays** — the base is "CPU-only" w.r.t. NVIDIA/GPU only; it still ships CPU parakeet (sherpa-onnx CPU wheel). Do NOT claim "no ASR on CPU."
+
+#### Current primitives in-tree (reuse these)
+- ASR engine: **Parakeet** (sherpa-onnx `nemo_transducer`, TDT v3, `int8`) — the ONLY engine; faster-whisper was removed (`backend/services/archive_transcribe.py`, `backend/requirements.txt`).
+- CPU: `sherpa-onnx>=1.13.0` (base). GPU: `backend/requirements-gpu.txt` → `sherpa-onnx==1.13.4+cuda12.cudnn9` + `nvidia-{cublas,cuda-runtime,cufft,curand,cudnn}-cu12`; `archive_transcribe._ensure_cuda_libs` exposes the DLL dirs.
+- Existing release scripts: `scripts/sign-release.ps1` (Authenticode) and `scripts/build-install.ps1` (build+install to H:). A runtime-archive builder and a sha256-hashing step do NOT exist yet — entries below marked `[FUTURE]` are proposed, not yet written.
+
+### Security / integrity invariants (non-negotiable)
+
+1. **HTTPS only** — every download (base, runtime, Inno Setup component) is fetched over HTTPS, never plain HTTP.
+2. **SHA-256 verification** — every artifact ships a signed `.sha256` manifest; the app verifies the download digest against the manifest before extraction/execution. Refuse on mismatch.
+3. **Per-user writable runtime location** — the GPU-ASR runtime installs to a per-user writable path (e.g. `%LOCALAPPDATA%\VOD.RIP\runtime\<asr-version>\`), never `C:\Program Files`, so in-app install works without elevation.
+4. **No `pip install` from the frozen app** — the frozen app MUST NOT shell out to `pip`/`uv` to install the runtime; it downloads the versioned runtime archive and extracts it, matching its own pinned ABI. (The runtime archive is built once, offline, during release.)
+5. **Version pinning** — app build and runtime archive share one release version; the app requests exactly that version and validates it in the manifest.
+
+### Release steps (concrete)
+
+```bash
+# 1. Build CPU base — no bundled NVIDIA stack, but CPU parakeet (sherpa-onnx CPU wheel) stays
+pyinstaller vod-rip.spec            # CPU sherpa-onnx; NO +cuda wheel, NO nvidia-*cu12
+# 2. [FUTURE] Build the GPU-ASR runtime archive from the SAME commit's pinned deps
+scripts/build-gpu-runtime.ps1       # proposed: offline, install backend/requirements-gpu.txt wheels to a
+                                    #   temp venv, bundle parakeet model + CUDA DLLs -> .7z
+# 3. [FUTURE] Generate a SHA-256 manifest per artifact; sign with the existing Authenticode key
+scripts/hash-artifacts.ps1          # proposed: writes *.sha256; reuse scripts/sign-release.ps1 cert/timestamp
+# 4. Upload base + runtime archive + manifest to the HTTPS release endpoint
+# 5. Inno Setup [FUTURE]: add the runtime as an optional component
+#    (download + verify SHA-256 + extract to %LOCALAPPDATA%\VOD.RIP\runtime\<version>\)
+```
+
+### Release verification (runs BEFORE shipping)
+
+- Fetch every artifact **over HTTPS** and assert `sha256 -c <artifact>.sha256` passes.
+- From a **clean frozen CPU install** (no runtime present): confirm the base runs end-to-end with CPU parakeet (sherpa-onnx CPU wheel).
+- Install the GPU-ASR runtime via the Inno Setup optional component; confirm it verifies the digest, extracts only to the per-user writable path, and enables GPU parakeet (sherpa-onnx +cuda) with no `pip` involved.
+- Negative tests: tampered archive → manifest mismatch → install refused; missing runtime → base still works on CPU parakeet, no crash.
+
 
 
 
