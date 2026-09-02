@@ -1116,7 +1116,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
         </div>
       )}
 
-      {status === 'done' && hits.length === 0 && remoteStatus !== 'loading' && (
+      {status === 'done' && hits.length === 0 && (
         <p className="text-[10px] font-mono text-zinc-500 shrink-0">
           {query.trim()
             ? (remoteStatus === 'done' && remoteHits.length === 0 && !remoteError
