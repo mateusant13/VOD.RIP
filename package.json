@@ -14,6 +14,7 @@
     "preview": "vite preview",
     "sync-icon": "python scripts/generate-icon.py",
     "build-dist": "npm run sync-icon && npm run build-copy && pyinstaller vod-rip.spec --noconfirm && node scripts/deploy-dist.mjs && node scripts/stage-cookie-extension.mjs && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/sign-release.ps1",
+    "build-asr-runtime": "pyinstaller vod-rip-asr.spec --clean --noconfirm && node scripts/deploy-asr-runtime.mjs",
     "test:e2e": "playwright test --config=e2e/playwright.config.ts",
     "test:e2e:list": "playwright test --config=e2e/playwright.config.ts --list",
     "test:e2e:frame-live": "playwright test --config=e2e/playwright.config.ts e2e/tests/frame-mode.spec.ts e2e/tests/live-badge.spec.ts"
