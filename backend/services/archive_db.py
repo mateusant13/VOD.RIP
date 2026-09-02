@@ -3586,6 +3586,12 @@ def _titles_search(
     if date_to:
         where.append("date(started_at) <= date(?)")
         params.append(date_to)
+    if exact:
+        # Exact title queries only need rows containing every token; this
+        # avoids walking the whole catalog for a guaranteed no-match.
+        for token in q_tokens:
+            where.append("(lower(title) LIKE ? OR lower(original_title) LIKE ?)")
+            params.extend((f"%{token}%", f"%{token}%"))
     if where:
         sql += " WHERE " + " AND ".join(where)
     out: list[dict] = []
