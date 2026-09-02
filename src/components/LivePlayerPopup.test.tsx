@@ -1614,7 +1614,7 @@ describe('LivePlayerPopup replay rail (wheel zoom + arrow seek)', () => {
     expect(rail.disabled).toBe(true);
 
     // Live edge = liveSyncPosition(100) + three-segment lag (3 × 2s) = 106;
-    // the back-buffer window is [106−30, 106−0.75] = [76, 105.25].
+    // the ~20s back-buffer window is [106−20, 106−0.75] = [86, 105.25].
     hls.liveSyncPosition = 100;
     const video = document.querySelector('video') as HTMLVideoElement;
     video.currentTime = 95;
@@ -1625,10 +1625,10 @@ describe('LivePlayerPopup replay rail (wheel zoom + arrow seek)', () => {
     fireEvent.keyDown(window, { key: 'ArrowRight' });
     expect(video.currentTime).toBe(95); // 90 + 5
 
-    // Clamped to the buffer's leading edge: 5 − 5 → −0 → 76.
+    // Clamped to the buffer's leading edge: 5 − 5 → 0 → 86.
     video.currentTime = 5;
     fireEvent.keyDown(window, { key: 'ArrowLeft' });
-    expect(video.currentTime).toBe(76);
+    expect(video.currentTime).toBe(86);
 
     // Clamped just below the live edge (0.75s safety): 110 + 5 → 115 → 105.25.
     video.currentTime = 110;
@@ -1706,10 +1706,10 @@ describe('LivePlayerPopup live latency config', () => {
     expect(hls.config.lowLatencyMode).toBe(false);
     expect(hls.config.maxLiveSyncPlaybackRate).toBe(1.1);
 
-    // Deep forward buffer to absorb proxy jitter; 30s retained back-buffer.
+    // Deep forward buffer to absorb proxy jitter; ~20s retained back-buffer.
     expect(hls.config.maxBufferLength).toBe(30);
     expect(hls.config.maxMaxBufferLength).toBe(60);
-    expect(hls.config.backBufferLength).toBe(30);
+    expect(hls.config.backBufferLength).toBe(20);
     expect(hls.config.liveDurationInfinity).toBe(false);
 
     // Live mode auto-starts.

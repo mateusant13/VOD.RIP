@@ -230,8 +230,11 @@ export function startHealthMonitor({
 
 function viteHealthy(port) {
   return new Promise((resolve) => {
-    const req = http.get(`http://127.0.0.1:${port}/`, (res) => {
-      resolve(res.statusCode >= 200 && res.statusCode < 500);
+    // Vite binds the hostname configured in vite.config.ts (localhost may
+    // resolve to IPv6 on Windows); probing 127.0.0.1 falsely reports a live
+    // Vite as down and makes the next npm run dev take over unnecessarily.
+    const req = http.get(`http://localhost:${port}/`, (res) => {
+      resolve(res.statusCode === 200);
       res.resume();
     });
     req.on("error", () => resolve(false));

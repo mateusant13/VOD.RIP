@@ -144,8 +144,8 @@ const LIVE_SESSION_MAX_RETRIES = 3;
  *  paused read of the rail/menus never flickers. */
 const LIVE_CONTROLS_HIDE_MS = 2_500;
 /** Retained live back-buffer (hls.js backBufferLength) — ArrowLeft/Right seek
- *  inside it when the live has NO DVR archive (the rail stays disabled). */
-const LIVE_BACK_BUFFER_SEC = 30;
+ *  inside the ~20s retained window when the live has NO DVR archive. */
+const LIVE_BACK_BUFFER_SEC = 20;
 /** Never land the back-buffer arrow seek ON the live edge — stay a hair below
  *  it (hls.js's own sync target rides ~liveSyncDuration behind the edge). */
 const LIVE_EDGE_SEEK_SAFETY_SEC = 0.75;
@@ -361,6 +361,9 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     h: POPUP_HEIGHT,
   });
   const [loading, setLoading] = useState(true);
+  // Loading can outlive the session POST while the first media frame arrives;
+  // only an unresolved session request blocks auto-hide.
+  const sessionPendingRef = useRef(true);
   const [error, setError] = useState<string | null>(null);
   // Confirmed-missing Kick/YouTube channel (live master 404): swaps the player
   // for a centered channel-name input until the user submits a correction.
@@ -442,7 +445,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   // Inactivity auto-hide for the transport + header: a ref-backed timer
   // hides ~2.5s after the last interaction; any mousemove/keydown/pointerdown/
   // touchstart bumps it back. The timer only ARMS when a hide-block is clear —
-  // paused/loading/error/open menus keep the controls up regardless.
+  // paused, an unresolved session, errors, or open menus keep the controls up.
   const [controlsVisible, setControlsVisible] = useState(true);
   const controlsHideTimerRef = useRef<number | null>(null);
 
@@ -1025,7 +1028,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       && el.tagName === 'INPUT'
       && (el as HTMLInputElement).type === 'text';
   };
-  const hideBlocked = paused || loading || error !== null
+  const hideBlocked = paused || (loading && sessionPendingRef.current) || error !== null
     || qualityMenuOpen || captionLangMenuOpen || captionFontSizeMenuOpen || isTransportTextFocused();
   const hideBlockedRef = useRef(hideBlocked);
   hideBlockedRef.current = hideBlocked;
@@ -1478,6 +1481,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     void import('hls.js').catch(() => {});
 
     (async () => {
+      sessionPendingRef.current = true;
       // Pre-loop setup: invisible recreate / loading state, body construction
       if (invisibleRecreateRef.current) {
         invisibleRecreateRef.current = false;
@@ -1563,6 +1567,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       res: PreviewSessionResponse,
       isCancelled: boolean,
     ): Promise<void> {
+      sessionPendingRef.current = false;
       if (isCancelled) {
         if (res?.session_id) apiDelete(`/api/preview/session/${res.session_id}`).catch(() => {});
         return;
@@ -2225,11 +2230,11 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   // with the popup's buttons. railTime is read via a ref so the listener
   // does not reattach on every timeupdate. WITHOUT an archive the rail stays
   // disabled/undraggable (user asked for KEYBOARD seek only), so the arrows
-  // instead seek inside the retained live back-buffer — hls.js retains
-  // LIVE_BACK_BUFFER_SEC behind the playhead (backBufferLength 30) and the
-  // finite live timeline (liveDurationInfinity false) makes currentTime
-  // seeks land in it. The listener is window-level, so it keeps working
-  // while the auto-hidden controls are pointer-events-none.
+  // seek inside the retained ~20s live back-buffer. hls.js retains
+  // LIVE_BACK_BUFFER_SEC behind the playhead and the finite live timeline
+  // (liveDurationInfinity false) makes currentTime seeks land in it. The
+  // listener is window-level, so it keeps working while the auto-hidden
+  // controls are pointer-events-none.
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (shouldIgnorePlayerKeyEvent(e as unknown as React.KeyboardEvent)) return;
@@ -2246,9 +2251,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       }
       // LIVE without archive — seek within the retained back-buffer, clamped
       // to [max(0, edge − 30), edge − 0.75] so the playhead never lands on
-      // (or past) the live edge. No-op while the session is still loading or
-      // before the edge is known (edgeSec 0).
-      if (loading) return;
+      // (or past) the live edge. No-op before the edge is known (edgeSec 0).
       const video = videoRef.current;
       const edgeSec = computeLiveEdgeSec();
       if (!video || edgeSec <= 0) return;
@@ -2260,7 +2263,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [railDisabled, railMax, handleRailChange, computeLiveEdgeSec, loading]);
+  }, [railDisabled, railMax, handleRailChange, computeLiveEdgeSec]);
 
   return createPortal(
     <div
@@ -2506,7 +2509,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         {/* Transport controls — same layout as the mini preview player: a
             timeline row (current/total timestamps + rail) above the transport
             row (play, volume, live-edge, quality, fullscreen). No trim here. */}
-        {!error && (mode === 'live' || !loading) && (
+        {!error && ((!sessionPendingRef.current && (mode === 'live' || mode === 'replay')) || !loading) && (
           <div
             data-live-transport
             className={`px-2 py-1.5 bg-gradient-to-t from-black/85 to-black/0 transition-all duration-300 ${
@@ -2760,7 +2763,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         {/* Live captions overlay — draggable inside the video area. The
             entire overlay is pointer-events-auto for drag; the text
             stopPropagation prevents stealing video click-to-pause. */}
-        {captionsHeard && captionsEnabled && caption && !loading && !error && (
+        {captionsHeard && captionsEnabled && caption && !error && (
           <div
             data-live-captions-overlay
             className="pointer-events-auto absolute inset-x-0 bottom-16 z-[5] flex justify-center px-4 select-none"

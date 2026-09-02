@@ -20,8 +20,9 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from deps import settings_mgr, download_mgr
@@ -1019,6 +1020,23 @@ async def _app_lifespan(_app: FastAPI):
 app = FastAPI(title="Kick & Twitch Downloader", version=__version__, lifespan=_app_lifespan)
 
 
+@app.exception_handler(StarletteHTTPException)
+async def _http_exception_handler(request: Request, exc: StarletteHTTPException):
+    """Record HTTP errors without changing FastAPI's response contract."""
+    if exc.status_code >= 400:
+        from services.error_log import record_error
+
+        record_error(
+            f"http_{exc.status_code}",
+            f"{request.method} {request.url.path}: {exc.detail}",
+        )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=exc.headers,
+    )
+
+
 @app.exception_handler(Exception)
 async def _unhandled_exception_handler(request: Request, exc: Exception):
     """Record every uncaught server/application error into the latest-500
@@ -1032,9 +1050,12 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
     detail = f"{request.method} {request.url.path}: {exc}"
     # Do NOT leak the query string — it can carry po_tokens / cookies.
     record_error("unhandled", detail)
-    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
-    from fastapi.responses import JSONResponse
-
+    logger.exception(
+        "Unhandled error on %s %s",
+        request.method,
+        request.url.path,
+        extra={"vodrip_error_recorded": True},
+    )
     return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 # CORS: localhost-only for this desktop app (prevents cross-origin abuse).

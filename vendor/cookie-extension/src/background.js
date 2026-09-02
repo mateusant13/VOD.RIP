@@ -76,6 +76,21 @@ const pushBridgeCookies = createDebouncedPush({
 });
 chrome.cookies.onChanged.addListener(pushBridgeCookies);
 
+// A normal navigation is the one safe browser-side freshness signal: it lets
+// the bridge immediately capture cookies rotated by the platform without
+// reloading or opening a user tab on its own.
+chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
+  if (changeInfo.status !== 'complete' || !tab.url) return;
+  try {
+    const host = new URL(tab.url).hostname.toLowerCase();
+    if (BRIDGE_DOMAINS.some((domain) => host === domain || host.endsWith(`.${domain}`))) {
+      pushBridgeCookies();
+    }
+  } catch {
+    // chrome:// and malformed URLs are not bridge pages
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Passive cycle: onChanged only fires while the user browses. A fresh install
 // or browser start may already hold platform cookies, and cookies rotate with

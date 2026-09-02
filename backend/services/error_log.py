@@ -147,6 +147,8 @@ class _ErrorFileHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            if getattr(record, "vodrip_error_recorded", False):
+                return
             message = record.getMessage()
             if record.exc_info and record.exc_info[1] is not None:
                 message = f"{message}: {record.exc_info[1]}"

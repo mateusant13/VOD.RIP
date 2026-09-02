@@ -13,7 +13,7 @@
 //    Each hook should own its state + effects and return a narrow API;
 //    the App component stays a thin layout shell.
 // ─────────────────────────────────────────────────────────────────────────────
-import { memo, useState, useEffect, useCallback, useLayoutEffect, useMemo, useRef, type Dispatch, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type SetStateAction } from 'react';
+import { Fragment, memo, useState, useEffect, useCallback, useLayoutEffect, useMemo, useRef, type Dispatch, type KeyboardEvent, type MutableRefObject, type PointerEvent as ReactPointerEvent, type SetStateAction } from 'react';
 import { createPortal } from 'react-dom';
 import Hls from 'hls.js';
 import { createTwitchAdRotationHandler, twitchAdBlockHlsConfig } from './twitchAdBlock';
@@ -5041,6 +5041,7 @@ export default function App() {
       } else {
         const limit = incremental ? CHANNEL_INCREMENTAL_LIMIT : CHANNEL_FETCH_LIMIT;
         let anyRefreshing = false;
+        const vodTasks: Promise<void>[] = [];
         const fetchVods = async (platform: 'Kick' | 'Twitch' | 'YouTube', slug: string) => {
           if (!slug?.trim()) return;
           const params = new URLSearchParams({
@@ -7257,7 +7258,7 @@ export default function App() {
                 {savedChannels.map((ch, index) => {
                   const liveStatus = channelLiveStatuses[ch.id];
                   return (
-                  <>
+                  <Fragment key={ch.id}>
                   <ChannelRow
                     ch={ch}
                     index={index}
@@ -7731,7 +7732,7 @@ export default function App() {
                       )}
                     </div>
                   )}
-                  </>
+                  </Fragment>
                   );
                 })}
               </div>
