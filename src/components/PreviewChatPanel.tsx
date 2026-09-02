@@ -390,7 +390,7 @@ export function PreviewChatPanel({
     if (controlled) onOpenChange?.(v);
     else setInternalOpen(v);
   }, [controlled, onOpenChange]);
-  const [tab, setTab] = useState<PreviewPanelTab>('chat');
+  const [tab, setTab] = useState<PreviewPanelTab>('transcript');
   const [width, setWidth] = useState<number>(readPreviewChatPanelWidth);
   /** Start/end chat markers (green/red). One pair per surface — the host
    *  lifts it via onMarkersChange so the next download writes the chat txt
@@ -629,7 +629,7 @@ export function PreviewChatPanel({
   // Stale tab across video switches: a non-YouTube video must never keep the
   // Subtitles tab selected (its tab is hidden for that platform).
   useEffect(() => {
-    if (!subtitlesTabEnabled && tab === 'subtitles') setTab('chat');
+    if (!subtitlesTabEnabled && tab === 'subtitles') setTab('transcript');
   }, [subtitlesTabEnabled, tab]);
 
   // ── Rows / active index ---------------------------------------------------

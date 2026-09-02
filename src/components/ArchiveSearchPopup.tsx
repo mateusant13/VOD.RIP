@@ -125,10 +125,10 @@ const SEED_Y = 80;
 const SEED_RIGHT = 24;
 
 /** Kind-badge display words — i18n keys (message → chat, transcript →
- *  speech). 'title' and remote 'youtube' badges keep their raw kind values. */
+ * transcription). 'title' and remote 'youtube' badges keep their raw kind values. */
 const KIND_BADGE_LABEL: Record<string, string> = {
   message: 'chat',
-  transcript: 'speech',
+  transcript: 'transcription',
 };
 
 /** PlatformVodIcon expects capitalized platform names; archive rows are lowercase. */

@@ -413,9 +413,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   ai_api_key_set: false,
 };
 
-/** Main-preview chat default: CLOSED. Only the header Chat toggle opens it
- *  (no preview click does). Exported so the host contract is testable.
- *  resetPreview() restores this on close, so the next preview starts closed. */
+/** Main-preview panel default: CLOSED. The first tab is transcription; the
+ * panel's own state selects it when the header opens the panel. */
 export const PREVIEW_CHAT_DEFAULT_OPEN = false;
 
 export default function App() {
@@ -6819,7 +6818,7 @@ export default function App() {
                 }`}
               >
                 <MessageSquare size={10} className="shrink-0" />
-                {previewChatOpen ? t('Close chat') : t('Chat')}
+                {previewChatOpen ? t('Close chat') : t('Transcription / chat')}
               </button>
               <button
                 type="button"
