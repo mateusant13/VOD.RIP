@@ -1018,6 +1018,25 @@ async def _app_lifespan(_app: FastAPI):
 
 app = FastAPI(title="Kick & Twitch Downloader", version=__version__, lifespan=_app_lifespan)
 
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    """Record every uncaught server/application error into the latest-500
+    ring/file (services.error_log), then return a generic 500.
+
+    No cookie/token is logged: error_log sanitizes the message and we only
+    capture the request path + method, never headers or body.
+    """
+    from services.error_log import record_error
+
+    detail = f"{request.method} {request.url.path}: {exc}"
+    # Do NOT leak the query string — it can carry po_tokens / cookies.
+    record_error("unhandled", detail)
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
 # CORS: localhost-only for this desktop app (prevents cross-origin abuse).
 app.add_middleware(
     CORSMiddleware,

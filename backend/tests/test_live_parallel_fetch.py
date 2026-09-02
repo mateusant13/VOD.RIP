@@ -121,24 +121,28 @@ def test_missing_slugs_skip_fetches(monkeypatch):
     assert payload == {"live": [], "channel_id": "ch_par2"}
 
 
-def test_first_platform_error_still_fails_the_refresh(monkeypatch):
-    """A dead platform keeps the old failure semantics: the refresh fails
-    (stale-serve kicks in) even though the other platforms succeeded."""
+def test_one_dead_platform_keeps_others_live(monkeypatch):
+    """A single platform outage must NOT fail the whole channel refresh: the
+    succeeded platforms' LIVE entries survive so the user never sees a
+    genuinely-live channel go missing. Regression: the all-or-nothing refresh
+    dropped live entries and tripped the live-badge verifier."""
 
     def bad(slug):
         raise RuntimeError("kick API down")
 
     def good(slug):
-        return _live_entry("Twitch")
+        return _live_entry(slug.title())
 
     monkeypatch.setattr(live_router, "kick_live_info", bad)
     monkeypatch.setattr(live_router, "twitch_live_info", good)
     monkeypatch.setattr(live_router, "youtube_live_info", good)
 
-    with pytest.raises(RuntimeError, match="kick API down"):
-        live_router._fetch_channel_live_payload(
-            {"id": "ch_par3", "kickSlug": "k", "twitchSlug": "t", "youtubeSlug": "y"}
-        )
+    payload = live_router._fetch_channel_live_payload(
+        {"id": "ch_par3", "kickSlug": "k", "twitchSlug": "t", "youtubeSlug": "y"}
+    )
+    # Kick failed; Twitch and YouTube still report live.
+    platforms = [e["platform"] for e in payload["live"]]
+    assert platforms == ["Twitch", "YouTube"], platforms
 
 
 # ---------------------------------------------------------------------------

@@ -184,6 +184,15 @@ def _setup_logging() -> Path:
     logger.info("Install dir: %s", _get_install_dir())
     logger.info("App data dir: %s", app_data)
     logger.info("Log path: %s", log_path)
+
+    # Central ERROR ring/file (latest-500, sanitized) for the frozen build.
+    try:
+        from services.error_log import install_error_handler
+
+        install_error_handler()
+    except Exception:
+        pass
+
     return log_path
 
 

@@ -839,6 +839,18 @@ async function main() {
     await ensurePortFree(vitePort, "Vite");
   } else {
     removeLock(); // stale lock (owner died without cleanup)
+    // A live, healthy API on apiPort with no lock is an orphaned server from
+    // a crashed supervisor (lock lost, child survived). Do NOT raw-taskkill
+    // it (defect A) — reuse it instead of spawning a duplicate daemon. Only
+    // when nothing answers do we go on to ensure the port is free.
+    if (await apiHealthy(apiPort)) {
+      console.log(`[dev] live API already on :${apiPort} (orphan, no lock) — reusing its logs.`);
+      console.log(`[dev] Ctrl+C detaches. Run \`npm run dev -- --kill\` to stop it and take over.`);
+      process.on("SIGINT", () => process.exit(0));
+      process.on("SIGTERM", () => process.exit(0));
+      await Promise.all([tailLog("api"), tailLog("web")]);
+      return;
+    }
     await ensurePortFree(apiPort, "API");
   }
   if (!tryWriteLock()) {

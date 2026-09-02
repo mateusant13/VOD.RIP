@@ -347,22 +347,23 @@ def _fetch_channel_live_payload(
     if ys:
         jobs.append(("youtube", pool.submit(youtube_live_info, ys)))
 
-    # Settle all futures; re-raise the first platform error in slug order
-    # (kick before twitch before youtube), matching the old sequential path's
-    # failure semantics so a dead platform still fails the whole refresh.
+    # Settle all futures. A single platform outage (Kick/Twitch/YT down or
+    # parsing broken) must NOT fail the whole channel refresh — that drops
+    # genuinely-LIVE entries from the other platforms and trips the live-badge
+    # verifier, so the user sees channels missing even when they are live.
+    # Each platform's error is logged; succeeded platforms' entries survive.
     infos: dict[str, dict] = {}
-    first_exc: Optional[BaseException] = None
     for plat, fut in jobs:
         try:
             info = fut.result()
         except Exception as exc:
-            if first_exc is None:
-                first_exc = exc
+            logger.warning(
+                "live status %s fetch failed for channel %s: %s",
+                plat, channel.get("id") or "?", exc,
+            )
             continue
         if info and isinstance(info, dict):
             infos[plat] = info
-    if first_exc is not None:
-        raise first_exc
 
     live: list[dict] = []
     kick_info = infos.get("kick")
@@ -552,19 +553,24 @@ def warm_channel_live_status(channel_id: str) -> None:
 
 def _assert_live_cache_populated(channel_id: str, deadline_sec: float = 10.0) -> None:
     """Background verifier: poll until channel_id appears in _LIVE_STATUS_CACHE
-    or deadline elapses. Runs on a daemon thread so it never blocks the caller."""
+    or deadline elapses. Runs on a daemon thread so it never blocks the caller.
+
+    Logs loudly (warning) instead of asserting: this runs on a production
+    daemon thread where an AssertionError is uncaught noise — the 10s window
+    legitimately trips when a platform refresh is slow, and the badge being
+    briefly delayed is a warning, not a crash.
+    """
     deadline = time.monotonic() + deadline_sec
     while time.monotonic() < deadline:
         with _LIVE_STATUS_LOCK:
             if channel_id in _LIVE_STATUS_CACHE:
                 return
         time.sleep(0.2)
-    # Assertion failed — log loudly so the issue is visible in tests/logs.
-    with _LIVE_STATUS_LOCK:
-        present = channel_id in _LIVE_STATUS_CACHE
-    assert present, (
-        f"trigger_live_detection: {channel_id} not in _LIVE_STATUS_CACHE "
-        f"after {deadline_sec}s — live badge will be delayed"
+    # Warn loudly so the delay is visible in logs/tests, but never raise.
+    logger.warning(
+        "live badge may be delayed for %s: not in _LIVE_STATUS_CACHE after %ss",
+        channel_id,
+        deadline_sec,
     )
 
 
@@ -579,7 +585,8 @@ def trigger_live_detection(channel_id: str) -> None:
     with _LIVE_STATUS_LOCK:
         _LIVE_RECENTLY_ADDED[channel_id] = time.monotonic()
     warm_channel_live_status(channel_id)
-    # Verify the background refresh lands in cache within 10s (assert req 4).
+    # Verify the background refresh lands in cache within 10s; logs a warning
+    # on delay instead of asserting (runs on a production daemon thread).
     t = threading.Thread(
         target=_assert_live_cache_populated, args=(channel_id, 10.0), daemon=True
     )
