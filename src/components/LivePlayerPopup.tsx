@@ -514,6 +514,11 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   }, [activeEntry.url, activeEntry.platform, channel, channelSlug]);
   const [captionsAvailable, setCaptionsAvailable] = useState(false);
   const [captionsEnabled, setCaptionsEnabled] = useState(true);
+  // Backend NLLB translate gate — the /available contract exposes
+  // translation_available (false in the slim frozen base). When false the
+  // in-player language selector is disabled (captions still stream in the
+  // source language).
+  const [captionTranslationAvailable, setCaptionTranslationAvailable] = useState(false);
   // Overlay font size (px) — seeded from localStorage; the overlay's corner
   // drag grip (mouse-drag resize only, no A−/A+ buttons) steps it within the
   // clamp; the save effect below writes every change back so the user's
@@ -685,6 +690,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   useEffect(() => {
     setCaption(null); // a new stream starts with a clean overlay
     setCaptionsAvailable(false); // …and a clean availability (per-stream)
+    setCaptionTranslationAvailable(false); // …and a clean translate gate (per-stream)
     setCaptionsHeard(false); // …and a clean heard-state (per-stream)
     const st = captionRetryRef.current;
     if (st.timer != null) window.clearTimeout(st.timer);
@@ -697,8 +703,13 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         .then((r) => (r.ok ? r.json() : null))
         .then((body) => {
           if (cancelled) return;
-          if (body?.available === true) {
+          // available = runtime + parakeet ready; pending = runtime exists but
+          // the model downloads on first caption use. BOTH permit an explicit
+          // caption stream, so the CC toggle shows in either case (the SSE
+          // opens regardless of the gate — see the caption SSE effect).
+          if (body?.available === true || body?.pending === true) {
             setCaptionsAvailable(true);
+            setCaptionTranslationAvailable(body?.translation_available === true);
             return;
           }
           // Unavailable (models missing) or empty — bounded re-probe: the
@@ -765,8 +776,11 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         fetch(`/api/live/captions/available?${new URLSearchParams(captionSource)}`)
           .then((r) => (r.ok ? r.json() : null))
           .then((body) => {
-            if (body?.available === true) setCaptionSseTick((n) => n + 1);
-            else setCaptionsAvailable(false);
+            // Same gate as the startup probe: pending still allows a stream.
+            if (body?.available === true || body?.pending === true) {
+              setCaptionTranslationAvailable(body?.translation_available === true);
+              setCaptionSseTick((n) => n + 1);
+            } else setCaptionsAvailable(false);
           })
           .catch(() => setCaptionSseTick((n) => n + 1)); // transient probe failure — still retry
       }, CAPTION_RECONNECT_BASE_MS * 2 ** (st.attempt - 1));
@@ -2512,9 +2526,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                 )}
               </div>
 
-              {/* Live captions toggle — CC overlay over the video. Only
-                  rendered when the parakeet gate reports available (503 /
-                  missing engine → no button, no overlay). */}
+              {/* Live captions toggle — CC overlay over the video. Rendered
+                  when the gate reports available OR pending (both allow an
+                  explicit caption stream — pending downloads the model on
+                  first use); truly unavailable → no button, no overlay. */}
               {captionsAvailable && (
                 <>
                   <button
@@ -2538,9 +2553,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
                       onClick={() => setCaptionLangMenuOpen((o) => !o)}
                       aria-haspopup="menu"
                       aria-expanded={captionLangMenuOpen}
-                      aria-label={t('Caption language')}
-                      title={t('Caption language')}
-                      className={transportBtn}
+                      aria-label={captionTranslationAvailable ? t('Caption language') : t('Caption translation unavailable')}
+                      title={captionTranslationAvailable ? t('Caption language') : t('Caption translation unavailable')}
+                      disabled={!captionTranslationAvailable}
+                      className={`${transportBtn} ${captionTranslationAvailable ? '' : 'opacity-40'}`}
                     >
                       <Languages size={15} aria-hidden />
                     </button>

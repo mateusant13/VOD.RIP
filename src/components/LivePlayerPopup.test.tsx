@@ -113,8 +113,10 @@ function mockFetch() {
       return new Response(JSON.stringify({ videos: [] }), { status: 200 });
     }
     if (url.includes('/api/live/captions/available')) {
-      // Parakeet gate probe — captions available for the playing entry.
-      return new Response(JSON.stringify({ available: true }), { status: 200 });
+      // Parakeet gate probe — full contract shape; translation enabled.
+      return new Response(JSON.stringify({
+        available: true, pending: false, reason: null, translation_available: true, low_latency: false,
+      }), { status: 200 });
     }
     if (url.includes('/api/preview/session')) {
       // TwitchClipPopup mini-preview session — resolves so the popup's HLS
@@ -174,7 +176,9 @@ function mockFetchWithLiveSrc() {
       return new Response('', { status: 404 });
     }
     if (url.includes('/api/live/captions/available')) {
-      return new Response(JSON.stringify({ available: true }), { status: 200 });
+      return new Response(JSON.stringify({
+        available: true, pending: false, reason: null, translation_available: true, low_latency: false,
+      }), { status: 200 });
     }
     return new Response(JSON.stringify({}), { status: 404 });
   });
@@ -360,7 +364,9 @@ describe('LivePlayerPopup fast clip', () => {
         return new Response('', { status: 404 });
       }
       if (url.includes('/api/live/captions/available')) {
-        return new Response(JSON.stringify({ available: true }), { status: 200 });
+        return new Response(JSON.stringify({
+          available: true, pending: false, reason: null, translation_available: true, low_latency: false,
+        }), { status: 200 });
       }
       if (url.includes('/api/preview/session')) {
         return new Response(JSON.stringify({
@@ -990,6 +996,55 @@ describe('LivePlayerPopup live captions', () => {
     expect(screen.queryByTitle('Hide captions')).toBeNull();
     expect(screen.queryByTitle('Live captions')).toBeNull();
     expect(document.querySelector('[data-live-captions-overlay]')).toBeNull();
+  });
+
+  it('renders the CC cluster when the gate reports pending (model downloads on first use)', async () => {
+    const fn = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/preview/live')) {
+        return new Response(JSON.stringify({ session_id: 's1' }), { status: 200 });
+      }
+      if (url.includes('/api/live/captions/available')) {
+        return new Response(JSON.stringify({ available: false, pending: true, reason: 'model downloading', translation_available: false, low_latency: false }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+    vi.stubGlobal('fetch', fn);
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+    // pending permits an explicit caption stream → captions default ON, the
+    // toggle appears, and the SSE opens (the first use triggers the download).
+    await screen.findByTitle('Hide captions');
+    await waitFor(() => expect(captionEsInstances()).toHaveLength(1));
+    // Without NLLB translation the language selector is disabled+marked.
+    const langBtn = screen.getByTitle('Caption translation unavailable');
+    expect((langBtn as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(langBtn);
+    expect(screen.queryByText('Español')).toBeNull();
+  });
+
+  it('disables the caption language selector when translation_available is false', async () => {
+    const fn = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/preview/live')) {
+        return new Response(JSON.stringify({ session_id: 's1' }), { status: 200 });
+      }
+      if (url.includes('/api/live/captions/available')) {
+        return new Response(JSON.stringify({ available: true, pending: false, reason: null, translation_available: false, low_latency: false }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 404 });
+    });
+    vi.stubGlobal('fetch', fn);
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+    // Captions still available; only the translate target is off.
+    await screen.findByTitle('Hide captions');
+    const langBtn = screen.getByTitle('Caption translation unavailable');
+    expect((langBtn as HTMLButtonElement).disabled).toBe(true);
+    // Clicking a disabled selector never opens the lang menu.
+    fireEvent.click(langBtn);
+    expect(screen.queryByText('Español')).toBeNull();
+    expect(screen.queryByText('Auto')).toBeNull();
   });
 
   it('shows a caption only when the mapped video clock reaches its wall window (frag PDT anchor)', async () => {
@@ -1931,7 +1986,9 @@ describe('LivePlayerPopup session retry loop', () => {
           return new Response(JSON.stringify({ videos: [] }), { status: 200 });
         }
         if (url.includes('/api/live/captions/available')) {
-          return new Response(JSON.stringify({ available: true }), { status: 200 });
+          return new Response(JSON.stringify({
+            available: true, pending: false, reason: null, translation_available: true, low_latency: false,
+          }), { status: 200 });
         }
         return new Response(JSON.stringify({}), { status: 404 });
       });
@@ -1969,7 +2026,7 @@ describe('LivePlayerPopup live session prefetch', () => {
         return new Response(JSON.stringify({ videos: [] }), { status: 200 });
       }
       if (url.includes('/api/live/captions/available')) {
-        return new Response(JSON.stringify({ available: true }), { status: 200 });
+        return new Response(JSON.stringify({ available: true, pending: false, reason: null, translation_available: true, low_latency: false }), { status: 200 });
       }
       return new Response(JSON.stringify({}), { status: 404 });
     });
@@ -2025,7 +2082,7 @@ describe('LivePlayerPopup live session prefetch', () => {
           return new Response(JSON.stringify({ videos: [] }), { status: 200 });
         }
         if (url.includes('/api/live/captions/available')) {
-          return new Response(JSON.stringify({ available: true }), { status: 200 });
+          return new Response(JSON.stringify({ available: true, pending: false, reason: null, translation_available: true, low_latency: false }), { status: 200 });
         }
         return new Response(JSON.stringify({}), { status: 404 });
       });
