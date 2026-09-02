@@ -1,8 +1,9 @@
 // Behavioral harness for the kick-overlay content.js fixes (injectStyles,
 // ensureYtHls TTL/backoff, yt fallback GATE + non-persisting handover, URL
-// reload, #ko-status chip + <=4-char badge tokens, sticky tw_delete via
-// MutationObserver, yt frame-death watchdog). Runs the real content.js source
-// with a stubbed DOM/chrome environment and asserts on observable behavior.
+// reload, normalized <=4-char badge tokens, arrow-left/right live-window
+// seek + ~20s HLS live buffer, sticky tw_delete via MutationObserver, yt
+// frame-death watchdog). Runs the real content.js source with a stubbed
+// DOM/chrome environment and asserts on observable behavior.
 // `node content-fix-test.cjs` (no frameworks).
 'use strict';
 const fs = require('fs');
@@ -34,7 +35,7 @@ const el = (tag) => ({
   isConnected: true,
   removed: 0,
   contentWindow: null,
-  classList: { add() {}, remove() {}, contains: () => false },
+  classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
   appendChild() {},
   remove() { this.removed = (this.removed || 0) + 1; this.isConnected = false; },
   addEventListener() {},
@@ -145,12 +146,9 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
   assert.ok(styleEl, 'ko-style must be appended to document.head');
   assert.ok(!styleEl.textContent.includes('appendChild(st)'), 'CSS must not contain the stray appendChild text');
   assert.ok(styleEl.textContent.includes('#ko-wrap{position:fixed'), 'CSS body present');
-  assert.ok(styleEl.textContent.includes('#ko-wrap.ko-yt #ko-top{display:none;}'), 'stale LIVE pill hidden in yt mode');
   assert.ok(styleEl.textContent.includes('#ko-bar{position:absolute;left:0;right:0;bottom:0;pointer-events:auto;opacity:1;'), 'control bar defaults visible');
   assert.ok(styleEl.textContent.includes('#ko-wrap:not(.ko-hot) #ko-bar{opacity:1;}'), 'bar stays visible after inactivity');
-  assert.ok(styleEl.textContent.includes('#ko-wrap.ko-offline #ko-top{display:none;}'), 'offline LIVE pill hidden');
   assert.ok(styleEl.textContent.includes('#ko-quality-menu{display:none;'), 'quality menu CSS present');
-  assert.ok(styleEl.textContent.includes('#ko-top{display:none;'), 'persistent top-left LIVE label disabled');
   assert.ok(styleEl.textContent.includes('#ko-seekbar{position:absolute;top:6px;'), 'seek bar contained inside bar');
   assert.ok(!styleEl.textContent.includes('top:-28px'), 'seek bar no longer extends above bar');
   assert.ok(src.includes("document.addEventListener('keydown', onOverlayKeydown, true)"), 'F key capture listener present');
@@ -158,7 +156,14 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
   assert.ok(src.includes('iframe.allowFullscreen = true') && src.includes('fr.allowFullscreen = true'), 'both iframe fullscreen permissions present');
   assert.ok(src.includes('if (!v.paused)') && src.includes('v.pause();'), 'native Twitch video is paused under overlay');
   assert.ok(bridgeSrc.includes("case 'quality':") && bridgeSrc.includes('setAutoQualityMode'), 'quality command reaches both player engines');
-  console.log('A injectStyles: style appended, bar/seek/offline CSS — OK');
+  assert.ok(bridgeSrc.includes('liveBackBufferLength: 20'), '~20s live DVR buffer configured in the HLS engine');
+  assert.ok(bridgeSrc.includes('V.seekable.start(0)') && bridgeSrc.includes('Math.min(s1, m.s)'), 'HLS seek clamped to the actual buffered range');
+  assert.ok(bridgeSrc.includes('win > 0) dur = win'), 'live window reported as the bar duration');
+  assert.ok(src.includes('const ARROW_SEEK_SEC = 5;'), 'arrow seek step constant present');
+  assert.ok(src.includes("key === 'arrowleft'") && src.includes("key === 'arrowright'"), 'arrow left/right seek handled');
+  assert.ok(src.includes('seekOverlayStep('), 'overlay step seeks the live window');
+  assert.ok(src.includes('seekOverlayStep(-ARROW_SEEK_SEC)') && src.includes('seekOverlayStep(ARROW_SEEK_SEC)'), 'arrow step passed in both directions');
+  console.log('A injectStyles: style appended, bar/seek/offline CSS, arrow seek + live buffer config — OK');
 
   // ---- C: ensureYtHls TTL + backoff -----------------------------------------
   KO.slug = 'rodil';
@@ -268,7 +273,6 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
   // ---- teardown resets the new fields ---------------------------------------
   KO.ytHlsUrl = 'u'; KO.ytHlsAt = 1; KO.ytHlsFailed = true; KO.ytHlsFailedAt = 2; KO.ytLoadedUrl = 'u';
   KO.lastYtSt = 123;
-  KO.statusChip = { remove() {} };
   KO.kickFrame = null; KO.wrap = null;
   api.teardown();
   assert.strictEqual(KO.ytHlsUrl, null);
@@ -277,8 +281,7 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
   assert.strictEqual(KO.ytHlsFailedAt, 0);
   assert.strictEqual(KO.ytLoadedUrl, null);
   assert.strictEqual(KO.lastYtSt, 0, 'teardown resets the yt silence clock');
-  assert.strictEqual(KO.statusChip, null, 'teardown removes the status chip');
-  console.log('teardown: yt mint bookkeeping + chip + yt watchdog clock reset — OK');
+  console.log('teardown: yt mint bookkeeping + yt watchdog clock reset — OK');
 
   // ---- H: yt→kick fallback gate ---------------------------------------------
   KO.slug = 'rodil';
@@ -323,26 +326,23 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
   KO.player = 'youtube';
   const playsAfterFail = swCalls.filter((m) => m && m.type === 'ko-yt-play').length;
   assert.strictEqual(playsAfterFail, playsBefore, 'backoff must prevent a mint hit during the gate probe');
-  // The reported failure case: wrap hidden, but the chip still reports state.
-  assert.ok(KO.statusChip, 'chip created after the enabled check');
-  assert.strictEqual(KO.statusChip.textContent, 'YT ✕', 'chip shows the failed yt state');
-  assert.strictEqual(KO.statusChip.style.display, 'block', 'chip visible with the wrap hidden');
-  assert.strictEqual(KO.statusChip.style.color, '#f87171', 'chip red for the failed yt state');
+  // The reported failure case: wrap hidden, but the badge still reports state.
+  assert.ok(badgeTexts.includes('YT'), 'badge reports the failed yt state');
+  assert.strictEqual(KO.wrap.style.display, 'none', 'failed mint hides the wrap');
   // 30s backoff expires -> the probe loop re-enters the youtube branch and re-mints.
   KO.ytHlsFailedAt = Date.now() - 31000;
   await api.probe();
   assert.strictEqual(KO.player, 'youtube', 're-mint keeps youtube mode');
   assert.strictEqual(KO.ytHlsUrl, 'https://hls.example/u1', 'backoff-expired re-mint succeeded');
   assert.strictEqual(KO.ytHlsFailed, false, 'successful re-mint clears the failed flag');
-  assert.strictEqual(KO.statusChip.textContent, 'YT…', 'chip flips to the connecting state');
-  assert.strictEqual(KO.statusChip.style.color, '#fbbf24', 'chip amber while minting');
-  console.log('H fallback gate: same-handle stays youtube, no persist, backoff re-mint, chip YT ✕/YT… — OK');
+  console.log('H fallback gate: same-handle stays youtube, no persist, backoff re-mint — OK');
 
-  // ---- I: #ko-status chip state transitions (driven from setBadge) ----------
+  // ---- I: badge follows the source state (corner labels removed) ------------
   KO.mappings['rodil'] = { kick: 'realkick', yt: '@x' };
   KO.ytHlsFailed = false;
   KO.ytHlsFailedAt = 0;
-  // KICK Playing -> green KICK
+  const lastBadge = () => badgeTexts[badgeTexts.length - 1];
+  // KICK Playing -> state machine emits the KICK badge
   KO.player = 'kick';
   KO.kickSlug = 'realkick';
   KO.activeUrl = 'https://ivs.example/live';
@@ -350,26 +350,22 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
   KO.kickEverPlayed = true;
   KO.kickState = { state: 'Playing', paused: false, muted: false, pos: 10, lat: 2, dur: 120 };
   await api.probe();
-  assert.strictEqual(KO.statusChip.textContent, 'KICK', 'chip KICK while kick Playing');
-  assert.strictEqual(KO.statusChip.style.color, '#53fc18', 'chip green while kick Playing');
-  assert.strictEqual(KO.statusChip.style.display, 'block', 'chip visible');
-  // KICK connecting (url/ready pending) -> amber KICK…
+  assert.strictEqual(lastBadge(), 'KICK', 'kick Playing emits the KICK badge');
+  // KICK connecting (url/ready pending) -> still KICK
   KO.kickState = { state: 'Idle', paused: true, muted: true, pos: 0, lat: 0, dur: 0 };
   KO.kickUrlT = Date.now(); // fresh url inside the transition grace
   await api.probe();
-  assert.strictEqual(KO.statusChip.textContent, 'KICK…', 'chip KICK… while kick connecting');
-  assert.strictEqual(KO.statusChip.style.color, '#fbbf24', 'chip amber while kick connecting');
-  // KICK failed/offline -> gray KICK ✕
+  assert.strictEqual(lastBadge(), 'KICK', 'kick connecting keeps the KICK badge');
+  // KICK failed/offline -> gray KICK ✕ (no corner chip, the badge carries state)
   KO.activeUrl = null;
   assert.ok(kickSrc.includes('ev.origin !== PLAYER_ORIGIN'), 'kick messages must use the extension-frame origin');
   KO.kickUrlT = 0;
   KO.kickState = null;
   KO.kickEverPlayed = false;
   await api.probe();
-  assert.strictEqual(KO.statusChip.textContent, 'KICK ✕', 'chip KICK ✕ when kick offline');
-  assert.strictEqual(KO.statusChip.style.color, '#f87171', 'chip red when kick offline');
+  assert.strictEqual(lastBadge(), 'KICK', 'kick offline emits the KICK badge');
   assert.strictEqual(KO.wrap.style.display, 'none', 'wrap hidden when kick offline');
-  // YT live -> red YT
+  // YT live -> YT badge
   KO.player = 'youtube';
   KO.ytRaw = '@x';
   KO.ytId = 'UCxxxxxxxxxxxxxxxxxxxxxx';
@@ -379,20 +375,18 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
   KO.ytState = { ready: true, playing: true, muted: false, live: true, dur: 0, ct: 0, error: 0 };
   KO.ytLoadedUrl = 'https://hls.example/u1';
   await api.probe();
-  assert.strictEqual(KO.statusChip.textContent, 'YT', 'chip YT while yt live');
-  assert.strictEqual(KO.statusChip.style.color, '#ff0000', 'chip red while yt live');
-  // YT minting/loading (not live yet) -> amber YT…
+  assert.strictEqual(lastBadge(), 'YT', 'yt live emits the YT badge');
+  // YT minting/loading (not live yet) -> still YT
   KO.ytState = { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, error: 0 };
   KO.ytEmbedAt = Date.now(); // embed grace not expired
   await api.probe();
-  assert.strictEqual(KO.statusChip.textContent, 'YT…', 'chip YT… while minting/loading');
-  assert.strictEqual(KO.statusChip.style.color, '#fbbf24', 'chip amber while minting/loading');
-  // twitch mode -> chip hidden
+  assert.strictEqual(lastBadge(), 'YT', 'yt minting keeps the YT badge');
+  // twitch mode -> any normalized badge, never a corner chip
   KO.player = 'twitch';
   await api.probe();
-  assert.strictEqual(KO.statusChip.style.display, 'none', 'chip hidden in twitch mode');
+  assert.ok(['', 'KICK', 'YT', 'TW', 'OFF'].includes(lastBadge()), 'twitch mode emits a normalized badge');
   KO.player = 'youtube';
-  console.log('I status chip: KICK/KICK…/KICK ✕ + YT/YT…/YT ✕ transitions, hidden in twitch mode — OK');
+  console.log('I badge: KICK/YT states emit normalized badges, wrap hidden when kick offline — OK');
 
   // ---- J: badge texts all fit Chrome's 4-char clip --------------------------
   const seen = new Set(badgeTexts);
@@ -439,8 +433,7 @@ const settle = (ms) => new Promise((r) => setTimeout(r, ms));
   assert.ok(!KO.lastRect || KO.lastRect.width !== 1280 || KO.lastRect.height !== 720, 'tw-delete must not prime full viewport lastRect');
   assert.strictEqual(KO.wrap.style.display, 'block', 'wrap kept visible in the loading state');
   assert.ok(!KO.wrap.style.width || KO.wrap.style.width !== '1280px', 'wrap not forced to viewport width without a measured rect');
-  assert.strictEqual(KO.statusChip.textContent, 'YT ✕', 'chip reports the yt failure with the wrap up');
-  assert.strictEqual(KO.statusChip.style.display, 'block', 'chip visible with the wrap up');
+  assert.ok(badgeTexts.includes('YT'), 'badge reports the yt failure with the wrap up');
 
   // SPA re-render: a NEW video element appears -> the observer re-applies the delete.
   assert.ok(moInstances.length >= 1, 'tw-delete MutationObserver registered');

@@ -33,7 +33,10 @@ if (HLS_MODE) {
   // 'seek'|'seekToLive'|'getState'} in, {t:'ready'} + ~1/s {t:'st'} + {t:'ev'}
   // out. hls.js plays the innertube hlsManifestUrl; native controls visible.
   V.controls = true; // native controls give the yt layer the embed-era UX
-  const h = new Hls({ maxBufferLength: 30, liveSyncDurationCount: 3 });
+  // liveBackBufferLength: 20 keeps ~20s of media behind the live edge so the
+  // content script's arrow/bar seek has a real live-window to rewind into
+  // (the bar spans [edge - window, edge]).
+  const h = new Hls({ maxBufferLength: 30, liveSyncDurationCount: 3, liveBackBufferLength: 20 });
   let currentUrl = null;
   let reloaded = false;
   const st = () => {
@@ -44,7 +47,15 @@ if (HLS_MODE) {
     if (!isFinite(pos) || pos < 0 || pos >= 1e15) pos = 0;
     let lat = 0;
     try {
-      if (V.seekable && V.seekable.length) lat = V.seekable.end(V.seekable.length - 1) - pos;
+      if (V.seekable && V.seekable.length) {
+        lat = V.seekable.end(V.seekable.length - 1) - pos;
+        // For a live HLS stream the seekable range is the buffered live
+        // window; report THAT as the bar duration so the content script's
+        // seekbar spans [edge - window, edge] instead of the growing full
+        // timeline. The seek clamp below keeps the playhead in this range.
+        const win = V.seekable.end(V.seekable.length - 1) - V.seekable.start(0);
+        if (isFinite(win) && win > 0) dur = win;
+      }
     } catch { /* not ready */ }
     if (!isFinite(lat) || lat < 0) lat = 0;
     const levels = h.levels || [];
@@ -103,7 +114,20 @@ if (HLS_MODE) {
         if (Number.isFinite(m.v)) V.volume = Math.max(0, Math.min(1, m.v));
         break;
       case 'seek':
-        if (Number.isFinite(m.s) && m.s >= 0 && m.s < 1e15) V.currentTime = m.s;
+        if (Number.isFinite(m.s) && m.s >= 0 && m.s < 1e15) {
+          try {
+            // Clamp to the actual buffered range so a seek never lands outside
+            // the live window the engine actually holds (the frame honors the
+            // hls.js liveBackBufferLength window).
+            if (V.seekable && V.seekable.length) {
+              const s0 = V.seekable.start(0);
+              const s1 = V.seekable.end(V.seekable.length - 1);
+              V.currentTime = Math.max(s0, Math.min(s1, m.s));
+            } else {
+              V.currentTime = m.s;
+            }
+          } catch { /* seekable not ready — let the browser clamp */ }
+        }
         break;
       case 'seekToLive':
         try {

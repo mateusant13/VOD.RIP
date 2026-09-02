@@ -22,8 +22,10 @@
 // players are PAUSED (not just covered) — kick frame, yt iframe, and the
 // native Twitch player all pause while another layer is shown; switching
 // resumes instantly (buffers are kept; kick/yt seek back to the live edge
-// on return). The Kick player also offers seek-back within the live window
-// + a LIVE button.
+// on return). Both overlay players offer seek-back within their live
+// window: kick seeks its full DVR broadcast, the YT HLS layer rews into
+// the ~20s live buffer. Arrow-left/right and the seekbar drive the same
+// clamped seek path.
 //
 // Manual player switches NEVER wait on the Twitch player state: clicking
 // KICK/YOUTUBE/TWITCH always takes effect immediately (the Twitch-live
@@ -38,6 +40,7 @@ const YT_EMBED_GRACE = 8000; // yt embed must init (onReady) within this or fall
 const SPA_MS = 900;      // Twitch SPA pathname poll (no reload on channel nav)
 const HIDE_TICKS = 3;    // consecutive ticks without a Twitch player before hiding
 const MAX_RECONNECT = 3; // kick fatal retries (fresh playback_url each time)
+const ARROW_SEEK_SEC = 5; // per-press arrow-left/right step inside the live window
 
 // Diagnostics stay inside the extension's service-worker console. Only the
 // event name is logged there; payloads are intentionally not forwarded.
@@ -84,7 +87,6 @@ const KO = {
   ytId: null,
   activeUrl: null, // kick playback_url currently loaded in the frame
   wrap: null,      // overlay container — persists across switches
-  statusChip: null, // #ko-status pill — a SIBLING of the wrap (survives hideWrap)
   kickFrame: null, // <iframe src=player.html> (IVS engine, same as kick.com)
   kickWin: null,   // kickFrame.contentWindow (set on first ready message)
   kickReady: false,
@@ -107,7 +109,7 @@ const KO = {
   dvrFetchedFor: null, // playback_url the DVR source was fetched for (once per url)
   ytVol: 1,         // user's YouTube volume in the player bridge's 0..1 range
   ytMuted: false,   // user's YouTube mute choice (persisted)
-  ytState: { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, error: 0 },
+  ytState: { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, lat: 0, error: 0 },
   ytHlsUrl: null,   // last minted HLS manifest url (refreshed under the background cache TTL)
   ytHlsAt: 0,       // epoch ms of the successful mint
   ytHlsFailed: false, // last mint (or a fatal frame error) failed — fall back to kick
@@ -280,44 +282,6 @@ async function kickPlaybackUrl(slug) {
 //   KICK green = Playing | KICK amber = connecting (url/ready pending)
 //   KICK gray  = failed/offline | YT red = live | YT amber = minting/loading
 //   YT gray    = failed | TW/OFF gray | '' clear.
-// The #ko-status pill is driven from the SAME call (single choke point) so
-// the chip and the badge can never disagree.
-const CHIP_STATES = {
-  'KICK|#059669': ['KICK', '#53fc18'],
-  'KICK|#d97706': ['KICK…', '#fbbf24'],
-  'KICK|#6b7280': ['KICK ✕', '#f87171'],
-  'YT|#ff0000': ['YT', '#ff0000'],
-  'YT|#d97706': ['YT…', '#fbbf24'],
-  'YT|#6b7280': ['YT ✕', '#f87171'],
-};
-
-// Pin the chip to the top-right of the player rect; lastRect keeps the pin
-// after ko-delete-twitch (viewport-primed when no rect was ever measured).
-function positionStatusChip() {
-  const c = KO.statusChip;
-  if (!c || c.style.display === 'none') return;
-  const r = twitchAnchorRect() || KO.lastRect || { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
-  const right = typeof r.right === 'number' ? r.right : r.left + r.width;
-  c.style.left = `${Math.max(0, right - (c.offsetWidth || 0) - 8)}px`;
-  c.style.top = `${r.top + 8}px`;
-}
-
-function updateStatusChip(text, color) {
-  const c = KO.statusChip;
-  if (!c) return;
-  const st = CHIP_STATES[text + '|' + color];
-  // Chip only exists for mapped channels with an overlay player active —
-  // twitch mode / unmapped / disabled pages get no pill.
-  if (!st || !KO.enabled || !KO.slug || !KO.mappings[KO.slug] || KO.player === 'twitch') {
-    if (c.style.display !== 'none') c.style.display = 'none';
-    return;
-  }
-  c.textContent = st[0];
-  c.style.color = st[1];
-  if (c.style.display === 'none') c.style.display = 'block';
-  positionStatusChip();
-}
-
 function setBadge(text, color) {
   try {
     chrome.action.setBadgeBackgroundColor({ color: color || [0, 0, 0, 0] });
@@ -325,7 +289,6 @@ function setBadge(text, color) {
   } catch {
     /* badge is cosmetic */
   }
-  updateStatusChip(text, color);
 }
 
 // ---- YouTube bridge ---------------------------------------------------------
@@ -357,6 +320,7 @@ function ytCmd(cmd, arg) {
     case 'unmute': return ytSend({ t: 'mute', m: false });
     case 'setVolume': return ytSend({ t: 'volume', v: arg });
     case 'seekToLive': return ytSend({ t: 'seekToLive' });
+    case 'seek': return ytSend({ t: 'seek', s: arg });
   }
 }
 
@@ -489,11 +453,13 @@ window.addEventListener('message', (ev) => {
     KO.ytState.live = st.state === 'Playing' || st.state === 'Buffering' || st.state === 'Paused';
     KO.ytState.dur = st.dur || 0;
     KO.ytState.ct = st.pos || 0;
+    KO.ytState.lat = st.lat || 0; // gap to the live edge (absolute seconds)
     KO.ytState.vq = (st.q && st.q.name) || '';
     KO.ytState.qualities = Array.isArray(st.qualities) ? st.qualities : [];
     updatePlayUI();
     updateKickVolUI();
     renderQualityMenu();
+    updateKickBar();
     if (typeof st.volume === 'number' && st.volume >= 0 && !st.muted && KO.ytVol !== st.volume) {
       KO.ytVol = st.volume; // remember the user's yt volume slider
       saveState();
@@ -773,24 +739,6 @@ function ensureAttached(el) {
   if (el && !el.isConnected) overlayAnchor().appendChild(el);
 }
 
-// #ko-status pill — always-visible phase indicator. Appended to overlayAnchor
-// as a SIBLING of #ko-wrap (never a wrap child) so it survives hideWrap and
-// keeps reporting the failure state when the layer is gone. Created by
-// probe() after the enabled check; removed by teardown().
-function ensureStatusChip() {
-  if (KO.statusChip) return;
-  const c = document.createElement('div');
-  c.id = 'ko-status';
-  c.style.cssText =
-    'position:fixed;z-index:6;pointer-events:none;display:none;' +
-    'font:700 12px system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;' +
-    'background:rgba(0,0,0,.65);border:1px solid rgba(255,255,255,.18);' +
-    'border-radius:999px;padding:3px 10px;white-space:nowrap;color:#fff;';
-  c.style.display = 'none'; // cssText already carries it; explicit for clarity
-  overlayAnchor().appendChild(c);
-  KO.statusChip = c;
-}
-
 // ---- overlay lifecycle ------------------------------------------------------
 
 // ---- kick.com-identical player chrome (mined 2026-08-14) ---------------------
@@ -954,13 +902,6 @@ function mount() {
     '<div id="ko-thumb"></div>' +
     '</div>';
   wrap.appendChild(bar);
-  const top = document.createElement('div');
-  top.id = 'ko-top';
-  top.innerHTML =
-    '<button id="ko-livebadge" class="ko-livebadge"><span id="ko-live-dot" class="ko-live-dot"></span>' +
-    '<span id="ko-live-txt" class="ko-live-txt">LIVE</span></button>' +
-    '<span id="ko-elapsed" class="ko-elapsed"></span>';
-  wrap.appendChild(top);
   const rc = document.createElement('div');
   rc.id = 'ko-reconnecting';
   rc.textContent = 'RECONNECTING\u2026';
@@ -1110,7 +1051,16 @@ function mount() {
     KO.seeking = false;
     sb.classList.remove('ko-drag');
     hov.style.display = 'none';
-    kickSeekTo(fracFromEvent(e) * KO.kickDur);
+    const target = fracFromEvent(e) * KO.kickDur;
+    if (KO.player === 'youtube') {
+      // yt live window: the seekbar spans [edge - window, edge]; a drag maps
+      // to an absolute media time, clamped by the frame's own seek logic.
+      const edge = (KO.ytState.ct || 0) + (KO.ytState.lat || 0);
+      const winStart = edge - KO.kickDur;
+      ytCmd('seek', winStart + target);
+    } else {
+      kickSeekTo(target);
+    }
   };
   sb.addEventListener('pointerup', endDrag);
   sb.addEventListener('pointercancel', () => {
@@ -1118,10 +1068,6 @@ function mount() {
     KO.seeking = false;
     sb.classList.remove('ko-drag');
     hov.style.display = 'none';
-  });
-  const badge = top.querySelector('#ko-livebadge');
-  badge.addEventListener('click', () => {
-    if (KO.kickOnDvr) kickBackToLive();
   });
   bar.querySelector('#ko-fs').addEventListener('click', toggleOverlayFullscreen);
   startRectLoop();
@@ -1143,16 +1089,8 @@ function teardown() {
     KO.wrap.remove();
     KO.wrap = null;
   }
-  if (KO.statusChip) {
-    try {
-      KO.statusChip.remove();
-    } catch {
-      /* already gone */
-    }
-    KO.statusChip = null;
-  }
   // the frame dies with the removed iframe; no ytCmd('destroy') exists
-  KO.ytState = { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, error: 0 };
+  KO.ytState = { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, lat: 0, error: 0 };
   KO.ytUnlock = false;
   KO.ytWin = null;
   KO.lastYtSt = 0;
@@ -1278,15 +1216,43 @@ async function reconnect() {
   }
 }
 
-// Kick bar: full-broadcast seek slider (kick-style DVR: rewinds switch to
-// the replay url, ≤30s from the edge goes live) + VOLTAR AO VIVO pill when
-// behind. Position/latency/duration come from the IVS frame's ~1s messages.
+// Unified bar: full-broadcast seek slider (kick-style DVR: rewinds switch
+// to the replay url, ≤30s from the edge goes live) + VOLTAR AO VIVO pill
+// when behind for kick; for the yt HLS layer the bar is the ~20s live
+// window (liveBackBufferLength) so it tracks the current buffered range.
+// Position/latency/duration come from the frame's ~1s messages.
 function updateKickBar() {
-  if (!KO.wrap || KO.player !== 'kick') return;
-  const st = KO.kickState;
-  const liveVisible = !!(st && (st.state === 'Playing' || st.state === 'Buffering' || KO.kickOnDvr));
+  if (!KO.wrap) return;
+  const isYt = KO.player === 'youtube';
+  const st = isYt ? null : KO.kickState;
+  const liveVisible = isYt
+    ? !!KO.ytState.live
+    : !!(st && (st.state === 'Playing' || st.state === 'Buffering' || KO.kickOnDvr));
   KO.wrap.classList.toggle('ko-offline', !liveVisible);
   renderQualityMenu();
+
+  if (isYt) {
+    // yt live window (hls.js liveBackBufferLength): pos rides the buffer,
+    // lat is the gap to the live edge. The bar spans [edge - window, edge].
+    let max = KO.ytState.dur || 0;
+    if (!(max > 0) || !isFinite(max)) max = Math.max(1, KO.ytState.ct || 1);
+    const lat = isFinite(KO.ytState.lat) && KO.ytState.lat >= 0 ? KO.ytState.lat : 0;
+    KO.kickDur = max;
+    const head = Math.max(0, max - lat);
+    if (!KO.seeking) setKickFill(max > 0 ? head / max : 0);
+    const loaded = KO.wrap.querySelector('#ko-loaded');
+    const loadind = KO.wrap.querySelector('#ko-loadind');
+    if (loaded) loaded.style.transform = 'scaleX(1)';
+    if (loadind) loadind.style.transform = 'scaleX(1)';
+    const cur = KO.wrap.querySelector('#ko-cur');
+    const total = KO.wrap.querySelector('#ko-total');
+    if (cur) cur.textContent = fmtDur(head, max >= 3600);
+    if (total) total.textContent = fmtDur(max, max >= 3600);
+    updatePlayUI();
+    updateKickVolUI();
+    return;
+  }
+
   if (!st) return;
   const pos = st.pos || 0;
   const lat = st.lat;
@@ -1320,23 +1286,6 @@ function updateKickBar() {
   const total = KO.wrap.querySelector('#ko-total');
   if (cur) cur.textContent = fmtDur(head, max >= 3600);
   if (total) total.textContent = fmtDur(max, max >= 3600);
-  // Keep the hidden status state coherent for diagnostics. The persistent
-  // top-left LIVE label is intentionally not rendered.
-  const dot = KO.wrap.querySelector('#ko-live-dot');
-  const btxt = KO.wrap.querySelector('#ko-live-txt');
-  const badge = KO.wrap.querySelector('#ko-livebadge');
-  const elapsed = KO.wrap.querySelector('#ko-elapsed');
-  if (KO.kickOnDvr) {
-    if (dot) dot.style.background = '#3f4448';
-    if (btxt) btxt.textContent = 'Voltar ao vivo';
-    if (badge) badge.style.cursor = 'pointer';
-    if (elapsed) elapsed.textContent = '';
-  } else {
-    if (dot) dot.style.background = '#53fc18';
-    if (btxt) btxt.textContent = 'LIVE';
-    if (badge) badge.style.cursor = 'default';
-    if (elapsed && Number.isFinite(KO.kickStreamStart)) elapsed.textContent = fmtDur((Date.now() - KO.kickStreamStart) / 1000, max >= 3600);
-  }
   updatePlayUI();
   updateKickVolUI();
 }
@@ -1369,7 +1318,6 @@ async function probe() {
     teardown();
     return;
   }
-  ensureStatusChip(); // always-visible phase pill (survives hideWrap)
   // NOTE (2026-08-13): no Twitch-live gate here anymore. It used to
   // teardown() the whole overlay whenever the native player paused or
   // swapped elements during ad transitions, which made the manual KICK
@@ -1545,14 +1493,40 @@ function toggleOverlayFullscreen() {
   else KO.wrap.requestFullscreen().catch((err) => diag('fullscreen', { err: String(err).slice(0, 100) }));
 }
 
+// Arrow-left/right seek inside the live window. The absolute media time is
+// the current playhead +/- the step; each engine clamps to what it actually
+// holds (yt/hls: the liveBackBufferLength window; kick: full-broadcast DVR).
+function seekOverlayStep(delta) {
+  if (!KO.wrap || KO.player === 'twitch' || KO.wrap.style.display === 'none') return;
+  if (KO.player === 'youtube') {
+    ytCmd('seek', (KO.ytState.ct || 0) + delta);
+    return;
+  }
+  // kick: broadcast-timeline position of the playhead (live edge rides
+  // pos + lat, DVR pos is the seeked offset). Mirror kick.com's routing —
+  // a back-seek within 30s of the edge just goes live, farther back seeks
+  // the DVR url clamped safely around the live edge.
+  const st = KO.kickState || {};
+  const lat = isFinite(st.lat) && st.lat >= 0 ? st.lat : 0;
+  kickSeekTo((KO.kickOnDvr ? (st.pos || 0) : (st.pos || 0) + lat) + delta);
+}
+
 function onOverlayKeydown(e) {
-  if (String(e.key).toLowerCase() !== 'f' || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+  const key = String(e.key).toLowerCase();
+  const want = key === 'f' || key === 'arrowleft' || key === 'arrowright';
+  if (!want || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
   const target = e.target;
   if (target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))) return;
   if (!KO.wrap || KO.player === 'twitch' || KO.wrap.style.display === 'none') return;
   e.preventDefault();
   e.stopImmediatePropagation();
-  toggleOverlayFullscreen();
+  if (key === 'f') {
+    toggleOverlayFullscreen();
+  } else if (key === 'arrowleft') {
+    seekOverlayStep(-ARROW_SEEK_SEC);
+  } else {
+    seekOverlayStep(ARROW_SEEK_SEC);
+  }
 }
 
 function startWatchers() {
@@ -1765,7 +1739,7 @@ function rectTick() {
         console.log('[ko] yt bridge silent — rebuilding frame');
         const yf = document.getElementById('ko-yt');
         if (yf) yf.remove();
-        KO.ytState = { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, error: 0 };
+        KO.ytState = { ready: false, playing: false, muted: true, live: false, dur: 0, ct: 0, lat: 0, error: 0 };
         KO.ytWin = null;
         KO.lastYtSt = 0;
         fire(probe); // recreate now instead of waiting for the 20s poll
@@ -1782,9 +1756,6 @@ function rectTick() {
       resumeTwitchIfOurs();
       syncMute();
     }
-    // The chip lives outside the wrap — keep it pinned to the player rect
-    // on every tick, whether the wrap is shown or hidden.
-    positionStatusChip();
 }
 
 function stopRectLoop() {
@@ -1810,8 +1781,6 @@ function injectStyles() {
     'font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}' +
     '#ko-wrap:not(.ko-hot) #ko-bar{opacity:1;}' +
     '#ko-wrap.ko-yt #ko-bar{display:flex;}' +
-    '#ko-wrap.ko-yt #ko-top{display:none;}' + // stale LIVE pill in yt mode
-    '#ko-wrap.ko-offline #ko-top{display:none;}' + // hide LIVE pill when kick is offline/not playing
     '#ko-reconnecting{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;' +
     'background:rgba(0,0,0,.82);color:#fff;font:700 15px system-ui,sans-serif;letter-spacing:.04em;pointer-events:none;}' +
     '.ko-g{display:flex;flex-direction:row;align-items:center;}' +
@@ -1849,16 +1818,7 @@ function injectStyles() {
     '#ko-seekbar:hover #ko-thumb,#ko-seekbar.ko-drag #ko-thumb{display:block;}' +
     '#ko-hov{position:absolute;top:-20px;left:0;transform:translateX(-50%);background:rgba(0,0,0,.78);' +
     'border-radius:6px;padding:4px 6px;font-size:12px;font-weight:700;color:#fff;' +
-    'font-variant-numeric:tabular-nums;white-space:nowrap;display:none;pointer-events:none;z-index:2;}' +
-    '#ko-top{display:none;position:absolute;top:0;left:0;right:0;pointer-events:none;flex-direction:row;' +
-    'align-items:center;gap:12px;padding:10px 14px;color:#fff;' +
-    'background:linear-gradient(180deg,rgba(0,0,0,.7),rgba(0,0,0,0));' +
-    'font-family:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}' +
-    '#ko-livebadge{pointer-events:auto;display:flex;flex-direction:row;align-items:center;gap:6px;' +
-    'background:transparent;border:0;color:#fff;cursor:default;padding:0;}' +
-    '#ko-live-dot{width:10px;height:10px;border-radius:50%;background:#53fc18;}' +
-    '#ko-live-txt{font-size:14px;font-weight:600;white-space:nowrap;}' +
-    '#ko-elapsed{font-size:12px;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap;}';
+    'font-variant-numeric:tabular-nums;white-space:nowrap;display:none;pointer-events:none;z-index:2;}';
   (document.head || document.documentElement).appendChild(st);
 }
 
@@ -1931,9 +1891,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       saveState(true);
     }
     // Youtube layer not shown (mint pending/failed)? Keep the wrap visible
-    // in its loading state instead of hiding — the chip shows YT…/YT ✕ and
-    // the black layer covers the deleted player slot (probe()'s hide sites
-    // respect twDeleted via hideWrapForProbe()).
+    // in its loading state instead of hiding — the badge reports YT…/YT ✕
+    // and the black layer covers the deleted player slot (probe()'s hide
+    // sites respect twDeleted via hideWrapForProbe()).
     if (KO.player === 'youtube' && KO.wrap && KO.wrap.style.display === 'none') {
       if (KO.lastRect) {
         const s = KO.wrap.style;
@@ -2066,7 +2026,6 @@ window.addEventListener('kick-overlay:status', () => {
             cur: (KO.wrap.querySelector('#ko-cur') || {}).textContent || '',
             total: (KO.wrap.querySelector('#ko-total') || {}).textContent || '',
             fillPct: Math.round(parseFloat((KO.wrap.querySelector('#ko-fill') || {}).style?.width || '0')),
-            badge: (KO.wrap.querySelector('#ko-live-txt') || {}).textContent || '',
             vol: Math.round(((KO.kickMuted || KO.kickVol === 0) ? 0 : KO.kickVol) * 100),
             dur: Math.round(KO.kickDur || 0),
             hot: KO.wrap.classList.contains('ko-hot'),
