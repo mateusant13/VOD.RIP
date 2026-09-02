@@ -5036,6 +5036,7 @@ export default function App() {
         }
       } else {
         const limit = incremental ? CHANNEL_INCREMENTAL_LIMIT : CHANNEL_FETCH_LIMIT;
+        let anyRefreshing = false;
         const fetchVods = async (platform: 'Kick' | 'Twitch' | 'YouTube', slug: string) => {
           if (!slug?.trim()) return;
           const params = new URLSearchParams({
@@ -5064,8 +5065,6 @@ export default function App() {
             errs[platform] = err instanceof Error ? err.message : `Failed to fetch ${platform} VODs`;
           }
         };
-        const vodTasks: Promise<void>[] = [];
-        let anyRefreshing = false;
         if (wantKick) vodTasks.push(fetchVods('Kick', ch.kickSlug));
         if (wantTwitch) vodTasks.push(fetchVods('Twitch', ch.twitchSlug));
         if (wantYoutube) vodTasks.push(fetchVods('YouTube', ch.youtubeSlug));
@@ -5083,11 +5082,22 @@ export default function App() {
         const vodVideos = mergeVodLists(latest.vodVideos ?? [], incoming,
           prunePlatforms.length ? { prunePlatforms } : undefined);
         const anyMore = Object.values(pageHasMore).some(Boolean);
+        const scheduleRefreshingFollowup = () => {
+          if (!anyRefreshing) return;
+          const followKey = `${channelId}:${mode}`;
+          if (channelFollowupRef.current.has(followKey)) return;
+          channelFollowupRef.current.add(followKey);
+          window.setTimeout(() => {
+            channelFollowupRef.current.delete(followKey);
+            refreshChannel(channelId, ch, mode, { incremental: true, silent: true }).catch(() => {});
+          }, 6000);
+        };
         if (incremental) {
           updateChannel(channelId, {
             vodVideos,
             updatedAt: new Date().toISOString(),
           });
+          scheduleRefreshingFollowup();
         } else if (pageFetch) {
           // Show-more page: append-only (no prune), advance the cursor. A
           // stale response (a newer page already landed) is ignored — see
@@ -5129,19 +5139,10 @@ export default function App() {
             loading: false,
             updatedAt: new Date().toISOString(),
           });
-          // Backend served a stale index and is refreshing in the background:
-          // schedule one silent incremental pull so the merged +1 shows up
-          // without another spinner.
-          if (anyRefreshing) {
-            const followKey = `${channelId}:${mode}`;
-            if (!channelFollowupRef.current.has(followKey)) {
-              channelFollowupRef.current.add(followKey);
-              window.setTimeout(() => {
-                channelFollowupRef.current.delete(followKey);
-                refreshChannel(channelId, ch, mode, { incremental: true, silent: true }).catch(() => {});
-              }, 6000);
-            }
-          }
+          // Backend served an index while refreshing in the background.
+          // Poll from both the initial request and each silent follow-up so a
+          // cold YouTube channel cannot remain permanently empty.
+          scheduleRefreshingFollowup();
         }
       }
 
