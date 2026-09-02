@@ -281,19 +281,30 @@ def request_app_exit() -> None:
             except (OSError, RuntimeError, AttributeError) as exc:
                 _logger.debug("stop tray: %s", exc)
 
-        from services.shutdown_util import shutdown_downloads_and_children
+        try:
+            from services.shutdown_util import shutdown_downloads_and_children
 
-        shutdown_downloads_and_children()
+            shutdown_downloads_and_children()
+        except Exception as exc:
+            _logger.debug("download cleanup failed: %s", exc)
         try:
             from services.entity_watch import stop_entity_watcher
-            from services.archive_watchdog import stop_archive_watchdog
-            from services.archive_transcribe import stop_worker
 
             stop_entity_watcher(timeout=5.0)
+        except Exception as exc:
+            _logger.debug("entity watcher stop failed: %s", exc)
+        try:
+            from services.archive_watchdog import stop_archive_watchdog
+
             stop_archive_watchdog(timeout=10.0)
+        except Exception as exc:
+            _logger.debug("archive watchdog stop failed: %s", exc)
+        try:
+            from services.archive_transcribe import stop_worker
+
             stop_worker(timeout=6.0)
         except Exception as exc:
-            _logger.debug("stop in-process workers: %s", exc)
+            _logger.debug("transcription worker stop failed: %s", exc)
 
         try:
             import os as _os
