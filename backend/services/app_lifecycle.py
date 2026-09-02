@@ -284,6 +284,16 @@ def request_app_exit() -> None:
         from services.shutdown_util import shutdown_downloads_and_children
 
         shutdown_downloads_and_children()
+        try:
+            from services.entity_watch import stop_entity_watcher
+            from services.archive_watchdog import stop_archive_watchdog
+            from services.archive_transcribe import stop_worker
+
+            stop_entity_watcher(timeout=5.0)
+            stop_archive_watchdog(timeout=10.0)
+            stop_worker(timeout=6.0)
+        except Exception as exc:
+            _logger.debug("stop in-process workers: %s", exc)
 
         try:
             import os as _os

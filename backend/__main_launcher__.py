@@ -406,7 +406,7 @@ def _server_health_watchdog(port: int) -> None:
                 miss_interval * max_misses,
             )
             try:
-                stop_api_server(port)
+                stop_api_server(port, restart=True)
             except Exception as exc:
                 logger.debug("stop_api_server failed: %s", exc)
             misses = 0
