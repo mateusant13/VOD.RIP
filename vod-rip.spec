@@ -9,7 +9,7 @@ captions and lexical archive search until the separate
 ``VOD-RIP-ASR.exe`` runtime is installed on first use. The ASR stack ships in
 ``backend/asr_worker.py`` + ``vod-rip-asr.spec`` as that separate runtime.
 
-From project root::
+Invocation (any CWD — paths are anchored to this spec's directory)::
 
     npm run build-dist
 """
@@ -18,7 +18,10 @@ import os
 import sys
 from pathlib import Path
 
-_SPEC_DIR = Path.cwd()
+# PyInstaller injects SPECPATH (the spec file's own directory) into the spec
+# namespace; __file__ is NOT defined there. Keeping the import anchored to
+# SPECPATH makes the build independent of the launch CWD.
+_SPEC_DIR = Path(SPECPATH)
 if str(_SPEC_DIR) not in sys.path:
     sys.path.insert(0, str(_SPEC_DIR))
 

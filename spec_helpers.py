@@ -19,7 +19,12 @@ import re
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(os.getcwd())
+# Derive the repository root from this module's own location, not the CWD.
+# PyInstaller runs the .spec body with an exec() namespace that does not define
+# __file__, but spec_helpers is imported as a normal module, so __file__ here
+# reliably points at the spec directory (the repository root) regardless of
+# where `pyinstaller` is launched from.
+PROJECT_ROOT = Path(__file__).resolve().parent
 BACKEND_DIR = PROJECT_ROOT / "backend"
 STATIC_DIR = BACKEND_DIR / "static"
 ASSETS_DIR = PROJECT_ROOT / "assets"
