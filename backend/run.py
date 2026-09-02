@@ -35,6 +35,14 @@ def _install_logging() -> None:
     )
     logging.getLogger("VOD.RIP.youtube").setLevel(logging.INFO)
     logging.getLogger("VOD.RIP.preview_timing").setLevel(logging.INFO)
+    # Central ERROR ring/file (latest-500, sanitized) — must attach even in
+    # dev so uncaught server/app 500s land in the inspectable error log.
+    try:
+        from services.error_log import install_error_handler
+
+        install_error_handler()
+    except Exception:
+        pass
 
 
 def _install_shutdown_hook() -> None:

@@ -7,7 +7,7 @@ import logging
 import os
 import platform
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 
 from deps import OS_EXECUTOR, settings_mgr
@@ -100,6 +100,20 @@ async def install_asr_runtime() -> dict:
         logger.warning("ASR runtime installation failed: %s", exc)
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return runtime_status()
+
+
+@router.get("/api/errors/latest")
+async def latest_errors(limit: int = Query(20, ge=1, le=500)) -> dict:
+    """Latest server/application errors (bounded ring, no secrets).
+
+    Mirrors the live-captions error ring: unauthenticated but bounded (max
+    500 entries, sanitized — cookies/tokens are stripped on ingest).
+    """
+    from services.error_log import get_error_ring
+
+    # ponytail: unauthenticated but bounded (500 entries, sanitized); gate
+    # behind auth when app auth lands (same caveat as live_captions_errors).
+    return {"errors": get_error_ring(limit)}
 
 
 @router.get("/api/health")
