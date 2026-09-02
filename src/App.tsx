@@ -590,6 +590,11 @@ export default function App() {
     url: string;
     session: PreviewSessionResponse;
   } | null>(null);
+  /** Live session pre-warm — created on channel hover, consumed by LivePlayerPopup on mount. */
+  const liveSessionPrefetchRef = useRef<{
+    url: string;
+    session: PreviewSessionResponse;
+  } | null>(null);
   /** URL currently being warmed by prefetchLiveSession — an in-flight guard so
    *  a hover storm on one channel issues one POST, not N. */
   const livePrefetchInFlightRef = useRef<string | null>(null);
@@ -5450,6 +5455,7 @@ export default function App() {
     setAddChannelInput(raw);
     setPendingAddChannel(channelLinkDraftFromParsed(parsed, raw));
   }, []);
+
 
   const toggleChannelSelection = useCallback((channelId: string) => {
     setSelectedChannelId((prev) => {

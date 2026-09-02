@@ -362,6 +362,15 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Confirmed-missing Kick/YouTube channel (live master 404): swaps the player
+  // for a centered channel-name input until the user submits a correction.
+  const [notFound, setNotFound] = useState(false);
+  const [missingName, setMissingName] = useState('');
+  // Seed the not-found input with the current channel name each time the
+  // state activates (the name differs per entry in the fallback chain).
+  useEffect(() => {
+    if (notFound) setMissingName(channelName);
+  }, [notFound, channelName]);
   // Per-media retry state — the live pipeline is a single stage (session
   // create + attach happen together), so every retry re-runs it end-to-end.
   const [previewRetry, setPreviewRetry] = useState<PreviewRetryState | null>(null);
@@ -1267,8 +1276,6 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
           hls.startLoad(startPos);
         }
       }
-      setLoading(false);
-      clearRetry();
     });
 
     hls.on(Hls.Events.LEVEL_SWITCHED, (_e, data) => {
@@ -1320,6 +1327,20 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     });
 
     hls.on(Hls.Events.ERROR, (_e, data) => {
+      // Confirmed-missing channel (Kick/YouTube): the live master URL proxies
+      // to a 404 when the channel id/slug has no playable stream — the channel
+      // doesn't exist, not a transient blip. Surface the centered channel-name
+      // input instead of advancing the fallback chain or showing retry.
+      if (modeRef.current === 'live'
+        && data?.type === Hls.ErrorTypes.NETWORK_ERROR
+        && (data.response as { code?: number } | undefined)?.code === 404
+        && (sessionPlatformRef.current === 'kick' || sessionPlatformRef.current === 'youtube')) {
+        setNotFound(true);
+        setLoading(false);
+        setError(null);
+        markPreviewError();
+        return;
+      }
       // Stall guard (live only): hls.js 1.6.2 reports a stall as
       // BUFFER_STALLED_ERROR — NON-fatal once per stall period (hls.js
       // nudges and retries first), then fatal if the nudges fail. A
@@ -1431,6 +1452,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     const ctx = previewRetryRef.current;
     if (!ctx) return;
     setError(null);
+    setNotFound(false);
     previewRetryingRef.current = true;
     const sid = sessionIdRef.current;
     if (sid) {
@@ -1463,6 +1485,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         setLoading(true);
       }
       setError(null);
+      setNotFound(false);
       const body: {
         url: string;
         is_live: boolean;
@@ -1665,6 +1688,14 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       firstFrameLoggedRef.current = true;
       console.info('[live] first-frame', Math.round(performance.now() - firstFrameStartRef.current));
     };
+    // MANIFEST_PARSED no longer ends the spinner: a manifest is just the
+    // playlist facade and its bytes arrive before any decodable frame — a dead
+    // upstream thus showed a black player instead of the spinner. Spinner ends
+    // on the first DECODED frame (loadeddata) instead.
+    const onLoadedData = () => {
+      setLoading(false);
+      clearRetry();
+    };
     const onPlayingMarkPlayed = () => { hasPlayedOnceRef.current = true; };
     video.addEventListener('play', onPlay);
     video.addEventListener('pause', onPause);
@@ -1676,6 +1707,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     video.addEventListener('playing', onFirstFrame);
     video.addEventListener('timeupdate', onFirstFrame);
     video.addEventListener('canplay', onPlayingMarkPlayed);
+    video.addEventListener('loadeddata', onLoadedData);
     return () => {
       bufferingHandle.detach();
       bufferingHandleRef.current = null;
@@ -1689,8 +1721,9 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       video.removeEventListener('timeupdate', onFirstFrame);
       video.removeEventListener('timeupdate', onTimeClearBuffer);
       video.removeEventListener('canplay', onPlayingMarkPlayed);
+      video.removeEventListener('loadeddata', onLoadedData);
     };
-  }, [captionClockSync]);
+  }, [captionClockSync, clearRetry]);
 
   // Track fullscreen state — element-equality like App.tsx and
   // ChannelExplorePopup: this popup only claims fullscreen when IT is the
@@ -2415,6 +2448,39 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
           </div>
         )}
 
+        {notFound && (
+          <form
+            data-live-not-found
+            className="absolute inset-0 z-[2] flex flex-col items-center justify-center gap-3 bg-black/85 text-center px-6"
+            onSubmit={(e) => {
+              e.preventDefault();
+              const name = missingName.trim();
+              if (name) onNotFoundChannel?.(name);
+            }}
+          >
+            <div className="flex items-center gap-1.5 text-zinc-400 text-[10px] font-mono uppercase tracking-widest">
+              <Search size={12} />
+              {t('Channel not found')}
+            </div>
+            <input
+              type="text"
+              value={missingName}
+              onChange={(e) => setMissingName(e.target.value)}
+              placeholder={t('Kick or YouTube name')}
+              aria-label={t('Kick or YouTube name')}
+              autoFocus
+              className="w-full max-w-[240px] rounded-md border-2 border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-sm text-zinc-100 outline-none focus:border-white"
+            />
+            <button
+              type="submit"
+              disabled={!missingName.trim()}
+              className="rounded-md border-2 border-zinc-600 bg-zinc-800 px-3 py-1 text-[10px] font-black uppercase tracking-wider text-zinc-200 hover:border-white hover:text-white disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+            >
+              {t('Open channel')}
+            </button>
+          </form>
+        )}
+
         {!loading && !error && buffering && (
           <div
             className="absolute inset-0 z-[1] flex items-center justify-center bg-black/50 text-zinc-300 text-xs font-mono pointer-events-none"
@@ -2440,7 +2506,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         {/* Transport controls — same layout as the mini preview player: a
             timeline row (current/total timestamps + rail) above the transport
             row (play, volume, live-edge, quality, fullscreen). No trim here. */}
-        {!loading && !error && (
+        {!error && (mode === 'live' || !loading) && (
           <div
             data-live-transport
             className={`px-2 py-1.5 bg-gradient-to-t from-black/85 to-black/0 transition-all duration-300 ${
