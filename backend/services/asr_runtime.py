@@ -283,7 +283,20 @@ def transcribe_window(audio: bytes) -> tuple[str, Optional[str]]:
 
 
 def start_archive_worker() -> int:
-    """Start one detached archive worker from the optional runtime."""
+    """Start one detached archive worker from the optional runtime.
+
+    Fire-and-forget by design: the worker must outlive this process tree
+    (it drains archive jobs after the app closes), so it is never reaped
+    or joined here. The stored Popen handle is only consulted to avoid
+    spawning a duplicate while a previous worker still runs (first-wins
+    is also enforced inside worker_server itself); once its process has
+    exited the handle is dropped on the next call and a fresh supervisor
+    may spawn. Recovery after a hard process-tree kill is heartbeat-based,
+    not PID-parentage-based: the app's worker watchdog and the closed-app
+    background daemon both respawn the worker from the queue state, so a
+    lost supervisor is replaced without losing queued (crash-safe) jobs.
+    May trigger the one-time runtime download via ``ensure_runtime()``.
+    """
     global _archive_worker_process
     with _archive_worker_lock:
         if _archive_worker_process is not None:
