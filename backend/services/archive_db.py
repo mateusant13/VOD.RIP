@@ -3260,20 +3260,26 @@ def search(
             if len(t) >= 4
         }
         # The vocabulary may intentionally be stale while a rebuild runs.
-        # Probe absent exact tokens through FTS so newly ingested rows still
-        # keep the split-phrase recall path without scanning for typos.
+        # Probe all unresolved exact terms in one fts5vocab query so newly
+        # ingested rows still keep split-phrase recall without token-by-token
+        # FTS work or a full scan for isolated typos.
         span_exact_tokens: set[str] = set()
-        for token in span_tokens:
-            if q_freq.get(token, 0) > 0 or any(
-                term != token for term in span_variants.get(token, ())
-            ):
-                continue
+        unresolved = [
+            token
+            for token in span_tokens
+            if q_freq.get(token, 0) == 0
+            and not any(term != token for term in span_variants.get(token, ()))
+        ]
+        if unresolved:
             try:
-                if query(
-                    "SELECT 1 FROM transcripts_fts WHERE transcripts_fts MATCH ? LIMIT 1",
-                    (_fts_phrase(token),),
-                ):
-                    span_exact_tokens.add(token)
+                placeholders = ", ".join("?" for _ in unresolved)
+                span_exact_tokens = {
+                    str(row["term"])
+                    for row in query(
+                        f"SELECT term FROM transcripts_vocab WHERE term IN ({placeholders})",
+                        tuple(unresolved),
+                    )
+                }
             except sqlite3.Error:
                 pass
         # Floor coverage for vocab-absent tokens: their rows only surface
