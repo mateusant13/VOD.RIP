@@ -25,6 +25,55 @@ const out = path.resolve(
   process.argv[2] ?? path.join(root, 'dist', 'VOD-RIP', 'cookie-extension', 'src'),
 );
 
+/**
+ * Post-copy integrity check: every file a staged extension tree actually
+ * references must be present on disk. Catches a partial cpSync (Windows
+ * sharing violation retried to success mid-tree, or a vendored asset that
+ * was never checked in) that would otherwise ship an extension whose
+ * manifest loads but whose runtime files are missing — the kick-overlay's
+ * player.html loads its engine (`ivs/index.js`, `hls/hls.min.js`,
+ * `player-bridge.js`) via <script src> outside the manifest, so those are
+ * checked here, not by Chrome.
+ * Throws so the build fails loudly instead of packaging a black player.
+ */
+function assertTreeComplete(treeRoot, { extraRefs = [] } = {}) {
+  const missing = [];
+  const manifestPath = path.join(treeRoot, 'manifest.json');
+  let manifest = null;
+  try {
+    manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  } catch {
+    missing.push('manifest.json');
+    manifest = null;
+  }
+  const refs = [];
+  if (manifest) {
+    if (manifest.background) {
+      const sw = manifest.background.service_worker || manifest.background.scripts;
+      (Array.isArray(sw) ? sw : [sw]).filter(Boolean).forEach((r) => refs.push(r));
+    }
+    (manifest.content_scripts || []).forEach((cs) => (cs.js || []).forEach((r) => refs.push(r)));
+    if (manifest.action) {
+      if (manifest.action.default_popup) refs.push(manifest.action.default_popup);
+      if (manifest.action.default_icon) Object.values(manifest.action.default_icon).forEach((r) => refs.push(r));
+    }
+    if (manifest.icons) Object.values(manifest.icons).forEach((r) => refs.push(r));
+  }
+  refs.push(...extraRefs);
+  for (const rel of refs) {
+    if (rel.startsWith('/')) { // absolute within the extension package
+      if (!existsSync(path.join(treeRoot, rel.slice(1)))) missing.push(rel);
+      continue;
+    }
+    if (!existsSync(path.join(treeRoot, rel))) missing.push(rel);
+  }
+  if (missing.length) {
+    throw new Error(
+      `[stage] incomplete extension tree at ${treeRoot} — missing: ${missing.join(', ')}`,
+    );
+  }
+}
+
 // --- guard: this must be OUR fork, not upstream drift --------------------
 const manifest = path.join(src, 'manifest.json');
 const bridgeModule = path.join(src, 'modules', 'cookie_bridge.mjs');
@@ -62,6 +111,7 @@ for (let attempt = 0; attempt < 3; attempt += 1) {
   }
 }
 if (lastErr) throw lastErr;
+assertTreeComplete(out);
 
 // The silent installer also loads the Kick Overlay, so ship both unpacked
 // sources beside the frozen executable.
@@ -77,6 +127,19 @@ const overlaySrc = path.join(root, 'vendor', 'kick-overlay');
 const overlayOut = path.join(appOut, 'kick-overlay');
 if (existsSync(path.join(overlaySrc, 'manifest.json')) && existsSync(path.join(overlaySrc, 'content.js'))) {
   cpSync(overlaySrc, overlayOut, { recursive: true, force: true });
+  // player.html loads its engine via <script src> OUTSIDE the manifest —
+  // verify those too so a partial copy can never ship a black player.
+  assertTreeComplete(overlayOut, {
+    extraRefs: [
+      'player.html',
+      'player-bridge.js',
+      'ivs/index.js',
+      'hls/hls.min.js',
+      'background.js',
+      'popup.html',
+    ],
+  });
   console.log(`[kick-overlay] staged ${path.relative(root, overlaySrc)} -> ${path.relative(root, overlayOut)}`);
 }
+assertTreeComplete(src);
 console.log(`[cookie-extension] staged ${path.relative(root, src)} -> ${path.relative(root, out)}`);
