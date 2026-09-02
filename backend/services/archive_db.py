@@ -3003,6 +3003,26 @@ _SPAM_MIN_TOKENS = 4
 _SPAM_MAX_UNIQUE_TOKENS = 2
 
 
+def _span_query_has_signal(
+    tokens: list[str],
+    frequencies: dict[str, int],
+    variants: dict[str, list[str]],
+) -> bool:
+    """Avoid a full transcript scan when a split phrase cannot match.
+
+    Exact vocabulary terms or a real fuzzy variant keep the cross-segment
+    recall pass enabled. An absent short token or an isolated typo has no
+    plausible split match and should not scan every transcript row.
+    """
+    for token in tokens:
+        if frequencies.get(token, 0) > 0:
+            continue
+        if len(token) >= 4 and any(term != token for term in variants.get(token, ())):
+            continue
+        return False
+    return True
+
+
 def _spam_penalty(text: str) -> float:
     """1.0 for real content, _SPAM_DOWNWEIGHT for repeated-token spam."""
     toks = re.findall(r"[^\W_]+", str(text or "").casefold())
@@ -3326,7 +3346,12 @@ def search(
         # only ADDS split-case recall — when the exact phrase exists in
         # single segments the user already has real hits, so the scan is
         # pure redundant cost ('vale da estranheza' was 15s → ~5s).
-        if hit_kind == "transcript" and len(span_tokens) >= 2 and not phrase_rows:
+        if (
+            hit_kind == "transcript"
+            and len(span_tokens) >= 2
+            and not phrase_rows
+            and _span_query_has_signal(span_tokens, q_freq, span_variants)
+        ):
             try:
                 span_rows = _phrase_span_rows(
                     span_tokens, fetch, span_variants=span_variants,
@@ -3561,6 +3586,12 @@ def _titles_search(
     if date_to:
         where.append("date(started_at) <= date(?)")
         params.append(date_to)
+    if exact:
+        # Exact title queries only need rows containing every token; this
+        # avoids walking the whole catalog for a guaranteed no-match.
+        for token in q_tokens:
+            where.append("(lower(title) LIKE ? OR lower(original_title) LIKE ?)")
+            params.extend((f"%{token}%", f"%{token}%"))
     if where:
         sql += " WHERE " + " AND ".join(where)
     out: list[dict] = []
@@ -5514,6 +5545,11 @@ def _now_iso() -> str:
 # FTS index entries cascade via the AFTER DELETE triggers on the content
 # tables — scrub content rows only (external-content FTS owns no row data).
 def _run_module_selfcheck() -> None:
+    assert not _span_query_has_signal(
+        ["esse", "titiltei"],
+        {"esse": 1, "titiltei": 0},
+        {"titiltei": ["titiltei"]},
+    ), "unmatched typo must not trigger a full transcript scan"
     # Distance-contract asserts first (no DB): the transposition branch reads
     # b[j - 2]/prev2_row[j - 2], valid only for j > 1 — without the guard the
     # negative index wrapped around and fabricated too-low distances.
