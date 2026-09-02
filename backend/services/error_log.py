@@ -132,10 +132,26 @@ def record_error(kind: str, message: str) -> None:
 
 
 def get_error_ring(limit: int = 50) -> list[dict]:
-    """Return the latest up to ``limit`` (max 500) error records."""
+    """Return the latest up to ``limit`` (max 500) persisted error records."""
+    cap = max(1, min(limit, _ERROR_RING_MAX))
+    try:
+        # ponytail: read the bounded JSONL on demand so the endpoint survives
+        # process restarts; hydrate-on-start would need another global lifecycle.
+        lines = _error_log_path().read_text(encoding="utf-8", errors="replace").splitlines()
+        rows = []
+        for line in lines[-_ERROR_RING_MAX:]:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+        if rows:
+            return rows[-cap:]
+    except OSError:
+        pass
     with _ERROR_RING_LOCK:
-        return list(_ERROR_RING)[-max(1, min(limit, _ERROR_RING_MAX)):]
-
+        return list(_ERROR_RING)[-cap:]
 
 def clear_error_ring_for_tests() -> None:
     with _ERROR_RING_LOCK:

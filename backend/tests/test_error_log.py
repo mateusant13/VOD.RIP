@@ -1,6 +1,6 @@
 import json
 
-from services.error_log import _error_log_path, clear_error_ring_for_tests, record_error
+from services.error_log import _error_log_path, clear_error_ring_for_tests, get_error_ring, record_error
 
 
 def test_error_log_keeps_latest_500_and_redacts_secrets(tmp_path, monkeypatch):
@@ -23,3 +23,7 @@ def test_error_log_keeps_latest_500_and_redacts_secrets(tmp_path, monkeypatch):
     assert "TOKEN" not in rows[-1]["message"]
     assert "QUERY" not in rows[-1]["message"]
     assert "[REDACTED]" in rows[-1]["message"]
+
+    # The API must still expose retained errors after a process restart.
+    clear_error_ring_for_tests()
+    assert get_error_ring(1)[0]["message"] == rows[-1]["message"]
