@@ -90,13 +90,36 @@ def _detached_launcher_cmd(script: Path) -> list[str]:
 def _spawn_detached_worker() -> Optional[int]:
     """Spawn the detached supervised archive worker (worker_server.py).
 
-    The worker must survive even a hard kill of the whole app process tree
-    (taskkill /T), so on Windows it is spawned through a short-lived
-    launcher: the launcher Popen()s worker_server.py and exits immediately,
-    orphaning it (its parent pid goes stale, so tree-walk kills never reach
-    it). POSIX uses start_new_session() (setsid) for the same effect.
+    Two intentionally different orphan/hard-kill stories:
+
+    * Source/dev tree — the worker must survive even a hard kill of the
+      whole app process tree (taskkill /T), so on Windows it is spawned
+      through a short-lived launcher: the launcher Popen()s worker_server.py
+      and exits immediately, orphaning it (its parent pid goes stale, so
+      tree-walk kills never reach it). POSIX uses start_new_session()
+      (setsid) for the same effect.
+
+    * Frozen app — the base EXE no longer contains the ASR worker. The
+      optional versioned runtime owns an independent process tree, so we
+      spawn VOD-RIP-ASR.exe --archive-worker directly. A hard kill of the
+      base app tree therefore DOES take the worker down with it — the old
+      orphaning launcher was removed with the split. This is a deliberate,
+      documented tradeoff: archive jobs are crash-safe (SQLite stale-window
+      reclaim in worker_server / archive_transcribe), and the heartbeat-based
+      respawn policy below recovers the worker without losing queued work:
+        - while the app runs, the _watch_detached_worker watchdog in
+          _boot_archive_worker respawns it when its heartbeat goes stale;
+        - when the app is closed, the detached background daemon's
+          _maybe_spawn_worker (background_server.py) restarts it on its tick
+          as long as the queue has pending jobs.
+      Normal close needs no action: the worker simply outlives the app and
+      keeps draining (worker_server's own respawn loop covers child crashes).
+      First-wins mutex + heartbeat guard make any duplicate spawn a harmless
+      immediate exit 0, so the respawn policy cannot double-start a worker.
+
     Returns a child pid (the launcher's), or None when the spawn failed
-    (the caller falls back to the in-process worker).
+    (source builds fall back to the in-process worker; frozen builds leave
+    jobs queued until an explicit ASR request installs the runtime).
     """
     if os.environ.get("VODRIP_NO_DAEMONS") == "1":
         return None  # tests: never leak orphaned daemons on a user's box
@@ -843,9 +866,16 @@ async def _app_lifespan(_app: FastAPI):
     except Exception:
         logger.debug("background daemon spawn skipped", exc_info=True)
 
-    # Archive jobs use the optional ASR runtime in frozen builds. It is
-    # downloaded only when queued work exists (or when a user explicitly
-    # opens a caption stream); source builds retain the in-process fallback.
+    # Archive jobs use the optional ASR runtime in frozen builds. The runtime
+    # is NEVER downloaded from this boot path: a frozen app that merely has
+    # queued work must not trigger a multi-GB download off the critical boot
+    # path (asr_runtime contract). The download happens lazily on the first
+    # explicit ASR/archive request — a caption stream (routers/live.py), the
+    # /api/system install endpoint, or a job enqueue/search kick
+    # (routers/archive.py -> start_archive_worker). If the runtime is not yet
+    # installed here, _spawn_detached_worker returns None and the jobs stay
+    # queued (crash-safe) until that first explicit request installs it.
+    # Source builds retain the in-process fallback.
     def _boot_archive_worker() -> None:
         if _warm_shutdown.wait(_BOOT_WARM_GRACE_SEC):
             return
@@ -854,10 +884,6 @@ async def _app_lifespan(_app: FastAPI):
             from services import archive_db
 
             pending = archive_db.has_pending_jobs()
-            if pending and getattr(sys, "frozen", False):
-                from services.asr_runtime import ensure_runtime
-
-                ensure_runtime()
             spawned_pid = _spawn_detached_worker() if pending else None
             if spawned_pid is not None:
                 logger.info(
