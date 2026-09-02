@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
-import { fireEvent, render } from '@testing-library/react';
+import { act, fireEvent, render } from '@testing-library/react';
 import FrameOverlay, { FRAME_DRAG_DESPAWN_MS } from './FrameOverlay';
 
 describe('FrameOverlay', () => {
@@ -65,7 +65,9 @@ describe('FrameOverlay', () => {
     const overlay = container.querySelector('[data-frame-overlay]') as HTMLElement;
 
     fireEvent.dragStart(document, { bubbles: true, cancelable: true });
-    vi.advanceTimersByTime(FRAME_DRAG_DESPAWN_MS + 50);
+    act(() => {
+      vi.advanceTimersByTime(FRAME_DRAG_DESPAWN_MS + 50);
+    });
 
     expect(document.body.dataset.frameDragging).toBeUndefined();
     expect(overlay.style.opacity).toBe('0');

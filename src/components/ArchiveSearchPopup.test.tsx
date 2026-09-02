@@ -427,8 +427,8 @@ describe('ArchiveSearchPopup', () => {
     expect(toggle).not.toBeDisabled();
     fireEvent.click(toggle);
     // The lang filter defaults to '' (all languages) — chips are opt-in.
-    // mode always rides along; it precedes semantic in the query string.
-    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra&mode=semantic&semantic=1')).toBeTruthy());
+    // URLSearchParams appends semantic before mode; assert the wire contract.
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra&semantic=1&mode=semantic')).toBeTruthy());
 
     // Concept search covers transcripts only — deselecting transcription disables it.
     fireEvent.click(screen.getByRole('button', { name: 'transcription' }));
@@ -439,7 +439,7 @@ describe('ArchiveSearchPopup', () => {
     fireEvent.click(screen.getByRole('button', { name: 'transcription' }));
     await waitFor(() => expect(screen.getByRole('button', { name: 'CONTEXT' })).not.toBeDisabled());
     await waitFor(() =>
-      expect(searchUrlWith(fetchMock, 'q=zebra&mode=semantic&semantic=1')).toBeTruthy(),
+      expect(searchUrlWith(fetchMock, 'q=zebra&semantic=1&mode=semantic')).toBeTruthy(),
     );
   });
 

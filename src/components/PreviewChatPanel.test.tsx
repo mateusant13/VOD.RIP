@@ -301,10 +301,11 @@ describe('PreviewChatPanel', () => {
     expect(screen.queryByText(MSG)).toBeNull();
   });
 
-  it('auto-switches from an empty Chat tab to a populated Transcript tab', async () => {
+  it('opens on the transcription tab when chat is unavailable', async () => {
     mockPanelFetch({ ...PAYLOAD, chat: [], has_chat: false });
-    render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+    rtlRender(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
     await waitFor(() => expect(screen.getByText('hello world')).toBeTruthy());
+    expect(screen.getByRole('button', { name: 'Transcript' })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.queryByText('No archived chat for this video.')).toBeNull();
   });
 
@@ -358,6 +359,7 @@ describe('PreviewChatPanel', () => {
     expect(document.querySelector('[data-preview-chat-panel-collapsed]')).toBeNull();
     // Host flips the prop → panel renders without internal state.
     rerender(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} open onOpenChange={onOpenChange} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Chat' }));
     await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
     // Collapse button reports the close intent to the host instead of
     // closing itself.
