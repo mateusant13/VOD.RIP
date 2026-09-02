@@ -4,8 +4,11 @@ The on-device ASR stack (torch / torchaudio / sherpa-onnx / ctranslate2 /
 onnxruntime / panns-inference / silero-vad) is deliberately NOT bundled into
 the base ``VOD-RIP.exe`` (see ``vod-rip.spec``): the base app boots without
 importing any of it. This executable is the companion runtime, produced by
-``vod-rip-asr.spec``, and is placed under a *versioned runtime directory*
-next to the base app so the main app can discover and spawn it.
+``vod-rip-asr.spec``. The base app installs it on demand (see
+``services.asr_runtime``) under the AI-models folder — the same root that
+hosts model weights — resolving the payload from a versioned runtime
+archive (``scripts/deploy-asr-runtime.mjs`` stages it under
+``dist/runtimes/asr/<version>/`` for the release workflow).
 
 Modes (argv, first match wins):
 
