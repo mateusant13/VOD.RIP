@@ -1,13 +1,15 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render } from '@testing-library/react';
-import FrameOverlay from './FrameOverlay';
+import FrameOverlay, { FRAME_DRAG_DESPAWN_MS } from './FrameOverlay';
 
 describe('FrameOverlay', () => {
   beforeEach(() => {
+    vi.useFakeTimers();
     delete document.body.dataset.frameDragging;
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     delete document.body.dataset.frameDragging;
   });
 
@@ -44,6 +46,41 @@ describe('FrameOverlay', () => {
     expect(overlay.style.opacity).toBe('0');
     expect(document.body.dataset.frameDragging).toBeUndefined();
     expect(cell.style.border).toContain('dashed');
+  });
+  it('keeps the drag alive while dragover keeps arriving (no premature clear)', () => {
+    const { container } = render(<FrameOverlay active onDropCell={vi.fn()} />);
+    const overlay = container.querySelector('[data-frame-overlay]') as HTMLElement;
+
+    fireEvent.dragStart(document, { bubbles: true, cancelable: true });
+    for (let i = 0; i < 3; i++) {
+      vi.advanceTimersByTime(FRAME_DRAG_DESPAWN_MS - 100);
+      fireEvent.dragOver(document, { bubbles: true, cancelable: true });
+    }
+    expect(overlay.style.pointerEvents).toBe('auto');
+    expect(document.body.dataset.frameDragging).toBe('1');
+  });
+
+  it('self-clears a stale drag flag when dragend never fires', () => {
+    const { container } = render(<FrameOverlay active onDropCell={vi.fn()} />);
+    const overlay = container.querySelector('[data-frame-overlay]') as HTMLElement;
+
+    fireEvent.dragStart(document, { bubbles: true, cancelable: true });
+    vi.advanceTimersByTime(FRAME_DRAG_DESPAWN_MS + 50);
+
+    expect(document.body.dataset.frameDragging).toBeUndefined();
+    expect(overlay.style.opacity).toBe('0');
+    expect(overlay.style.pointerEvents).toBe('none');
+  });
+
+  it('clears the drag flag immediately on pointerdown', () => {
+    const { container } = render(<FrameOverlay active onDropCell={vi.fn()} />);
+    const overlay = container.querySelector('[data-frame-overlay]') as HTMLElement;
+
+    fireEvent.dragStart(document, { bubbles: true, cancelable: true });
+    fireEvent.pointerDown(document, { bubbles: true });
+
+    expect(document.body.dataset.frameDragging).toBeUndefined();
+    expect(overlay.style.pointerEvents).toBe('none');
   });
 
   it('invokes onDropCell and resets drag state on drop', () => {
