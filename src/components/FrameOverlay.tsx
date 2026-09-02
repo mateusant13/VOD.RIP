@@ -12,6 +12,13 @@ import { EXPLORE_POPUP_Z } from '../layoutUtils';
  * ponytail: drag uses HTML5 DnD ghost; upgrade to pointer-capture + absolute positioning for smoother cross-panel moves
  */
 
+/**
+ * How long an in-flight drag may go quiet before the drag flag self-clears.
+ * 600ms comfortably exceeds the browser's dragover cadence (~350ms), so a
+ * live drag keeps refreshing the deadline and never gets cut off.
+ */
+export const FRAME_DRAG_DESPAWN_MS = 600;
+
 export function FrameOverlay({
   active,
   children,
@@ -38,19 +45,47 @@ export function FrameOverlay({
     }
     // Recover from a prior crash/tab kill that left the body flag set.
     delete document.body.dataset.frameDragging;
+    // Watchdog: HTML5 dragend sometimes never fires when the drag source is
+    // unmounted mid-drag (channel-list refresh, preview close/collapse, dedupe)
+    // or dropped outside the window. Without a deadline, the body
+    // `data-frame-dragging` flag sticks and frame.css freezes every floating
+    // popup (`pointer-events: none`) until Frame is toggled off/on. Each
+    // dragover pushes the deadline out so a genuine drag never gets cut off;
+    // a stale flag self-clears ~the interval after the last activity, and
+    // any pointerdown (the user grabbing something else) clears it instantly.
+    let deadline: number | null = null;
+    const armDespawn = () => {
+      if (deadline != null) window.clearTimeout(deadline);
+      deadline = window.setTimeout(() => {
+        deadline = null;
+        endDrag();
+      }, FRAME_DRAG_DESPAWN_MS);
+    };
+    const disarm = () => {
+      if (deadline != null) window.clearTimeout(deadline);
+      deadline = null;
+      endDrag();
+    };
     const onStart = () => {
       setDragging(true);
       document.body.dataset.frameDragging = '1';
+      armDespawn();
     };
-    const onEnd = () => endDrag();
+    const onDragOverAnywhere = () => {
+      if (deadline != null) armDespawn();
+    };
     document.addEventListener('dragstart', onStart, true);
-    document.addEventListener('dragend', onEnd, true);
-    document.addEventListener('drop', onEnd, true);
+    document.addEventListener('dragover', onDragOverAnywhere, true);
+    document.addEventListener('dragend', disarm, true);
+    document.addEventListener('drop', disarm, true);
+    document.addEventListener('pointerdown', disarm, true);
     return () => {
-      endDrag();
+      disarm();
       document.removeEventListener('dragstart', onStart, true);
-      document.removeEventListener('dragend', onEnd, true);
-      document.removeEventListener('drop', onEnd, true);
+      document.removeEventListener('dragover', onDragOverAnywhere, true);
+      document.removeEventListener('dragend', disarm, true);
+      document.removeEventListener('drop', disarm, true);
+      document.removeEventListener('pointerdown', disarm, true);
     };
   }, [active, endDrag]);
 
