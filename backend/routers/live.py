@@ -70,7 +70,9 @@ async def live_captions_stream(
 
     Emits ``event: caption`` frames (``{text, start, end}``) plus keepalive
     comments; a confirmed ``event: offline`` ends the stream. The optional ASR
-    runtime is installed on this explicit stream request when missing. The
+    runtime is installed on this explicit stream request when missing; the
+    parakeet model downloads on the ASR worker's first use, so a ``pending``
+    state (runtime present, model missing) does NOT block the stream. The
     captioner's refcount drops when the connection closes (generator finally).
 
     ``lang`` overrides the translate target per session (the captioner is
@@ -100,10 +102,7 @@ async def live_captions_stream(
         await asyncio.to_thread(ensure_runtime)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    from services.live_captions import captions_available, get_captioner
-    ok, reason = await asyncio.to_thread(captions_available, plat)
-    if not ok:
-        raise HTTPException(status_code=503, detail=reason)
+    from services.live_captions import get_captioner
     captioner = get_captioner(plat, chan, asyncio.get_running_loop())
     if captioner is None:
         raise HTTPException(status_code=429, detail="too many active caption streams — try again later")
@@ -128,8 +127,14 @@ async def live_captions_available(
     platform: str = Query(..., description="twitch | kick | youtube"),
     channel: str = Query(..., description="channel slug / login"),
 ) -> dict:
-    """Runtime gate probe: ``{available, reason}`` — the popup renders the
-    CC toggle only when the optional ASR runtime is already installed."""
+    """Runtime gate probe: ``{available, pending, reason, translation_available}``.
+
+    The popup shows the CC toggle when ``available``; ``pending`` is True when
+    the ASR runtime is installed but the parakeet model is still downloading
+    (proceed anyway — the worker fetches it on first use); ``reason`` explains
+    any non-ready state. ``translation_available`` gates the translate-subtitle
+    switch (True only when the NLLB translation model files are present).
+    ``low_latency`` is appended for the subtitle timing toggle."""
     plat = (platform or "").lower()
     chan = (channel or "").strip().lower()
     if plat not in _CAPTION_PLATFORMS or not chan:
@@ -138,13 +143,20 @@ async def live_captions_available(
     try:
         from services.feature_registry import is_enabled as _feat_enabled
         if not _feat_enabled("live-captions"):
-            return {"available": False, "reason": "live-captions feature is disabled", "low_latency": False}
+            return {"available": False, "pending": False, "reason": "live-captions feature is disabled", "translation_available": False, "low_latency": False}
     except Exception:
-        return {"available": False, "reason": "live-captions feature is disabled", "low_latency": False}
+        return {"available": False, "pending": False, "reason": "live-captions feature is disabled", "translation_available": False, "low_latency": False}
     import os
-    from services.live_captions import captions_available, LOW_LATENCY_ENV
+    from services.live_captions import (
+        LOW_LATENCY_ENV,
+        captions_available,
+        captions_pending,
+        translation_available,
+    )
 
     ok, reason = await asyncio.to_thread(captions_available, plat)
+    pending = await asyncio.to_thread(captions_pending, plat)
+    translation_ok = await asyncio.to_thread(translation_available)
     # Read from settings first, fall back to env var.
     try:
         from deps import settings_mgr
@@ -153,7 +165,13 @@ async def live_captions_available(
         low_latency = False
     if not low_latency:
         low_latency = (os.environ.get(LOW_LATENCY_ENV, "0") or "0").strip() == "1"
-    return {"available": ok, "reason": reason or None, "low_latency": low_latency}
+    return {
+        "available": ok,
+        "pending": pending,
+        "reason": reason or None,
+        "translation_available": translation_ok,
+        "low_latency": low_latency,
+    }
 
 
 @router.get("/live/captions/errors")
