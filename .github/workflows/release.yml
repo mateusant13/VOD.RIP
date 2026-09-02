@@ -99,6 +99,16 @@ jobs:
           python -m pip install pyinstaller pywebview pystray Pillow
           npm ci
 
+      - name: Install GPU ASR runtime deps (best-effort)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          # Swaps the CPU sherpa-onnx for the +cuda wheel and pulls the nvidia
+          # cu12 runtime libs so vod-rip-asr.spec ships a GPU-capable runtime.
+          # Best-effort: `_asr_gpu_binaries()` degrades to the CPU EP if the
+          # wheel download fails, so the base build is never blocked.
+          python -m pip install -r backend/requirements-gpu.txt
+
       - name: Build frontend and frozen bundle
         shell: pwsh
         run: |
@@ -107,6 +117,11 @@ jobs:
           pyinstaller vod-rip.spec --clean --noconfirm
           node scripts/deploy-dist.mjs
           node scripts/stage-cookie-extension.mjs
+
+      - name: Build ASR runtime bundle
+        shell: pwsh
+        run: |
+          npm run build-asr-runtime
 
       - name: Download Microsoft WebView2 bootstrapper
         shell: pwsh
@@ -122,6 +137,19 @@ jobs:
           New-Item -ItemType Directory -Force -Path release | Out-Null
           Compress-Archive -Path dist\VOD-RIP\* `
             -DestinationPath "release\VOD.RIP-$ver-win-x64.zip" -Force
+
+      - name: Package ASR runtime zip
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}".TrimStart('v')
+          $runtime = "dist\runtimes\asr\$ver"
+          if (Test-Path (Join-Path $runtime "VOD-RIP-ASR.exe")) {
+            Compress-Archive -Path "$runtime\*" `
+              -DestinationPath "release\VOD-RIP-ASR-$ver-win-x64.zip" -Force
+            Write-Host "Packaged ASR runtime v$ver"
+          } else {
+            Write-Warning "No ASR runtime at $runtime — skipping ASR zip (base still built)"
+          }
 
       - name: Build Windows installer
         shell: pwsh
