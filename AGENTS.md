@@ -146,6 +146,13 @@ codeintel search "callers of schedule_youtube_window_hls_mux"
 - Kick Overlay (Twitch ad-kill): `vendor/kick-overlay/`
 - Cookies (VOD.RIP cookie/po_token): `vendor/cookie-extension/src/` — installed from the `VOD.RIP-cookies` subfolder (staging: `%APPDATA%\VOD.RIP\cookie-extension\VOD.RIP-cookies\`)
 
+
+## Runtime logs
+
+- Application/server error log: `%APPDATA%\VOD.RIP\logs\errors.jsonl` (override the data root with `VODRIP_APP_DATA`).
+- The error log retains the latest 500 sanitized error records; the running API exposes them at `GET /api/errors/latest?limit=500`.
+- Dev supervisor stdout/stderr logs: `tmp\vodrip-devall-api.log` and `tmp\vodrip-devall-web.log`.
+
 ## Heavy project data lives OFF C: (learned 2026-08-15)
 
 **C: is the system NVMe — never put heavy project artifacts there.** It has ~15GB free and the repo bloated to 18.7GB on C: (9GB `dist` + 9GB `_internal` + `build` + a stray CUDA-13 stack). Disk map:
