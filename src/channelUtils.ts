@@ -625,6 +625,25 @@ export function isChannelAlreadySaved(
   });
 }
 
+/**
+ * Live entries from the backend poll, filtered to genuinely-live rows and
+ * deduplicated by URL. A duplicate stream URL in the `live` list would render
+ * duplicate badge rows and duplicate fallback/platform entries in the popup,
+ * so it is squashed here — the single chokepoint every consumer reads.
+ */
+export function dedupeLiveEntries<T extends { url?: string; is_live?: boolean }>(entries: readonly T[]): T[] {
+  if (!entries?.length) return [];
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const e of entries) {
+    if (!e?.is_live || !e.url) continue;
+    if (seen.has(e.url)) continue;
+    seen.add(e.url);
+    out.push(e);
+  }
+  return out;
+}
+
 /** Parse YouTube channel handle/id from a channel URL (not watch/shorts links). */
 export function youtubeSlugFromChannelUrl(raw: string): string {
   const trimmed = raw.trim();
@@ -836,10 +855,50 @@ export function loadSavedChannels(): SavedChannel[] {
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return parsed.map((ch) => normalizeSavedChannel(ch as SavedChannel));
+    return dedupeSavedChannels(parsed.map((ch) => normalizeSavedChannel(ch as SavedChannel)));
   } catch {
     return [];
   }
+}
+
+/**
+ * Merge saved-channel rows that share ANY platform slug (the same identity
+ * rule as `isChannelAlreadySaved`): legacy/corrupt storage or an API merge
+ * keyed only by id can leave two rows for one creator (e.g. a row created by
+ * a stale settings snapshot plus a freshly re-added row). The first row keeps
+ * its id/order/display name; the duplicate's slugs are UNIONed in so distinct
+ * platforms are never hidden, and its cached videos are merged into the
+ * survivor by channel-video key. Rows that share no slug are untouched.
+ */
+export function dedupeSavedChannels(channels: SavedChannel[]): SavedChannel[] {
+  if (channels.length < 2) return channels;
+  const out: SavedChannel[] = [];
+  for (const ch of channels) {
+    const existing = out.find((kept) => {
+      const keepSlugs = [kept.kickSlug, kept.twitchSlug, kept.youtubeSlug].map((s) => (s || '').toLowerCase());
+      const chSlugs = [ch.kickSlug, ch.twitchSlug, ch.youtubeSlug].map((s) => (s || '').toLowerCase());
+      return chSlugs.some((s) => s && keepSlugs.includes(s));
+    });
+    if (!existing) {
+      out.push(ch);
+      continue;
+    }
+    const mergeVideos = (a: ChannelVideo[] | undefined, b: ChannelVideo[] | undefined): ChannelVideo[] => {
+      const byKey = new Map(a?.map((v) => [channelVideoKey(v), v]) ?? []);
+      for (const v of b ?? []) byKey.set(channelVideoKey(v), v);
+      return [...byKey.values()];
+    };
+    existing.kickSlug = existing.kickSlug || ch.kickSlug;
+    existing.twitchSlug = existing.twitchSlug || ch.twitchSlug;
+    existing.youtubeSlug = existing.youtubeSlug || ch.youtubeSlug;
+    existing.vodVideos = mergeVideos(existing.vodVideos, ch.vodVideos);
+    existing.clipVideos = mergeVideos(existing.clipVideos, ch.clipVideos);
+    existing.vodPlatformsFetched = { ...existing.vodPlatformsFetched, ...ch.vodPlatformsFetched };
+    existing.clipPlatformsFetched = { ...existing.clipPlatformsFetched, ...ch.clipPlatformsFetched };
+    existing.clipsFetched = existing.clipsFetched || ch.clipsFetched;
+    existing.streamsFetched = existing.streamsFetched || ch.streamsFetched;
+  }
+  return out;
 }
 
 export function persistChannels(channels: SavedChannel[]) {

@@ -82,6 +82,10 @@ interface LivePlayerPopupProps {
   vodUrl?: string;
   /** Open an archive hit in the explore-player flow (App owns the popup stack). */
   onOpenHit: (hit: ArchiveSearchHit, video: ArchiveVideoRow | undefined) => void;
+  /** Confirmed-missing Kick/YouTube channel (live master 404): the popup swaps
+   *  the player for a centered channel-name input, and the submitted name is
+   *  handed up so App can open the add-channel editor. */
+  onNotFoundChannel?: (name: string) => void;
   /** Optional saved channels (App state) — unioned into the channel dropdown. */
   savedChannels?: SavedChannel[];
   /** Position cascade offset — 0 = default corner; each sibling steps 28px. */
@@ -272,7 +276,7 @@ export function __resetLivePlayerRegistryForTests(): void {
   liveQualityCount = 0;
 }
 
-export function LivePlayerPopup({ entry, entries, channelName, onClose, channelSlug, channel, vodUrl, onOpenHit, savedChannels, cascadeIndex = 0, zIndex, onBringToFront, liveSessionPrefetchRef }: LivePlayerPopupProps) {
+export function LivePlayerPopup({ entry, entries, channelName, onClose, channelSlug, channel, vodUrl, onOpenHit, onNotFoundChannel, savedChannels, cascadeIndex = 0, zIndex, onBringToFront, liveSessionPrefetchRef }: LivePlayerPopupProps) {
   const { t } = useI18n();
   const videoRef = useRef<HTMLVideoElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);

@@ -96,7 +96,7 @@ import { createFullscreenGate, type FullscreenGate } from './utils/fullscreenGat
 import { actionBtnHover, platformPreviewCtrlBtn, platformCardShadow, platformVodPanelBtn, platformWatchPreviewBtn, platformBulkDownloadBtn, type PlatformStyleKey } from './platformStyles';
 import { fmtDuration, formatClipDurationHuman, fmtDateAndAgo, fmtViews, parseVideoTs, formatBytes, basename, sourceQualityOptionLabel } from './formatters';
 import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout, PreviewSessionResponse, PanelPos } from './types';
-import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, isMembersOnlyVideo, isPublicVideo, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, effectivePlatformFlags, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, deriveChannelDisplayName, normalizeSavedChannel, displayTitle, loadSavedChannels, orderChannelsForSync, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, isSyntheticArchiveId, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_CLIP_FETCH_LIMIT, CHANNEL_UI_STORAGE_KEY, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, channelShowMoreNeedsFetch, nextChannelPage, stalePageResponse, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft, loadStoredChannelLiveStatuses, persistChannelLiveStatuses, shouldDropChannelFromLivePoll, type StoredChannelLiveStatus } from './channelUtils';
+import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, isMembersOnlyVideo, isPublicVideo, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, effectivePlatformFlags, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, dedupeLiveEntries, dedupeSavedChannels, deriveChannelDisplayName, normalizeSavedChannel, displayTitle, loadSavedChannels, orderChannelsForSync, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, isSyntheticArchiveId, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_CLIP_FETCH_LIMIT, CHANNEL_UI_STORAGE_KEY, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, channelShowMoreNeedsFetch, nextChannelPage, stalePageResponse, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft, loadStoredChannelLiveStatuses, persistChannelLiveStatuses, shouldDropChannelFromLivePoll, type StoredChannelLiveStatus } from './channelUtils';
 import ChannelLinkCard from './components/ChannelLinkCard';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, zoomWindowFromView, fracToSec, zoomTrimViewAround, resolveTimestampSeek, TRIM_ZOOM_STEP, type TrimRangeOpts, type TrimViewWindow } from './trimUtils';
@@ -295,7 +295,9 @@ const ChannelRow = memo(function ChannelRow({
   const { t } = useI18n();
   const dropAbove = dragId != null && dropInsertIndex === index;
   const dropBelow = dragId != null && dropInsertIndex === savedChannelsLength && isLast;
-  const liveEntries = liveStatus?.live.filter((e) => e.is_live && e.url) ?? [];
+  // Dedupe live entries by URL — a duplicate stream row would render a
+  // duplicate badge and feed the popup duplicate fallback/platform entries.
+  const liveEntries = dedupeLiveEntries(liveStatus?.live ?? []);
   return (
     <div
       data-channel-row
@@ -588,11 +590,9 @@ export default function App() {
     url: string;
     session: PreviewSessionResponse;
   } | null>(null);
-  /** Live session pre-warm — created on channel hover, consumed by LivePlayerPopup on mount. */
-  const liveSessionPrefetchRef = useRef<{
-    url: string;
-    session: PreviewSessionResponse;
-  } | null>(null);
+  /** URL currently being warmed by prefetchLiveSession — an in-flight guard so
+   *  a hover storm on one channel issues one POST, not N. */
+  const livePrefetchInFlightRef = useRef<string | null>(null);
   /** URL of the last VOD clicked in a list — auto-opens the main preview once its info loads. */
   const autoOpenPreviewPendingRef = useRef<string | null>(null);
   /** Bumped on every list-VOD click so re-clicking the already-active VOD re-fires the auto-open effect. */
@@ -5439,6 +5439,17 @@ export default function App() {
     setPendingAddChannel(channelLinkDraftFromParsed(parsed, raw));
     setAddChannelInput('');
   }, [addChannelInput]);
+  // A confirmed-missing Kick/YouTube live channel hands its name up from the
+  // player popup's not-found input; open the same add-channel editor the top
+  // input uses so the user can correct or complete the channel.
+  const openChannelFromName = useCallback((name: string) => {
+    const raw = name.trim();
+    if (!raw) return;
+    const parsed = parseChannelInput(raw);
+    if (!parsed.kickSlug && !parsed.twitchSlug && !parsed.youtubeSlug && !parsed.displayName) return;
+    setAddChannelInput(raw);
+    setPendingAddChannel(channelLinkDraftFromParsed(parsed, raw));
+  }, []);
 
   const toggleChannelSelection = useCallback((channelId: string) => {
     setSelectedChannelId((prev) => {
@@ -5655,9 +5666,22 @@ export default function App() {
   /** Pre-warm a live session on channel hover — the popup consumes it on mount. */
   const prefetchLiveSession = useCallback(async (entry: ChannelLiveStatus['live'][number]) => {
     if (!entry?.url) return;
-    // Don't re-prefetch if already cached for this URL
-    if (liveSessionPrefetchRef.current?.url === entry.url) return;
+    // A popup already playing this URL — the popup owns the POST/session, so a
+    // hover pre-warm would just duplicate the request and the HLS consumer.
+    if (livePopupsRef.current.some((p) => p.entry.url === entry.url)) return;
+    // In-flight guard: a hover storm on one channel issues one POST, not N.
+    if (livePrefetchInFlightRef.current === entry.url) return;
+    // Replace the previous pre-warm. An un-consumed prefetch (one the popup did
+    // NOT take) would otherwise linger on the backend as an orphan session, so
+    // release it server-side now instead of waiting for its TTL. If a popup owns
+    // that URL, only drop the ref — the popup holds the session in sessionRef.
+    const prev = liveSessionPrefetchRef.current;
+    if (prev && prev.url !== entry.url
+      && !livePopupsRef.current.some((p) => p.entry.url === prev.url)) {
+      void apiDelete(`/api/preview/session/${prev.session.session_id}`).catch(() => {});
+    }
     liveSessionPrefetchRef.current = null;
+    livePrefetchInFlightRef.current = entry.url;
     try {
       const body: { url: string; is_live: boolean; platform?: string } = { url: entry.url, is_live: true };
       if (entry.platform) body.platform = entry.platform;
@@ -5667,16 +5691,21 @@ export default function App() {
       }
     } catch {
       // Best effort — don't break the UI
+    } finally {
+      if (livePrefetchInFlightRef.current === entry.url) livePrefetchInFlightRef.current = null;
     }
   }, []);
 
   const openLivePreview = useCallback(async (entry: ChannelLiveStatus['live'][number], entries: ChannelLiveStatus['live'], channelName?: string, channel?: SavedChannel | null): Promise<void> => {
     if (!entry?.url) return;
     const name = channelName || entry.platform || 'Live';
+    // Dedupe by URL so duplicated platform rows don't feed the popup duplicate
+    // fallback/platform entries (matches ChannelRow's badge dedupe).
+    const deduped = dedupeLiveEntries(entries);
     const item: LivePopupItem = {
       id: ++livePopupIdRef.current,
       entry,
-      entries: entries.length > 0 ? entries : [entry],
+      entries: deduped.length > 0 ? deduped : [entry],
       channelName: name,
       channel: channel ?? null,
     };
@@ -5763,9 +5792,12 @@ export default function App() {
       byId.set(ch.id, ch);
       merged.push(ch);
     }
-    setSavedChannels(merged);
-    if (merged.some((ch) => !local.some((l) => l.id === ch.id))) {
-      persistChannels(merged);
+    // Indexed rows that share a platform slug with a local channel would
+    // otherwise double-render one row — merge by identity instead.
+    const deduped = dedupeSavedChannels(merged);
+    setSavedChannels(deduped);
+    if (deduped.some((ch) => !local.some((l) => l.id === ch.id))) {
+      persistChannels(deduped);
     }
     channelsPersistReadyRef.current = true;
   }, []);
@@ -7838,6 +7870,10 @@ export default function App() {
             onOpenHit={openArchiveHit}
             savedChannels={savedChannels}
             liveSessionPrefetchRef={liveSessionPrefetchRef}
+            onNotFoundChannel={(name) => {
+              openChannelFromName(name);
+              closeLivePopup(popup.id);
+            }}
           />
         );
       })}
