@@ -700,17 +700,42 @@ async def test_captions_stream_validates_platform(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_captions_stream_503_when_parakeet_gated(monkeypatch):
-    """VODRIP_PARAAKEET=0 / missing sherpa -> 503 with the reason; the
-    feature gate is patched to enabled so this tests the parakeet gate."""
+async def test_captions_stream_proceeds_when_parakeet_pending(monkeypatch):
+    """A pending parakeet model (runtime installed, model still downloading)
+    must NOT block the explicit caption stream — the ASR worker downloads the
+    model on first use. The feature gate stays enforced; only validation/feature
+    gates may reject."""
+    from pathlib import Path
+    from services import asr_runtime
     from services import live_captions
     from services.feature_registry import is_enabled as _orig_enabled
     monkeypatch.setattr("services.feature_registry.is_enabled", lambda fid: True if fid == "live-captions" else _orig_enabled(fid))
-    monkeypatch.setattr(live_captions, "captions_available", lambda plat: (False, "parakeet engine unavailable"))
+    # Runtime present, parakeet model NOT yet downloaded (pending probe False).
+    monkeypatch.setattr(asr_runtime, "ensure_runtime", lambda progress=None: Path("stub-runtime"))
+    monkeypatch.setattr(live_captions, "captions_available", lambda plat: (False, "parakeet model is not downloaded yet — start a caption stream to download it"))
+
+    class _StubCaptioner:
+        def acquire(self, lang=None):
+            pass
+        def subscribe(self):
+            return asyncio.Queue()
+        def unsubscribe(self, queue):
+            pass
+        def release(self):
+            pass
+
+    monkeypatch.setattr(live_captions, "get_captioner", lambda p, c, loop: _StubCaptioner())
+
+    async def _fake_gen(request, captioner, queue):
+        return
+        yield  # pragma: no cover — keeps this an async generator
+
+    from routers import live as live_router
+    monkeypatch.setattr(live_router, "_captions_sse_gen", _fake_gen)
+
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         res = await client.get("/api/live/captions", params={"platform": "twitch", "channel": "srdogg"})
-        assert res.status_code == 503
-        assert "parakeet" in res.json()["detail"]
+        assert res.status_code == 200, f"pending model must not 503, got {res.status_code}: {res.text}"
 
 
 @pytest.mark.anyio
@@ -1241,24 +1266,26 @@ async def test_captions_available_returns_false_when_gate_raises(monkeypatch):
 
 
 def test_captions_available_youtube_true_when_model_present(monkeypatch):
-    """captions_available('youtube') returns (True, '') when model dir is present."""
+    """captions_available('youtube') returns (True, '') when runtime AND model are present."""
     from pathlib import Path
     from services import live_captions as lc
+    from services import asr_runtime
     from services.feature_registry import is_enabled as _orig_enabled  # noqa: F401 — keep import shape
-    import services.archive_transcribe as at
 
-    monkeypatch.setattr(at, "_parakeet_resolve_dir", lambda: Path("/fake/parakeet"))
+    monkeypatch.setattr(asr_runtime, "runtime_available", lambda: True)
+    monkeypatch.setattr(lc, "_parakeet_model_dir_probe", lambda: Path("/fake/parakeet"))
     ok, reason = lc.captions_available("youtube")
     assert ok is True
     assert reason == ""
 
 
 def test_captions_available_youtube_false_when_model_missing(monkeypatch):
-    """captions_available('youtube') returns (False, ...) when model dir is None."""
+    """captions_available('youtube') returns (False, ...) when the model dir probe is None."""
     from services import live_captions as lc
-    import services.archive_transcribe as at
+    from services import asr_runtime
 
-    monkeypatch.setattr(at, "_parakeet_resolve_dir", lambda: None)
+    monkeypatch.setattr(asr_runtime, "runtime_available", lambda: True)
+    monkeypatch.setattr(lc, "_parakeet_model_dir_probe", lambda: None)
     ok, reason = lc.captions_available("youtube")
     assert ok is False
     assert "parakeet" in reason.lower() or "model" in reason.lower()

@@ -375,20 +375,96 @@ def _warm_asr() -> bool:
         return False
 
 
-def captions_available(platform: str) -> tuple[bool, str]:
-    """Report whether the optional ASR runtime can serve captions.
+# Parakeet model files a caption stream needs on top of the ASR runtime.
+# Mirrors services.archive_transcribe (the only ASR engine). Kept as a
+# LIGHTWEIGHT copy so captions_available() never imports the heavy archive
+# worker stack just to stat a directory — the resolution below is the same
+# as archive_transcribe._parakeet_cache_dir/_parakeet_resolve_dir, minus the
+# model load/news downloads (a pure path/file probe).
+_PARAAKEET_MODEL = "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
+_PARAAKEET_FILES = ("encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt")
+_PARAAKEET_CACHE_ENV = "VODRIP_SHERRPA_CACHE"
 
-    The model itself is intentionally not required here: it is downloaded by
-    the ASR worker on the first actual caption request.
+
+def _parakeet_model_dir_probe() -> Optional[Path]:
+    """The parakeet model dir when all four files are present locally, else None.
+
+    Pure filesystem probe — never downloads, never loads the model. Resolves
+    the sherpa cache exactly like ``archive_transcribe._parakeet_cache_dir``
+    (the ``VODRIP_SHERRPA_CACHE`` override, else the AI-models
+    ``<root>/parakeet-models`` with the legacy-sibling migration), then checks
+    either the model-name subdir or the cache root for the required ONNX/token
+    files. Kept independent of ``archive_transcribe`` so a live-caption probe
+    on a frozen base app never imports the heavy archive-worker stack.
+    """
+    override = os.environ.get(_PARAAKEET_CACHE_ENV, "").strip()
+    if override:
+        cache = Path(override)
+    else:
+        from services.disk_hygiene import _migrated_model_dir, whisper_cache_dir
+
+        base = whisper_cache_dir()
+        cache = _migrated_model_dir(
+            base / "parakeet-models", base.parent / "parakeet-models", "parakeet"
+        )
+    for d in (cache / _PARAAKEET_MODEL, cache):
+        if all((d / f).is_file() for f in _PARAAKEET_FILES):
+            return d
+    return None
+
+
+def captions_available(platform: str) -> tuple[bool, str]:
+    """Report whether the optional ASR runtime AND the parakeet model are
+    present so live captions can serve right now.
+
+    Readiness is a pure/lightweight check: the runtime is probed via the
+    installed-runtime marker (``asr_runtime.runtime_available``) and the model
+    via a path/file probe on the sherpa cache (``_parakeet_model_dir_probe``).
+    Nothing is downloaded here — the runtime and model land only on an explicit
+    caption-stream request (``ensure_runtime`` / the ASR worker's first use).
     """
     plat = (platform or "").lower()
     if plat not in SUPPORTED_PLATFORMS:
         return False, "captions support twitch, kick and youtube"
+
     from services.asr_runtime import runtime_available
 
     if not runtime_available():
         return False, "speech runtime is not installed — start a caption stream to download it"
+    if _parakeet_model_dir_probe() is None:
+        return False, "parakeet model is not downloaded yet — start a caption stream to download it"
     return True, ""
+
+
+def captions_pending(platform: str) -> bool:
+    """True when the ASR runtime is installed but the parakeet model files are
+    still missing — the ASR worker downloads them on a caption stream's first
+    use, so an explicit request may proceed even though ``captions_available``
+    reports False. Invalid platforms, a missing runtime, or a present model all
+    return False (nothing is pending)."""
+    plat = (platform or "").lower()
+    if plat not in SUPPORTED_PLATFORMS:
+        return False
+    from services.asr_runtime import runtime_available
+
+    if not runtime_available():
+        return False
+    return _parakeet_model_dir_probe() is None
+
+
+def translation_available() -> bool:
+    """Whether source caption translation can run right now: the translation
+    feature is enabled and the NLLB checkpoint files are present locally.
+
+    Readiness probe only — never downloads (a caption stream must not trigger a
+    multi-GB model fetch mid-stream; mirrors the parakeet gate). False in a
+    frozen slim base where the translation models are absent."""
+    try:
+        from services import caption_translate as ct
+
+        return bool(ct.enabled() and ct.nllb_dir() is not None)
+    except Exception:
+        return False
 
 
 def _resolve_evidence(platform: str, channel: str) -> Optional[str]:
