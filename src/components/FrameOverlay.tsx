@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from 'react';
-import { FRAME_GRID_CELLS } from '../frameLayout';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { FRAME_GRID_CELLS, encodeFrameDragPopupId, getFrameCellRect } from '../frameLayout';
 import { EXPLORE_POPUP_Z } from '../layoutUtils';
 
 /**
@@ -30,6 +30,21 @@ export function FrameOverlay({
 }) {
   const [hoverCell, setHoverCell] = useState<number | null>(null);
   const [dragging, setDragging] = useState(false);
+
+  // Popup body/video drags are POINTER drags (startFloatingPanelDrag), which never
+  // fire an HTML5 dragstart. In frame mode the explore popup dispatches
+  // 'explore-frame-arm' so the grid arms for the primary gesture too; we track the
+  // cursor over the 6 cells by geometry and snap on pointerup.
+  const pointerArmIdRef = useRef<string | null>(null);
+
+  /** Which frame cell (by shared grid geometry, not hit-testing) contains (x, y). */
+  const cellIndexAt = useCallback((x: number, y: number): number | null => {
+    for (let i = 0; i < FRAME_GRID_CELLS; i++) {
+      const r = getFrameCellRect(i);
+      if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) return i;
+    }
+    return null;
+  }, []);
 
   // Track global HTML5 drag lifecycle — grid only becomes interactive while a drag is active.
   const endDrag = useCallback(() => {
@@ -66,28 +81,61 @@ export function FrameOverlay({
       deadline = null;
       endDrag();
     };
-    const onStart = () => {
-      setDragging(true);
-      document.body.dataset.frameDragging = '1';
-      armDespawn();
-    };
-    const onDragOverAnywhere = () => {
-      if (deadline != null) armDespawn();
-    };
-    document.addEventListener('dragstart', onStart, true);
-    document.addEventListener('dragover', onDragOverAnywhere, true);
-    document.addEventListener('dragend', disarm, true);
-    document.addEventListener('drop', disarm, true);
-    document.addEventListener('pointerdown', disarm, true);
-    return () => {
-      disarm();
-      document.removeEventListener('dragstart', onStart, true);
-      document.removeEventListener('dragover', onDragOverAnywhere, true);
-      document.removeEventListener('dragend', disarm, true);
-      document.removeEventListener('drop', disarm, true);
-      document.removeEventListener('pointerdown', disarm, true);
-    };
-  }, [active, endDrag]);
+          const onStart = () => {
+        setDragging(true);
+        document.body.dataset.frameDragging = '1';
+        armDespawn();
+      };
+      const onDragOverAnywhere = () => {
+        if (deadline != null) armDespawn();
+      };
+      // Pointer-drag co-op (explore popup body/video). The arm event carries the
+      // popup id; the grid stays armed until pointerup (no 600ms deadline, since a
+      // held pointer-drag has no dragover cadence). Geometry-based hover/snap, so it
+      // works even though the dragged popup paints above the cells.
+      const onPointerArm = (ev: Event) => {
+        const id = (ev as CustomEvent<{ id?: string }>).detail?.id;
+        if (!id) return;
+        pointerArmIdRef.current = id;
+        setDragging(true);
+        setHoverCell(null);
+        document.body.dataset.frameDragging = '1';
+      };
+      const onPointerMoveAnywhere = (ev: PointerEvent) => {
+        if (pointerArmIdRef.current === null) return;
+        setHoverCell(cellIndexAt(ev.clientX, ev.clientY));
+      };
+      const onPointerRelease = (ev: PointerEvent) => {
+        const id = pointerArmIdRef.current;
+        if (id === null) return;
+        pointerArmIdRef.current = null;
+        const idx = cellIndexAt(ev.clientX, ev.clientY);
+        endDrag();
+        if (idx != null) onDropCell?.(idx, encodeFrameDragPopupId(id));
+      };
+      document.addEventListener('dragstart', onStart, true);
+      document.addEventListener('dragover', onDragOverAnywhere, true);
+      document.addEventListener('dragend', disarm, true);
+      document.addEventListener('drop', disarm, true);
+      document.addEventListener('pointerdown', disarm, true);
+      document.addEventListener('explore-frame-arm', onPointerArm);
+      document.addEventListener('pointermove', onPointerMoveAnywhere, true);
+      document.addEventListener('pointerup', onPointerRelease, true);
+      document.addEventListener('pointercancel', onPointerRelease, true);
+      return () => {
+        disarm();
+        pointerArmIdRef.current = null;
+        document.removeEventListener('dragstart', onStart, true);
+        document.removeEventListener('dragover', onDragOverAnywhere, true);
+        document.removeEventListener('dragend', disarm, true);
+        document.removeEventListener('drop', disarm, true);
+        document.removeEventListener('pointerdown', disarm, true);
+        document.removeEventListener('explore-frame-arm', onPointerArm);
+        document.removeEventListener('pointermove', onPointerMoveAnywhere, true);
+        document.removeEventListener('pointerup', onPointerRelease, true);
+        document.removeEventListener('pointercancel', onPointerRelease, true);
+      };
+    }, [active, endDrag, cellIndexAt, onDropCell]);
 
   const onDragOver = useCallback((e: React.DragEvent, idx: number) => {
     e.preventDefault();

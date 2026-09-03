@@ -1129,8 +1129,15 @@ export default function ChannelExplorePopup({
       posRef.current = layoutExplorePopupWindow(el, panelWidthRef.current + chatTotal, posRef, stackIndex);
       setPos(posRef.current);
     }
+    // The natural gesture to snap into a frame cell is grabbing the popup body/video.
+    // That is a pointer drag (below), which never fires HTML5 dragstart — so in frame
+    // mode we arm the snap grid explicitly. FrameOverlay computes the hovered cell by
+    // geometry and snaps on pointerup.
+    if (frameMode) {
+      document.dispatchEvent(new CustomEvent('explore-frame-arm', { detail: { id } }));
+    }
     startFloatingPanelDrag(e, posRef, setPos, el);
-  }, [fullscreen, stackIndex, frameSnapRect, onUnsnap]);
+  }, [fullscreen, stackIndex, frameSnapRect, onUnsnap, frameMode, id]);
 
   const fsGateRef = useRef<FullscreenGate | null>(null);
   if (fsGateRef.current === null) {

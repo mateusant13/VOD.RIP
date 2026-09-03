@@ -8032,7 +8032,11 @@ export default function App() {
             position: 'fixed',
             inset: 0,
             pointerEvents: 'none',
-            zIndex: 5,
+            // Above every floating popup (EXPLORE_POPUP_Z + rank) so snap cells paint
+            // over the popups while a drag is active. pointerEvents:none keeps the
+            // wrapper click-through when idle; the grid itself is opacity 0 + pointerEvents
+            // none unless a drag is in flight.
+            zIndex: EXPLORE_POPUP_Z + 40,
           }}
         >
             <FrameOverlay

@@ -103,6 +103,47 @@ describe('FrameOverlay', () => {
     expect(document.body.dataset.frameDragging).toBeUndefined();
   });
 
+  it('arms on explore-frame-arm and snaps on pointerup over a cell (body/video drag)', () => {
+    window.innerWidth = 1280; // 3 columns (frameGridColumns > 1100)
+    window.innerHeight = 720;
+    const onDropCell = vi.fn();
+    const { container } = render(<FrameOverlay active onDropCell={onDropCell} />);
+    const overlay = container.querySelector('[data-frame-overlay]') as HTMLElement;
+
+    // Explore popup dispatches this when the user grabs the popup body/video.
+    fireEvent(document, new CustomEvent('explore-frame-arm', { detail: { id: 'my-popup' } }));
+
+    expect(overlay.style.pointerEvents).toBe('auto');
+    expect(overlay.style.opacity).toBe('1');
+    expect(document.body.dataset.frameDragging).toBe('1');
+
+    // Hover into cell 2 (col 2, row 0): x in [856, 1272], y in [8, 356].
+    fireEvent.pointerMove(document, { bubbles: true, clientX: 900, clientY: 100 });
+    const cell2 = container.querySelector('[data-frame-cell="2"]') as HTMLElement;
+    expect(cell2.style.border).toContain('2px solid');
+
+    // Release over the same cell snaps it.
+    fireEvent.pointerUp(document, { bubbles: true, clientX: 900, clientY: 100 });
+
+    expect(onDropCell).toHaveBeenCalledWith(2, 'vodrip-frame:my-popup');
+    expect(overlay.style.pointerEvents).toBe('none');
+    expect(document.body.dataset.frameDragging).toBeUndefined();
+  });
+
+  it('does not snap when a pointer-drag releases outside every cell', () => {
+    window.innerWidth = 1280;
+    window.innerHeight = 720;
+    const onDropCell = vi.fn();
+    render(<FrameOverlay active onDropCell={onDropCell} />);
+
+    fireEvent(document, new CustomEvent('explore-frame-arm', { detail: { id: 'pop' } }));
+    // Release far outside the 3-col/2-row grid (e.g. overflowing x=5000).
+    fireEvent.pointerUp(document, { bubbles: true, clientX: 5000, clientY: 8000 });
+
+    expect(onDropCell).not.toHaveBeenCalled();
+    expect(document.body.dataset.frameDragging).toBeUndefined();
+  });
+
   it('recovers from a stale body frameDragging flag on mount', () => {
     document.body.dataset.frameDragging = '1';
     render(<FrameOverlay active onDropCell={vi.fn()} />);
