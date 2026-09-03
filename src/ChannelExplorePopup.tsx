@@ -54,6 +54,7 @@ import {
   pinHlsToLowestLevel,
 } from './previewPlayerUtils';
 import { PreviewTiming, waitVideoPlayable } from './previewTiming';
+import { PreviewStartTimeout } from './previewStartTimeout';
 import { PREVIEW_DEFAULT_VOLUME } from './layoutUtils';
 import { pauseOtherPreviews, autoPauseOtherPreviews, noteUserUnpause, registerPreviewPlayback } from './previewPlaybackBus';
 import { youtubeIframeCommand, youtubeIframeListen } from './youtubeEmbed';
@@ -274,6 +275,8 @@ export default function ChannelExplorePopup({
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  /** Hard bound for the 'Starting…' phase — see PreviewStartTimeout. */
+  const previewStartTimeoutRef = useRef<PreviewStartTimeout | null>(null);
   const hlsRef = useRef<Hls | null>(null);
   // Reset on VOD change — hook manages the runtime copies, but the
   // setup effect needs to clear these before initialising a new preview.
@@ -478,6 +481,7 @@ export default function ChannelExplorePopup({
     onPreviewError: (msg) => {
       if (msg) {
         setError(msg);
+        previewStartTimeoutRef.current?.settle();
         markPreviewError('playback');
       }
     },
@@ -571,6 +575,26 @@ export default function ChannelExplorePopup({
     previewTimingRef.current = timing;
     timing.markOpen(vod.url.slice(0, 80));
 
+    // Hard bound on the 'Starting…' phase: from here until canplay (or a
+    // terminal error). A hung session-create or playback that never starts
+    // would otherwise spin the loading overlay forever — surface the RETRY
+    // UI instead. Mirrors the main-preview guard in App.tsx.
+    const armedGen = sessionRetryTick;
+    const guard = new PreviewStartTimeout(vod.url, {
+      onTimeout: (_url, stage) => {
+        if (armedGen !== sessionRetryTick) return false;
+        setError(t('Preview took too long — try again'));
+        markPreviewError(stage);
+        hlsRef.current?.destroy();
+        hlsRef.current = null;
+        setLoading(false);
+        setBuffering(false);
+        return true;
+      },
+    });
+    previewStartTimeoutRef.current = guard;
+    guard.start();
+
     // Never embed youtube.com: controls=0 cannot suppress every native overlay.
     // Use the same proxied media pipeline as every other platform so only the
     // application's controls receive pointer/keyboard input.
@@ -596,7 +620,7 @@ export default function ChannelExplorePopup({
           crop_start: 0,
           crop_end: knownDuration > 0 ? knownDuration : 0,
           prefer_height: preferHeight,
-        });
+        }, guard.signal ?? undefined);
         const [clipInfo, res] = await Promise.all([clipInfoPromise, sessionPromise]);
         if (cancelled) {
           // ponytail: StrictMode runs this effect twice. The in-flight dedup
@@ -615,6 +639,7 @@ export default function ChannelExplorePopup({
         }
         // ponytail: res.duration_sec comes from the extract — prefer it over
         // the channel-list hint (which is 0 for YouTube RSS rows).
+        guard.markCreateResolved();
         if (res.duration_sec && res.duration_sec > 0) {
           setSessionDurationSec(Math.floor(res.duration_sec));
         }
@@ -652,6 +677,7 @@ export default function ChannelExplorePopup({
         if (!cancelled) {
           setError(err instanceof Error ? err.message : 'Could not start player');
           setLoading(false);
+          guard.settle();
           markPreviewError('session');
         }
       }
@@ -694,6 +720,7 @@ export default function ChannelExplorePopup({
       if (sid) {
         void apiDelete(`/api/preview/session/${sid}`).catch(() => {});
       }
+      previewStartTimeoutRef.current?.settle();
     };
   }, [vod.url, vod.durationSec, sessionRetryTick]);
 
@@ -1313,6 +1340,7 @@ export default function ChannelExplorePopup({
       setReady(true);
       setBuffering(false);
       setLoading(false);
+      previewStartTimeoutRef.current?.markReady();
       previewTimingRef.current?.mark('canplay');
       video.volume = PREVIEW_DEFAULT_VOLUME;
       volumeRef.current = PREVIEW_DEFAULT_VOLUME;
@@ -1387,6 +1415,7 @@ export default function ChannelExplorePopup({
       const onVideoError = () => {
         setError('Preview interrupted — try again');
         setLoading(false);
+        previewStartTimeoutRef.current?.settle();
         markPreviewError('playback');
       };
       appliedHeightRef.current = activeH;
@@ -1565,6 +1594,7 @@ export default function ChannelExplorePopup({
       if (!isValidPreviewUrl(playbackUrl)) {
         setError('Invalid playback URL');
         setLoading(false);
+        previewStartTimeoutRef.current?.settle();
         markPreviewError('playback');
         return;
       }
@@ -1581,6 +1611,7 @@ export default function ChannelExplorePopup({
 
     setError('HLS playback is not supported in this browser');
     setLoading(false);
+    previewStartTimeoutRef.current?.settle();
     markPreviewError('playback');
     };
 
@@ -2049,6 +2080,7 @@ export default function ChannelExplorePopup({
                 onLoad={() => {
                   setReady(true);
                   setLoading(false);
+                  previewStartTimeoutRef.current?.markReady();
                   youtubeIframeListen(youtubeIframeRef.current);
                   postYoutubeCommand('setVolume', [Math.round(volumeRef.current * 100)]);
                 }}
