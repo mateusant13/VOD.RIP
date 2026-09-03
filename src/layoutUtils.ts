@@ -1037,7 +1037,11 @@ export function sanitizeStoredPanelSize(value: unknown, fallback: PanelSize): Pa
 }
 
 export const PREVIEW_KEY_SKIP_SEC = 5;
-export const PREVIEW_FS_CONTROLS_HIDE_MS = 200;
+// Fullscreen transport auto-hide delay. 200ms made the controls flash and
+// vanish mid-gesture (any mousemove re-armed it), leaving fullscreen with
+// unusable controls — the "fullscreen is bugged" report. Standard 2s matches
+// video-player auto-hide norms and only hides when the pointer is idle.
+export const PREVIEW_FS_CONTROLS_HIDE_MS = 2000;
 export const PREVIEW_DEFAULT_VOLUME = 0.3;
 export const PREVIEW_PANEL_DEFAULT_W = 640;
 export const PREVIEW_PANEL_MIN_W = 280;

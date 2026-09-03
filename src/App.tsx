@@ -3314,7 +3314,23 @@ export default function App() {
       const wasFs = previewFsActiveRef.current;
       previewFsActiveRef.current = fs;
       setPreviewFullscreen(fs);
-      setPreviewFsControlsVisible(!fs);
+      // Show the transport on enter and on exit; on enter, arm the auto-hide
+      // so idle fullscreen still clears the overlay (the old behaviour hid
+      // the controls the instant fullscreen began, so they only reappeared on
+      // a mousemove and then vanished ~200ms later — the "fullscreen works
+      // but the controls are unusable/bugged" report).
+      setPreviewFsControlsVisible(true);
+      if (previewFsHideTimerRef.current) {
+        window.clearTimeout(previewFsHideTimerRef.current);
+        previewFsHideTimerRef.current = null;
+      }
+      if (fs) {
+        previewFsHideTimerRef.current = window.setTimeout(() => {
+          if (!trimDragActiveRef.current) {
+            setPreviewFsControlsVisible(false);
+          }
+        }, PREVIEW_FS_CONTROLS_HIDE_MS);
+      }
       // Leaving fullscreen must not keep the in-fullscreen resize — reset to
       // the default panel height (entering may keep the user's resize). The
       // wasFs guard keeps other surfaces' fullscreenchange events out of it.
@@ -7026,13 +7042,6 @@ export default function App() {
                   </div>
                 )}
               </div>
-              {previewFullscreen && (
-                <div
-                  className="absolute bottom-0 right-0 z-30 w-10 h-10 cursor-pointer"
-                  title={t('Exit fullscreen')}
-                  onClick={() => void togglePreviewFullscreen()}
-                />
-              )}
               {previewChatOpen && (
                 <div
                   data-preview-chat-overlay
