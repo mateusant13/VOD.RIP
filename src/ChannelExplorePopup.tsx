@@ -1122,7 +1122,7 @@ export default function ChannelExplorePopup({
       // fullscreenchange state-lag window (the 'chat swaps the whole screen'
       // flash). A recovery effect below reverts if the request is denied.
       setFullscreen(true);
-      setFsControlsVisible(false);
+      setFsControlsVisible(true);
       applyExplorePopupFullscreenPosition(container);
     }
   }, [ready]);
@@ -1162,7 +1162,21 @@ export default function ChannelExplorePopup({
       fsGateRef.current?.sync();
       const fs = document.fullscreenElement === containerRef.current;
       setFullscreen(fs);
-      setFsControlsVisible(!fs);
+      // Show the transport on enter and on exit; on enter, arm the auto-hide
+      // so idle fullscreen still clears the overlay (mirrors App.tsx main
+      // preview — the old `!fs` hid controls the instant fullscreen began,
+      // leaving a fullscreen player with no exit, which felt like the app
+      // "locked you out of doing anything").
+      setFsControlsVisible(true);
+      if (fsHideTimerRef.current) {
+        window.clearTimeout(fsHideTimerRef.current);
+        fsHideTimerRef.current = null;
+      }
+      if (fs) {
+        fsHideTimerRef.current = window.setTimeout(() => {
+          setFsControlsVisible(false);
+        }, PREVIEW_FS_CONTROLS_HIDE_MS);
+      }
       const el = containerRef.current;
       if (!el) return;
       if (fs) {
