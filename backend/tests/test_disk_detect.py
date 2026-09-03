@@ -161,6 +161,16 @@ def test_settings_cache_dir_roundtrip(monkeypatch, tmp_path):
     assert raw["cache_dir"] == "D:/caches", "settings.json must round-trip cache_dir"
     reloaded = SettingsManager()
     assert reloaded.get().cache_dir == "D:/caches"
+def test_settings_ffmpeg_autofill_is_cached(monkeypatch, tmp_path):
+    app_dir = tmp_path / "VOD.RIP"
+    monkeypatch.setattr("services.settings._get_appdata_dir", lambda: app_dir)
+    mgr = SettingsManager()
+    with patch("services.ytdlp_ffmpeg._find_ffmpeg", return_value="C:/ffmpeg.exe"):
+        with patch.object(mgr, "save", wraps=mgr.save) as save:
+            assert mgr.get().ffmpeg_path == "C:/ffmpeg.exe"
+            assert mgr.get().ffmpeg_path == "C:/ffmpeg.exe"
+    assert save.call_count == 1, "unchanged ffmpeg discovery must not rewrite settings per get"
+
 
 
 def test_settings_cache_dir_default_empty():

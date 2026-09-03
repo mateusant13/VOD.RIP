@@ -133,6 +133,8 @@ interface CaptionBlock {
 }
 /** Re-snapshot the archive playlist while parked in REPLAY (grows while live). */
 const REPLAY_RESNAPSHOT_MS = 30_000;
+/** Live popup start ceiling, including session creation and first frame. */
+const FIRST_FRAME_STALL_MS = 60_000;
 /** Live session POST stall budget per attempt — after this the attempt is
  *  aborted and the next retry (or fallback entry) takes over. 15s covers
  *  cold-backend wake + transcode ramp without pinning the spinner. */
@@ -320,6 +322,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
    *  360/720/1080 or 360-anon; twitch/kick → up to source). */
   const sessionPlatformRef = useRef((activeEntry.platform || '').toLowerCase());
   // First-frame timing marker (fast-start verification hook).
+  const firstFrameTimerRef = useRef<number | null>(null);
   const firstFrameStartRef = useRef<number>(performance.now());
   const firstFrameLoggedRef = useRef(false);
   const sizeRef = useRef<PanelSize>({ w: POPUP_WIDTH, h: POPUP_HEIGHT });
@@ -1102,6 +1105,21 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     stallGuardRef.current = { at: 0, count: 0 };
   }, []);
 
+  const clearFirstFrameWatchdog = useCallback(() => {
+    if (firstFrameTimerRef.current != null) {
+      window.clearTimeout(firstFrameTimerRef.current);
+      firstFrameTimerRef.current = null;
+    }
+  }, []);
+
+  const failFirstFrameWatchdog = useCallback(() => {
+    clearFirstFrameWatchdog();
+    destroyHls();
+    setError(t('Live playback failed — try again'));
+    setLoading(false);
+    markPreviewError();
+  }, [clearFirstFrameWatchdog, destroyHls, markPreviewError, t]);
+
 
   /** ONE invisible session recreate per popup — the first fatal NETWORK_ERROR
    *  deletes the stale session and re-runs the mount effect (re-POST + re-
@@ -1224,6 +1242,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     hls.loadSource(src);
     hls.attachMedia(video);
     let networkRetries = 0;
+    let mediaRetries = 0;
 
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
       if (modeRef.current === 'live') {
@@ -1401,23 +1420,34 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
             }, networkRetries * 1000);
             break;
           }
+          clearFirstFrameWatchdog();
           setError(t('Live playback failed — try again'));
           setLoading(false);
+          markPreviewError();
           break;
         case Hls.ErrorTypes.MEDIA_ERROR:
-          hls.recoverMediaError();
-          break;
-        default:
+          if (mediaRetries < 1) {
+            mediaRetries += 1;
+            hls.recoverMediaError();
+            break;
+          }
+          clearFirstFrameWatchdog();
           setError(t('Live playback failed — try again'));
           setLoading(false);
+          markPreviewError();
+          break;
+        default:
+          clearFirstFrameWatchdog();
+          setError(t('Live playback failed — try again'));
+          setLoading(false);
+          markPreviewError();
           break;
       }
     });
 
     if (startPos >= 0 && modeRef.current !== 'replay') hls.startLoad(startPos);
     else if (modeRef.current !== 'replay') hls.startLoad();
-    return hls;
-  }, [destroyHls, onAdRotation, clearRetry, markPreviewError, tryAdvanceEntry, recreateSessionInvisible, armQualityPin]); // ponytail: maybeTuneCaptionLiveSync removed — only called from a separate useEffect, never inside createHlsPlayer; including it caused CC toggle to cascade into HLS player destroy/recreate
+  }, [destroyHls, onAdRotation, clearRetry, clearFirstFrameWatchdog, markPreviewError, tryAdvanceEntry, recreateSessionInvisible, armQualityPin]); // ponytail: maybeTuneCaptionLiveSync removed — only called from a separate useEffect, never inside createHlsPlayer; including it caused CC toggle to cascade into HLS player destroy/recreate
 
   // Cleanup player on unmount
   const cleanup = useCallback(() => {
@@ -1510,8 +1540,14 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       if (prefetched) {
         if (liveSessionPrefetchRef) liveSessionPrefetchRef.current = null;
         if (cancelled) return;
-        // Fall through to the shared success path below with res = prefetched.
-        await handleLiveSessionSuccess(prefetched, cancelled);
+        try {
+          await handleLiveSessionSuccess(prefetched, cancelled);
+        } catch (err) {
+          if (cancelled) return;
+          setError(err instanceof Error ? err.message : t('Failed to start live stream'));
+          setLoading(false);
+          markPreviewError();
+        }
         return;
       }
 
@@ -1698,8 +1734,12 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     // upstream thus showed a black player instead of the spinner. Spinner ends
     // on the first DECODED frame (loadeddata) instead.
     const onLoadedData = () => {
+      clearFirstFrameWatchdog();
       setLoading(false);
       clearRetry();
+    };
+    const onMediaError = () => {
+      if (!sessionPendingRef.current) failFirstFrameWatchdog();
     };
     const onPlayingMarkPlayed = () => { hasPlayedOnceRef.current = true; };
     video.addEventListener('play', onPlay);
@@ -1709,6 +1749,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     video.addEventListener('durationchange', onDuration);
     video.addEventListener('timeupdate', onTimeClearBuffer);
     video.addEventListener('playing', onPlayingMarkPlayed);
+    video.addEventListener('error', onMediaError);
     video.addEventListener('playing', onFirstFrame);
     video.addEventListener('timeupdate', onFirstFrame);
     video.addEventListener('canplay', onPlayingMarkPlayed);
@@ -1723,12 +1764,20 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       video.removeEventListener('durationchange', onDuration);
       video.removeEventListener('playing', onPlayingMarkPlayed);
       video.removeEventListener('playing', onFirstFrame);
+      video.removeEventListener('error', onMediaError);
       video.removeEventListener('timeupdate', onFirstFrame);
       video.removeEventListener('timeupdate', onTimeClearBuffer);
       video.removeEventListener('canplay', onPlayingMarkPlayed);
       video.removeEventListener('loadeddata', onLoadedData);
     };
-  }, [captionClockSync, clearRetry]);
+  }, [captionClockSync, clearFirstFrameWatchdog, clearRetry, failFirstFrameWatchdog]);
+
+  useEffect(() => {
+    clearFirstFrameWatchdog();
+    if (!loading) return;
+    firstFrameTimerRef.current = window.setTimeout(failFirstFrameWatchdog, FIRST_FRAME_STALL_MS);
+    return clearFirstFrameWatchdog;
+  }, [activeEntry.url, clearFirstFrameWatchdog, failFirstFrameWatchdog, loading, retryTick]);
 
   // Track fullscreen state — element-equality like App.tsx and
   // ChannelExplorePopup: this popup only claims fullscreen when IT is the

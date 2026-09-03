@@ -61,18 +61,11 @@ from services import archive_db
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["preview"])
 
-# Hard wall-clock cap for ONE YouTube preview session-create POST. The extract
-# chain is bounded between passes (8s fast race + 24s fallback), but a single
-# stuck yt-dlp/innerTube pass (no per-read socket activity, wedged JS runtime,
-# DNS) can hold a PREVIEW_EXECUTOR worker forever — with 12 workers a few of
-# those wedge every create behind them and the frontend's 'Starting YouTube
-# preview…' spinner has no terminal event. The executor thread keeps running
-# after the 504 (threads cannot be killed), but the request returns promptly
-# and the worker is freed; the aborted create still populates the resolve
-# cache, so the frontend RETRY usually lands instantly. Non-YouTube creates
-# (fast Twitch/Kick CDN fetches, legit 30-60s yt-dlp VOD fallbacks) are NOT
-# capped — no regression to their paths.
-_YOUTUBE_CREATE_HARD_TIMEOUT_SEC = max(
+# Hard wall-clock cap for every preview session-create POST. The extract
+# chain can stall on a dead CDN, wedged JS runtime, or DNS; a bounded request
+# must return a retryable error instead of pinning the UI and an executor
+# worker indefinitely.
+_PREVIEW_CREATE_HARD_TIMEOUT_SEC = max(
     5.0,
     float(os.environ.get("VODRIP_PREVIEW_CREATE_TIMEOUT_SEC", "45") or "45"),
 )
@@ -487,48 +480,45 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
                 prefer_height=req.prefer_height,
             ),
         )
-        if detect_platform(preview_url) == "YouTube":
-            try:
-                session = await asyncio.wait_for(
-                    create_future, timeout=_YOUTUBE_CREATE_HARD_TIMEOUT_SEC
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "preview session create timed out url=%s after %.1fs",
-                    preview_url[:100],
-                    _YOUTUBE_CREATE_HARD_TIMEOUT_SEC,
-                )
-                # The executor thread keeps running (threads cannot be killed)
-                # and still populates the resolve/extract caches — the client's
-                # RETRY reuses that work. Surface the 504 so the frontend's
-                # create promise rejects instead of hanging the spinner.
-                raise HTTPException(
-                    status_code=504,
-                    detail="Preview timed out — try again.",
-                )
-        else:
-            session = await create_future
+        try:
+            session = await asyncio.wait_for(
+                create_future,
+                timeout=_PREVIEW_CREATE_HARD_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "preview session create timed out url=%s after %.1fs",
+                preview_url[:100],
+                _PREVIEW_CREATE_HARD_TIMEOUT_SEC,
+            )
+            # The executor thread keeps running (threads cannot be killed)
+            # and may still populate caches, but the client gets a terminal
+            # response instead of an unbounded spinner.
+            raise HTTPException(
+                status_code=504,
+                detail="Preview timed out — try again.",
+            )
         resolve_ms = (_time.monotonic() - t0) * 1000.0
-        logger.info(
-            "preview session created id=%s kind=%s url=%s",
-            session.session_id[:8],
-            session.kind,
-            preview_url[:100],
-        )
         from services.preview_timing import log_server_session_created
         log_server_session_created(session, resolve_ms=resolve_ms)
-        # Preview-queue priority (WS-1): a previewed archived video jumps its
-        # transcribe job to the front of the queue. Best-effort — a DB hiccup
-        # must never fail the preview response.
-        try:
-            _priority_transcribe_for_preview(session)
-        except Exception:
-            logger.warning(
-                "preview priority transcribe failed id=%s",
-                session.session_id[:8],
-                exc_info=True,
-            )
-        return _preview_session_response(session)
+
+        def _finalize_preview_response():
+            # Archive DB/settings reads are synchronous; keep them off the
+            # event loop so one preview cannot freeze health and HLS requests.
+            try:
+                _priority_transcribe_for_preview(session)
+            except Exception:
+                logger.warning(
+                    "preview priority transcribe failed id=%s",
+                    session.session_id[:8],
+                    exc_info=True,
+                )
+            return _preview_session_response(session)
+
+        response = await asyncio.get_running_loop().run_in_executor(
+            INFO_EXECUTOR, _finalize_preview_response,
+        )
+        return response
     except HTTPException:
         # Already-shaped responses (e.g. the 504 create hard-timeout) must not
         # be re-wrapped by the generic handler below into a 500.

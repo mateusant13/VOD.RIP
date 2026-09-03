@@ -5297,6 +5297,8 @@ export default function App() {
   // open so app startup stays quiet — the cache is only needed once the user
   // starts browsing channels.
   const warmedUrlsRef = useRef<Set<string>>(new Set());
+  const warmingUrlsRef = useRef<Set<string>>(new Set());
+  const warmBatchChainRef = useRef<Promise<void>>(Promise.resolve());
   useEffect(() => {
     if (tab !== 'channels') return;
     const channels = savedChannels;
@@ -5304,59 +5306,77 @@ export default function App() {
     const PER_KIND = 3;
     const STAGGER_MS = 100;
     const KINDS = ['vods', 'streams'] as const;
-    const isYouTubeUrl = (u: string) => /youtube\.com|youtu\.be/.test(u || '');
-    const urlsForKind = (ch: typeof channels[number], kind: typeof KINDS[number]): string[] => {
-      const pool = (ch.vodVideos ?? []).slice(0, YOUTUBE_WARM_VOD_LIMIT).filter((v) =>
-        kind === 'streams' ? v.content_kind === 'stream' : v.content_kind !== 'stream' && v.content_kind !== 'clip',
-      );
-      const out: string[] = [];
-      for (const v of pool) {
-        const u = v?.url;
-        if (u && isYouTubeUrl(u) && !warmedUrlsRef.current.has(u)) {
-          warmedUrlsRef.current.add(u);
-          out.push(u);
-          if (out.length >= PER_KIND) break;
-        }
-      }
-      return out;
-    }
-    // ponytail: dedup across kinds so the same URL doesn't get re-warmed
-    // (a VOD could appear in both vods and clips in stale localStorage).
-    const seenForBatch = new Set<string>();
     const queue: string[] = [];
+    const seenForBatch = new Set<string>();
     for (const ch of channels) {
       for (const kind of KINDS) {
-        for (const u of urlsForKind(ch, kind)) {
-          if (seenForBatch.has(u)) continue;
+        const pool = (ch.vodVideos ?? []).slice(0, YOUTUBE_WARM_VOD_LIMIT).filter((v) =>
+          kind === 'streams'
+            ? v.content_kind === 'stream'
+            : v.content_kind !== 'stream' && v.content_kind !== 'clip',
+        );
+        let kindCount = 0;
+        for (const v of pool) {
+          const u = v?.url;
+          if (!u || !/youtube\.com|youtu\.be/.test(u)
+            || warmedUrlsRef.current.has(u) || warmingUrlsRef.current.has(u)
+            || seenForBatch.has(u)) continue;
+          warmingUrlsRef.current.add(u);
           seenForBatch.add(u);
           queue.push(u);
+          if (++kindCount >= PER_KIND) break;
         }
       }
     }
     if (!queue.length) return;
+
     const sendBatch = (urls: string[]) => {
-      fetch('/api/preview/warm/batch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        // ponytail: 360 = PREVIEW_FAST_START_HEIGHT — must match the height
-        // create_session reads on click ({vid}:360:v2), or the whole batch
-        // warm lands in a cache key nobody reads and every click re-extracts.
-        body: JSON.stringify({ urls, prefer_height: 360 }),
-      }).catch((e) => console.warn('[warm] fetch failed:', e));
+      const request = warmBatchChainRef.current.then(async () => {
+        try {
+          const response = await fetch('/api/preview/warm/batch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ urls, prefer_height: 360 }),
+          });
+          if (response.ok) {
+            for (const u of urls) {
+              warmedUrlsRef.current.add(u);
+              warmingUrlsRef.current.delete(u);
+            }
+          } else {
+            for (const u of urls) warmingUrlsRef.current.delete(u);
+          }
+        } catch (e) {
+          for (const u of urls) warmingUrlsRef.current.delete(u);
+          console.warn('[warm] fetch failed:', e);
+        }
+      });
+      warmBatchChainRef.current = request;
+      return request;
     };
-    // ponytail: small batches of 2 URLs at a time, 150ms between batches.
-    // Keeps WARM_EXECUTOR (4 workers) under saturation and leaves room for
-    // the user's click path.
+
+    // One cancellable chain per effect run. New channel data can arrive while
+    // a prior chain is alive; the in-flight set prevents duplicate requests.
     let i = 0;
     const BATCH = 4;
+    let timer: number | null = null;
+    let cancelled = false;
     const tick = () => {
+      if (cancelled) return;
       const slice = queue.slice(i, i + BATCH);
       i += BATCH;
       if (!slice.length) return;
-      sendBatch(slice);
-      if (i < queue.length) setTimeout(tick, STAGGER_MS);
+      void sendBatch(slice);
+      if (i < queue.length) timer = window.setTimeout(tick, STAGGER_MS);
     };
     tick();
+    return () => {
+      cancelled = true;
+      if (timer != null) window.clearTimeout(timer);
+      // Unsent URLs were only reserved by this chain; allow the next state
+      // snapshot to enqueue them instead of losing them.
+      for (const u of queue.slice(i)) warmingUrlsRef.current.delete(u);
+    };
   }, [savedChannels, tab]);
 
   const addChannelFromSlugs = useCallback(async (

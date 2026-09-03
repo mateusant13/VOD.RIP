@@ -2018,6 +2018,28 @@ describe('LivePlayerPopup session retry loop', () => {
   });
 });
 
+describe('LivePlayerPopup first-frame watchdog', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('settles a stream that never produces a decoded frame', async () => {
+    vi.useFakeTimers();
+    mockFetchWithLiveSrc();
+    renderPopup();
+
+    await act(async () => {
+      for (let i = 0; i < 12; i++) await Promise.resolve();
+    });
+    expect(screen.getByText('Loading live stream…')).toBeTruthy();
+
+    act(() => { vi.advanceTimersByTime(60_000); });
+
+    expect(screen.queryByText('Loading live stream…')).toBeNull();
+    expect(screen.getByTitle('Retry this live stream')).toBeTruthy();
+  });
+});
+
 describe('LivePlayerPopup live session prefetch', () => {
   it('consumes a prefetched session without calling POST', async () => {
     const fn = vi.fn(async (input: RequestInfo | URL) => {

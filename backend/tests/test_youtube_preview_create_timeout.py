@@ -1,11 +1,10 @@
-"""Regression: the YouTube preview create POST must never hang forever.
+"""Regression: preview session create POSTs must never hang forever.
 
-The 'Starting YouTube preview…' spinner had no terminal event when
-`create_session` wedged (stuck yt-dlp/innerTube pass occupying a
+The 'Starting preview…' spinner had no terminal event when
+`create_session` wedged (stuck yt-dlp/InnerTube/CDN pass occupying a
 PREVIEW_EXECUTOR worker): the request hung until the client's own 60s fetch
-timeout (x3 retries ≈ 3 min of spinner). The router now wraps the YouTube
-create in a hard wall-clock timeout (VODRIP_PREVIEW_CREATE_TIMEOUT_SEC, default
-45s) and returns 504. Non-YouTube creates are NOT capped.
+timeout. The router now wraps every preview create in a hard wall-clock
+timeout (VODRIP_PREVIEW_CREATE_TIMEOUT_SEC, default 45s) and returns 504.
 
 Run from anywhere: `python backend/tests/test_youtube_preview_create_timeout.py`
 """
@@ -28,9 +27,10 @@ from app import app
 from routers import preview as preview_router
 
 YT_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+TWITCH_URL = "https://www.twitch.tv/videos/123456789"
 
 
-def test_youtube_create_returns_504_when_create_session_hangs():
+def test_preview_create_returns_504_when_create_session_hangs():
     """A wedged create_session must produce a prompt 504, not a hanging POST."""
 
     def _stuck(*_args, **_kwargs):
@@ -41,27 +41,25 @@ def test_youtube_create_returns_504_when_create_session_hangs():
     # test imports the app first and the 0.5 never applies. Pin the module
     # constant directly so this test is order-independent (5.0 = the clamp
     # floor the env path would produce for 0.5).
-    original_timeout = preview_router._YOUTUBE_CREATE_HARD_TIMEOUT_SEC
-    preview_router._YOUTUBE_CREATE_HARD_TIMEOUT_SEC = 5.0
+    original_timeout = preview_router._PREVIEW_CREATE_HARD_TIMEOUT_SEC
+    preview_router._PREVIEW_CREATE_HARD_TIMEOUT_SEC = 5.0
     original = preview_router.create_session
     preview_router.create_session = _stuck
     try:
         with TestClient(app) as c:
-            t0 = time.monotonic()
-            resp = c.post("/api/preview/session", json={"url": YT_URL})
-            elapsed = time.monotonic() - t0
+            for label, url in (("YouTube", YT_URL), ("Twitch", TWITCH_URL)):
+                t0 = time.monotonic()
+                resp = c.post("/api/preview/session", json={"url": url})
+                elapsed = time.monotonic() - t0
+                assert resp.status_code == 504, (
+                    f"expected 504 from timed-out {label} create, got "
+                    f"{resp.status_code}: {resp.text[:256]}"
+                )
+                assert elapsed < 12.0, f"{label} 504 arrived after {elapsed:.1f}s"
+                assert "timed out" in resp.json().get("detail", "").lower()
     finally:
         preview_router.create_session = original
-        preview_router._YOUTUBE_CREATE_HARD_TIMEOUT_SEC = original_timeout
-
-    assert resp.status_code == 504, (
-        f"expected 504 from timed-out YouTube create, got {resp.status_code}: "
-        f"{resp.text[:256]}"
-    )
-    # The constant clamps to a 5s floor, so the response lands ~5s — far
-    # before the 60s stub could ever return on its own.
-    assert elapsed < 12.0, f"504 arrived after {elapsed:.1f}s — timeout not applied"
-    assert "timed out" in resp.json().get("detail", "").lower()
+        preview_router._PREVIEW_CREATE_HARD_TIMEOUT_SEC = original_timeout
 
 
 def test_youtube_create_passthrough_when_fast():
@@ -111,6 +109,6 @@ def test_youtube_create_passthrough_when_fast():
 
 
 if __name__ == "__main__":
-    test_youtube_create_returns_504_when_create_session_hangs()
+    test_preview_create_returns_504_when_create_session_hangs()
     test_youtube_create_passthrough_when_fast()
     print("OK: youtube preview create timeout tests passed")

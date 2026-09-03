@@ -104,9 +104,16 @@ class SettingsManager:
         if not found:
             self._ffmpeg_probe_failed = True
             return
+        if found == self._settings.ffmpeg_path:
+            # A prior save already persisted this path. Do not rewrite the
+            # settings file on every request.
+            self._ffmpeg_probe_failed = True
+            return
         updated = self._settings.model_copy(update={"ffmpeg_path": found})
         self.save(updated)
-
+        # save() re-arms the probe for explicit callers; this get() already
+        # completed the probe and must not immediately repeat it.
+        self._ffmpeg_probe_failed = True
     def get(self) -> AppSettings:
         with self._lock:
             self._autofill_ffmpeg_if_needed()
