@@ -50,6 +50,9 @@ from services.preview.warm import (
 SESSION_TTL_SEC = 1800  # 30 min — long browsing rarely exceeds 30 min; channels page keeps last-touched in localStorage so re-opening is cheap.
 LRU_SIZE_HARD_LIMIT = 12
 _SESSION_DELETE_GRACE_SEC = 3.0
+
+_PERSISTED_SESSION_VERSION = 1
+_PERSISTED_SESSION_MAX_AGE_SEC = SESSION_TTL_SEC
 PLAYLIST_REWRITE_TTL_SEC = 2
 def _run_ffmpeg_in_session_ctx(session_id: str, fn: Callable[[], None]) -> None:
     """Run *fn* with the ffmpeg child-pid download context scoped to *session_id*.
@@ -461,14 +464,151 @@ class PreviewManager:
     """Manages preview session lifecycle — create, get, delete, cleanup."""
 
     # ponytail: _sessions dict + _lock moved from module-level into a class.
-    # This bounds the state to a manager instance, making it testable and
-    # preventing stale state across test runs or single-instance redirects.
-
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._sessions: Dict[str, "PreviewSession"] = {}
         self._last_cleanup_time = 0.0
         self._cleanup_interval = 60  # seconds
+        self._load_persisted_sessions()
+
+    @staticmethod
+    def _registry_path() -> Path:
+        return preview_root() / "sessions.json"
+
+    def _persist_sessions(self) -> None:
+        """Persist restart-safe VOD metadata, never signed CDN credentials."""
+        now = time.time()
+        with self._lock:
+            rows = [
+                {
+                    "session_id": session.session_id,
+                    "vod_url": session.vod_url,
+                    "platform": session.platform,
+                    "kind": session.kind,
+                    "crop_start": session.crop_start,
+                    "crop_end": session.crop_end,
+                    "prefer_height": session.prefer_height,
+                    "last_access": session.last_access,
+                }
+                for session in self._sessions.values()
+                if (
+                    not session.closed
+                    and not session.is_live
+                    and now - session.last_access <= _PERSISTED_SESSION_MAX_AGE_SEC
+                )
+            ]
+        path = self._registry_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+            tmp.write_text(
+                json.dumps(
+                    {"version": _PERSISTED_SESSION_VERSION, "sessions": rows},
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp, path)
+        except OSError as exc:
+            logger.warning("preview session registry write failed: %s", exc)
+
+    def _load_persisted_sessions(self) -> None:
+        path = self._registry_path()
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return
+        if not isinstance(payload, dict) or payload.get("version") != _PERSISTED_SESSION_VERSION:
+            return
+        now = time.time()
+        restored: Dict[str, PreviewSession] = {}
+        for row in payload.get("sessions") or []:
+            if not isinstance(row, dict):
+                continue
+            sid = str(row.get("session_id") or "")
+            url = str(row.get("vod_url") or "")
+            try:
+                last_access = float(row.get("last_access") or 0)
+            except (TypeError, ValueError):
+                continue
+            if (
+                not re.fullmatch(r"[0-9a-f]{16}", sid)
+                or not url.lower().startswith(("http://", "https://"))
+                or row.get("kind") != "hls"
+                or now - last_access > _PERSISTED_SESSION_MAX_AGE_SEC
+            ):
+                continue
+            try:
+                prefer_height = max(0, int(row.get("prefer_height") or 0))
+                crop_start = max(0.0, float(row.get("crop_start") or 0))
+                crop_end = max(0.0, float(row.get("crop_end") or 0))
+                last_access = float(row.get("last_access") or now)
+            except (TypeError, ValueError):
+                continue
+            cache_dir = preview_root() / sid
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            restored[sid] = PreviewSession(
+                session_id=sid,
+                vod_url=url,
+                master_url="",
+                entry_url="",
+                platform=str(row.get("platform") or "Unknown"),
+                cache_dir=cache_dir,
+                kind="hls",
+                crop_start=crop_start,
+                crop_end=crop_end,
+                prefer_height=prefer_height,
+                last_access=last_access,
+                needs_recovery=True,
+            )
+        with self._lock:
+            self._sessions.update(restored)
+
+    def _recover_persisted_session(self, session: "PreviewSession") -> None:
+        if not session.needs_recovery:
+            return
+        with session.recovery_lock:
+            if not session.needs_recovery:
+                return
+            raw_entry, headers, platform, variant_formats, kind, _yt_info = (
+                resolve_stream_info(
+                    session.vod_url,
+                    prefer_height=session.prefer_height or 360,
+                )
+            )
+            if kind != "hls":
+                raise RuntimeError("Persisted preview no longer resolves to HLS")
+            session.master_url = raw_entry
+            session.entry_url = raw_entry
+            session.platform = platform
+            session.http_headers = dict(headers or {})
+            session.allowed_hosts = _hosts_for_url(raw_entry)
+            session.variant_entries = [
+                (int(fmt.get("height") or 0), fmt.get("url") or "")
+                for fmt in (variant_formats or [])
+                if int(fmt.get("height") or 0) > 0 and fmt.get("url")
+            ]
+            for _height, variant_url in session.variant_entries:
+                session.allowed_hosts.update(_hosts_for_url(variant_url))
+            if session.variant_entries:
+                session.entry_url = (
+                    _pick_variant_by_height(
+                        session.variant_entries,
+                        session.prefer_height,
+                    )
+                    or session.variant_entries[0][1]
+                )
+            if len(session.variant_entries) >= 2 and platform != "YouTube":
+                session.custom_master = _build_synthetic_master_playlist(
+                    session, variant_formats
+                )
+            session.needs_recovery = False
+            session.recovery_error = None
+            self._persist_sessions()
 
     def _maybe_cleanup(self) -> None:
         """Run stale session cleanup at most once per interval."""
@@ -515,6 +655,7 @@ class PreviewManager:
                 shutil.rmtree(session.cache_dir, ignore_errors=True)
         except OSError:
             pass
+        self._persist_sessions()
 
     def delete_session(self, session_id: str) -> bool:
         self._maybe_cleanup()
@@ -527,6 +668,7 @@ class PreviewManager:
                 return False
             session.closed = True
             session.closed_at = time.time()
+        self._persist_sessions()
         _PREVIEW_MUX_LOCKS.pop(session_id, None)
         # The scoped ffmpeg kill happens in _finalize_delete after the grace
         # window, so in-flight window-HLS segment writes finish first.
@@ -548,6 +690,8 @@ class PreviewManager:
             # window after DELETE and we don't want a late GET extending their
             # life beyond the scheduled wipe.
             if not session.closed:
+                if session.needs_recovery:
+                    self._recover_persisted_session(session)
                 session.touch()
         return session
 
@@ -632,6 +776,7 @@ class PreviewManager:
                         ),
                         daemon=True,
                     ).start()
+        self._persist_sessions()
         return session
 
     def create_session(
@@ -857,6 +1002,7 @@ class PreviewManager:
                         daemon=True,
                     ).start()
 
+        self._persist_sessions()
         return _finalize_youtube_session(session, crop_start)
 
     # ponytail: live HLS (Kick/Twitch/YouTube live) — bypass InnerTube/yt-dlp.
@@ -1133,6 +1279,14 @@ class PreviewSession:
     # Quality policy: True when a YouTube session was resolved without user
     # auth (anonymous bootstrap jar only) — previews stay 360p-only.
     anonymous: bool = False
+    # Restored VOD sessions resolve fresh signed URLs on their first request.
+    needs_recovery: bool = False
+    recovery_error: Optional[str] = None
+    recovery_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        repr=False,
+        compare=False,
+    )
 
     def touch(self) -> None:
         self.last_access = time.time()

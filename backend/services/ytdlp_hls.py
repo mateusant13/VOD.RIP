@@ -1551,11 +1551,15 @@ def _parse_m3u8(
         raise RuntimeError(
             f"HLS media playlist too large ({len(lines)} lines) at {media_url}"
         )
-
     segments = []
     current_duration = None
     for line in lines:
         line = line.strip()
+        if line.startswith("#EXT-X-MAP:"):
+            map_match = re.search(r'URI="([^"]+)"', line)
+            if map_match:
+                stream_info["init_url"] = urljoin(media_url, map_match.group(1))
+            continue
         if line.startswith("#EXTINF:"):
             try:
                 current_duration = float(line.split(":")[1].split(",")[0])
@@ -1571,6 +1575,19 @@ def _parse_m3u8(
             )
             current_duration = None
     return segments, stream_info
+
+
+def _is_fragmented_mp4_segment(path: str) -> bool:
+    """Recognize a media fragment that needs its HLS init segment."""
+    try:
+        with open(path, "rb") as handle:
+            prefix = handle.read(128)
+    except OSError:
+        return False
+    return b"moof" in prefix or b"styp" in prefix
+
+
+assert _is_fragmented_mp4_segment  # self-check: helper is importable
 
 
 def _select_segments(
@@ -1760,7 +1777,6 @@ def _feed_path_to_stdin(
     except OSError:
         pass
 
-
 def _progressive_hls_copy_to_mp4(
     segments: list[dict],
     headers: dict,
@@ -1775,8 +1791,10 @@ def _progressive_hls_copy_to_mp4(
     register_abort: Optional[Callable[[Callable[[], None]], None]] = None,
     first_segment_path: Optional[str] = None,
     mp4_faststart: bool = False,
+    input_format: str = "mpegts",
+    init_path: Optional[str] = None,
 ) -> None:
-    """Parallel download with backpressure, piped into a Premiere-ready MP4."""
+    """Parallel-download HLS media and pipe TS or fragmented MP4 to ffmpeg."""
     total = len(segments)
     if total == 0:
         raise RuntimeError("No HLS segments to mux")
@@ -1792,6 +1810,7 @@ def _progressive_hls_copy_to_mp4(
         )
 
     tmp_mp4 = os.path.join(temp_dir, f"stream_{uuid.uuid4().hex}.mp4")
+    is_fmp4 = input_format == "mp4"
     mux_cmd = [
         ffmpeg_exe,
         "-y",
@@ -1801,7 +1820,7 @@ def _progressive_hls_copy_to_mp4(
         "-fflags",
         "+genpts+igndts",
         "-f",
-        "mpegts",
+        "mp4" if is_fmp4 else "mpegts",
         "-i",
         "pipe:0",
     ]
@@ -1812,8 +1831,10 @@ def _progressive_hls_copy_to_mp4(
         str(duration),
         "-c",
         "copy",
-        "-bsf:a",
-        "aac_adtstoasc",
+    ]
+    if not is_fmp4:
+        mux_cmd += ["-bsf:a", "aac_adtstoasc"]
+    mux_cmd += [
         "-avoid_negative_ts",
         "make_zero",
         "-max_muxing_queue_size",
@@ -1912,6 +1933,14 @@ def _progressive_hls_copy_to_mp4(
             assert proc.stdin is not None
             pipe_eof_exc: Optional[Exception] = None
             try:
+                if is_fmp4 and init_path:
+                    _feed_path_to_stdin(
+                        init_path,
+                        proc.stdin,
+                        cancel_event,
+                        pause_event,
+                        on_chunk=_touch_ffmpeg_activity,
+                    )
                 for i in range(total):
                     _schedule_through(i + HLS_DOWNLOAD_AHEAD)
                     ready[i].wait()
@@ -2045,6 +2074,8 @@ def _progressive_hls_copy_to_mp4(
             progress_hook=progress_hook,
         )
     _verify_output_file(output_path)
+
+
 
 
 def _concat_and_trim(
@@ -2188,7 +2219,12 @@ def download_hls_media_clip(
             f"HLS trim range {start_sec}-{end_sec} results in non-positive duration"
         )
     selected, first_offset = _select_segments(segments, start_sec, end_sec)
-    playlist_encoder = resolve_concat_encoder(stream_info, None, video_encoder)
+    is_fmp4 = bool(stream_info.get("init_url"))
+    playlist_encoder = (
+        "copy"
+        if is_fmp4
+        else resolve_concat_encoder(stream_info, None, video_encoder)
+    )
     if progress_hook and playlist_encoder != "copy":
         progress_hook(
             {
@@ -2233,6 +2269,7 @@ def download_hls_media_clip(
             pass
     try:
         first_path: Optional[str] = None
+        init_path: Optional[str] = None
         if selected:
             first_path = _download_one_segment(
                 0,
@@ -2242,10 +2279,28 @@ def download_hls_media_clip(
                 cancel_event,
                 pause_event,
             )
+            if is_fmp4:
+                init_path = _download_one_segment(
+                    -1,
+                    {"url": stream_info["init_url"]},
+                    headers,
+                    tmpdir,
+                    cancel_event,
+                    pause_event,
+                )
+            elif _is_fragmented_mp4_segment(first_path):
+                raise RuntimeError(
+                    "HLS playlist contains fragmented MP4 media without "
+                    "#EXT-X-MAP initialization data"
+                )
             probe_info = probe_segment_codec(first_path, resolved_ffmpeg)
         else:
             probe_info = {}
-        hls_encoder = resolve_concat_encoder(stream_info, probe_info, video_encoder)
+        hls_encoder = (
+            "copy"
+            if is_fmp4
+            else resolve_concat_encoder(stream_info, probe_info, video_encoder)
+        )
         logger.info(
             "HLS concat: %s (playlist=%s, probe=%s)",
             hls_encoder,
@@ -2275,6 +2330,8 @@ def download_hls_media_clip(
                 register_abort=register_abort,
                 first_segment_path=first_path,
                 mp4_faststart=mp4_faststart,
+                input_format="mp4" if is_fmp4 else "mpegts",
+                init_path=init_path,
             )
             if progress_hook:
                 progress_hook({"status": "downloading", "percent": 100})

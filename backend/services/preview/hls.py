@@ -27,6 +27,8 @@ from services.ytdlp_service import (
 )
 from services.ytdlp_hls import _youtube_soft_neg_error
 
+logger = logging.getLogger(__name__)
+
 from services.preview.session import (
     MAX_SEGMENT_BYTES,
     PLAYLIST_REWRITE_TTL_SEC,
@@ -41,6 +43,7 @@ from services.preview.session import (
     _guess_content_type,
     _host_allowed,
     _is_playlist_url,
+    _hosts_for_url,
     _playlist_cache,
     _read_cache,
     _request_headers,
@@ -61,17 +64,45 @@ def _twitch_refresh_and_remap(session, expired_url: str):
     try:
         from services.twitch_gql_service import get_vod_playback_sync
 
-        info = get_vod_playback_sync(getattr(session, "vod_url", "") or "")
+        master_url, headers, variants = get_vod_playback_sync(
+            getattr(session, "vod_url", "") or ""
+        )
         target_h = int(getattr(session, "prefer_height", 0) or 720) or 720
-        variants = (info or {}).get("variants") or []
         best = min(
-            variants,
+            variants or [],
             key=lambda v: abs(int((v or {}).get("height") or 0) - target_h),
             default=None,
         )
         url = (best or {}).get("url")
-        return url if url and url != expired_url else None
-    except Exception:
+        if not url or url == expired_url:
+            return None
+
+        # Replace every signed URL and cached rewrite together. Keeping the
+        # old synthetic master or playlist cache would immediately hand the
+        # browser the same expired CDN URL after a successful transplant.
+        session.http_headers = dict(headers or {})
+        session.allowed_hosts.clear()
+        session.allowed_hosts.update(_hosts_for_url(master_url))
+        session.variant_entries = [
+            (int(fmt.get("height") or 0), fmt.get("url") or "")
+            for fmt in (variants or [])
+            if int(fmt.get("height") or 0) > 0 and fmt.get("url")
+        ]
+        for _height, variant_url in session.variant_entries:
+            session.allowed_hosts.update(_hosts_for_url(variant_url))
+        session.master_url = master_url
+        session.entry_url = url
+        if getattr(session, "custom_master", None):
+            from services.preview.session import _build_synthetic_master_playlist
+
+            session.custom_master = _build_synthetic_master_playlist(session, variants)
+        _playlist_cache(session).clear()
+        return url
+    except Exception as exc:
+        # Subscriber-only, removed, and geo-restricted VODs must remain a
+        # terminal preview error; never turn a failed token refresh into an
+        # unauthorised retry loop.
+        logger.info("Twitch preview URL refresh failed: %s", exc)
         return None
 
 # Connection pool for upstream HTTP requests — reuses TCP connections across

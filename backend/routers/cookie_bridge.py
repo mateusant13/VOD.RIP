@@ -57,6 +57,10 @@ from services.yt_gate import gate_remaining_sec
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["cookie-bridge"])
 
+# Pairing is a first-writer-wins operation. Serialize the read/check/write
+# sequence so concurrent extension posts cannot overwrite the owner token.
+_PAIR_LOCK = threading.Lock()
+
 
 def _require_platform(platform: str) -> str:
     p = (platform or "").strip().lower()
@@ -1081,15 +1085,18 @@ async def session_cookies_ingest(request: Request, body: dict):
     token = (body.get("token") or "").strip()
     if not token:
         raise HTTPException(status_code=422, detail="token required")
-    paired = (current.cookie_bridge_token or "").strip()
-    if not paired:
-        # Pairing = first successful POST: any token becomes the paired one.
-        s = settings_mgr.get()
-        s.cookie_bridge_token = token
-        settings_mgr.save(s)
-        logger.info("cookie bridge paired (token set)")
-    elif token != paired:
-        raise HTTPException(status_code=403, detail="token mismatch")
+    with _PAIR_LOCK:
+        # Re-read inside the lock: settings_mgr.get() before the lock can be
+        # stale when two extension profiles pair at the same time.
+        paired = _paired_token()
+        if not paired:
+            s = settings_mgr.get()
+            s.cookie_bridge_token = token
+            settings_mgr.save(s)
+            paired = token
+            logger.info("cookie bridge paired (token set)")
+        if token != paired:
+            raise HTTPException(status_code=403, detail="token mismatch")
     cookies = body.get("cookies")
     if not isinstance(cookies, list):
         raise HTTPException(status_code=422, detail="cookies must be a list")
