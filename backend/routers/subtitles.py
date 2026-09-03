@@ -20,6 +20,16 @@ negative results are cached too, so a caption-less video is not re-fetched
 on every tab switch. Concurrent requests for the same video share one
 in-flight fetch (single-flight) instead of each spawning a full extraction.
 Never touches the archive DB.
+
+NOTE(2026-09-03): the manager's shared transcript tool now exists at
+`I:/!manager/tools/yt-transcript/index.ts` (Bun) / OMP tool
+`youtube_transcript` (~/.omp/agent/tools/youtube_transcript.ts). It uses an
+InnerTube ANDROID player-client call that fetches the caption track WITHOUT a
+PO token — a path that today survives the timedtext 429s this module fights
+with retries. TODO: evaluate delegating the fetch here (subprocess bun) or
+porting the InnerTube ANDROID approach into `_fetch_track`; frozen bundles
+ship this backend compiled, so an external `bun` dependency needs the
+bundler story sorted first. See I:/!manager/agents-sessions/transcript-tool.md.
 """
 
 from __future__ import annotations
