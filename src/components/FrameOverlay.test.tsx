@@ -144,6 +144,33 @@ describe('FrameOverlay', () => {
     expect(document.body.dataset.frameDragging).toBeUndefined();
   });
 
+  it('keeps an armed pointer-drag across an onDropCell identity change (mid-drag churn)', () => {
+    window.innerWidth = 1280;
+    window.innerHeight = 720;
+    const first = vi.fn();
+    const second = vi.fn();
+    const { container, rerender } = render(<FrameOverlay active onDropCell={first} />);
+    const overlay = container.querySelector('[data-frame-overlay]') as HTMLElement;
+
+    fireEvent(document, new CustomEvent('explore-frame-arm', { detail: { id: 'p1' } }));
+    expect(overlay.style.pointerEvents).toBe('auto');
+
+    // Simulate App churn (channel refresh / popup open-close) swapping the handler
+    // mid-drag. The listeners must survive — no disarm, no pointerArmIdRef clear.
+    rerender(<FrameOverlay active onDropCell={second} />);
+    expect(overlay.style.pointerEvents).toBe('auto');
+    expect(document.body.dataset.frameDragging).toBe('1');
+
+    fireEvent.pointerMove(document, { bubbles: true, clientX: 900, clientY: 100 });
+    fireEvent.pointerUp(document, { bubbles: true, clientX: 900, clientY: 100 });
+
+    // The snap resolves against the LATEST handler.
+    expect(first).not.toHaveBeenCalled();
+    expect(second).toHaveBeenCalledWith(2, 'vodrip-frame:p1');
+    expect(overlay.style.pointerEvents).toBe('none');
+    expect(document.body.dataset.frameDragging).toBeUndefined();
+  });
+
   it('recovers from a stale body frameDragging flag on mount', () => {
     document.body.dataset.frameDragging = '1';
     render(<FrameOverlay active onDropCell={vi.fn()} />);

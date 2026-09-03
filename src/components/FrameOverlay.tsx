@@ -37,6 +37,17 @@ export function FrameOverlay({
   // cursor over the 6 cells by geometry and snap on pointerup.
   const pointerArmIdRef = useRef<string | null>(null);
 
+  // handleDropCell (App.tsx) changes identity whenever visibleChannelVideos or
+  // explorePopups churn (channel refresh, popup open/close). If it were a dep of
+  // the listener effect below, that churn mid-drag would re-run the effect and its
+  // cleanup would disarm the grid + clear pointerArmIdRef — snapping would silently
+  // never happen ("grid appears then vanishes, no snap"). Keep the latest onDropCell
+  // in a ref so the listeners register once per active flip and survive churn.
+  const onDropCellRef = useRef(onDropCell);
+  useEffect(() => {
+    onDropCellRef.current = onDropCell;
+  });
+
   /** Which frame cell (by shared grid geometry, not hit-testing) contains (x, y). */
   const cellIndexAt = useCallback((x: number, y: number): number | null => {
     for (let i = 0; i < FRAME_GRID_CELLS; i++) {
@@ -111,7 +122,7 @@ export function FrameOverlay({
         pointerArmIdRef.current = null;
         const idx = cellIndexAt(ev.clientX, ev.clientY);
         endDrag();
-        if (idx != null) onDropCell?.(idx, encodeFrameDragPopupId(id));
+        if (idx != null) onDropCellRef.current?.(idx, encodeFrameDragPopupId(id));
       };
       document.addEventListener('dragstart', onStart, true);
       document.addEventListener('dragover', onDragOverAnywhere, true);
@@ -135,7 +146,7 @@ export function FrameOverlay({
         document.removeEventListener('pointerup', onPointerRelease, true);
         document.removeEventListener('pointercancel', onPointerRelease, true);
       };
-    }, [active, endDrag, cellIndexAt, onDropCell]);
+    }, [active, endDrag, cellIndexAt]);
 
   const onDragOver = useCallback((e: React.DragEvent, idx: number) => {
     e.preventDefault();
