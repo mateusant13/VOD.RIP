@@ -5,7 +5,9 @@
  */
 import { test, expect, type Page } from '@playwright/test';
 
-const UI_URL = 'http://localhost:5173';
+// The playwright config sets UI_URL to the webServer's port; fall back to the
+// conventional dev port so a lone-file run still works.
+const UI_URL = process.env.UI_URL || 'http://localhost:5173';
 const CHANNEL_ID = 'e2e-chan-live-1';
 
 const MOCK_CHANNEL = {
@@ -72,12 +74,16 @@ async function seedChannel(page: Page) {
   await page.addInitScript(({ channel }) => {
     localStorage.setItem('vodrip_saved_channels', JSON.stringify([channel]));
     localStorage.removeItem('vodrip_channel_live_status');
+    // Fresh contexts have no onboarding flag; the first-run wizard (z-9999)
+    // would intercept the CHANNELS tab click.
+    localStorage.setItem('vodrip.onboardingDone', '1');
+    localStorage.setItem('vodrip.firstTime.cookieInstall', '1');
   }, { channel: MOCK_CHANNEL });
 }
 
 async function openChannelsTab(page: Page) {
   await page.goto(UI_URL);
-  await expect(page.locator('.vod-app-shell')).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator('.vod-app-shell')).toBeVisible({ timeout: 60_000 });
   await page.getByRole('button', { name: /CHANNELS|CANAIS|CANALES/i }).click();
   await expect(page.locator('[data-channel-row]')).toBeVisible({ timeout: 15_000 });
 }

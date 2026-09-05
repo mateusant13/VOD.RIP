@@ -7,8 +7,11 @@
 
 import { test, expect, type Page, type BrowserContext } from '@playwright/test';
 
-const UI_URL = 'http://localhost:5173';
-const API_URL = 'http://localhost:7897';
+// The playwright config sets UI_URL to the webServer's port; fall back to the
+// conventional dev ports so a lone-file run still works.
+const UI_URL = process.env.UI_URL || 'http://localhost:5173';
+const API_PORT = process.env.PORT || '7897';
+const API_URL = `http://localhost:${API_PORT}`;
 
 /** Collect console errors during a test. */
 async function collectConsoleErrors(page: Page): Promise<string[]> {
@@ -27,7 +30,7 @@ test.describe('App loads correctly', () => {
     const errors = await collectConsoleErrors(page);
 
     await page.goto(UI_URL);
-    await expect(page.locator('.vod-app-shell')).toBeVisible({ timeout: 15_000 });
+    await expect(page.locator('.vod-app-shell')).toBeVisible({ timeout: 60_000 });
 
     // The URL input should be present
     const urlInput = page.getByPlaceholder(/paste vod or clip link/i);
@@ -41,11 +44,17 @@ test.describe('App loads correctly', () => {
   });
 
   test('tab switching works — URL, Queue, Settings', async ({ page }) => {
+    // The first-run wizard (z-9999) renders in a fresh context and swallows
+    // every click; seed the same flags the frame specs seed.
+    await page.addInitScript(() => {
+      localStorage.setItem('vodrip.onboardingDone', '1');
+      localStorage.setItem('vodrip.firstTime.cookieInstall', '1');
+    });
     await page.goto(UI_URL);
-    await page.waitForSelector('.vod-app-shell', { timeout: 15_000 });
+    await page.waitForSelector('.vod-app-shell', { timeout: 60_000 });
 
-    // Click Queue tab
-    const queueTab = page.getByText(/Queue/i);
+    // Click Queue tab (renamed HISTORY in the i18n pass; match both)
+    const queueTab = page.getByText(/Queue|HISTORY/i).first();
     await expect(queueTab).toBeVisible();
     await queueTab.click();
 

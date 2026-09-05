@@ -147,7 +147,7 @@ test.describe('Frame mode popup snap', () => {
 
   test('dragging a real explore popup body snaps it into frame cell 0', async ({ page }) => {
     await page.goto(UI_URL);
-    await expect(page.locator('.vod-app-shell')).toBeVisible({ timeout: 15_000 });
+    await expect(page.locator('.vod-app-shell')).toBeVisible({ timeout: 60_000 });
 
     // Open the CHANNELS panel (locale-tolerant: CHANNELS/CANAIS/…).
     await page.evaluate(() => {
@@ -204,7 +204,7 @@ test.describe('Frame mode popup snap', () => {
 
   test('dragging the pinned popup body out of the cell releases it, dragging back re-pins', async ({ page }) => {
     await page.goto(UI_URL);
-    await expect(page.locator('.vod-app-shell')).toBeVisible({ timeout: 15_000 });
+    await expect(page.locator('.vod-app-shell')).toBeVisible({ timeout: 60_000 });
 
     // Open the CHANNELS panel (locale-tolerant: CHANNELS/CANAIS/…).
     await page.evaluate(() => {

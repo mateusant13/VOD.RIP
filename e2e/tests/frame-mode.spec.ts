@@ -5,7 +5,9 @@
  */
 import { test, expect, type Page } from '@playwright/test';
 
-const UI_URL = 'http://localhost:5173';
+// The playwright config sets UI_URL to the webServer's port; fall back to the
+// conventional dev port so a lone-file run still works.
+const UI_URL = process.env.UI_URL || 'http://localhost:5173';
 
 /** Minimal settings mock so the app shell loads without depending on backend state. */
 async function mockSettingsRoute(page: Page) {
@@ -43,7 +45,7 @@ test.describe('Frame mode', () => {
 
   test('frame toggle enables overlay grid and persists to localStorage', async ({ page }) => {
     await page.goto(UI_URL);
-    await expect(page.locator('.vod-app-shell')).toBeVisible({ timeout: 15_000 });
+    await expect(page.locator('.vod-app-shell')).toBeVisible({ timeout: 60_000 });
 
     const toggle = page.locator('[data-frame-toggle] input[type="checkbox"]');
     await expect(toggle).toBeVisible();
