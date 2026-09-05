@@ -319,6 +319,39 @@ export function effectivePlatformFlags(
   };
 }
 
+/** Gap 2: rows cached for a platform whose effective filter is OFF. The list
+ * silently drops them (e.g. 48 Kick VODs hidden by channel_kick_enabled=false
+ * on a multi-platform channel), which reads as "zero VODs". Returns the
+ * per-platform hidden counts so the UI can say so instead. */
+export function hiddenPlatformCounts(
+  ch: Pick<SavedChannel, 'vodVideos' | 'clipVideos'> | null | undefined,
+  flags: { kick: boolean; twitch: boolean; youtube: boolean },
+  mode: 'vods' | 'clips' | 'streams',
+): { platform: 'Kick' | 'Twitch' | 'YouTube'; count: number }[] {
+  if (!ch) return [];
+  const list = mode === 'clips' ? (ch.clipVideos ?? []) : (ch.vodVideos ?? []);
+  const off: { platform: 'Kick' | 'Twitch' | 'YouTube'; count: number }[] = [];
+  for (const [platform, on] of [
+    ['Kick', flags.kick],
+    ['Twitch', flags.twitch],
+    ['YouTube', flags.youtube],
+  ] as const) {
+    if (on) continue;
+    const count = list.filter(
+      (v) =>
+        v.platform === platform &&
+        isPublicVideo(v) &&
+        (mode === 'clips'
+          ? true
+          : mode === 'streams'
+            ? v.content_kind === 'stream'
+            : v.content_kind !== 'clip'),
+    ).length;
+    if (count > 0) off.push({ platform, count });
+  }
+  return off;
+}
+
 export function channelClipsMissing(
   ch: SavedChannel,
   kickOn: boolean,

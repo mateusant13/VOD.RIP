@@ -13,6 +13,7 @@ import {
   channelVodsMissing,
   channelStreamsMissing,
   effectivePlatformFlags,
+  hiddenPlatformCounts,
   mergeVodPlatformsFetched,
   channelPlatformVisibleSlice,
   channelPlatformCanExpand,
@@ -493,6 +494,51 @@ describe('effectivePlatformFlags', () => {
     const result = effectivePlatformFlags(twitchOnly, flags);
     expect(flags).toEqual(allOff);
     expect(result).not.toBe(flags);
+  });
+});
+
+describe('hiddenPlatformCounts', () => {
+  const multi = {
+    vodVideos: [
+      makeVod({ platform: 'Kick', id: 'k1' }),
+      makeVod({ platform: 'Kick', id: 'k2' }),
+      makeVod({ platform: 'Twitch', id: 't1' }),
+      makeVod({ platform: 'YouTube', id: 'y1', content_kind: 'stream' }),
+      makeVod({ platform: 'Kick', id: 'k3', availability: 'subscriber_only' }),
+      makeVod({ platform: 'Kick', id: 'k4', content_kind: 'clip' }),
+    ],
+    clipVideos: [makeClip({ platform: 'Kick', id: 'c1' })],
+  };
+
+  it('counts cached rows of OFF platforms in vods mode', () => {
+    expect(
+      hiddenPlatformCounts(multi, { kick: false, twitch: true, youtube: false }, 'vods'),
+    ).toEqual([
+      { platform: 'Kick', count: 2 },
+      { platform: 'YouTube', count: 1 },
+    ]);
+  });
+
+  it('returns nothing when every platform is ON', () => {
+    expect(
+      hiddenPlatformCounts(multi, { kick: true, twitch: true, youtube: true }, 'vods'),
+    ).toEqual([]);
+  });
+
+  it('streams mode counts only stream rows', () => {
+    expect(
+      hiddenPlatformCounts(multi, { kick: true, twitch: true, youtube: false }, 'streams'),
+    ).toEqual([{ platform: 'YouTube', count: 1 }]);
+  });
+
+  it('clips mode reads clipVideos', () => {
+    expect(
+      hiddenPlatformCounts(multi, { kick: false, twitch: true, youtube: true }, 'clips'),
+    ).toEqual([{ platform: 'Kick', count: 1 }]);
+  });
+
+  it('handles null channel', () => {
+    expect(hiddenPlatformCounts(null, { kick: false, twitch: false, youtube: false }, 'vods')).toEqual([]);
   });
 });
 
