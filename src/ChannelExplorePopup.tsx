@@ -307,6 +307,11 @@ export default function ChannelExplorePopup({
   const videoAspectRef = useRef(EXPLORE_VIDEO_ASPECT_DEFAULT);
   const posRef = useRef<PanelPos | null>(null);
   const chromeHRef = useRef(EXPLORE_PANEL_CHROME_H_EST);
+  // Bumped whenever the measured chrome height changes, so the snap-pin
+  // layout effect re-runs and keeps the popup centered after late chrome
+  // growth (error banner, subtitle row, etc.). chromeHRef alone is invisible
+  // to React.
+  const [chromeHVersion, setChromeHVersion] = useState(0);
   const videoWrapRef = useRef<HTMLDivElement>(null);
   const videoPointerRef = useRef<{ x: number; y: number; moved: boolean } | null>(null);
   /** Player column (video + chrome + optional archive-search dock). Its
@@ -1286,7 +1291,7 @@ export default function ChannelExplorePopup({
     }
     const p = layoutExplorePopupWindow(el, containerW, posRef, stackIndex);
     setPos((prev) => (prev?.x === p.x && prev?.y === p.y ? prev : p));
-  }, [fullscreen, containerW, videoAspect, stackIndex, frameSnapRect, chatTotal]);
+  }, [fullscreen, containerW, videoAspect, stackIndex, frameSnapRect, chatTotal, chromeHVersion]);
 
   useEffect(() => {
     if (fullscreen || frameSnapRect) return;
@@ -1313,8 +1318,11 @@ export default function ChannelExplorePopup({
   useEffect(() => {
     if (fullscreen || !containerRef.current || !videoWrapRef.current) return;
     const chromeH = containerRef.current.offsetHeight - videoWrapRef.current.offsetHeight;
-    if (chromeH > 0) chromeHRef.current = chromeH;
-  }, [fullscreen, panelWidth, videoAspect, ready]);
+    if (chromeH > 0 && Math.abs(chromeH - chromeHRef.current) >= 1) {
+      chromeHRef.current = chromeH;
+      setChromeHVersion((v) => v + 1);
+    }
+  }, [fullscreen, panelWidth, videoAspect, ready, error]);
 
   useEffect(() => {
     if (!playback?.url) return;

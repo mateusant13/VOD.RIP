@@ -71,7 +71,11 @@ describe('PreviewStartTimeout (preview start phase guard)', () => {
     expect(signal.aborted).toBe(false);
   });
 
-  it('settle() clears the pending timer and aborts the fetch (terminal error path)', () => {
+  it('settle() clears the pending timer but does NOT abort the fetch', () => {
+    // The session-create dedup map shares one POST across StrictMode's
+    // double-invoke; a discarded cleanup that aborts kills the survivor's
+    // request (spurious "signal is aborted" error). Only the handled 60s
+    // timeout performs a teardown abort.
     const onTimeout = vi.fn(() => true);
     const guard = new PreviewStartTimeout('https://youtu.be/x', { onTimeout });
     guard.start();
@@ -79,7 +83,7 @@ describe('PreviewStartTimeout (preview start phase guard)', () => {
     guard.settle();
     vi.advanceTimersByTime(PREVIEW_START_TIMEOUT_MS * 2);
     expect(onTimeout).not.toHaveBeenCalled();
-    expect(signal.aborted).toBe(true);
+    expect(signal.aborted).toBe(false);
   });
 
   it('a new start() supersedes the previous phase: only the new timer fires, the old fetch is left alone', () => {

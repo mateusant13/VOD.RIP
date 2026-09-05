@@ -1,7 +1,8 @@
 import { defineConfig } from '@playwright/test';
 
 const API_PORT = process.env.PORT || '7897';
-const UI_PORT = '5173';
+const UI_PORT = process.env.UI_PORT || '5173';
+process.env.UI_URL = `http://localhost:${UI_PORT}`;
 
 export default defineConfig({
   testDir: './tests',
@@ -24,7 +25,7 @@ export default defineConfig({
       cwd: '.',
     },
     {
-      command: 'npx vite --port 5173',
+      command: `npx vite --port ${UI_PORT} --strictPort`,
       port: Number(UI_PORT),
       timeout: 30_000,
       reuseExistingServer: !process.env.CI,

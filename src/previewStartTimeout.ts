@@ -104,11 +104,14 @@ export class PreviewStartTimeout {
     this.clearTimer();
   }
 
-  /** A terminal error already surfaced — stop the timer and any in-flight abort. */
+  /** A terminal error already surfaced — stop the timer. Deliberately does NOT
+   *  abort the in-flight create fetch: the session-create dedup map shares one
+   *  POST across StrictMode's double-invoke, so the discarded first cleanup
+   *  must not kill the survivor's request (only the handled 60s timeout above
+   *  performs a teardown abort, freeing the dedup entry for RETRY). */
   settle(): void {
     this.settled = true;
     this.clearTimer();
-    this.controller?.abort();
     this.controller = null;
   }
 
