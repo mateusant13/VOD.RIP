@@ -4,7 +4,7 @@
  */
 import { test, expect, type Page } from '@playwright/test';
 
-const UI_URL = 'http://localhost:5173';
+const UI_URL = process.env.UI_URL || 'http://localhost:5173';
 const MAIN_URL = 'https://www.youtube.com/watch?v=4kyvGbRpV7M';
 
 type PlayerProbe = {
@@ -98,6 +98,12 @@ test.describe('Preview stress — 5 mini + main', () => {
     page.on('pageerror', (e) => consoleErrors.push(`pageerror: ${e.message}`));
     page.on('console', (msg) => {
       if (msg.type() === 'error') consoleErrors.push(`console: ${msg.text()}`);
+    });
+    // Fresh contexts have no onboarding flag; the first-run wizard (z-9999)
+    // would intercept the CHANNELS tab click.
+    await page.addInitScript(() => {
+      localStorage.setItem('vodrip.onboardingDone', '1');
+      localStorage.setItem('vodrip.firstTime.cookieInstall', '1');
     });
 
     await page.goto(UI_URL);

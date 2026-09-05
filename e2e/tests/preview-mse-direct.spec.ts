@@ -8,6 +8,7 @@
  * `window.__VITE_PREVIEW_MSE_DIRECT__` which the app exposes when enabled).
  */
 import { test, expect, type Page } from '@playwright/test';
+import http from 'node:http';
 
 const UI_URL = 'http://localhost:4173'; // preview build server
 const YT_URL = 'https://www.youtube.com/watch?v=4kyvGbRpV7M';
@@ -21,12 +22,27 @@ async function openYoutubePreview(page: Page, url: string) {
   await page.waitForSelector('video', { timeout: 30_000 });
 }
 
+/** True when the dedicated :4173 preview build answers (main suite never starts it). */
+async function previewServerUp(): Promise<boolean> {
+  const { promise, resolve } = Promise.withResolvers<boolean>();
+  const req = http.get(UI_URL, (res) => {
+    res.resume();
+    resolve(true);
+  });
+  req.setTimeout(2_000, () => { req.destroy(); resolve(false); });
+  req.on('error', () => resolve(false));
+  return promise;
+}
+
 test.describe('MSE-direct window-HLS', () => {
+  test.beforeAll(async () => {
+    // This spec targets a dedicated `vite preview` build on :4173 (see file
+    // header). The main suite never starts it — skip cleanly instead of
+    // failing with ERR_CONNECTION_REFUSED on goto().
+    test.skip(!(await previewServerUp()), 'no preview build server on :4173 — run `npx vite preview --port 4173` with VITE_PREVIEW_MSE_DIRECT=true');
+  });
+
   test('attaches a blob: MediaSource URL and plays', async ({ page }) => {
-    // Skip unless the MSE-direct build is active.
-    const mseEnabled = await page.addInitScript(() => {
-      // no-op; real check happens after load
-    });
     await openYoutubePreview(page, YT_URL);
 
     const flagOn = await page.evaluate(
