@@ -1111,7 +1111,13 @@ class PreviewManager:
                 session.entry_url = entry
                 session.allowed_hosts.update(_hosts_for_url(entry))
             except Exception as exc:
-                logger.debug("live session %s media resolve failed: %s", session_id[:8], exc)
+                # Never raise from the prewarm thread (the POST already
+                # returned), but RECORD the reason: a dead/403 master means
+                # the user stares at a spinner while /status reports
+                # all-green. Surfaced verbatim by preview_session_mux_status
+                # → live_upstream_error.
+                session.live_upstream_error = str(exc)[:240]
+                logger.info("live session %s media resolve failed: %s", session_id[:8], exc)
 
         threading.Thread(
             target=_bg_prewarm_live,
@@ -1288,8 +1294,15 @@ class PreviewSession:
         compare=False,
     )
 
+    # Live sessions only: last background prewarm failure (upstream master/
+    # media fetch died). Surfaced verbatim by GET /status as live_upstream_
+    # error so a dead/invalid master surfaces at the poll instead of the
+    # player spinning forever on a 403/404 upstream. Cleared on rotate.
+    live_upstream_error: Optional[str] = None
+
     def touch(self) -> None:
         self.last_access = time.time()
+
 def _vod_duration_from_info(info: Optional[dict]) -> float:
     if not info:
         return 0.0
@@ -1921,7 +1934,7 @@ def preview_session_mux_status(session_id: str) -> Dict[str, object]:
     ready = preview_mux_ready(session)
     if ready and session.mux_status == "pending":
         session.mux_status = "ready"
-    return {
+    status = {
         "mux_ready": ready,
         "playlist_ready": preview_playlist_ready(session),
         "segment_buffer_ready": preview_segment_buffer_ready(session),
@@ -1930,6 +1943,13 @@ def preview_session_mux_status(session_id: str) -> Dict[str, object]:
         "window_hls_mux_start": float(getattr(session, "window_hls_mux_start", 0) or 0),
         "window_hls_mux_end": float(getattr(session, "window_hls_mux_end", 0) or 0),
     }
+    if session.is_live:
+        # Live-only truth signal: the create POST returns before the upstream
+        # master/media resolve finishes, so a dead master (403/404/HTML page)
+        # previously surfaced only as a silent player spin — the status poll
+        # kept reporting all-green. Expose the recorded prewarm failure.
+        status["live_upstream_error"] = session.live_upstream_error or ""
+    return status
 def _run_youtube_mux_job(session_id: str) -> None:
     _run_ffmpeg_in_session_ctx(session_id, lambda: _run_youtube_mux_job_body(session_id))
 

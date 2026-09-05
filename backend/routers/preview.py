@@ -546,6 +546,21 @@ async def preview_live(req: LivePreviewRequest):
     platform = (req.platform or "").strip() or "Unknown"
     if not url:
         raise HTTPException(status_code=400, detail="Live preview requires a master.m3u8 url")
+    # User-facing guard: this POST historically accepted ANY http(s) URL and
+    # returned a session that dies later with an unexplained playback error —
+    # pasting a channel page (twitch.tv/xqc) served the Twitch HTML through
+    # master.m3u8 with HTTP 200, and hls.js failed silently. Reject non-HLS
+    # playlists here with an actionable reason instead.
+    if not _is_playlist_url(url):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Live preview requires an HLS playlist URL ending in .m3u8 "
+                "(usher.ttvnw.net, playback.live-video.net, googlevideo master.m3u8) — "
+                f"got {url!r}. Channel/video page URLs are not playable; resolve the "
+                "HLS master via GET /api/live/{platform} first (login=|slug=|handle=)."
+            ),
+        )
     try:
         session = await asyncio.get_running_loop().run_in_executor(
             LIVE_EXECUTOR,
@@ -615,6 +630,9 @@ def _rotate_live_twitch_session(session_id: str, player_type: Optional[str]) -> 
     session.entry_url = probed["url"]
     session.allowed_hosts = _hosts_for_url(probed["url"])
     session.twitch_player_type = probed["player_type"]
+    # Fresh master → any prewarm failure recorded for the previous upstream is
+    # stale; the next prewarm/status poll re-records it if the new one dies.
+    session.live_upstream_error = None
     # The rewritten-playlist cache is keyed by upstream URL, so old entries
     # become unreachable after the swap — no explicit purge needed.
     return {
@@ -651,7 +669,13 @@ async def preview_live_rotate(session_id: str, req: LiveRotateRequest):
 
 @router.get("/api/preview/session/{session_id}/status")
 async def preview_session_status(session_id: str):
-    """Poll YouTube DASH mux readiness (background job started at session create)."""
+    """Poll YouTube DASH mux readiness (background job started at session create).
+
+    Live sessions additionally expose ``live_upstream_error``: the last
+    background master/media prewarm failure ('' = healthy) — a dead usher/
+    kick/googlevideo master must surface at the poll instead of leaving the
+    player spinning on an all-green status.
+    """
     try:
         status = await asyncio.get_running_loop().run_in_executor(
             PREVIEW_EXECUTOR,
@@ -660,7 +684,6 @@ async def preview_session_status(session_id: str):
         return PreviewSessionStatusResponse(**status)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
-
 
 @router.post("/api/preview/session/{session_id}/seek")
 async def preview_session_seek(session_id: str, req: PreviewSeekRequest):

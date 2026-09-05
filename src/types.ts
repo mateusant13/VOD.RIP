@@ -290,6 +290,10 @@ export interface PreviewSessionStatusResponse {
   mux_error?: string;
   window_hls_mux_start?: number;
   window_hls_mux_end?: number;
+  /** Live sessions only: last background master/media prewarm failure
+   *  ('' = healthy) — a dead usher/kick/googlevideo master surfaces here
+   *  instead of leaving the player spinning on an all-green status. */
+  live_upstream_error?: string;
 }
 
 export type Tab = 'url' | 'channels' | 'queue' | 'settings';
