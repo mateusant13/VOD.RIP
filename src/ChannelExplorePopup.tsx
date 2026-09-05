@@ -669,6 +669,7 @@ export default function ChannelExplorePopup({
         timing.setSessionId(res.session_id);
         timing.mark('session_ready', `kind=${res.kind} trim=${res.trim_timeline === true}`);
         extractSourceRef.current = res.extract_source ?? '';
+        console.info('[VOD.RIP preview] resolve_ms=', Math.round(res.resolve_ms ?? 0));
         if (extractSourceRef.current) {
           console.info('[VOD.RIP preview] extract_source=', extractSourceRef.current);
         }

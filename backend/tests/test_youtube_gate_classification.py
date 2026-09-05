@@ -187,9 +187,10 @@ def _drop_session(session) -> None:
     shutil.rmtree(session.cache_dir, ignore_errors=True)
 
 
-def test_create_session_retries_once_on_soft_verdict():
-    """Soft InnerTube verdict (gate reason 'Video unavailable') -> the resolve
-    retries once and the session builds."""
+def test_create_session_does_not_retry_soft_verdict_in_request():
+    """Gap 1: a soft InnerTube verdict must NOT sleep+retry inside the click —
+    the resolve raises on the first failure (503 + Retry-After at the router);
+    the 30s neg-cache + frontend bounded retries cover transience."""
     with ExitStack() as stack:
         rsi = _session_patches(stack)
         stack.enter_context(
@@ -198,12 +199,13 @@ def test_create_session_retries_once_on_soft_verdict():
                 return_value=("LOGIN_REQUIRED", "Video unavailable", "retry"),
             )
         )
-        session = _manager.create_session(YOUTUBE_URL, prefer_height=360)
-    try:
-        assert rsi.call_count == 2, "soft verdict must trigger the one retry"
-        assert session is not None and session.session_id
-    finally:
-        _drop_session(session)
+        sleep = stack.enter_context(
+            patch("services.preview.session.time.sleep")
+        )
+        with pytest.raises(RuntimeError):
+            _manager.create_session(YOUTUBE_URL, prefer_height=360)
+    assert rsi.call_count == 1, "soft verdict must fail fast — no in-request retry"
+    sleep.assert_not_called()
 
 
 def test_create_session_does_not_retry_fatal_verdict():

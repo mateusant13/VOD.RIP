@@ -62,6 +62,13 @@ _ACTIVE_YOUTUBE_PREVIEW_LOCK = threading.Lock()
 _PREFLIGHT_MUX_INFLIGHT: Dict[str, threading.Event] = {}
 _PREFLIGHT_MUX_LOCK = threading.Lock()
 
+# --- Cold create dedup (Gap 1) ---
+# Leader/follower registry for concurrent cold create_session calls on the
+# same YouTube video: the first click resolves, later clicks wait on the
+# event and reuse the snapshot instead of stampeding the extract chain.
+_CREATE_INFLIGHT: Dict[str, threading.Event] = {}
+_CREATE_INFLIGHT_LOCK = threading.Lock()
+
 # --- Warm rate limiter ---
 _MAX_WARM_FAILURES: int = 3
 _WARM_COOLDOWN_SEC: int = 120  # 2 minutes

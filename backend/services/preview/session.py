@@ -5,7 +5,6 @@ import json
 import logging
 import math
 import os
-import random
 import re
 import socket
 import secrets
@@ -26,7 +25,6 @@ from services.ytdlp_service import (
     detect_platform,
     is_clip_url,
 )
-from services.ytdlp_hls import _youtube_soft_neg_error
 # session.py — Preview sessions
 logger = logging.getLogger(__name__)
 
@@ -105,6 +103,8 @@ REPLAY_PLAYLIST_RESOURCE = "replay-playlist"  # archive snapshot media playlist
 from services.preview._state import (
     _ACTIVE_YOUTUBE_PREVIEW_KEY,
     _CHANNEL_WARM_SLOTS,
+    _CREATE_INFLIGHT,
+    _CREATE_INFLIGHT_LOCK,
     _full_warm_queued,
     _PREFLIGHT_MUX_INFLIGHT,
     _RESOLVED_STREAM_CACHE,
@@ -116,7 +116,6 @@ from services.preview._state import (
     _YOUTUBE_WARM_LOCK,
     _validate_proxy_url,
 )
-# Import shared functions and executors from warm module
 from services.preview.warm import (
     _ANON_PROBE_EXECUTOR,
     _ANON_PROBE_HEAD_START_SEC,
@@ -141,6 +140,10 @@ from services.preview._state import preview_root
 
 def _full_mux_cache_dir() -> Path:
     return preview_root() / "full_mux_cache"
+
+# Gap 1: bounded follower wait for a concurrent cold create on the same video.
+# Kept under the 45s router hard timeout so a follower never 504s.
+_CREATE_FOLLOW_WAIT_SEC = 35.0
 
 FULL_MUX_CACHE_TTL_SEC = 86400 * 7  # 7 days
 def _prog_head_dir() -> Path:
@@ -850,9 +853,44 @@ class PreviewManager:
             # the key shape matches what create_session will look up.
             # NOTE: helper returns (vid, height, snapshot_dict) — the reuse path
             # wants the bare dict (passing the tuple 500'd every cold first click).
-            resolved = _resolve_and_cache_youtube_snapshot(
-                url, prefer_height=prefer_height,
-            )
+            # Gap 1: concurrent cold clicks on the same video dedup here — the
+            # leader resolves; followers wait bounded and reuse its snapshot
+            # instead of stampeding the extract chain (each cold grind up to
+            # ~32s). Followers never share the leader's PreviewSession:
+            # session_id registration is single-owner.
+            resolved = None
+            if vid:
+                with _CREATE_INFLIGHT_LOCK:
+                    ev = _CREATE_INFLIGHT.get(vid)
+                    leader = ev is None
+                    if leader:
+                        ev = threading.Event()
+                        _CREATE_INFLIGHT[vid] = ev
+                if leader:
+                    try:
+                        resolved = _resolve_and_cache_youtube_snapshot(
+                            url, prefer_height=prefer_height,
+                        )
+                    finally:
+                        with _CREATE_INFLIGHT_LOCK:
+                            _CREATE_INFLIGHT.pop(vid, None)
+                        ev.set()
+                else:
+                    ev.wait(_CREATE_FOLLOW_WAIT_SEC)
+                    snap = _get_session_snapshot(vid, prefer_height)
+                    if snap:
+                        resolved = (vid, prefer_height, snap)
+                    else:
+                        # leader failed/timed out — resolve ourselves; the
+                        # 30s neg-cache / 5min fatal-cache / extract dedup
+                        # inside cached_extract_info make this return fast.
+                        resolved = _resolve_and_cache_youtube_snapshot(
+                            url, prefer_height=prefer_height,
+                        )
+            else:
+                resolved = _resolve_and_cache_youtube_snapshot(
+                    url, prefer_height=prefer_height,
+                )
             if resolved:
                 snap = resolved[2]
                 session = self._reuse_youtube_snapshot(
@@ -863,45 +901,19 @@ class PreviewManager:
                     session.session_id[:8], resolved[0][:11], prefer_height,
                 )
                 return _finalize_youtube_session(session, crop_start)
-        # ponytail: retry once with jitter when the YouTube gate is transient —
-        # either a soft-neg marker in the exception, or a soft InnerTube
-        # playability verdict (gated probes report the same "Video unavailable"
-        # reason as dead videos, so the verdict kind — not the message — is the
-        # signal). Skip the retry while the process-wide yt_gate freeze is
-        # armed: the IP is gated, retrying just hammers it.
-        for _try in range(2):
-            try:
-                raw_entry, headers, platform, variant_formats, kind, yt_info = (
-                    resolve_stream_info(
-                        url,
-                        prefer_height=prefer_height,
-                    )
-                )
-                break
-            except BaseException as exc:
-                if _try == 0:
-                    from services.yt_gate import youtube_gate_active
-
-                    if not youtube_gate_active():
-                        soft = _youtube_soft_neg_error(exc)
-                        if not soft:
-                            from services.youtube_innertube import (
-                                extract_video_id,
-                                innertube_last_playability,
-                            )
-
-                            vid = extract_video_id(url or "")
-                            if vid:
-                                _st, _rs, _pb_kind = innertube_last_playability(vid)
-                                soft = _pb_kind == "retry"
-                        if soft:
-                            # ponytail: 30-90s made session_ready 52s+ (observed); a
-                            # short backoff still spreads retries without burning the
-                            # user's click on a dead wait. Upgrade path: honor a
-                            # Retry-After header if YouTube ever sends one.
-                            time.sleep(random.uniform(5, 15))
-                            continue
-                raise
+        # Gap 1: no in-request retry. A soft-negative (bot-gate) failure used
+        # to sleep 5-15s and re-grind the whole chain inside the click — the
+        # dominant cost behind 45s 504s. The first failure now raises and the
+        # router maps it to 503 + Retry-After (youtube_diag); the 30s negative
+        # cache (ytdlp_hls._EXTRACT_NEG_TTL_SEC), the frontend's bounded
+        # retries (createPreviewSessionWithRetry), and the background warm
+        # cover transient gates far cheaper than holding the request open.
+        raw_entry, headers, platform, variant_formats, kind, yt_info = (
+            resolve_stream_info(
+                url,
+                prefer_height=prefer_height,
+            )
+        )
 
         preview_audio_url: Optional[str] = None
         variant_muxed: Dict[int, bool] = {}

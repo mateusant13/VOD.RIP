@@ -126,7 +126,7 @@ def _preview_channel_language(session) -> str:
     return archive_db.video_channel_language(platform, video_id) or ""
 
 
-def _preview_session_response(session) -> PreviewSessionResponse:
+def _preview_session_response(session, resolve_ms: float = 0.0) -> PreviewSessionResponse:
     master = f"/api/preview/hls/{session.session_id}/master.m3u8"
     if session.kind == "progressive":
         playback = f"/api/preview/hls/{session.session_id}/stream.mp4"
@@ -161,6 +161,7 @@ def _preview_session_response(session) -> PreviewSessionResponse:
         has_transcript=has_transcript,
         has_chat=has_chat,
         channel_language=_preview_channel_language(session),
+        resolve_ms=resolve_ms,
     )
 
 
@@ -503,9 +504,12 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
         from services.preview_timing import log_server_session_created
         log_server_session_created(session, resolve_ms=resolve_ms)
 
-        def _finalize_preview_response():
-            # Archive DB/settings reads are synchronous; keep them off the
-            # event loop so one preview cannot freeze health and HLS requests.
+        # Gap 1: the priority-transcribe bump is a pure side effect — it used
+        # to run *inside* the response path and blocked 43s on the archive DB
+        # global lock during scheduler commit bursts (observed 08:44 probe:
+        # create 16s, response 59s). Fire-and-forget on INFO_EXECUTOR instead;
+        # the worker picks the job up whenever the enqueue lands.
+        def _bump_transcribe():
             try:
                 _priority_transcribe_for_preview(session)
             except Exception:
@@ -514,10 +518,11 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
                     session.session_id[:8],
                     exc_info=True,
                 )
-            return _preview_session_response(session)
+
+        asyncio.get_running_loop().run_in_executor(INFO_EXECUTOR, _bump_transcribe)
 
         response = await asyncio.get_running_loop().run_in_executor(
-            INFO_EXECUTOR, _finalize_preview_response,
+            INFO_EXECUTOR, lambda: _preview_session_response(session, resolve_ms),
         )
         return response
     except HTTPException:
@@ -530,7 +535,12 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
     except Exception as e:
         status = youtube_http_status(e)
         logger.warning("preview session rejected url=%s status=%d msg=%s", preview_url[:100], status, _preview_user_message(e))
-        raise HTTPException(status_code=status, detail=_preview_user_message(e))
+        headers = {}
+        if status == 503:
+            # Gap 1: transient YouTube gate — the 30s negative cache makes an
+            # immediate retry cheap; tell the client when to come back.
+            headers["Retry-After"] = "30"
+        raise HTTPException(status_code=status, detail=_preview_user_message(e), headers=headers)
 
 
 @router.post("/api/preview/live")

@@ -313,6 +313,9 @@ class PreviewSessionResponse(BaseModel):
     # ('' when the video is not archived / language unknown) — the preview
     # header badge renders this.
     channel_language: str = ""
+    # Gap 1: server-side create_session wall time (ms) — surfaces cold vs warm
+    # resolve cost to the client (console diagnostic; 0 for non-create paths).
+    resolve_ms: float = 0.0
 
 
 class PreviewSeekRequest(BaseModel):

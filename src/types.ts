@@ -280,6 +280,8 @@ export interface PreviewSessionResponse {
   archive_duration?: number;
   /** WS-3: detected channel language of the previewed archived video ('' = unknown). */
   channel_language?: string;
+  /** Gap 1: server-side create_session wall time (ms) — cold vs warm resolve cost. */
+  resolve_ms?: number;
 }
 
 export interface PreviewSessionStatusResponse {
