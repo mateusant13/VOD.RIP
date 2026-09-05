@@ -695,6 +695,16 @@ class PreviewManager:
                 session.touch()
         return session
 
+    def peek_session(self, session_id: str) -> Optional["PreviewSession"]:
+        """Read a session WITHOUT touching it — no TTL refresh, no recovery.
+
+        Status-style pollers use this to snapshot lifecycle state (idle age,
+        TTL countdown) that ``get_session`` would reset as a side effect.
+        """
+        self._maybe_cleanup()
+        with self._lock:
+            return self._sessions.get(session_id)
+
     def _reuse_youtube_snapshot(
         self,
         url: str,
@@ -1926,6 +1936,16 @@ def preview_mux_ready(session: PreviewSession) -> bool:
         return True
     return False
 def preview_session_mux_status(session_id: str) -> Dict[str, object]:
+    # get_session() touches the session (extends the TTL) — snapshot the idle
+    # age first so expires_in reports the real pre-poll countdown instead of
+    # reading as the full constant on every poll. A peek miss (session not in
+    # the manager — e.g. patched get_session in tests) falls back to the
+    # post-touch value.
+    pre = peek_session(session_id)
+    # Snapshot the VALUE now — pre IS the session object, and the get_session
+    # touch below mutates last_access in place; reading the attribute after
+    # the touch would silently report the renewed (full) TTL.
+    pre_idle = max(0.0, time.time() - pre.last_access) if pre is not None else None
     session = get_session(session_id)
     if not session:
         raise ValueError("Preview session not found or expired")
@@ -1943,6 +1963,16 @@ def preview_session_mux_status(session_id: str) -> Dict[str, object]:
         "window_hls_mux_start": float(getattr(session, "window_hls_mux_start", 0) or 0),
         "window_hls_mux_end": float(getattr(session, "window_hls_mux_end", 0) or 0),
     }
+    # User-facing lifecycle truth: sessions die silently at SESSION_TTL_SEC
+    # of no access (or LRU eviction) — the poll previously gave the client no
+    # way to see the end coming. expires_in is seconds until that wipe; 0 =
+    # already eligible, the next cleanup sweep removes it without notice.
+    # pre_idle is elapsed-seconds at peek time (pre IS the session object;
+    # the get_session touch already renewed last_access). Fallback: a peek
+    # miss means the caller's get_session is not the registry's — derive
+    # elapsed from the (touched) session.
+    idle = pre_idle if (pre_idle is not None and pre is session) else max(0.0, time.time() - session.last_access)
+    status["expires_in"] = max(0, int(SESSION_TTL_SEC - idle))
     if session.is_live:
         # Live-only truth signal: the create POST returns before the upstream
         # master/media resolve finishes, so a dead master (403/404/HTML page)
@@ -4999,6 +5029,7 @@ delete_session = _manager.delete_session
 get_session = _manager.get_session
 create_session = _manager.create_session
 create_live_session = _manager.create_live_session
+peek_session = _manager.peek_session
 if __name__ == "__main__":
     assert _formats_are_dash_https([{"protocol": "https", "url": "https://x/v.mp4"}])
     assert not _formats_are_dash_https(
