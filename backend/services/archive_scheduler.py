@@ -76,6 +76,9 @@ TWITCH_CHANNEL_FRESH_SEC = 600.0     # matches deps.TWITCH_CHANNEL_FRESH_SEC
 # not re-extracted for this long (survives restarts; the in-memory 1h
 # _yt_attempted_at backoff remains the fast-path within a process).
 CAPTIONS_UNAVAILABLE_FRESH_S = 86400.0
+# Transition-only logging state for the pass-2 idle gate (None = not yet
+# logged this process; True = last logged state was idle; False = active).
+_pass2_idle_logged: Optional[bool] = None
 
 _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
@@ -660,9 +663,17 @@ def _enqueue_transcriptions() -> None:
                LIMIT 1"""
         )
     )
+    global _pass2_idle_logged
     if not inflight:
-        logger.debug("scheduler skip transcribe pass-2 (idle queue)")
+        # Gap 3b: INFO on state transition only (debug was invisible; an
+        # unconditional INFO would spam every 180s pass).
+        if _pass2_idle_logged is not True:
+            logger.info("scheduler transcribe pass-2 idle (no queued/running transcribe work)")
+            _pass2_idle_logged = True
         return
+    if _pass2_idle_logged is True:
+        logger.info("scheduler transcribe pass-2 active again")
+    _pass2_idle_logged = False
 
     # Pass 2 — fresh candidates. FIX A: twitch/kick rows are candidates
     # WITHOUT a local archive file (the worker downloads the audio at job

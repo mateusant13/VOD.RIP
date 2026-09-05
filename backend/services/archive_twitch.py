@@ -495,9 +495,18 @@ def backfill_chat(
     # it — non-blocking acquire, clear 'busy' status, and the job row is
     # requeued so the worker drains it on a later pass.
     if interactive and not _BACKFILL_SEM.acquire(blocking=False):
+        # Gap 3b: the "worker will pick this up" promise was a lie whenever no
+        # worker was alive (transcribe-vod off pre-fix) — the row sat queued
+        # forever. Keep the 'busy' requeue contract (pinned by test_yt_gate)
+        # but state what's actually true.
+        _worker_live = archive_db.worker_live()
         archive_db.update_job(
             job_id, status="queued",
-            error="chat backfill busy (background backfills in flight) — worker will pick this up",
+            error=(
+                "chat backfill busy (background backfills in flight) — worker will pick this up"
+                if _worker_live
+                else "chat backfill busy (background backfills in flight) — requeued; no worker running, will retry when one starts"
+            ),
         )
         return {
             "video_id": vid,

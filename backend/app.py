@@ -960,15 +960,19 @@ async def _app_lifespan(_app: FastAPI):
             logger.debug("archive worker boot skipped", exc_info=True)
 
     def _archive_worker_allowed() -> bool:
+        # Gap 3b: the worker is also the ONLY consumer of 'chat' jobs (the
+        # twitch/kick backfill queue) — gating boot on transcribe-vod alone
+        # left every queued tw-backfill-* job stranded with a "worker will
+        # pick this up" error while no worker existed. chat-live needs it too.
         try:
             from services.feature_registry import is_enabled as _fe_aw
-            return _fe_aw("transcribe-vod")
+            return _fe_aw("transcribe-vod") or _fe_aw("chat-live")
         except Exception:
             return False
     if _archive_worker_allowed():
         threading.Thread(target=_boot_archive_worker, daemon=True, name="archive-worker-boot").start()
     else:
-        import logging as _lg4; _lg4.getLogger(__name__).info("Archive worker boot skipped (transcribe-vod disabled)")
+        import logging as _lg4; _lg4.getLogger(__name__).info("Archive worker boot skipped (transcribe-vod and chat-live disabled)")
 
     # Entity watcher — scans new transcription segments for saved words /
     # saved channels (auto mode), once at startup then every minute.
