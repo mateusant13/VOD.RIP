@@ -990,7 +990,10 @@ query ChannelStream($login: String!) {
       id
       title
       viewersCount
-      startedAt
+      # ponytail 2026-09-04: Twitch removed Stream.startedAt from the public
+      # schema ("Cannot query field startedAt") — createdAt carries the same
+      # ISO-8601 start instant and keeps live detection working.
+      createdAt
     }
   }
 }
@@ -1022,7 +1025,7 @@ def get_channel_stream_status_sync(login: str) -> Optional[dict]:
         return {"live": False, "started_at": None}
     return {
         "live": True,
-        "started_at": stream.get("startedAt") or None,
+        "started_at": stream.get("createdAt") or None,
         "title": stream.get("title") or None,
         "viewers": int(stream.get("viewersCount") or 0),
     }
