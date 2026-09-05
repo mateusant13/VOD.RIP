@@ -153,6 +153,14 @@ class SettingsManager:
             except Exception:
             # ponytail: best-effort — invalidation must never break a save
                 pass
+            # Gap 3a: the archive DB path memo reads settings.data_dir — any
+            # save may change the data-disk pick, so drop the memo too.
+            try:
+                from services.archive_db import invalidate_db_path_cache
+
+                invalidate_db_path_cache()
+            except Exception:
+                pass  # best-effort — invalidation must never break a save
             # One fresh ffmpeg probe re-armed per explicit save.
             self._ffmpeg_probe_failed = False
 

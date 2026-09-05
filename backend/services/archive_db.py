@@ -261,9 +261,29 @@ def _db_path() -> Path:
     override = os.environ.get("VODRIP_ARCHIVE_DB", "").strip()
     if override:
         return Path(override)
+    # Gap 3a: data_dir() reads settings (a model_copy of the whole 12k-line
+    # AppSettings) — re-resolving it on every DB touch made warm panel opens
+    # scale with payload size. Memoized on the env inputs (cheap) + invalidated
+    # by SettingsManager.save() (same lazy pattern as feature_registry), so the
+    # runtime data-disk pick still rebinds via _init_schema's path compare.
+    global _DB_PATH_MEMO
+    key = (os.environ.get("VODRIP_DATA_DIR", ""), os.environ.get("VODRIP_APP_DATA", ""))
+    if _DB_PATH_MEMO is not None and _DB_PATH_MEMO[0] == key:
+        return _DB_PATH_MEMO[1]
     from services.disk_hygiene import data_dir  # lazy: keeps module import light
 
-    return data_dir() / "archive.db"
+    path = data_dir() / "archive.db"
+    _DB_PATH_MEMO = (key, path)
+    return path
+
+
+_DB_PATH_MEMO: tuple[tuple[str, str], Path] | None = None
+
+
+def invalidate_db_path_cache() -> None:
+    """Drop the memoized DB path (settings save / tests)."""
+    global _DB_PATH_MEMO
+    _DB_PATH_MEMO = None
 
 
 def _migrate_db_to_data_dir(target: Path) -> None:

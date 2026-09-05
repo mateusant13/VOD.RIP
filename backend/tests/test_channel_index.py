@@ -157,6 +157,33 @@ async def test_first_fetch_persists_and_second_is_served_from_disk(client, _fake
     assert len(rows) == 6
     assert all(status == "known" and archive_path is None for _, _, status, archive_path in rows)
 
+@pytest.mark.asyncio
+async def test_warm_cache_hit_marks_no_priority(client, _fake_platform_services, monkeypatch):
+    """Gap 3a: a warm L1 panel open must perform ZERO priority DB writes, and a
+    refresh path must mark only the requested platforms (not all three)."""
+    marks: list[str] = []
+    monkeypatch.setattr(
+        channels, "mark_channel_priority", lambda p, s: marks.append(f"{p}/{s}")
+    )
+
+    first = await client.get(_videos_url(100))
+    assert first.status_code == 200
+    # miss path: all three wanted platforms marked
+    assert sorted(marks) == ["kick/titiltei", "twitch/titiltei", "youtube/@titiltei"]
+
+    marks.clear()
+    second = await client.get(_videos_url(100))
+    assert second.status_code == 200
+    # (the bg YouTube warm re-caches with refreshing=False — compare rows)
+    assert second.json()["videos"] == first.json()["videos"]
+    assert marks == [], f"warm cache hit performed priority writes: {marks}"
+
+    # force refresh bypasses the cache: only the requested platform is marked
+    marks.clear()
+    forced = await client.get(_videos_url(100, force="1", platforms="Twitch"))
+    assert forced.status_code == 200
+    assert marks == ["twitch/titiltei"], f"expected twitch-only mark, got {marks}"
+
 
 @pytest.mark.asyncio
 async def test_force_refetches_even_when_index_exists(client, _fake_platform_services):
