@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import sqlite3
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -20,9 +21,9 @@ from services.preview_service import (
     PreviewMuxPending,
     REPLAY_HLS_MARKER,
     StalePreviewUrls,
-    WINDOW_HLS_MARKER,
     create_session,
     create_live_session,
+    SESSION_TTL_SEC,
     delete_session,
     open_progressive_proxy,
     open_replay_hls_proxy,
@@ -590,14 +591,23 @@ def _rotate_live_twitch_session(session_id: str, player_type: Optional[str]) -> 
     frontend reloads the same proxy path and gets the new stream. Every player
     type is probed with a fresh GQL token; if none is ad-free the embed master
     is returned with ``ad_free=False`` and the frontend pLoader strips locally.
+
+    The response carries the session's remaining TTL (``expires_in``) so the
+    client sees lifecycle state without an extra /status round-trip: sessions
+    otherwise vanish silently after SESSION_TTL_SEC of no access.
     """
     from services.live_capture import (
         _TWITCH_FALLBACK_PLAYER_TYPE,
         _TWITCH_PLAYER_TYPES,
         probe_twitch_live_master,
     )
-    from services.preview.session import _hosts_for_url
+    from services.preview.session import _hosts_for_url, peek_session
 
+    pre = peek_session(session_id)
+    # Snapshot the VALUE now — pre IS the session object and get_session
+    # touches last_access in place below; reading it after would report the
+    # renewed (full) TTL instead of the real pre-rotate countdown.
+    pre_idle = max(0.0, time.time() - pre.last_access) if pre is not None else None
     session = get_session(session_id)
     if not session:
         raise ValueError("Preview session not found or expired")
@@ -633,8 +643,10 @@ def _rotate_live_twitch_session(session_id: str, player_type: Optional[str]) -> 
     # Fresh master → any prewarm failure recorded for the previous upstream is
     # stale; the next prewarm/status poll re-records it if the new one dies.
     session.live_upstream_error = None
-    # The rewritten-playlist cache is keyed by upstream URL, so old entries
-    # become unreachable after the swap — no explicit purge needed.
+    # pre_idle is elapsed-seconds at peek time (pre IS the session object;
+    # get_session already renewed last_access). Fallback: peek miss means the
+    # caller's get_session is not the registry's — derive from the session.
+    idle = pre_idle if (pre_idle is not None and pre is session) else max(0.0, time.time() - session.last_access)
     return {
         "ok": True,
         "player_type": probed["player_type"],
@@ -642,6 +654,7 @@ def _rotate_live_twitch_session(session_id: str, player_type: Optional[str]) -> 
         "url": probed["url"],
         "master_url": f"/api/preview/hls/{session_id}/master.m3u8",
         "headers": probed["headers"],
+        "expires_in": max(0, int(SESSION_TTL_SEC - idle)),
     }
 
 
@@ -649,7 +662,7 @@ def _rotate_live_twitch_session(session_id: str, player_type: Optional[str]) -> 
 async def preview_live_rotate(session_id: str, req: LiveRotateRequest):
     """Rotate a live Twitch session to the next vaft player type (midroll defense).
 
-    Response: ``{ok, player_type, ad_free, url, master_url, headers}``. The
+    Response: ``{ok, player_type, ad_free, url, master_url, headers, expires_in}``. The
     proxied ``master_url`` already serves the rotated upstream — reload it in
     the player. Fails 404 when the session is not a Twitch live usher session
     (e.g. YouTube or the e2e synthetic master) — the frontend then keeps
@@ -671,10 +684,12 @@ async def preview_live_rotate(session_id: str, req: LiveRotateRequest):
 async def preview_session_status(session_id: str):
     """Poll YouTube DASH mux readiness (background job started at session create).
 
-    Live sessions additionally expose ``live_upstream_error``: the last
-    background master/media prewarm failure ('' = healthy) — a dead usher/
-    kick/googlevideo master must surface at the poll instead of leaving the
-    player spinning on an all-green status.
+    Every response also carries ``expires_in`` — seconds until the session is
+    wiped by the idle TTL (or LRU eviction); 0 means the next cleanup sweep
+    removes it. Live sessions additionally expose ``live_upstream_error``:
+    the last background master/media prewarm failure ('' = healthy) — a dead
+    usher/kick/googlevideo master must surface at the poll instead of leaving
+    the player spinning on an all-green status.
     """
     try:
         status = await asyncio.get_running_loop().run_in_executor(

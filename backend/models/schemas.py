@@ -357,6 +357,11 @@ class PreviewSessionStatusResponse(BaseModel):
     # ('' = healthy). Lets the poller surface a dead upstream instead of
     # spinning forever on an all-green status.
     live_upstream_error: str = ""
+    # Seconds until the session is wiped by the idle TTL (or LRU eviction).
+    # Sessions die silently — the poll is the only lifecycle surface the
+    # client has; expires_in lets it see the end coming. 0 = already
+    # eligible for the next cleanup sweep.
+    expires_in: int = 0
 
 
 class PreviewQualityUpdateRequest(BaseModel):
