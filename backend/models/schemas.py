@@ -353,6 +353,10 @@ class PreviewSessionStatusResponse(BaseModel):
     mux_error: str = ""
     window_hls_mux_start: float = 0.0
     window_hls_mux_end: float = 0.0
+    # Live sessions only: last background master/media prewarm failure
+    # ('' = healthy). Lets the poller surface a dead upstream instead of
+    # spinning forever on an all-green status.
+    live_upstream_error: str = ""
 
 
 class PreviewQualityUpdateRequest(BaseModel):
