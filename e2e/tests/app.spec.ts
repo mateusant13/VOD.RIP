@@ -25,10 +25,37 @@ async function collectConsoleErrors(page: Page): Promise<string[]> {
   return errors;
 }
 
+// The owner's backend serves ui_language=pt-BR; the app's async language
+// switch mid-test translates labels (HISTÓRICO/CONFIGURAÇÕES) and breaks the
+// English selectors. Snapshot settings once and serve them pinned to English.
+let settingsEn: string | null = null;
+test.beforeAll(async () => {
+  for (let attempt = 0; attempt < 3 && settingsEn === null; attempt++) {
+    try {
+      const resp = await fetch(`${API_URL}/api/settings`, { signal: AbortSignal.timeout(30_000) });
+      const body: Record<string, unknown> = await resp.json();
+      body.ui_language = 'en';
+      settingsEn = JSON.stringify(body);
+    } catch {
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  }
+});
+
+/** Register the pinned-settings route; call before `page.goto`. */
+async function pinEnglishUi(page: Page): Promise<void> {
+  if (!settingsEn) return;
+  const body = settingsEn;
+  await page.route('**/api/settings', (route) => {
+    if (route.request().method() !== 'GET') return route.continue();
+    return route.fulfill({ status: 200, headers: { 'content-type': 'application/json' }, body });
+  });
+}
+
 test.describe('App loads correctly', () => {
   test('homepage loads and shows the app shell', async ({ page }) => {
     const errors = await collectConsoleErrors(page);
-
+    await pinEnglishUi(page);
     await page.goto(UI_URL);
     await expect(page.locator('.vod-app-shell')).toBeVisible({ timeout: 60_000 });
 
@@ -50,6 +77,7 @@ test.describe('App loads correctly', () => {
       localStorage.setItem('vodrip.onboardingDone', '1');
       localStorage.setItem('vodrip.firstTime.cookieInstall', '1');
     });
+    await pinEnglishUi(page);
     await page.goto(UI_URL);
     await page.waitForSelector('.vod-app-shell', { timeout: 60_000 });
 

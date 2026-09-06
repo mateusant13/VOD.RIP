@@ -93,6 +93,26 @@ async function seekAllTo(page: Page, ratio: number) {
 test.describe('Preview stress — 5 mini + main', () => {
   test.setTimeout(360_000);
 
+  // The real backend serves the owner's saved ui_language (pt-BR on this
+  // box); the async switch mid-test translates aria-labels ("explore
+  // player" → "exploração") and breaks the English selectors below.
+  // Snapshot the settings once and serve them pinned to English.
+  let settingsEn: string | null = null;
+  test.beforeAll(async ({ request }) => {
+    const api = `http://localhost:${process.env.PORT || '7897'}`;
+    for (let attempt = 0; attempt < 3 && settingsEn === null; attempt++) {
+      try {
+        const resp = await request.get(`${api}/api/settings`, { timeout: 30_000 });
+        const body = await resp.json();
+        if (body && typeof body === 'object') body.ui_language = 'en';
+        settingsEn = JSON.stringify(body);
+      } catch {
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
+    if (settingsEn === null) console.warn('preview-stress: could not snapshot /api/settings; UI language not pinned');
+  });
+
   test('concurrent seeks: 0 → 30s play → 75%', async ({ page }) => {
     const consoleErrors: string[] = [];
     page.on('pageerror', (e) => consoleErrors.push(`pageerror: ${e.message}`));
@@ -105,6 +125,12 @@ test.describe('Preview stress — 5 mini + main', () => {
       localStorage.setItem('vodrip.onboardingDone', '1');
       localStorage.setItem('vodrip.firstTime.cookieInstall', '1');
     });
+    if (settingsEn) {
+      await page.route('**/api/settings', (route) => {
+        if (route.request().method() !== 'GET') return route.continue();
+        return route.fulfill({ status: 200, headers: { 'content-type': 'application/json' }, body: settingsEn! });
+      });
+    }
 
     await page.goto(UI_URL);
     await expect(page.locator('.vod-app-shell')).toBeVisible({ timeout: 20_000 });
@@ -120,7 +146,9 @@ test.describe('Preview stress — 5 mini + main', () => {
       tripleChannel = page.getByRole('button', { name: /titiltei/i });
     }
     await tripleChannel.first().click({ force: true, timeout: 30_000 });
-    await expect(page.getByRole('button', { name: /videos/i })).toBeVisible({ timeout: 30_000 });
+    // Label is "Videos" only in YouTube-only mode, "VODs" otherwise (App.tsx);
+    // a triple-linked channel shows both tabs, hence .first().
+    await expect(page.getByRole('button', { name: /^(videos|vods)$/i }).first()).toBeVisible({ timeout: 30_000 });
 
     const previewBtns = page.getByRole('button', { name: /^preview$/i });
     await expect(previewBtns.first()).toBeVisible({ timeout: 60_000 });
