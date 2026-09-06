@@ -113,7 +113,8 @@ describe('main preview chat overlay host', () => {
   it('renders as an absolute overlay inside the player container, not a row sibling', async () => {
     mockPanelFetch(PAYLOAD);
     render(<ChatOverlayHost open />);
-    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+    // Panel default tab is 'transcript' (30b0f3f) — gate on a transcript row.
+    await waitFor(() => expect(screen.getByText('hello world')).toBeTruthy());
 
     const row = document.querySelector('[data-preview-panel]')!;
     const container = document.querySelector('[data-player-container]')!;
@@ -135,19 +136,19 @@ describe('main preview chat overlay host', () => {
   it('unmounts the overlay when the chat closes', async () => {
     mockPanelFetch(PAYLOAD);
     render(<ChatOverlayHost open />);
-    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+    await waitFor(() => expect(screen.getByText('hello world')).toBeTruthy());
 
     fireEvent.click(screen.getByTitle('Collapse panel'));
 
     expect(document.querySelector('[data-preview-chat-overlay]')).toBeNull();
     expect(document.querySelector('[data-preview-chat-panel]')).toBeNull();
-    expect(screen.queryByText('LETS GO')).toBeNull();
+    expect(screen.queryByText('hello world')).toBeNull();
   });
 
   it('keeps the panel mounted (hidden) during fullscreen so state survives', async () => {
     mockPanelFetch(PAYLOAD);
     const { rerender } = render(<ChatOverlayHost open hidden />);
-    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+    await waitFor(() => expect(screen.getByText('hello world')).toBeTruthy());
 
     // Fullscreen: the overlay wrapper and panel stay in the DOM, display:none.
     const overlay = document.querySelector('[data-preview-chat-overlay]')!;
@@ -155,11 +156,12 @@ describe('main preview chat overlay host', () => {
     expect(overlay).toBeTruthy();
     expect(panel.className).toContain('hidden');
 
-    // Internal state (tab selection) is preserved across the hidden flip.
-    fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
+    // Internal state (tab selection) is preserved across the hidden flip:
+    // switch off the default transcript tab, then un-hide and check it stuck.
+    fireEvent.click(screen.getByRole('button', { name: 'Chat' }));
     rerender(<ChatOverlayHost open hidden={false} />);
-    expect(screen.getByRole('button', { name: 'Transcript' }).getAttribute('aria-pressed')).toBe('true');
-    await waitFor(() => expect(screen.getByText('hello world')).toBeTruthy());
+    expect(screen.getByRole('button', { name: 'Chat' }).getAttribute('aria-pressed')).toBe('true');
+    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
   });
 
   it('clamps the overlay width to the player container (maxWidth)', async () => {
