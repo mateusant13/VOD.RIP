@@ -226,25 +226,45 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
     # Merge adaptive formats from the multi-client InnerTube resolver so the UI
     # exposes 720p/1080p/source tiers even though those need audio muxing.
     if platform == "YouTube":
+        # Skip the merge when the cached extract already exposes a >=720p video
+        # tier: such a ladder is the full adaptive/HLS set the player returned,
+        # so the multi-client InnerTube pass adds no quality label and no size
+        # entry the UI shows (measured on dQw4w9WgXcQ / 4kyvGbRpV7M /
+        # 9bZkp7q19f0: identical qualities AND identical size_by_quality) while
+        # costing ~1.1 s of extra InnerTube on EVERY /api/info/video click.
+        # Residual risk: a client whose ladder is capped above 720p could hide a
+        # taller InnerTube-only tier — not observed on any probed video.
         try:
-            from services.youtube_innertube import innertube_extract_info
-
-            rich = innertube_extract_info(full_url, timeout=12.0, preview_fast=False)
-            if rich:
-                by_key = {
-                    (str(f.get("format_id") or ""), int(f.get("height") or 0), str(f.get("url") or "")): f
+            cached_max_height = max(
+                (
+                    int(f.get("height") or 0)
                     for f in formats
-                }
-                for fmt in rich.get("formats") or []:
-                    key = (
-                        str(fmt.get("format_id") or ""),
-                        int(fmt.get("height") or 0),
-                        str(fmt.get("url") or ""),
-                    )
-                    by_key.setdefault(key, fmt)
-                formats = list(by_key.values())
-        except Exception as exc:
-            logger.debug("YouTube quality enrichment failed: %s", exc)
+                    if (f.get("vcodec") or "none") != "none"
+                ),
+                default=0,
+            )
+        except (TypeError, ValueError):
+            cached_max_height = 0
+        if cached_max_height < 720:
+            try:
+                from services.youtube_innertube import innertube_extract_info
+
+                rich = innertube_extract_info(full_url, timeout=12.0, preview_fast=False)
+                if rich:
+                    by_key = {
+                        (str(f.get("format_id") or ""), int(f.get("height") or 0), str(f.get("url") or "")): f
+                        for f in formats
+                    }
+                    for fmt in rich.get("formats") or []:
+                        key = (
+                            str(fmt.get("format_id") or ""),
+                            int(fmt.get("height") or 0),
+                            str(fmt.get("url") or ""),
+                        )
+                        by_key.setdefault(key, fmt)
+                    formats = list(by_key.values())
+            except Exception as exc:
+                logger.debug("YouTube quality enrichment failed: %s", exc)
     # WS-4: prefer the archived original title over the en-serving yt-dlp
     # copy (the walk stores hl=en translations). Archived row = instant DB
     # read; otherwise one cheap hl-free InnerTube player fetch, persisted so
