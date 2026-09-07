@@ -4,6 +4,8 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Optional
@@ -1223,6 +1225,15 @@ def _original_language_from_player(data: Optional[dict]) -> Optional[str]:
     return code if re.fullmatch(r"[a-z]{2}", code) else None
 
 
+_ORIGINAL_META_CACHE: dict[str, tuple[float, Optional[dict[str, Any]]]] = {}
+_ORIGINAL_META_LOCK = threading.Lock()
+# Title/language are immutable once a video exists; the DB persistence path
+# only stores a result when language resolves to pt/en, so videos without
+# caption tracks (language=None) re-paid the full 3-client probe (~1.4 s) on
+# EVERY /api/info/video click. The memo makes the repeat click free.
+_ORIGINAL_META_TTL_SEC = 6 * 3600
+
+
 def innertube_original_meta(
     video_id: str,
     *,
@@ -1256,6 +1267,28 @@ def innertube_original_meta(
     video's original gets a translated title here; upgrade path = per-video
     watch-page fetch with hl=<language> (the only endpoint that localizes
     per video, at the cost of a ~1.4 MB page)."""
+    now = time.time()
+    with _ORIGINAL_META_LOCK:
+        hit = _ORIGINAL_META_CACHE.get(video_id)
+        if hit and (now - hit[0]) < _ORIGINAL_META_TTL_SEC:
+            return hit[1]
+    result = _innertube_original_meta_uncached(video_id, read_timeout=read_timeout)
+    with _ORIGINAL_META_LOCK:
+        if len(_ORIGINAL_META_CACHE) >= 256:
+            # Key on the timestamp only: comparing full (ts, meta) tuples falls
+            # through to the dict when two stores share a time.time() tick
+            # (Windows granularity ~15 ms) -> TypeError on the whole click.
+            oldest = min(_ORIGINAL_META_CACHE, key=lambda k: _ORIGINAL_META_CACHE[k][0])
+            _ORIGINAL_META_CACHE.pop(oldest, None)
+        _ORIGINAL_META_CACHE[video_id] = (time.time(), result)
+    return result
+
+
+def _innertube_original_meta_uncached(
+    video_id: str,
+    *,
+    read_timeout: float = 4.0,
+) -> Optional[dict[str, Any]]:
     title: Optional[str] = None
     language: Optional[str] = None
     for name in ("IOS", "ANDROID", "WEB"):
