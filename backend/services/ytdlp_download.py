@@ -163,6 +163,11 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
                 full_url, cachedir=cache_dir,
                 cookies_file=cookies_file,
             )
+            # Gap 4: this caller only reads metadata (title/duration/quality
+            # ladder) — VideoInfo carries no stream URL — so it may be served a
+            # stale-but-accurate cached resolve while the cache revalidates.
+            # Stream consumers (preview, download) never set this.
+            opts["_stale_metadata_ok"] = True
             return cached_extract_info(full_url, opts)
         from services.ytdlp_ffmpeg import _ytdlp_engine_opts
 
@@ -191,22 +196,86 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
                     return bypass
             raise
 
+    def _enrich():
+        """Merged multi-client InnerTube resolve — the 720p/1080p/source tiers.
+
+        Never raises: a failed enrichment costs quality tiers, not the request.
+        """
+        try:
+            from services.youtube_innertube import innertube_extract_info
+
+            return innertube_extract_info(full_url, timeout=12.0, preview_fast=False)
+        except Exception as exc:
+            logger.debug("YouTube quality enrichment failed: %s", exc)
+            return None
+
     loop = asyncio.get_running_loop()
     # CPU-01: route yt-dlp extracts off the unbounded asyncio default pool
     # onto the bounded INFO_EXECUTOR so a warm storm cannot spawn ~60
     # concurrent extract threads.
     from deps import INFO_EXECUTOR
 
-    info = await loop.run_in_executor(INFO_EXECUTOR, _extract)
+    if platform == "YouTube":
+        # SOTA-02: the preview extract and the quality enrichment are two
+        # independent resolves of the same video. They used to run back to back
+        # (~8s + ~12s worst case) even though neither reads the other's output,
+        # which is the whole cost of a cold click on /api/info/video. Submit
+        # both, then await — wall time becomes max(extract, enrich).
+        # cached_extract_info's own single-flight still dedupes the extract
+        # side, and the enrichment is a plain network fan-out (it never submits
+        # to INFO_EXECUTOR), so there is no nested-pool deadlock.
+        info_task = loop.run_in_executor(INFO_EXECUTOR, _extract)
+        rich_task = loop.run_in_executor(INFO_EXECUTOR, _enrich)
+        info, rich = await asyncio.gather(info_task, rich_task)
+    else:
+        info = await loop.run_in_executor(INFO_EXECUTOR, _extract)
+        rich = None
     if info is None:
         raise ValueError("Could not extract video info")
 
+    formats = list(info.get("formats") or [])
+    # Fast YouTube extraction may return only the muxed 360p stream.  That is
+    # useful for instant playback but must not become the download quality list.
+    # Merge adaptive formats from the multi-client InnerTube resolver so the UI
+    # exposes 720p/1080p/source tiers even though those need audio muxing.
     if platform == "YouTube":
+        if rich:
+            by_key = {
+                (str(f.get("format_id") or ""), int(f.get("height") or 0), str(f.get("url") or "")): f
+                for f in formats
+            }
+            for fmt in rich.get("formats") or []:
+                key = (
+                    str(fmt.get("format_id") or ""),
+                    int(fmt.get("height") or 0),
+                    str(fmt.get("url") or ""),
+                )
+                by_key.setdefault(key, fmt)
+            formats = list(by_key.values())
+
         try:
             dur = float(info.get("duration") or 0)
         except (TypeError, ValueError):
             dur = 0.0
-        if 0 < dur < 90:
+        # SOTA-02: a fast/preview extract can under-report duration on short
+        # videos, so the row metadata used to be re-probed here — a third
+        # serial resolve (up to 5s) on every sub-90s click. The merged player
+        # response that just landed carries the same videoDetails.lengthSeconds
+        # and microformat dates, so use it and only re-probe when it is missing
+        # or carries no microformat (i.e. we genuinely still don't know).
+        if 0 < dur < 90 and rich:
+            try:
+                rich_dur = float(rich.get("duration") or 0)
+            except (TypeError, ValueError):
+                rich_dur = 0.0
+            if rich_dur > dur:
+                info["duration"] = int(rich_dur)
+                dur = rich_dur
+        has_microformat = bool(
+            (info.get("created_at") or info.get("upload_date"))
+            or (rich and (rich.get("created_at") or rich.get("upload_date")))
+        )
+        if 0 < dur < 90 and not has_microformat:
             from services.youtube_innertube import extract_video_id, innertube_video_row_metadata
 
             vid = extract_video_id(full_url)
@@ -219,32 +288,6 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
                         fallback = 0.0
                     if fallback > dur:
                         info["duration"] = int(fallback)
-
-    formats = list(info.get("formats") or [])
-    # Fast YouTube extraction may return only the muxed 360p stream.  That is
-    # useful for instant playback but must not become the download quality list.
-    # Merge adaptive formats from the multi-client InnerTube resolver so the UI
-    # exposes 720p/1080p/source tiers even though those need audio muxing.
-    if platform == "YouTube":
-        try:
-            from services.youtube_innertube import innertube_extract_info
-
-            rich = innertube_extract_info(full_url, timeout=12.0, preview_fast=False)
-            if rich:
-                by_key = {
-                    (str(f.get("format_id") or ""), int(f.get("height") or 0), str(f.get("url") or "")): f
-                    for f in formats
-                }
-                for fmt in rich.get("formats") or []:
-                    key = (
-                        str(fmt.get("format_id") or ""),
-                        int(fmt.get("height") or 0),
-                        str(fmt.get("url") or ""),
-                    )
-                    by_key.setdefault(key, fmt)
-                formats = list(by_key.values())
-        except Exception as exc:
-            logger.debug("YouTube quality enrichment failed: %s", exc)
     # WS-4: prefer the archived original title over the en-serving yt-dlp
     # copy (the walk stores hl=en translations). Archived row = instant DB
     # read; otherwise one cheap hl-free InnerTube player fetch, persisted so
@@ -898,10 +941,10 @@ def _build_ydl_opts(
 
     # Enable POT (Proof of Origin Token) as anti-bot measure for YouTube.
     # Mirror the preview ladder exactly (YOUTUBE_LEAST_GATED_PLAYER_CLIENTS):
-    # android_vr is the least bot-gated client (no POT needed) and the one the
-    # preview demonstrably uses; the old android/web ladder is what YouTube
+    # android is the least bot-gated client that needs no POT and still exposes
+    # a muxed 360p + adaptive ladder; the old android/web ladder is what YouTube
     # throttles to ~0 B/s on some networks (4:13 VOD zZeycndzX24 stalled at
-    # fragment 438-444 while its android_vr preview played in ~1.8s).
+    # fragment 438-444 while its android-family preview played in ~1.8s).
     if "youtube" in url.lower() and not opts.get("cookies"):
         opts["po_token"] = ["web+default", "android+default"]
         opts["extractor_args"] = opts.get("extractor_args", {})
