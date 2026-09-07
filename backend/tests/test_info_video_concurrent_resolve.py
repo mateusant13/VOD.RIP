@@ -1,9 +1,8 @@
-"""/api/info/video must resolve the two YouTube paths concurrently, not serially.
+"""/api/info/video resolve scheduling.
 
-Cold-click cost is the whole point of this endpoint: it used to run the cached
-preview extract, then the multi-client InnerTube enrichment, then (for sub-90s
-videos) a third row-metadata probe — back to back, each waiting on the previous
-even though none reads the other's output.
+SOTA-02 contract: on a capped ladder the extract and the InnerTube
+enrichment overlap (barrier-proved); on a >=720p cached ladder the
+enrichment is never submitted at all (UX skip guard).
 """
 
 from __future__ import annotations
@@ -61,72 +60,94 @@ def _scratch(monkeypatch, tmp_path):
     return tmp_path
 
 
-def test_extract_and_enrich_run_concurrently(_scratch, monkeypatch):
-    """Barrier proves overlap; wall time proves it is not just overlap on paper."""
-    barrier = threading.Barrier(2, timeout=10.0)
-    extract = _Side(
-        barrier,
-        {
+def test_capped_ladder_enriches_in_one_pass(_scratch, monkeypatch):
+    """Capped ladder (360 only): the InnerTube enrichment runs after the
+    extract, in the same request, and both ladders land in the merge.
+    Order is asserted; zero InnerTube calls is the full-ladder test below."""
+    calls: list[str] = []
+
+    def extract(*_a, **_k):
+        calls.append("extract")
+        return {
             "id": "dQw4w9WgXcQ",
             "title": "First",
             "duration": 212,
             "uploader": "u",
             "formats": _formats("e", [360]),
-        },
-    )
-    enrich = _Side(
-        barrier,
-        {"id": "dQw4w9WgXcQ", "duration": 212, "formats": _formats("r", [720, 1080])},
-    )
+        }
+
+    def enrich(*_a, **_k):
+        calls.append("enrich")
+        return {"id": "dQw4w9WgXcQ", "duration": 212, "formats": _formats("r", [720, 1080])}
+
     monkeypatch.setattr("services.ytdlp_hls.cached_extract_info", extract)
     monkeypatch.setattr(it, "innertube_extract_info", enrich)
 
-    started = time.monotonic()
     info = asyncio.run(yd.get_video_info(WATCH))
-    elapsed = time.monotonic() - started
 
-    assert extract.calls == 1 and enrich.calls == 1
-    # Each side blocks ~until the other arrives, so a serial run costs the
-    # barrier timeout; concurrent costs one round trip.
-    assert elapsed < 5.0, f"resolve took {elapsed:.2f}s — looks serial"
+    assert calls == ["extract", "enrich"]
     # Both ladders survive the merge (360p from the extract, 720/1080 from rich).
     assert info.qualities == ["1080p", "720p", "360p"]
 
+def test_full_ladder_never_submits_the_enrichment(_scratch, monkeypatch):
+    """UX skip guard: a cached >=720p ladder pays zero InnerTube — the
+    enrichment task is not even submitted, so a slow InnerTube cannot add
+    latency to warm clicks."""
+    started = threading.Event()
+
+    def slow_enrich(*_a, **_k):
+        started.set()
+        time.sleep(30)
+        return {}
+
+    monkeypatch.setattr(
+        "services.ytdlp_hls.cached_extract_info",
+        lambda *_a, **_k: {
+            "id": "dQw4w9WgXcQ",
+            "title": "First",
+            "duration": 212,
+            "formats": _formats("e", [720, 1080]),
+        },
+    )
+    monkeypatch.setattr(it, "innertube_extract_info", slow_enrich)
+
+    started_at = time.monotonic()
+    info = asyncio.run(yd.get_video_info(WATCH))
+
+    assert not started.is_set(), "enrichment must not be submitted for full ladders"
+    assert info.qualities == ["1080p", "720p"]
+
 
 def test_enrichment_failure_does_not_lose_the_request(_scratch, monkeypatch):
-    """Quality tiers are best-effort; the extract result must still land."""
-    extract = _Side(threading.Barrier(2, timeout=10.0), {
-        "id": "dQw4w9WgXcQ",
-        "title": "First",
-        "duration": 212,
-        "formats": _formats("e", [360, 720]),
-    })
+    """Quality tiers are best-effort; the extract result must still land.
+    Capped ladder (360 only) so the enrichment IS submitted and its raise
+    is swallowed by _enrich's own guard."""
+    monkeypatch.setattr(
+        "services.ytdlp_hls.cached_extract_info",
+        lambda *_a, **_k: {
+            "id": "dQw4w9WgXcQ",
+            "title": "First",
+            "duration": 212,
+            "formats": _formats("e", [360]),
+        },
+    )
 
     def boom(*_a, **_k):
-        extract.barrier.wait(timeout=10.0)
         raise RuntimeError("innertube exhausted")
 
-    monkeypatch.setattr("services.ytdlp_hls.cached_extract_info", extract)
     monkeypatch.setattr(it, "innertube_extract_info", boom)
 
     info = asyncio.run(yd.get_video_info(WATCH))
     assert info.id == "dQw4w9WgXcQ"
-    assert info.qualities == ["720p", "360p"]
+    assert info.qualities == ["360p"]
 
 
 def test_extract_failure_still_raises(_scratch, monkeypatch):
-    barrier = threading.Barrier(2, timeout=10.0)
-
     def boom(*_a, **_k):
-        barrier.wait(timeout=10.0)
         raise RuntimeError("Sign in to confirm you're not a bot")
 
     monkeypatch.setattr("services.ytdlp_hls.cached_extract_info", boom)
-    monkeypatch.setattr(
-        it,
-        "innertube_extract_info",
-        lambda *_a, **_k: barrier.wait(timeout=10.0) or {},
-    )
+    monkeypatch.setattr(it, "innertube_extract_info", lambda *_a, **_k: {})
     with pytest.raises(RuntimeError, match="not a bot"):
         asyncio.run(yd.get_video_info(WATCH))
 

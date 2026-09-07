@@ -216,17 +216,40 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
     from deps import INFO_EXECUTOR
 
     if platform == "YouTube":
-        # SOTA-02: the preview extract and the quality enrichment are two
-        # independent resolves of the same video. They used to run back to back
-        # (~8s + ~12s worst case) even though neither reads the other's output,
-        # which is the whole cost of a cold click on /api/info/video. Submit
-        # both, then await — wall time becomes max(extract, enrich).
-        # cached_extract_info's own single-flight still dedupes the extract
-        # side, and the enrichment is a plain network fan-out (it never submits
-        # to INFO_EXECUTOR), so there is no nested-pool deadlock.
+        # SOTA-02+UX: the preview extract and the quality enrichment are two
+        # independent resolves of the same video. Cold clicks used to pay both
+        # back to back (~8s + ~12s worst case); capped ladders still fan the
+        # enrichment out here, but a cached ladder already reaching >=720p
+        # never submits it at all (skip guard below — the warm click, the
+        # frequent path, pays zero InnerTube). cached_extract_info's own
+        # single-flight still dedupes the extract side, and the enrichment is
+        # a plain network fan-out (it never submits to INFO_EXECUTOR), so
+        # there is no nested-pool deadlock.
         info_task = loop.run_in_executor(INFO_EXECUTOR, _extract)
-        rich_task = loop.run_in_executor(INFO_EXECUTOR, _enrich)
-        info, rich = await asyncio.gather(info_task, rich_task)
+        info = await info_task
+        # UX skip guard: a cached ladder already reaching >=720p is the full
+        # set the player returned — the InnerTube pass would add no quality
+        # label and no size entry the UI shows (measured on dQw4w9WgXcQ /
+        # 4kyvGbRpV7M / 9bZkp7q19f0: identical qualities AND identical
+        # size_by_quality). In that case never SUBMIT _enrich: the warm click
+        # (the frequent path) pays zero InnerTube. Capped ladders (the cold
+        # case the merge exists for) still fan out here.
+        def _ladder_capped() -> bool:
+            try:
+                return max(
+                    (
+                        int(f.get("height") or 0)
+                        for f in (info.get("formats") or [])
+                        if (f.get("vcodec") or "none") != "none"
+                    ),
+                    default=0,
+                ) < 720
+            except (TypeError, ValueError):
+                return True
+        rich_task = (
+            loop.run_in_executor(INFO_EXECUTOR, _enrich) if _ladder_capped() else None
+        )
+        rich = await rich_task if rich_task is not None else None
     else:
         info = await loop.run_in_executor(INFO_EXECUTOR, _extract)
         rich = None
@@ -238,72 +261,66 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
     # useful for instant playback but must not become the download quality list.
     # Merge adaptive formats from the multi-client InnerTube resolver so the UI
     # exposes 720p/1080p/source tiers even though those need audio muxing.
-    if platform == "YouTube":
-        if rich:
-            by_key = {
-                (str(f.get("format_id") or ""), int(f.get("height") or 0), str(f.get("url") or "")): f
-                for f in formats
-            }
-            for fmt in rich.get("formats") or []:
-                key = (
-                    str(fmt.get("format_id") or ""),
-                    int(fmt.get("height") or 0),
-                    str(fmt.get("url") or ""),
-                )
-                by_key.setdefault(key, fmt)
-            formats = list(by_key.values())
+    if rich:
+        by_key = {
+            (str(f.get("format_id") or ""), int(f.get("height") or 0), str(f.get("url") or "")): f
+            for f in formats
+        }
+        for fmt in rich.get("formats") or []:
+            key = (
+                str(fmt.get("format_id") or ""),
+                int(fmt.get("height") or 0),
+                str(fmt.get("url") or ""),
+            )
+            by_key.setdefault(key, fmt)
+        formats = list(by_key.values())
 
+    try:
+        dur = float(info.get("duration") or 0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    # SOTA-02: a fast/preview extract can under-report duration on short
+    # videos, so the row metadata used to be re-probed here — a third
+    # serial resolve (up to 5s) on every sub-90s click. The merged player
+    # response that just landed carries the same videoDetails.lengthSeconds
+    # and microformat dates, so use it and only re-probe when it is missing
+    # or carries no microformat (i.e. we genuinely still don't know).
+    if 0 < dur < 90 and rich:
         try:
-            dur = float(info.get("duration") or 0)
+            rich_dur = float(rich.get("duration") or 0)
         except (TypeError, ValueError):
-            dur = 0.0
-        # SOTA-02: a fast/preview extract can under-report duration on short
-        # videos, so the row metadata used to be re-probed here — a third
-        # serial resolve (up to 5s) on every sub-90s click. The merged player
-        # response that just landed carries the same videoDetails.lengthSeconds
-        # and microformat dates, so use it and only re-probe when it is missing
-        # or carries no microformat (i.e. we genuinely still don't know).
-        if 0 < dur < 90 and rich:
-            try:
-                rich_dur = float(rich.get("duration") or 0)
-            except (TypeError, ValueError):
-                rich_dur = 0.0
-            if rich_dur > dur:
-                info["duration"] = int(rich_dur)
-                dur = rich_dur
-        has_microformat = bool(
-            (info.get("created_at") or info.get("upload_date"))
-            or (rich and (rich.get("created_at") or rich.get("upload_date")))
-        )
-        if 0 < dur < 90 and not has_microformat:
-            from services.youtube_innertube import extract_video_id, innertube_video_row_metadata
+            rich_dur = 0.0
+        if rich_dur > dur:
+            info["duration"] = int(rich_dur)
+            dur = rich_dur
+    has_microformat = bool(
+        (info.get("created_at") or info.get("upload_date"))
+        or (rich and (rich.get("created_at") or rich.get("upload_date")))
+    )
+    if 0 < dur < 90 and not has_microformat:
+        from services.youtube_innertube import extract_video_id, innertube_video_row_metadata
 
-            vid = extract_video_id(full_url)
-            if vid:
-                meta = innertube_video_row_metadata(vid, read_timeout=5.0)
-                if meta:
-                    try:
-                        fallback = float(meta.get("duration") or 0)
-                    except (TypeError, ValueError):
-                        fallback = 0.0
-                    if fallback > dur:
-                        info["duration"] = int(fallback)
+        vid = extract_video_id(full_url)
+        if vid:
+            meta = innertube_video_row_metadata(vid, read_timeout=5.0)
+            if meta:
+                try:
+                    fallback = float(meta.get("duration") or 0)
+                except (TypeError, ValueError):
+                    fallback = 0.0
+                if fallback > dur:
+                    info["duration"] = int(fallback)
     formats = list(info.get("formats") or [])
     # Fast YouTube extraction may return only the muxed 360p stream.  That is
     # useful for instant playback but must not become the download quality list.
     # Merge adaptive formats from the multi-client InnerTube resolver so the UI
     # exposes 720p/1080p/source tiers even though those need audio muxing.
     if platform == "YouTube":
-        # SOTA-02+UX: the enrichment now runs CONCURRENTLY with the extract
-        # (see _enrich/gather above), and the merge is skipped when the cached
-        # extract already exposes a >=720p video tier: such a ladder is the
-        # full adaptive/HLS set the player returned, so the InnerTube pass
-        # adds no quality label and no size entry the UI shows (measured on
-        # dQw4w9WgXcQ / 4kyvGbRpV7M / 9bZkp7q19f0: identical qualities AND
-        # identical size_by_quality). The 720p guard preserves the capped-
-        # 360p fast-extract case the merge was written for.
-        # Residual risk: a client whose ladder is capped above 720p could
-        # hide a taller InnerTube-only tier — not observed on any probed video.
+        # rich is None when the lazy-submit skip guard held (cached ladder
+        # already >=720p): the InnerTube pass would add no quality label and
+        # no size entry the UI shows (measured on dQw4w9WgXcQ / 4kyvGbRpV7M /
+        # 9bZkp7q19f0: identical qualities AND identical size_by_quality).
+        # The guard lives at submission time, so no second height scan here.
         if rich:
             try:
                 cached_max_height = max(
