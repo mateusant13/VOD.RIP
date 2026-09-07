@@ -91,22 +91,40 @@ _HLS_FORWARD_KEYS = frozenset(
 
 
 class _YtdlpQuietLogger:
-    """Capture yt-dlp chatter; surface only at DEBUG."""
+    """Capture yt-dlp chatter; surface only at DEBUG.
+
+    One exception, monitoring-only: the subtitles PO-Token policy line. For
+    non-default clients yt-dlp reports it via report_warning (→ warning());
+    for the default clients it goes through write_debug, which reaches a logger
+    only when yt-dlp runs verbose — hence the debug() hook too. Without either,
+    a caption regression is invisible: the tracks are discarded and the extract
+    still succeeds. Nothing branches on the line.
+    """
 
     def __init__(self) -> None:
         self.lines: list[str] = []
 
     def debug(self, msg: object) -> None:
-        pass
+        # Default clients get the policy line via write_debug, not warning.
+        self._note_policy(msg)
 
     def info(self, msg: object) -> None:
         pass
 
     def warning(self, msg: object) -> None:
         self.lines.append(str(msg))
+        self._note_policy(msg)
 
     def error(self, msg: object) -> None:
         self.lines.append(str(msg))
+        self._note_policy(msg)
+
+    @staticmethod
+    def _note_policy(msg: object) -> None:
+        from services.youtube_diag import is_subs_pot_policy_error
+
+        if is_subs_pot_policy_error(msg):
+            logger.warning("SUBS_PO_TOKEN_POLICY observed: %s", msg)
 
 
 # fd-2 redirect is process-wide; concurrent extracts (warm storm + fallback
@@ -170,6 +188,28 @@ _EXTRACT_CACHE_TTL_SEC = 6 * 3600
 # forced a re-extract on every 2-min channel-rail re-warm (observed storm).
 _EXTRACT_CACHE_MAX = 128
 _EXTRACT_WAIT_SEC = 120
+# Stale-while-revalidate window for the extract cache (routers/live.py's
+# _LIVE_STATUS_MAX_STALE_SEC pattern, applied to VOD metadata).
+#
+# The 6h TTL is not a metadata staleness bound — it is the googlevideo
+# signature lifetime. Title/duration/publish-date/quality-ladder do not go
+# stale at 6h, so a click on a video watched this morning used to pay the full
+# InnerTube race again for no reason. Inside TTL..TTL+24h a metadata caller is
+# served the cached resolve immediately while ONE shared background re-extract
+# refreshes it.
+#
+# Stream-URL consumers (preview, download) are excluded by construction: only
+# callers that opt in with opts["_stale_metadata_ok"] take the stale branch,
+# and that flag is set solely by get_video_info, whose VideoInfo payload
+# carries no stream URL. Handing a 7h-old googlevideo signature to a player is
+# how you get a 403 where a 6h TTL promised freshness.
+_EXTRACT_SWR_WINDOW_SEC = 24 * 3600
+# key -> the one background re-extract currently covering that key's stale
+# serve. _SWR_CLAIMED marks the window between claiming under the lock and the
+# actual submit, so two clicks on the same stale entry never stack refreshes.
+_EXTRACT_SWR_INFLIGHT: dict[str, Any] = {}
+_SWR_CLAIMED = object()
+
 _YOUTUBE_EXTRACT_PARALLEL_SEC = 4.5
 _PREVIEW_EXTRACT_RACE_SEC = 5.5  # wall clock — innertube + yt-dlp paths race together
 _YOUTUBE_PREVIEW_SOCKET_SEC = 3
@@ -370,11 +410,18 @@ def _try_innertube_info(
 
 
 # Least bot-gated YouTube player-client ladder, shared by preview and full
-# downloads. android_vr/android are least bot-gated (no POT needed) and still
-# expose a muxed 360p + adaptive ladder; web_safari stays as POT last-resort.
+# downloads. android is the head: no POT needed, and it exposes a muxed 360p +
+# adaptive ladder (measured live on 21.26.364). web_safari is the POT last
+# resort for HLS. android_vr is demoted to LEGACY-FALLBACK position — yt-dlp
+# dropped it from its default clients in 2026.08.19 and 403s every format at
+# 1.65.10 since 2026.08.17, so it must never be the first thing tried; it stays
+# last because it still resolves videos the other two cannot.
+# (visionos is deliberately absent: it is yt-dlp's new anonymous default, but
+# an unsupported name in extractor_args is a hard ExtractorError, and
+# requirements.txt only floors yt-dlp at 2025.5.22.)
 # ponytail: yt-dlp queries every listed client sequentially and merges, so a
-# hard-walled video pays per-client time before failing (5 clients ~= 24s).
-YOUTUBE_LEAST_GATED_PLAYER_CLIENTS = ["android_vr", "android", "web_safari"]
+# hard-walled video pays per-client time before failing (3 clients ~= 14s).
+YOUTUBE_LEAST_GATED_PLAYER_CLIENTS = ["android", "web_safari", "android_vr"]
 
 
 def youtube_preview_ytdl_opts(
@@ -1045,6 +1092,43 @@ assert preview_fast_only_mode.__name__ == "preview_fast_only_mode"
 assert _youtube_extract_preview_race.__name__ == "_youtube_extract_preview_race"
 
 
+def _extract_swr_refresh(key: str, url: str, opts: dict) -> None:
+    """Background re-extract behind a stale metadata serve.
+
+    Re-enters ``cached_extract_info`` WITHOUT the stale opt-in, so the refresh
+    goes through the normal single-flight leader path: a click that arrived
+    meanwhile and is already re-extracting becomes this refresh's leader, and
+    the entry is written once by whoever wins. Failures are logged only — the
+    stale entry stays and the next caller retries (or pays the cold path).
+    """
+    fresh_opts = {k: v for k, v in opts.items() if k != "_stale_metadata_ok"}
+    try:
+        cached_extract_info(url, fresh_opts)
+    except Exception as exc:
+        logger.debug("extract SWR refresh failed for %s: %s", url[:60], exc)
+    finally:
+        with _EXTRACT_CACHE_LOCK:
+            _EXTRACT_SWR_INFLIGHT.pop(key, None)
+
+
+def _submit_extract_swr_refresh(key: str, url: str, opts: dict) -> None:
+    """Hand the claimed refresh to INFO_EXECUTOR (caller released the lock).
+
+    The claim is taken by the serving caller under ``_EXTRACT_CACHE_LOCK``, so
+    concurrent clicks on the same stale entry cannot stack refreshes. A submit
+    rejection releases the claim and leaves the caller with its stale payload —
+    a lost refresh costs one more cold click, never a wrong answer.
+    """
+    from deps import INFO_EXECUTOR
+
+    try:
+        INFO_EXECUTOR.submit(_extract_swr_refresh, key, url, opts)
+    except Exception:
+        with _EXTRACT_CACHE_LOCK:
+            _EXTRACT_SWR_INFLIGHT.pop(key, None)
+        logger.debug("extract SWR submit rejected for %s", url[:60], exc_info=True)
+
+
 def _cache_extract_result(key: str, info: dict) -> None:
     now = time.time()
     # Degenerate YouTube extracts (bot-wall with ≤1 format) get 60s TTL
@@ -1062,6 +1146,7 @@ def cached_extract_info(url: str, opts: dict) -> dict:
     """yt-dlp extract_info with in-memory TTL cache (preview + /api/info share hits)."""
     key = _extract_cache_key(url, opts)
     now = time.time()
+    stale_payload = None
     with _EXTRACT_CACHE_LOCK:
         hit = _EXTRACT_INFO_CACHE.get(key)
         if (
@@ -1072,6 +1157,7 @@ def cached_extract_info(url: str, opts: dict) -> dict:
             return hit[1]
         if hit and not _youtube_cache_ok(url, opts, hit[1]):
             _EXTRACT_INFO_CACHE.pop(key, None)
+            hit = None
         fatal_hit = _EXTRACT_FATAL_CACHE.get(key)
         if fatal_hit and (now - fatal_hit[0]) < _EXTRACT_FATAL_TTL_SEC:
             raise RuntimeError(fatal_hit[1])
@@ -1082,14 +1168,44 @@ def cached_extract_info(url: str, opts: dict) -> dict:
             raise RuntimeError(neg_hit[1])
         if neg_hit:
             _EXTRACT_NEG_CACHE.pop(key, None)
-        inflight = _EXTRACT_INFLIGHT.get(key)
-        if inflight is not None:
-            leader = False
-        else:
-            box: dict = {"result": None, "error": None}
-            inflight = (threading.Event(), box)
-            _EXTRACT_INFLIGHT[key] = inflight
-            leader = True
+        # Stale-while-revalidate: past TTL but inside the SWR window, a metadata
+        # caller gets the cached resolve now and the refresh happens behind it.
+        # Checked after the fatal/negative stamps on purpose — a video that
+        # hard-failed 3 minutes out is not "stale metadata", it is gone, and
+        # serving the old title would hide the error.
+        #
+        # len(formats) > 1 excludes degenerate bot-wall entries: those are
+        # deliberately back-dated to a 60s TTL by _cache_extract_result, so
+        # without the guard a bot-wall page would be re-served for 24h.
+        # An already-running re-extract also counts as the refresh (no second
+        # submit — the leader writes the entry).
+        if (
+            hit
+            and opts.get("_stale_metadata_ok")
+            and (now - hit[0]) < _EXTRACT_CACHE_TTL_SEC + _EXTRACT_SWR_WINDOW_SEC
+            and len(hit[1].get("formats") or []) > 1
+            and _EXTRACT_INFLIGHT.get(key) is None
+        ):
+            if _EXTRACT_SWR_INFLIGHT.get(key) is None:
+                _EXTRACT_SWR_INFLIGHT[key] = _SWR_CLAIMED
+                stale_payload = hit[1]
+            else:
+                return hit[1]
+        if stale_payload is None:
+            inflight = _EXTRACT_INFLIGHT.get(key)
+            if inflight is not None:
+                leader = False
+            else:
+                box: dict = {"result": None, "error": None}
+                inflight = (threading.Event(), box)
+                _EXTRACT_INFLIGHT[key] = inflight
+                leader = True
+
+    if stale_payload is not None:
+        # Claimed under the lock, submitted outside it (a pool submit can
+        # block, and _EXTRACT_CACHE_LOCK guards the click path).
+        _submit_extract_swr_refresh(key, url, opts)
+        return stale_payload
 
     if not leader:
         event, box = inflight

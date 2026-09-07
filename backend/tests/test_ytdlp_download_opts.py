@@ -34,7 +34,7 @@ def test_download_opts_use_preview_client_ladder():
     opts = _build_ydl_opts(YOUTUBE_URL, "C:/tmp/vodrip_test_out.mp4")
     yt_args = (opts.get("extractor_args") or {}).get("youtube", {})
     assert yt_args.get("player_client") == YOUTUBE_LEAST_GATED_PLAYER_CLIENTS, (
-        "download must use the preview ladder (android_vr first), got "
+        "download must use the preview ladder (android first, android_vr last), got "
         f"{yt_args.get('player_client')}"
     )
     # Transport hardening must survive the client change (regression guard).

@@ -85,6 +85,47 @@ def is_age_gate_error(exc: BaseException) -> bool:
     return any(marker in low for marker in _AGE_GATE_MARKERS)
 
 
+# Monitor-only taxonomy marker for the subtitles PO-Token policy (yt-dlp
+# `SUBS_PO_TOKEN_POLICY`, declared in yt_dlp/extractor/youtube/_base.py,
+# currently `required=False` but "in rollout"). When the policy flips on for a
+# client, yt-dlp does NOT raise: `_report_pot_subtitles_skipped` silently
+# DISCARDS the affected subtitle tracks — for the default clients it even routes
+# the note through `write_debug(..., only_once=True)`, so a caption regression
+# would reach users as "some languages are missing" with nothing visible at our
+# log level. The predicate below is what the extract loggers match on.
+#
+# Detection only — deliberately no retry, no client swap, no status change:
+# subtitles are not on the preview/download path this service gates on, and
+# acting on a policy that is not yet enforced would be guessing.
+_SUBS_PO_TOKEN_POLICY_MARKERS = (
+    # yt_dlp/extractor/youtube/_video.py::_report_pot_subtitles_skipped
+    "client subtitles require a po token which was not provided",
+    "subtitles po token",
+    # the remedy hint it prints, which names the context explicitly
+    ".subs+xxx",
+)
+
+
+def is_subs_pot_policy_error(text: Any) -> bool:
+    """True when `text` mentions the YouTube subtitles PO-Token policy.
+
+    Accepts a string or exception; matching is case-insensitive on the whole
+    message. Never used to classify a failure — see the marker comment.
+    """
+    low = str(text).lower()
+    return any(marker in low for marker in _SUBS_PO_TOKEN_POLICY_MARKERS)
+
+
+assert is_subs_pot_policy_error(
+    "dQw4w9WgXcQ: Some WEB client subtitles require a PO Token which was not "
+    "provided. They will be discarded since they are not downloadable as-is. "
+    'You can manually pass a Subtitles PO Token for this client with '
+    '--extractor-args "youtube:po_token=WEB.subs+XXX" .'
+)
+assert not is_subs_pot_policy_error("Sign in to confirm you're not a bot")
+assert not is_subs_pot_policy_error("WEB client formats require a GVS PO Token")
+
+
 def youtube_http_status(exc: BaseException) -> int:
     """Map a sanitized YouTube error to an HTTP status code.
 
@@ -192,6 +233,10 @@ def log_extract_fail(
     msg = f"extract fail video={video_id} reason={reason} auth={auth_hint(session)}"
     if detail:
         msg = f"{msg} {detail}"
+    if exc is not None and is_subs_pot_policy_error(exc):
+        # Log-only stamp: the taxonomy name is what makes the silent subtitle
+        # discard greppable. Nothing downstream branches on it.
+        msg = f"{msg} marker=SUBS_PO_TOKEN_POLICY"
     sink = log.warning if final else log.debug
     if exc is not None:
         sink("%s: %s", msg, exc)

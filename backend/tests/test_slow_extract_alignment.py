@@ -19,7 +19,7 @@ YOUTUBE_URL = "https://www.youtube.com/watch?v=1tap3CLaqr8"
 
 
 def check_preview_opts_aligned_with_fast_path():
-    """Slow path shares the fast path's opts: android_vr ladder + POT fetched.
+    """Slow path shares the fast path's opts: android-led ladder, android_vr last.
 
     Needs the real settings environment (YouTubeSession build pulls in deps /
     cookie cache), so it only runs under the plain-python __main__ self-check.
@@ -27,7 +27,10 @@ def check_preview_opts_aligned_with_fast_path():
     opts = youtube_preview_ytdl_opts(YOUTUBE_URL)
     yt_args = (opts.get("extractor_args") or {}).get("youtube", {})
     clients = yt_args.get("player_client")
-    assert clients == ["android_vr", "android", "web_safari"], (
+    # android_vr pinned LAST on purpose: yt-dlp dropped it from its defaults in
+    # 2026.08.19 (403s every format at 1.65.10), so it may only ever be a
+    # legacy fallback here.
+    assert clients == ["android", "web_safari", "android_vr"], (
         f"slow path must use the least bot-gated client ladder, got {clients}"
     )
     # POT must be fetched unless the operator forced fast-only mode (env off by default).

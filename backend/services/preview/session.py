@@ -2808,8 +2808,9 @@ def _extract_youtube_preview_info(
     ``warm_light=True`` (bulk warm) runs the InnerTube fast pass only — the
     yt-dlp lock and retry chain are reserved for real user clicks.
 
-    ponytail: prefer_height <= 360 first tries the anonymous InnerTube path
-    (ANDROID_VR client, no cookies/POT/visitor_data). The muxed progressive 360p
+    ponytail: prefer_height <= 360 first tries the anonymous InnerTube ladder
+    (_ANON_360P_ORDER: ANDROID, then legacy ANDROID_VR — no cookies/POT/visitor_data).
+    The muxed progressive 360p
     URL it returns is publicly fetchable and survives YouTube bot-gate better
     than the auth-required WEB client. Falls through to the full auth chain
     only if anonymous fails.
@@ -2846,7 +2847,7 @@ def _extract_youtube_preview_info(
         if anon_fut is None:
             # Anonymous path failed — fall through to the full chain. It races
             # InnerTube with po_token/visitor_data + yt-dlp and succeeds on videos
-            # where bare ANDROID_VR is bot-gated (LOGIN_REQUIRED); a hard fail-fast
+            # where the bare anonymous ladder is bot-gated (LOGIN_REQUIRED); a hard fail-fast
             # here 500'd every click on those videos even though the full chain
             # resolves them in ~3s.
             logger.debug("anonymous 360p miss for %s — falling through to full chain", vid)

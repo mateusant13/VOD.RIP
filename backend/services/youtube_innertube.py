@@ -51,19 +51,32 @@ class _ClientProfile:
     headers: dict[str, str]
 
 
+# InnerTube client matrix — pinned to yt-dlp master INNERTUBE_CLIENTS
+# (_base.py, verified against the installed 2026.08.19). These versions ARE the
+# product: the race/merge machinery below is client-agnostic, so this table is
+# the only place YouTube's per-client gating is tracked. Frozen builds cannot
+# self-heal through yt-dlp updates, so drift here is permanent once shipped.
+#
+# ANDROID_VR keeps master's 1.65.10 but is demoted to LEGACY-FALLBACK position
+# in every order below. yt-dlp dropped it from its default clients in 2026.08.19
+# and its own note reads "Since 2026.08.17, ALL formats (including live HLS and
+# itag 18) are 403'd with version 1.65.10". It still answers from a clean IP
+# today — that is the trap: a load-bearing dependency on it fails silently
+# server-side, with no code change and no test failure to point at.
 _CLIENT_PROFILES: tuple[_ClientProfile, ...] = (
     _ClientProfile(
         "TVHTML5",
         {
             "clientName": "TVHTML5",
-            "clientVersion": "7.20250312.16.00",
+            "clientVersion": "7.20260707.07.00",
             "hl": "en",
             "gl": "US",
         },
         {
             "Content-Type": "application/json",
             "User-Agent": (
-                "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version"
+                "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.1034943-gold"
+                " (unlike Gecko), Unknown_TV_Unknown_0/Unknown (Unknown, Unknown)"
             ),
         },
     ),
@@ -71,16 +84,16 @@ _CLIENT_PROFILES: tuple[_ClientProfile, ...] = (
         "MWEB",
         {
             "clientName": "MWEB",
-            "clientVersion": "2.20250224.01.00",
+            "clientVersion": "2.20260708.05.00",
             "hl": "en",
             "gl": "US",
         },
         {
             "Content-Type": "application/json",
             "User-Agent": (
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X)"
+                "Mozilla/5.0 (iPad; CPU OS 16_7_10 like Mac OS X)"
                 " AppleWebKit/605.1.15 (KHTML, like Gecko)"
-                " Version/17.4 Mobile/15E148 Safari/604.1"
+                " Version/16.6 Mobile/15E148 Safari/604.1,gzip(gfe)"
             ),
         },
     ),
@@ -88,24 +101,29 @@ _CLIENT_PROFILES: tuple[_ClientProfile, ...] = (
         "ANDROID",
         {
             "clientName": "ANDROID",
-            "clientVersion": "19.44.38",
+            "clientVersion": "21.26.364",
             "androidSdkVersion": 30,
+            "osName": "Android",
+            "osVersion": "11",
             "hl": "en",
             "gl": "US",
         },
         {
             "Content-Type": "application/json",
             "User-Agent": (
-                "com.google.android.youtube/19.44.38"
+                "com.google.android.youtube/21.26.364"
                 " (Linux; U; Android 11) gzip"
             ),
         },
     ),
     _ClientProfile(
+        # Legacy fallback (last in every order) — see the note above.
+        # yt-dlp also warns: '"Made for kids" videos aren't available with
+        # this client'.
         "ANDROID_VR",
         {
             "clientName": "ANDROID_VR",
-            "clientVersion": "1.60.19",
+            "clientVersion": "1.65.10",
             "deviceMake": "Oculus",
             "deviceModel": "Quest 3",
             "osName": "Android",
@@ -117,8 +135,8 @@ _CLIENT_PROFILES: tuple[_ClientProfile, ...] = (
         {
             "Content-Type": "application/json",
             "User-Agent": (
-                "com.google.android.apps.youtube.vr.oculus/1.60.19"
-                " (Linux; U; Android 12L) gzip"
+                "com.google.android.apps.youtube.vr.oculus/1.65.10"
+                " (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
             ),
         },
     ),
@@ -126,19 +144,43 @@ _CLIENT_PROFILES: tuple[_ClientProfile, ...] = (
         "IOS",
         {
             "clientName": "IOS",
-            "clientVersion": "20.03.02",
+            "clientVersion": "21.26.4",
             "deviceMake": "Apple",
             "deviceModel": "iPhone16,2",
-            "osName": "iOS",
-            "osVersion": "17.5.1.21F90",
+            "osName": "iPhone",
+            "osVersion": "18.3.2.22D82",
             "hl": "en",
             "gl": "US",
         },
         {
             "Content-Type": "application/json",
             "User-Agent": (
-                "com.google.ios.youtube/20.03.02"
-                " (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)"
+                "com.google.ios.youtube/21.26.4"
+                " (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)"
+            ),
+        },
+    ),
+    _ClientProfile(
+        # yt-dlp's current default anonymous client (_DEFAULT_CLIENTS =
+        # ('visionos', 'web')) — token-free HLS on a datacenter IP.
+        # '"Made for kids" videos aren't available with this client'.
+        "VISIONOS",
+        {
+            "clientName": "VISIONOS",
+            "clientVersion": "1.02",
+            "deviceMake": "Apple",
+            "deviceModel": "RealityDevice17,1",
+            "osName": "visionOS",
+            "osVersion": "26.5.23O471",
+            "hl": "en",
+            "gl": "US",
+        },
+        {
+            "Content-Type": "application/json",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3)"
+                " AppleWebKit/605.1.15 (KHTML, like Gecko)"
+                " Version/26.0 Safari/605.1.15"
             ),
         },
     ),
@@ -146,7 +188,7 @@ _CLIENT_PROFILES: tuple[_ClientProfile, ...] = (
         "WEB",
         {
             "clientName": "WEB",
-            "clientVersion": "2.20250224.01.00",
+            "clientVersion": "2.20260708.00.00",
             "hl": "en",
             "gl": "US",
         },
@@ -160,10 +202,13 @@ _CLIENT_PROFILES: tuple[_ClientProfile, ...] = (
         },
     ),
     _ClientProfile(
+        # Same clientName/version as WEB — the Safari UA is the whole point.
+        # yt-dlp note: 'Since 2026.07, HLS formats are only returned with some
+        # logged-in or "trusted" sessions'.
         "WEB_SAFARI",
         {
             "clientName": "WEB",
-            "clientVersion": "2.20250224.01.00",
+            "clientVersion": "2.20260708.00.00",
             "hl": "en",
             "gl": "US",
         },
@@ -172,13 +217,56 @@ _CLIENT_PROFILES: tuple[_ClientProfile, ...] = (
             "User-Agent": (
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
                 " AppleWebKit/605.1.15 (KHTML, like Gecko)"
-                " Version/17.4 Safari/605.1.15"
+                " Version/15.5 Safari/605.1.15,gzip(gfe)"
+            ),
+        },
+    ),
+    _ClientProfile(
+        # Embed-only client (head of yt-dlp _DEFAULT_AUTHED_CLIENTS). Sends
+        # clientScreen=EMBED — see _enrich_client_context. Reachable for
+        # embeddable videos where the watch-page clients are POT-gated.
+        "WEB_EMBEDDED",
+        {
+            "clientName": "WEB_EMBEDDED_PLAYER",
+            "clientVersion": "2.20260708.00.00",
+            "hl": "en",
+            "gl": "US",
+        },
+        {
+            "Content-Type": "application/json",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+                " AppleWebKit/537.36 (KHTML, like Gecko)"
+                " Chrome/131.0.0.0 Safari/537.36"
             ),
         },
     ),
 )
 
 _PROFILE_BY_NAME = {p.name: p for p in _CLIENT_PROFILES}
+
+# Probe order for the parallel race and the sequential merge collector.
+# Token-free clients that actually return streams from a datacenter IP lead
+# (IOS/VISIONOS give HLS, ANDROID gives muxed 360p + the adaptive ladder);
+# TVHTML5/MWEB/WEB are POT-gated anonymously but win with cookies;
+# WEB_EMBEDDED and ANDROID_VR are the last-resort fallbacks.
+_CLIENT_ORDER: tuple[str, ...] = (
+    "WEB_SAFARI",
+    "IOS",
+    "VISIONOS",
+    "ANDROID",
+    "TVHTML5",
+    "MWEB",
+    "WEB",
+    "WEB_EMBEDDED",
+    "ANDROID_VR",
+)
+
+# Anonymous muxed-360p ladder (innertube_extract_360p_anonymous). Only clients
+# that return a progressive itag-18 tier without cookies/POT belong here —
+# measured live: ANDROID 21.26.364 -> progressive [360] + 29 adaptive,
+# IOS/VISIONOS -> HLS/adaptive only, WEB/TVHTML5/MWEB -> gated.
+_ANON_360P_ORDER: tuple[str, ...] = ("ANDROID", "ANDROID_VR")
 
 
 def extract_video_id(url: str) -> Optional[str]:
@@ -499,8 +587,9 @@ def _record_playability(
 ) -> None:
     """Aggregate per-probe playability verdicts deterministically.
 
-    Probes race across 7 clients in parallel and can disagree — a bot-gated
-    WEB probe reports 'Video unavailable' while ANDROID plays the same video.
+    Probes race across every client in _CLIENT_ORDER in parallel and can
+    disagree — a bot-gated WEB probe reports 'Video unavailable' while ANDROID
+    plays the same video.
     The old last-writer-wins storage made the verdict probe-order-dependent.
     Rule: any definitive-fatal probe wins; else any soft ('retry') probe
     wins; 'ok' is never recorded here (callers only pass non-ok). The stored
@@ -614,15 +703,16 @@ def _enrich_client_context(client: dict[str, Any], profile_name: str) -> dict[st
     # ponytail: omit hl/gl — forced en/US triggers translated titles and auto-dubbed audio
     out.pop("hl", None)
     out.pop("gl", None)
-    out["clientScreen"] = "WATCH"
+    # WEB_EMBEDDED_PLAYER only plays with the embed screen; every other client
+    # here is a watch-page client.
+    out["clientScreen"] = "EMBED" if profile_name == "WEB_EMBEDDED" else "WATCH"
     out["utcOffsetMinutes"] = -180
     return out
 
 
 def _profiles_for_session(session: Optional["YouTubeSession"]) -> tuple[_ClientProfile, ...]:
-    """WEB_SAFARI HLS first, then mobile/TV fallbacks."""
-    order = ("WEB_SAFARI", "IOS", "ANDROID", "ANDROID_VR", "TVHTML5", "MWEB", "WEB")
-    return tuple(_PROFILE_BY_NAME[n] for n in order if n in _PROFILE_BY_NAME)
+    """WEB_SAFARI HLS first, then mobile/TV fallbacks, legacy clients last."""
+    return tuple(_PROFILE_BY_NAME[n] for n in _CLIENT_ORDER if n in _PROFILE_BY_NAME)
 
 
 def _player_body(
@@ -993,20 +1083,29 @@ def _collect_merged_innertube_info(
     session: Optional["YouTubeSession"],
     read_timeout: float,
 ) -> Optional[dict[str, Any]]:
-    """Merge formats from all InnerTube clients — ANDROID_VR muxed + IOS heights."""
+    """Merge formats from every InnerTube client in _CLIENT_ORDER.
+
+    Unlike the race, this walk is sequential, so its cost multiplies with the
+    size of the client table. Each probe is therefore clamped to the player
+    read timeout — a player response that hasn't landed in that window isn't
+    coming before the caller's budget expires anyway, and one hung client must
+    not cost 9x the table's worth of wall time.
+    """
     http = _http_for(session)
-    profile_order = ("WEB_SAFARI", "IOS", "ANDROID", "ANDROID_VR", "TVHTML5", "MWEB", "WEB")
     all_formats: list[dict[str, Any]] = []
     audio_fmt: Optional[dict[str, Any]] = None
     hls_url: Optional[str] = None
     meta_data: Optional[dict] = None
 
     bot_hits = 0
-    for name in profile_order:
+    for name in _CLIENT_ORDER:
         profile = _PROFILE_BY_NAME.get(name)
         if not profile:
             continue
-        timeout = min(read_timeout, _TV_TIMEOUT_SEC) if name == "TVHTML5" else read_timeout
+        if name == "TVHTML5":
+            timeout = min(read_timeout, _TV_TIMEOUT_SEC)
+        else:
+            timeout = min(read_timeout, _READ_TIMEOUT_PLAYER_SEC)
         data, _status, kind = _player_request(
             video_id, profile, timeout, session=session, http=http,
         )
@@ -1437,38 +1536,20 @@ def innertube_extract_info(
     return None
 
 
-def innertube_extract_360p_anonymous(url: str, *, read_timeout: float = 3.0) -> Optional[dict[str, Any]]:
-    """Anonymous InnerTube extract for 360p-only preview — no cookies, no POT.
+def _anon_360p_info_from_player(
+    data: dict[str, Any],
+    video_id: str,
+) -> tuple[Optional[dict[str, Any]], int]:
+    """Build the 360p preview info from one player response.
 
-    ponytail: bypasses the auth-tower (cookies/POT/visitor_data) for previews.
-    Uses ANDROID_VR client only (least bot-gated, returns muxed progressive 360p
-    + adaptive ladders for all heights if needed). The URL it returns is
-    fetchable directly from the browser proxy — no signing required for the
-    360p itag=18 path on public videos.
-
-    Returns None on any failure (bot-gate, video unavailable, network). Caller
-    should fall back to the full auth path (innertube_extract_info).
+    Returns (info, ladder_size) — ladder_size is the count of adaptive tiers
+    that actually carry a URL. It is part of the result because the clients
+    differ in more than height: measured live, ANDROID_VR returns the muxed
+    360p plus a 22-tier adaptive ladder, while ANDROID returns the muxed 360p
+    with adaptiveFormats entries that have no url at all (0 usable tiers). A
+    muxed-only win is still a playable preview, but it is a strictly worse
+    answer, so the caller keeps looking.
     """
-    video_id = extract_video_id(url)
-    if not video_id:
-        return None
-    profile = _PROFILE_BY_NAME.get("ANDROID_VR")
-    if profile is None:
-        return None
-    try:
-        data, _status, kind = _player_request(
-            video_id, profile, read_timeout, session=None
-        )
-    except Exception as exc:
-        logger.debug("anonymous 360p InnerTube request failed %s: %s", video_id, exc)
-        return None
-    if kind != "ok" or not data:
-        play = (data or {}).get("playabilityStatus") or {}
-        logger.debug(
-            "anonymous 360p InnerTube rejected for %s: status=%s reason=%s",
-            video_id, play.get("status"), (play.get("reason") or "")[:60],
-        )
-        return None
     streaming = data.get("streamingData") or {}
     progressive = _formats_from_streaming_progressive(streaming)
     url_formats = _streaming_url_formats(streaming)
@@ -1487,7 +1568,7 @@ def innertube_extract_360p_anonymous(url: str, *, read_timeout: float = 3.0) -> 
             "anonymous 360p InnerTube returned no 360p format for %s (have %d progressive, %d adaptive)",
             video_id, len(progressive), len(adaptive),
         )
-        return None
+        return None, 0
     formats_for_info = [fmt_360]
     formats_for_info.extend(adaptive)
     info = _info_from_player_data(
@@ -1495,16 +1576,72 @@ def innertube_extract_360p_anonymous(url: str, *, read_timeout: float = 3.0) -> 
     )
     if not info:
         logger.debug("anonymous 360p _info_from_player_data failed for %s", video_id)
-        return None
+        return None, 0
     # The adaptive ladder is video-only — attach the audio stream so DASH
     # tiers stay muxable (window-HLS) instead of collapsing to 360p muxed.
     audio = _pick_best_audio_format(streaming)
     if audio:
         info["_preview_audio_format"] = audio
+    return info, len(adaptive)
+
+
+def innertube_extract_360p_anonymous(url: str, *, read_timeout: float = 3.0) -> Optional[dict[str, Any]]:
+    """Anonymous InnerTube extract for 360p preview — no cookies, no POT.
+
+    ponytail: bypasses the auth-tower (cookies/POT/visitor_data) for previews.
+    Walks _ANON_360P_ORDER — the clients that return a muxed progressive 360p
+    tier without a token — and takes the first that also yields an adaptive
+    ladder, falling back to the first muxed-only answer. The URL it returns is
+    fetchable directly from the browser proxy; no signing is required for the
+    360p itag=18 path on public videos.
+
+    ANDROID_VR used to be the only client here. It is now the LAST attempt:
+    yt-dlp dropped it from its defaults in 2026.08.19 and 403s every format at
+    1.65.10 since 2026.08.17, so building the fast path on it alone means the
+    preview ladder dies server-side with no code change to blame. ANDROID leads
+    instead — same muxed 360p, ~150ms, and it survives the ANDROID_VR 403 wave.
+
+    Returns None on any failure (bot-gate, video unavailable, network). Caller
+    should fall back to the full auth path (innertube_extract_info).
+    """
+    video_id = extract_video_id(url)
+    if not video_id:
+        return None
+    muxed_only: Optional[dict[str, Any]] = None
+    for name in _ANON_360P_ORDER:
+        profile = _PROFILE_BY_NAME.get(name)
+        if profile is None:
+            continue
+        try:
+            data, _status, kind = _player_request(
+                video_id, profile, read_timeout, session=None
+            )
+        except Exception as exc:
+            logger.debug("anonymous 360p %s request failed %s: %s", name, video_id, exc)
+            continue
+        if kind != "ok" or not data:
+            play = (data or {}).get("playabilityStatus") or {}
+            logger.debug(
+                "anonymous 360p %s rejected for %s: status=%s reason=%s",
+                name, video_id, play.get("status"), (play.get("reason") or "")[:60],
+            )
+            continue
+        info, ladder = _anon_360p_info_from_player(data, video_id)
+        if info is None:
+            continue
+        if ladder:
+            from services.youtube_diag import log_extract_ok
+
+            log_extract_ok(video_id, "innertube_anonymous_360p", info, None)
+            return info
+        if muxed_only is None:
+            muxed_only = info
+    if muxed_only is None:
+        return None
     from services.youtube_diag import log_extract_ok
 
-    log_extract_ok(video_id, "innertube_anonymous_360p", info, None)
-    return info
+    log_extract_ok(video_id, "innertube_anonymous_360p", muxed_only, None)
+    return muxed_only
 
 
 assert extract_video_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ") == "dQw4w9WgXcQ"
@@ -1561,6 +1698,16 @@ assert innertube_last_playability(None) == ("", "", "")
 assert innertube_last_playability("unknown0000") == ("", "", "")
 assert _profiles_for_session(None)[0].name == "WEB_SAFARI"
 assert "WEB_SAFARI" in _PROFILE_BY_NAME
+# Client-table invariants (Gap 1). These are the assertions a stale table
+# breaks, which is exactly how the versions rot: ANDROID_VR must never lead a
+# ladder again, and every name in the order tuples must resolve to a profile.
+assert set(_CLIENT_ORDER) == set(_PROFILE_BY_NAME), "client order must cover the table"
+assert _CLIENT_ORDER[-1] == "ANDROID_VR", "legacy client must stay last in the ladder"
+assert _ANON_360P_ORDER[-1] == "ANDROID_VR", "legacy client must stay last in the 360p ladder"
+assert _PROFILE_BY_NAME["WEB_SAFARI"].context["clientName"] == "WEB"
+assert _PROFILE_BY_NAME["WEB_EMBEDDED"].context["clientName"] == "WEB_EMBEDDED_PLAYER"
+assert _enrich_client_context({}, "WEB_EMBEDDED")["clientScreen"] == "EMBED"
+assert _enrich_client_context({}, "IOS")["clientScreen"] == "WATCH"
 # WS-4 original-language rule: the translation-source track wins over track
 # order; en-US normalizes to en; empty/absent captions yield None.
 _orig_lang_pt = {
