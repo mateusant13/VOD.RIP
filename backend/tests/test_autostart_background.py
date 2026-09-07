@@ -112,7 +112,9 @@ def test_background_caps_cpu_lanes(monkeypatch):
     monkeypatch.setattr("os.cpu_count", lambda: 64)
     assert at._cpu_auto_workers() == 3
     monkeypatch.delenv("VODRIP_BACKGROUND")
-    assert at._cpu_auto_workers() == 4  # interactive: ladder unchanged
+    # 73d512e made the interactive ladder dynamic: 64 threads -> 8 lanes
+    # (threads // 8, capped at 8). The old fixed ceiling of 4 is gone.
+    assert at._cpu_auto_workers() == 8
 
 
 def test_background_widens_youtube_chat_pacing(monkeypatch):
