@@ -184,6 +184,12 @@ class TestSystemAPI:
         assert data["app_activity_age_s"] is None or isinstance(
             data["app_activity_age_s"], (int, float)
         )
+        # SUBS_PO_TOKEN_POLICY monitor: dict with the status shape (or None
+        # when the monitor itself degraded — health never raises for it).
+        subs_pot = data["subs_pot_policy"]
+        assert subs_pot is None or set(subs_pot) == {
+            "last", "count_in_window", "window_sec", "total_events"
+        }
 
     @pytest.mark.asyncio
     async def test_ytdlp_status(self, client):

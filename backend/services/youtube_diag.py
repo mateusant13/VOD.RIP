@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
+import collections
+import json
 import logging
+import os
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 log = logging.getLogger("VOD.RIP.youtube")
@@ -126,6 +133,184 @@ assert not is_subs_pot_policy_error("Sign in to confirm you're not a bot")
 assert not is_subs_pot_policy_error("WEB client formats require a GVS PO Token")
 
 
+# --- SUBS_PO_TOKEN_POLICY monitor (event-driven, no polling) ---------------
+#
+# The policy is detection-only by design (see the marker comment above), so
+# the only thing an operator can act on is *whether it is firing yet*. That
+# needs a durable record, not a log grep: every stamp site calls
+# `record_subs_pot_event`, which appends a timestamped line to a bounded
+# JSONL under the cache root and keeps a small in-memory ring for the status
+# read. No threads, no timers, no network — the file is touched only when
+# yt-dlp itself reported the policy.
+_POT_EVENT_FILE = "subs_pot_policy.jsonl"
+_POT_RING_MAX = 50
+_POT_FILE_MAX = 200
+_POT_DETAIL_MAX = 300
+_POT_EVENTS: "collections.deque[dict]" = collections.deque(maxlen=_POT_RING_MAX)
+_POT_LOCK = threading.Lock()
+# JSONL -> ring rehydration happens on the first status read after boot, so a
+# restart does not reset the window count to zero.
+_POT_REHYDRATED = False
+
+
+def _pot_event_path() -> Path:
+    """JSONL path: routed cache root, else the historical appdata log folder.
+
+    Resolved per call (never memoized) so the per-cache env knobs keep
+    working — including VODRIP_CACHE_DIR, which tests pin to scratch.
+    """
+    root = None
+    try:
+        from services.settings import cache_root  # lazy: keeps import light
+
+        root = cache_root()
+    except Exception:
+        root = None
+    if root:
+        return root / "youtube-diag" / _POT_EVENT_FILE
+    from services.settings import _get_appdata_dir
+
+    return _get_appdata_dir() / "logs" / _POT_EVENT_FILE
+
+
+def _pot_sanitize(text: str) -> str:
+    """Redact secret-bearing values (the policy line can quote a token hint)
+    and bound the stored detail. Lazy import: error_log pulls nothing heavy
+    but stays off this module's import graph."""
+    try:
+        from services.error_log import _sanitize_message
+
+        text = _sanitize_message(text)
+    except Exception:
+        text = str(text)
+    return text[:_POT_DETAIL_MAX]
+
+
+def record_subs_pot_event(video_id: str, detail: str, source: str) -> None:
+    """Stamp one policy sighting (thread-safe). Never raises: a diagnostic
+    sink must not break the extract path that hit the policy."""
+    entry = {
+        "ts": time.time(),
+        "video_id": str(video_id or ""),
+        "source": str(source or ""),
+        "detail": _pot_sanitize(detail),
+    }
+    with _POT_LOCK:
+        _POT_EVENTS.append(entry)
+        # Read-modify-write under the SAME lock as the ring append (mirrors
+        # error_log): two unlocked writers would each read the pre-append
+        # file and the second replace() would silently drop the first line.
+        try:
+            pp = _pot_event_path()
+            pp.parent.mkdir(parents=True, exist_ok=True)
+            on_disk: list[str] = []
+            try:
+                if pp.exists():
+                    on_disk = pp.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                on_disk = []
+            # Keep the file bounded to the latest _POT_FILE_MAX records;
+            # rewrite atomically (temp + replace) so a crash never leaves a
+            # torn JSONL.
+            keep = (on_disk + [json.dumps(_pot_line(entry), ensure_ascii=False)])[-_POT_FILE_MAX:]
+            payload = "\n".join(keep) + "\n"
+            tmp = pp.with_name(pp.name + ".tmp")
+            tmp.write_text(payload, encoding="utf-8")
+            tmp.replace(pp)
+        except Exception as exc:  # noqa: BLE001 — diagnostics must not raise
+            log.debug("subs POT event persist failed: %s", exc)
+
+
+def _pot_line(entry: dict) -> dict:
+    """JSONL shape: epoch ts (window math) + ISO ts (greppable by eye)."""
+    return {
+        "ts": entry["ts"],
+        "iso": datetime.fromtimestamp(entry["ts"], tz=timezone.utc).isoformat(),
+        "video_id": entry["video_id"],
+        "source": entry["source"],
+        "detail": entry["detail"],
+    }
+
+
+def _pot_rehydrate() -> None:
+    """Load the JSONL tail into the ring once per process (missing/corrupt
+    lines are skipped — the file is a diagnostic, not a source of truth)."""
+    global _POT_REHYDRATED
+    with _POT_LOCK:
+        if _POT_REHYDRATED:
+            return
+        _POT_REHYDRATED = True
+        if _POT_EVENTS:
+            return  # already live; a boot-time file must not double-count
+        try:
+            pp = _pot_event_path()
+            raw = pp.read_text(encoding="utf-8", errors="replace").splitlines() if pp.exists() else []
+        except Exception:
+            return
+        for line in raw[-_POT_RING_MAX:]:
+            try:
+                rec = json.loads(line)
+                _POT_EVENTS.append(
+                    {
+                        "ts": float(rec["ts"]),
+                        "video_id": str(rec.get("video_id") or ""),
+                        "source": str(rec.get("source") or ""),
+                        "detail": str(rec.get("detail") or ""),
+                    }
+                )
+            except Exception:
+                continue
+
+
+def _pot_status_from_entries(entries: list[dict], window_sec: float) -> dict:
+    """Pure status math over a ring snapshot (no lock, no disk)."""
+    cutoff = time.time() - window_sec
+    in_window = sum(1 for e in entries if e["ts"] >= cutoff)
+    return {
+        "last": dict(entries[-1]) if entries else None,
+        "count_in_window": in_window,
+        "window_sec": float(window_sec),
+        "total_events": len(entries),
+    }
+
+
+def subs_pot_policy_status(window_sec: float = 3600.0) -> dict:
+    """Last sighting + how many fired in the trailing `window_sec`.
+
+    Shape: {last: {ts, video_id, source, detail} | None, count_in_window,
+    window_sec, total_events}. Reads the in-memory ring (rehydrated from the
+    JSONL on first call), so it is cheap enough for a response field.
+    """
+    _pot_rehydrate()
+    with _POT_LOCK:
+        entries = list(_POT_EVENTS)
+    return _pot_status_from_entries(entries, window_sec)
+
+
+def reset_subs_pot_policy_state() -> None:
+    """Drop ring + rehydration flag (test hook: each case owns its scratch
+    cache dir, so the boot-time file must be re-readable)."""
+    global _POT_REHYDRATED
+    with _POT_LOCK:
+        _POT_EVENTS.clear()
+        _POT_REHYDRATED = False
+
+
+assert _pot_status_from_entries([], 60.0) == {
+    "last": None,
+    "count_in_window": 0,
+    "window_sec": 60.0,
+    "total_events": 0,
+}
+_POT_FIXTURE = {"ts": time.time(), "video_id": "abc", "source": "extract_fail", "detail": "d"}
+assert _pot_status_from_entries([_POT_FIXTURE], 60.0)["count_in_window"] == 1
+assert _pot_status_from_entries([_POT_FIXTURE], 60.0)["last"] == _POT_FIXTURE
+assert _pot_status_from_entries(
+    [{"ts": 1.0, "video_id": "", "source": "", "detail": ""}, _POT_FIXTURE], 60.0
+)["count_in_window"] == 1
+assert _pot_sanitize("https://x/watch?v=a&pot=SECRET").endswith("pot=[REDACTED]")
+
+
 def youtube_http_status(exc: BaseException) -> int:
     """Map a sanitized YouTube error to an HTTP status code.
 
@@ -235,8 +420,11 @@ def log_extract_fail(
         msg = f"{msg} {detail}"
     if exc is not None and is_subs_pot_policy_error(exc):
         # Log-only stamp: the taxonomy name is what makes the silent subtitle
-        # discard greppable. Nothing downstream branches on it.
+        # discard greppable. Nothing downstream branches on it. The monitor
+        # records the sighting (window count + last event) — still no retry,
+        # no client swap, no status change.
         msg = f"{msg} marker=SUBS_PO_TOKEN_POLICY"
+        record_subs_pot_event(video_id, f"{msg}: {exc}", "extract_fail")
     sink = log.warning if final else log.debug
     if exc is not None:
         sink("%s: %s", msg, exc)

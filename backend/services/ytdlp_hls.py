@@ -121,10 +121,14 @@ class _YtdlpQuietLogger:
 
     @staticmethod
     def _note_policy(msg: object) -> None:
-        from services.youtube_diag import is_subs_pot_policy_error
+        from services.youtube_diag import is_subs_pot_policy_error, record_subs_pot_event
 
         if is_subs_pot_policy_error(msg):
             logger.warning("SUBS_PO_TOKEN_POLICY observed: %s", msg)
+            # Monitor-only: no video-id context exists at this hook (the
+            # logger is shared per extract call), so the event records the
+            # line itself. record_* never raises.
+            record_subs_pot_event("", str(msg), "ytdlp_logger")
 
 
 # fd-2 redirect is process-wide; concurrent extracts (warm storm + fallback

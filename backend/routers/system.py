@@ -143,6 +143,17 @@ async def health():
         activity_age = archive_db.worker_heartbeat_age("app-activity")
     except Exception:
         activity_age = None
+    try:
+        # SUBS_PO_TOKEN_POLICY monitor (event-driven; see youtube_diag). A
+        # rollout of the subtitles PO-Token policy silently discards caption
+        # tracks, so supervisors need a greppable 'is it firing yet' signal —
+        # last sighting + count in the trailing hour. Best-effort like the
+        # rest of health: a hiccup degrades to None, never a 500.
+        from services.youtube_diag import subs_pot_policy_status
+
+        subs_pot = subs_pot_policy_status()
+    except Exception:
+        subs_pot = None
     return {
         "ok": True,
         "name": "VOD.RIP",
@@ -150,6 +161,7 @@ async def health():
         "worker_alive": worker,
         "background_alive": background,
         "app_activity_age_s": activity_age,
+        "subs_pot_policy": subs_pot,
     }
 
 
