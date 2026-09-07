@@ -1,15 +1,16 @@
 {
   "name": "IG FollowGuard",
-  "description": "Dashboard de quem não te segue de volta no Instagram + notificação quando alguém deixa de te seguir (últimas 100).",
-  "version": "0.3.2",
+  "description": "Veja quem não te segue de volta no Instagram, novos seguidores e quem deixou de te seguir. Dados só no seu navegador.",
+  "version": "0.6.1",
   "manifest_version": 3,
-  "minimum_chrome_version": "102",
+  "minimum_chrome_version": "111",
   "permissions": [
     "cookies",
     "storage",
     "alarms",
     "notifications",
-    "unlimitedStorage"
+    "unlimitedStorage",
+    "downloads"
   ],
   "host_permissions": [
     "https://www.instagram.com/*",
@@ -22,6 +23,25 @@
     "type": "module"
   },
   "content_scripts": [
+    {
+      "matches": [
+        "https://www.instagram.com/*"
+      ],
+      "js": [
+        "friendship_hook.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://www.instagram.com/*"
+      ],
+      "js": [
+        "friendship_watch.js"
+      ],
+      "run_at": "document_start"
+    },
     {
       "matches": [
         "https://www.instagram.com/*"
@@ -61,14 +81,14 @@
     {
       "resources": [
         "panel.html",
-        "panel.css",
         "dashboard.css",
         "dashboard.js",
         "images/*"
       ],
       "matches": [
         "https://www.instagram.com/*"
-      ]
+      ],
+      "use_dynamic_url": true
     }
   ]
 }

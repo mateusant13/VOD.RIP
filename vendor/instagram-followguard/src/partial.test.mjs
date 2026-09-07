@@ -344,6 +344,26 @@ test('fetchAllUsers: MAX_PAGES exhaustion throws limit (never completes short)',
   assert.equal(calls, 500);
 });
 
+test('fetchAllUsers: repeated next_max_id stops with limit (no infinite loop)', async () => {
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return {
+      ok: true, status: 200,
+      text: async () => JSON.stringify({
+        status: 'ok',
+        users: [{ username: 'u' + calls, pk: String(calls) }],
+        next_max_id: 'stuck',
+      }),
+    };
+  };
+  await assert.rejects(
+    fetchAllUsers('following', UID, SESSION, {}),
+    (err) => err instanceof IgApiError && err.code === 'limit',
+  );
+  assert.equal(calls, 2, 'must fail on the second identical cursor');
+});
+
 // --- Page-context transport (SOTA humanization) ---
 // Production runs every sync request through content_proxy.js on an IG tab
 // ({status, text} shape). apiFetch must treat that shape exactly like a

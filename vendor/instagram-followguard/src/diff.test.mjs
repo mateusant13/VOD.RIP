@@ -2,7 +2,7 @@
 'use strict';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { diffAndRecord, mergeEvents } from './diff.mjs';
+import { diffAndRecord, mergeEvents, detectNewFollowers, applyManualUnfollow, applyFriendshipAction } from './diff.mjs';
 
 const meta = (pk, name = '') => ({ pk: String(pk), username: 'u', full_name: name, is_private: false, is_verified: false, profile_pic_url: '' });
 const map = (o) => new Map(Object.entries(o));
@@ -70,4 +70,72 @@ test('mergeEvents empty stored keeps fresh', () => {
   const merged = mergeEvents([{ username: 'a' }], [], 100);
   assert.equal(merged.length, 1);
   assert.equal(merged[0].username, 'a');
+});
+
+test('detectNewFollowers empty prev snapshot returns none (baseline)', () => {
+  const next = map({ a: meta(1), b: meta(2) });
+  assert.equal(detectNewFollowers({}, next, 1000).length, 0);
+});
+
+test('detectNewFollowers finds accounts absent from previous snapshot', () => {
+  const prev = { a: meta(1) };
+  const next = map({ a: meta(1), b: meta(2), c: meta(3) });
+  const found = detectNewFollowers(prev, next, 5000);
+  assert.equal(found.length, 2);
+  assert.deepEqual(found.map((e) => e.username).sort(), ['b', 'c']);
+  assert.equal(found[0].detectedAt, 5000);
+});
+
+
+test('applyManualUnfollow removes by pk and recomputes not-following-back', () => {
+  const following = { a: { pk: '1', username: 'a' }, b: { pk: '2', username: 'b' } };
+  const followers = { c: { pk: '3', username: 'c' } };
+  const r = applyManualUnfollow(following, followers, { pk: '2' });
+  assert.equal(r.removedUsername, 'b');
+  assert.equal(r.followingCount, 1);
+  assert.equal(r.notFollowingBackCount, 1);
+});
+
+test('applyFriendshipAction follow with unknown pk (synthetic key) is skipped', () => {
+  // pk 9 is in no store: the resolved key would be the synthetic `id9`,
+  // creating a phantom row the dashboard can never reconcile. Must be null.
+  const r = applyFriendshipAction('follow', {}, { c: { pk: '3', username: 'c' } }, {}, { pk: '9' }, 1000);
+  assert.equal(r, null);
+});
+
+test('applyFriendshipAction follow with known username adds to following', () => {
+  const r = applyFriendshipAction('follow', {}, { c: { pk: '3', username: 'c' } }, {}, { pk: '9', username: 'newfella' }, 1000);
+  assert.ok(r);
+  assert.equal(r.followingCount, 1);
+  assert.equal(r.followingObj.newfella.pk, '9');
+});
+
+test('applyFriendshipAction remove_follower drops from followers', () => {
+  const followers = { bob: { pk: '2', username: 'bob' } };
+  const r = applyFriendshipAction('remove_follower', {}, followers, {}, { pk: '2' }, 2000);
+  assert.ok(r);
+  assert.equal(r.followersCount, 0);
+  assert.equal(r.username, 'bob');
+});
+
+test('applyFriendshipAction approve with unknown pk (synthetic key) is skipped', () => {
+  const r = applyFriendshipAction('approve', {}, {}, {}, { pk: '7' }, 3000);
+  assert.equal(r, null);
+});
+
+test('applyFriendshipAction approve with known username adds new follower event', () => {
+  const r = applyFriendshipAction('approve', {}, {}, {}, { pk: '7', username: 'fan7' }, 3000);
+  assert.ok(r);
+  assert.equal(r.followersCount, 1);
+  assert.equal(r.newFollowers.length, 1);
+  assert.equal(r.newFollowers[0].pk, '7');
+});
+
+test('applyFriendshipAction block removes from both lists', () => {
+  const following = { ann: { pk: '1', username: 'ann' } };
+  const followers = { ann: { pk: '1', username: 'ann' } };
+  const r = applyFriendshipAction('block', following, followers, {}, { pk: '1' }, 4000);
+  assert.ok(r);
+  assert.equal(r.followingCount, 0);
+  assert.equal(r.followersCount, 0);
 });

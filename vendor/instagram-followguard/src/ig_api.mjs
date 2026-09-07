@@ -12,10 +12,10 @@ const PAGE_SIZE = 24;               // web-app follow-list page size — the web
 // Humanized pacing base (ms/page). Fixed-interval loops are the #1 bot
 // fingerprint; the web app paces by the user's SCROLL — variable gaps and
 // pauses. pageDelayMs is the BASE: real gaps are randomized around it and
-// ~10% of pauses are 2-5.5× longer ("reading" the list). count=24 × ~2.6s
+// ~10% of pauses are 2-5.5× longer ("reading" the list). count=24 × ~2.0s
 // avg ≈ a real person scrolling the dialog; 1048 accounts take ~2min (the
 // web app itself would take as long).
-const PAGE_DELAY_MS = 2000;
+const PAGE_DELAY_MS = 1500;
 const FETCH_TIMEOUT_MS = 20000;     // per-request timeout — a throttled IG connection hangs forever without one
 const MAX_PAGES = 500;              // hard cap per list (500*24 = 12k users)
 const MAX_RETRIES = 5;              // consecutive transient failures
@@ -47,14 +47,19 @@ export function __setPageDelayMsForTests(v) { pageDelayMs = v; }
 let transport = null;
 export function __setTransport(fn) { transport = fn; }
 
+/** Randomized pause — never a flat interval (adds sub-second jitter). */
+export function jitteredPauseMs(baseMs, factorMin, factorSpread, extraJitterMs = 999) {
+  const factor = factorMin + Math.random() * factorSpread;
+  return Math.round(baseMs * factor + Math.random() * extraJitterMs);
+}
 // Humanized inter-page pause: never a fixed interval. Short gaps (0.6-1.8×
 // base) most of the time, ~10% of pauses are 2-5.5× base — the "hesitating /
 // reading" behavior of a real person scrolling a list.
 function humanPauseMs() {
   if (pageDelayMs <= 0) return 0;
   const r = Math.random();
-  if (r < 0.1) return Math.round(pageDelayMs * (2 + Math.random() * 3.5));
-  return Math.round(pageDelayMs * (0.6 + Math.random() * 1.2));
+  if (r < 0.1) return jitteredPauseMs(pageDelayMs, 2, 3.5);
+  return jitteredPauseMs(pageDelayMs, 0.6, 1.2);
 }
 function backoffFor(code, retries) {
   if (retryBaseMs !== 5000) return retryBaseMs; // test seam
@@ -76,20 +81,32 @@ function sleep(ms) {
 /** Read the Instagram session cookies of the user's real profile. */
 export async function readSession() {
   const all = await chrome.cookies.getAll({ domain: '.instagram.com' });
-  const get = (name) => {
-    const c = all.find((x) => x.name === name);
-    return c ? c.value : null;
-  };
+  // Multiple instagram cookies can share a name across subdomains (two
+  // logged-in accounts). Dedupe ONCE by name — prefer the general
+  // .instagram.com cookie, else first seen — and derive BOTH the values
+  // below and the concatenated header from that one map, so get() and the
+  // header can never disagree (the header itself is deduped by the same
+  // rule, not a concatenation of every match).
+  const best = new Map();
+  for (const c of all) {
+    const prev = best.get(c.name);
+    if (!prev || (c.domain === '.instagram.com' && prev.domain !== '.instagram.com')) best.set(c.name, c);
+  }
+  const get = (name) => best.get(name)?.value ?? null;
   const sessionid = get('sessionid');
   if (!sessionid) {
     throw new IgApiError('not-logged-in', 'Nenhuma sessão do Instagram encontrada. Abra instagram.com logado e tente de novo.');
   }
+  const uid = get('ds_user_id');
+  if (!uid) {
+    throw new IgApiError('not-logged-in', 'Não encontrei seu ID de usuário. Abra instagram.com logado.');
+  }
   return {
     sessionid,
-    uid: get('ds_user_id'),
+    uid,
     csrftoken: get('csrftoken'),
-    cookieHeader: all
-      .filter((c) => c.domain.includes('instagram.com') || c.domain === '.instagram.com')
+    cookieHeader: [...best.values()]
+      .filter((c) => c.domain.includes('instagram.com'))
       .map((c) => `${c.name}=${c.value}`)
       .join('; '),
   };
@@ -181,10 +198,29 @@ export async function apiFetch(path, session, { signal } = {}) {
   if (status === 403) throw new IgApiError('checkpoint', 'Instagram pediu verificação (403).');
   if (status < 200 || status >= 300) {
     // 4xx/5xx with an actionable fail body beats the generic HTTP message.
-    const why = body && (body.message || body.error_type);
+    // The gate family (rate limit / feedback_required) must classify the
+    // SAME way as on HTTP 200: an IG gate answering with 400/5xx used to
+    // fall through as transient 'http' → the walk retried it in-loop with
+    // 30-240s backoff, hammering an active gate — exactly the bot cadence
+    // that deepens it.
+    const why = body && (body.message || body.error_type || body.feedback_title);
     const low = String(why || '').toLowerCase();
     if (low.includes('login_required')) throw new IgApiError('not-logged-in', 'Sessão do Instagram expirou. Faça login e tente de novo.');
     if (low.includes('checkpoint')) throw new IgApiError('checkpoint', 'Instagram pediu verificação. Abra instagram.com no navegador.');
+    if (low.includes('rate_limit_error') || low.includes('rate limit') ||
+        low.includes('few minutes') || low.includes('try again') ||
+        low.includes('aguarde') || low.includes('alguns minutos')) {
+      throw new IgApiError('rate-limited', 'O Instagram limitou as requisições temporariamente. A extensão vai tentar de novo sozinha em alguns minutos, retomando de onde parou — não precisa fazer nada.');
+    }
+    if (low.includes('feedback_required') || low.includes('action_blocked') ||
+        low.includes('spam') || low.includes('automático') || low.includes('sinalizada') ||
+        // Title-only bot gates — same phrases the non-JSON sniff matches.
+        low.includes('temporariamente limitada') || low.includes('temporarily limited')) {
+      const title = (body && body.feedback_title) || 'Sua conta foi temporariamente limitada.';
+      throw new IgApiError('feedback-required', `${title} Aguarde algumas horas e tente de novo, ou abra o Instagram.`);
+    }
+    // 4xx gate bodies must classify like 200 gate bodies or the in-loop http ladder hammers an active gate.
+    if (body && body.status === 'fail' && !why) throw new IgApiError('rate-limited', 'O Instagram limitou as requisições temporariamente. A extensão vai tentar de novo sozinha em alguns minutos, retomando de onde parou — não precisa fazer nada.');
     throw new IgApiError('http', `HTTP ${status} em ${path.split('?')[0]}`);
   }
   if (!body || body.status === 'fail') {
@@ -277,8 +313,12 @@ async function fetchPage(kind, uid, maxId, session, signal) {
   const usersPresent = Array.isArray(body.users);
   const users = usersPresent ? body.users : [];
   const next = body.next_max_id;
-  const hasMore = !!(next && body.big_list !== false);
-  return { users, nextMaxId: hasMore ? next : null, usersPresent };
+  // A valid cursor means MORE pages — full stop. big_list:false is IG's
+  // "render this big list lazily" hint, NOT an end-of-list signal; honouring
+  // it discarded a live cursor mid-walk and accepted the prefix as complete
+  // (one of the "só 20 pessoas" vectors). The completeness oracle in
+  // fetchAllUsers is the real guard against short lists.
+  return { users, nextMaxId: next || null, usersPresent };
 }
 
 /**
@@ -290,14 +330,23 @@ async function fetchPage(kind, uid, maxId, session, signal) {
  *           the merged result is exactly what a from-scratch run would get.
  *   onPart  ({ seq, maxId, users }) — called after each page that has a next
  *           page; the caller persists the checkpoint (best-effort).
+ *   expectedCount — the account's own declared follower_count/following_count
+ *           (from /users/{pk}/info/). When present, a walk that finishes with
+ *           materially fewer users than declared is TRUNCATED (gate page that
+ *           answered "ok" with no cursor, expired resume cursor, etc.) and
+ *           throws 'incomplete' — the list is never accepted, persisted or
+ *           diffed short. Slack absorbs IG's own count lag + mid-walk
+ *           unfollows: max(30, 5%).
  * Returns Map<username, meta>. Throws IgApiError on terminal failure.
  */
-export async function fetchAllUsers(kind, uid, session, { signal, onProgress, resume, onPart } = {}) {
+export async function fetchAllUsers(kind, uid, session, { signal, onProgress, resume, onPart, expectedCount } = {}) {
   const out = new Map();
   let maxId = null;
   let seq = 0; // monotonic across runs — a restarted counter would clobber old checkpoints
   let retries = 0;
   let completed = false;
+  let page = 0;
+  const seenCursors = new Set();
   const pick = (u) => ({
     pk: String(u.pk || ''),
     username: u.username,
@@ -313,8 +362,9 @@ export async function fetchAllUsers(kind, uid, session, { signal, onProgress, re
       out.set(u.username, pick(u));
     }
     maxId = resume.maxId;
+    seenCursors.add(String(maxId));
   }
-  for (let page = 0; page < MAX_PAGES; page += 1) {
+  while (page < MAX_PAGES) {
     try {
       const { users, nextMaxId, usersPresent } = await fetchPage(kind, uid, maxId, session, signal);
       // Malformed response (no users array at all) would silently TRUNCATE
@@ -339,7 +389,7 @@ export async function fetchAllUsers(kind, uid, session, { signal, onProgress, re
         out.set(u.username, pick(u));
       }
       retries = 0; // page produced usable data — reset the consecutive-failure budget
-      if (onProgress) onProgress({ kind, fetched: out.size });
+      if (onProgress) onProgress({ kind, fetched: out.size, users: Array.from(out.values()) });
       if (onPart && users.length && nextMaxId) {
         try {
           // Await before advancing: a not-awaited checkpoint write can still
@@ -354,7 +404,16 @@ export async function fetchAllUsers(kind, uid, session, { signal, onProgress, re
         completed = true;
         break;
       }
+      const nextKey = String(nextMaxId);
+      if (seenCursors.has(nextKey)) {
+        throw new IgApiError(
+          'limit',
+          'O Instagram repetiu o cursor de paginação — a sincronização parou (o progresso foi guardado; tente de novo).',
+        );
+      }
+      seenCursors.add(nextKey);
       maxId = nextMaxId;
+      page += 1;
       await sleep(humanPauseMs());
     } catch (err) {
       if (signal && signal.aborted) throw err;
@@ -375,6 +434,19 @@ export async function fetchAllUsers(kind, uid, session, { signal, onProgress, re
     // the previous full snapshot and fire mass fake unfollows. Fail with
     // checkpoints intact; the next attempt resumes instead of re-fetching.
     throw new IgApiError('limit', `A lista passou de ${MAX_PAGES * PAGE_SIZE} contas — a sincronização não terminou (o progresso foi guardado; tente de novo).`);
+  }
+  // Completeness oracle: IG said the walk is done, but the account's own
+  // declared count says otherwise → the list was truncated and accepted
+  // short. 'incomplete' is transient-classified by the caller: checkpoints
+  // survive, the auto-retry resumes from the last persisted page.
+  if (Number.isFinite(expectedCount) && expectedCount > 0) {
+    const slack = Math.max(30, Math.ceil(expectedCount * 0.05));
+    if (out.size < expectedCount - slack) {
+      throw new IgApiError(
+        'incomplete',
+        `O Instagram devolveu a lista incompleta (${out.size} de ~${expectedCount} contas) — nada foi gravado. O progresso foi guardado e a extensão vai tentar de novo sozinha em alguns minutos.`,
+      );
+    }
   }
   return out;
 }

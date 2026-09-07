@@ -1,6 +1,7 @@
 <!doctype html>
 <html lang="pt-BR">
 <head>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta charset="utf-8" />
   <title>IG FollowGuard</title>
   <link rel="stylesheet" href="dashboard.css" />
@@ -8,10 +9,14 @@
 <body class="popup">
   <header>
     <img src="images/icon128.png" alt="" />
-    <div class="title">IG FollowGuard<small>quem não te segue de volta</small></div>
+    <div class="title">IG FollowGuard<small>gerenciador de seguidores</small></div>
     <span id="pill" class="pill"><span id="pill-text">…</span></span>
     <button id="refresh" class="btn ghost" title="Sincronizar agora">↻</button>
   </header>
+
+  <div id="sync-hint" class="sync-hint" style="display:none" role="status">
+    <strong>Não feche a aba do Instagram</strong> enquanto sincroniza.
+  </div>
 
   <div id="error" class="error" style="display:none">
     <div id="err-text"></div>
@@ -26,6 +31,7 @@
 
   <div id="tabs" class="tabs"></div>
   <div class="search"><input id="search" type="text" placeholder="Buscar conta…" autocomplete="off" /></div>
+  <div id="toolbar" class="toolbar"></div>
 
   <div id="list" class="list"></div>
 
@@ -46,6 +52,17 @@
         </select>
       </label>
       <label><input type="checkbox" id="notif" /> notificações</label>
+    </div>
+    <div class="settings backup-row">
+      <button type="button" id="export-backup" class="btn ghost tiny">Exportar backup</button>
+      <label class="btn ghost tiny import-label">Importar backup
+        <input type="file" id="import-backup" accept=".json,application/json" hidden />
+      </label>
+      <span class="backup-hint">Guarde antes de reinstalar — o Chrome não migra dados entre instalações.</span>
+    </div>
+    <div class="settings privacy-row">
+      <p class="privacy-note">Ao sincronizar, seus dados de seguidores ficam apenas neste navegador.</p>
+      <button type="button" id="delete-data" class="btn ghost danger">Apagar todos os dados</button>
     </div>
     <div id="meta" class="meta"></div>
   </footer>

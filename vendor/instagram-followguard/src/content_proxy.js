@@ -27,7 +27,9 @@
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg || sender.id !== chrome.runtime.id) return;
-    if (msg.igf === 'ping') { sendResponse({ pong: true }); return; }
+    // Version token lets the service worker detect a proxy left behind by a
+    // pre-reload content script (stale build) and open a fresh tab instead.
+    if (msg.igf === 'ping') { sendResponse({ pong: true, version: chrome.runtime.getManifest().version }); return; }
     if (msg.igf !== 'fetch') return;
     if (!ALLOWED_PATH.test(msg.path || '')) {
       sendResponse({ ok: false, error: 'forbidden' });
