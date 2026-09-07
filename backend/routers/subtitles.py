@@ -1,40 +1,38 @@
 """Live YouTube subtitles for URL-only previews (no archive row).
 
 The preview chat panel shows captions for videos opened from a bare URL —
-99% YouTube. This router fetches those captions with yt-dlp in skip_download
-mode, prefers manual subtitles over auto-generated for each requested
+99% YouTube. Resolution is caption-first: one InnerTube ANDROID player-client
+call (the same token-free path the manager's `yt-transcript` tool uses) asks
+for the caption tracklist directly, and the winning track is served straight
+from its timedtext URL. Only when that fast path yields nothing usable does
+the router fall back to the historical full yt-dlp video-info resolve — which
+paid a complete format-ladder extraction before touching a single caption.
+`VODRIP_CAPTION_FIRST=0` disables the fast path.
+
+Manual subtitles are preferred over auto-generated for each requested
 language (pt > en > es family preference, mirroring archive_ytdlp's
-_CAPTION_LANG_PREF), then serves the best available track as preview-panel
+_CAPTION_LANG_PREF); the best available track is served as preview-panel
 transcript rows ({offset_sec, text}) so the panel's existing Subtitles tab
 renders them unchanged.
 
-The track itself is fetched straight from its timedtext URL (ydl.urlopen)
-with the same 429 retry/backoff + format fallback (vtt -> json3 -> srv3)
-the archive ingest uses. It deliberately does NOT use yt-dlp's
-``_write_subtitles``: that downloads every regional/merged track matching
-the requested language families (each a separate, rate-limit-prone request
-— a single HTTP 429 killed the whole call) and adds file I/O for nothing.
+Track bodies are fetched with the same 429 retry/backoff + format fallback
+(vtt -> json3 -> srv3) the archive ingest uses. It deliberately does NOT use
+yt-dlp's ``_write_subtitles``: that downloads every regional/merged track
+matching the requested language families (each a separate, rate-limit-prone
+request — a single HTTP 429 killed the whole call) and adds file I/O for
+nothing.
 
 Results are cached in a small process-lifetime LRU keyed by video id —
 negative results are cached too, so a caption-less video is not re-fetched
 on every tab switch. Concurrent requests for the same video share one
 in-flight fetch (single-flight) instead of each spawning a full extraction.
 Never touches the archive DB.
-
-NOTE(2026-09-03): the manager's shared transcript tool now exists at
-`I:/!manager/tools/yt-transcript/index.ts` (Bun) / OMP tool
-`youtube_transcript` (~/.omp/agent/tools/youtube_transcript.ts). It uses an
-InnerTube ANDROID player-client call that fetches the caption track WITHOUT a
-PO token — a path that today survives the timedtext 429s this module fights
-with retries. TODO: evaluate delegating the fetch here (subprocess bun) or
-porting the InnerTube ANDROID approach into `_fetch_track`; frozen bundles
-ship this backend compiled, so an external `bun` dependency needs the
-bundler story sorted first. See I:/!manager/agents-sessions/transcript-tool.md.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import re
 import threading
 import time
@@ -65,6 +63,17 @@ _SUBTITLE_LANGS_DEFAULT = "en,pt,es"
 _CAPTION_FMTS = ("vtt", "json3", "srv3")
 _CAPTION_RETRIES = 2
 _CAPTION_BACKOFF_S = 1.0
+
+# Caption-first fast path: wall-clock budgets for the InnerTube player call
+# and the timedtext track fetch. Both are far below the yt-dlp resolve they
+# replace, so a hung fast path must not make the endpoint slower than the
+# fallback it short-circuits.
+_CAPTION_FIRST = "VODRIP_CAPTION_FIRST"
+_CAPTION_FIRST_PLAYER_TIMEOUT_S = 8.0
+_CAPTION_FIRST_HTTP_TIMEOUT_S = 15.0
+_CAPTION_FIRST_UA = (
+    "com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip"
+)
 
 _CACHE_MAX = 64
 _MISS = object()
@@ -233,36 +242,168 @@ def _fetch_track(ydl, lang: str, entries: list[dict]) -> tuple[str, str, str] | 
     return None
 
 
+def _payload_from_info(url: str, info: dict, opener) -> dict | None:
+    """Walk the ranked candidates of an info dict and serve the first track
+    that fetches. `opener` needs only urlopen(url).read() (a YoutubeDL or the
+    caption-first HTTP adapter). Returns the response payload dict, or None
+    when no candidate served — the caller decides what "nothing found" means.
+    """
+    merged = {
+        str(k).lower(): v
+        for k, v in {
+            **(info.get("subtitles") or {}),
+            **(info.get("automatic_captions") or {}),
+        }.items()
+    }
+    for lang, is_manual, _url in _candidate_tracks(info):
+        got = _fetch_track(opener, lang, merged.get(lang) or [])
+        if got is None:
+            continue
+        fmt, data = got[1], got[2]
+        segments = _parse_vtt(data) if fmt == "vtt" else _parse_caption(fmt, data)
+        return {
+            "url": url,
+            "lang": lang,
+            "source": "manual" if is_manual else "auto",
+            "has_subtitles": True,
+            "rows": [{"offset_sec": seg["start_sec"], "text": seg["text"]} for seg in segments],
+        }
+    return None
+
+
+class _CaptionHttpError(Exception):
+    """Non-200 timedtext fetch. `.code` mirrors yt-dlp's DownloadError so
+    _fetch_track's 429 retry/backoff sees the same contract."""
+
+    def __init__(self, code: int, url: str) -> None:
+        super().__init__(f"HTTP {code}: {url}")
+        self.code = code
+
+
+class _CaptionResp:
+    """urllib-response-shaped wrapper so _fetch_track can stay agnostic."""
+
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+
+    def read(self) -> bytes:
+        return self._payload
+
+
+class _CaptionOpener:
+    """Adapter: exposes the yt-dlp `.urlopen(url).read()` contract over
+    _caption_http_get so the shared track walk serves both paths."""
+
+    def urlopen(self, url: str) -> _CaptionResp:
+        return _caption_http_get(url)
+
+
+def _caption_http_get(url: str) -> _CaptionResp:
+    """GET one timedtext URL through the shared InnerTube session with the
+    ANDROID UA — the client whose tracklist produced the URL, so it serves
+    without a PO token (verified against the yt-transcript tool path)."""
+    from services.youtube_innertube import _http_for  # lazy: circular-import guard
+
+    resp = _http_for(None).get(
+        url,
+        headers={"User-Agent": _CAPTION_FIRST_UA},
+        timeout=_CAPTION_FIRST_HTTP_TIMEOUT_S,
+    )
+    if resp.status_code != 200:
+        raise _CaptionHttpError(resp.status_code, url)
+    return _CaptionResp(resp.content)
+
+
+def _caption_track_url(base_url: str, fmt: str) -> str:
+    """timedtext URL for one format — mirrors yt-dlp's process_language
+    (`fmt=<fmt>&xosf=`; xosf=1 corrupts text positions, yt-dlp #13654)."""
+    if base_url.startswith("//"):
+        base_url = f"https:{base_url}"
+    sep = "&" if "?" in base_url else "?"
+    return f"{base_url}{sep}fmt={fmt}&xosf="
+
+
+def _caption_first_info(video_id: str) -> dict | None:
+    """InnerTube ANDROID player response -> yt-dlp-shaped info dict.
+
+    Only the caption containers are built (the walk below reads nothing
+    else). Language codes and the manual/auto split mirror yt-dlp's
+    get_lang_code + `kind == 'asr'` rule so _candidate_tracks ranks the
+    fast-path tracks exactly like the fallback's. Returns None when the
+    player response carries no usable captionTracks.
+    """
+    from services import youtube_innertube as it  # lazy: circular-import guard
+
+    # _player_request returns data even on a playability failure — caption
+    # tracks can be present while formats are gated — so the FailureKind is
+    # deliberately ignored; only captionTracks decides.
+    data, _status, _kind = it._player_request(
+        video_id, it._PROFILE_BY_NAME["ANDROID"], _CAPTION_FIRST_PLAYER_TIMEOUT_S
+    )
+    renderer = ((data or {}).get("captions") or {}).get("playerCaptionsTracklistRenderer") or {}
+    subs: dict[str, list[dict]] = {}
+    auto: dict[str, list[dict]] = {}
+    for track in renderer.get("captionTracks") or []:
+        base_url = track.get("baseUrl") or ""
+        if not base_url:
+            continue
+        is_asr = track.get("kind") == "asr"
+        lang = (
+            str(track.get("vssId") or "").lstrip(".").replace(".", "-")
+            or str(track.get("languageCode") or "")
+        )
+        if is_asr and lang.startswith("a-"):
+            lang = lang[2:]
+        if not lang:
+            continue
+        entries = auto.setdefault(lang, []) if is_asr else subs.setdefault(lang, [])
+        for fmt in _CAPTION_FMTS:
+            entries.append({"ext": fmt, "url": _caption_track_url(base_url, fmt)})
+    if not subs and not auto:
+        return None
+    return {"subtitles": subs, "automatic_captions": auto}
+
+
+def _caption_first(url: str) -> dict | None:
+    """Caption-first fast path: tracklist via one InnerTube call, then the
+    shared ranked walk. Returns the payload dict on a hit; None (→ caller
+    runs the yt-dlp fallback unchanged) when disabled, no video id, no
+    captionTracks, or no candidate served. Any exception degrades to None —
+    the fast path must never turn a working fallback into a 502."""
+    if os.environ.get(_CAPTION_FIRST, "1").strip() == "0":
+        return None
+    video_id = _video_id(url)
+    if not video_id:
+        return None
+    try:
+        info = _caption_first_info(video_id)
+        if info is None:
+            return None
+        return _payload_from_info(url, info, _CaptionOpener())
+    except Exception as exc:  # noqa: BLE001 — degrade to the yt-dlp fallback
+        logger.info("caption-first path failed for %s, using yt-dlp: %s", video_id, exc)
+        return None
+
+
 def _fetch_subtitles(url: str, langs: list[str]) -> dict:
     """Fetch the best available caption track for one YouTube URL.
 
+    Caption-first: the InnerTube fast path (see _caption_first) resolves the
+    tracklist without a full video-info extract. On a miss the historical
+    yt-dlp path runs unchanged — it is what still defines the 502 semantics.
     The ranked candidate list (see _candidate_tracks) is walked until a
-    track serves. Returns the response payload dict; ``has_subtitles`` is
-    False when the video has none of the requested languages.
+    track serves; ``has_subtitles`` is False when the video has none of the
+    requested languages.
     """
+    payload = _caption_first(url)
+    if payload is not None:
+        return payload
     try:
         with guarded_youtube_dl(_subtitles_opts()) as ydl:
             info = ydl.extract_info(url, download=False) or {}
-            merged = {
-                str(k).lower(): v
-                for k, v in {
-                    **(info.get("subtitles") or {}),
-                    **(info.get("automatic_captions") or {}),
-                }.items()
-            }
-            for lang, is_manual, _url in _candidate_tracks(info):
-                got = _fetch_track(ydl, lang, merged.get(lang) or [])
-                if got is None:
-                    continue
-                fmt, data = got[1], got[2]
-                segments = _parse_vtt(data) if fmt == "vtt" else _parse_caption(fmt, data)
-                return {
-                    "url": url,
-                    "lang": lang,
-                    "source": "manual" if is_manual else "auto",
-                    "has_subtitles": True,
-                    "rows": [{"offset_sec": seg["start_sec"], "text": seg["text"]} for seg in segments],
-                }
+            got = _payload_from_info(url, info, ydl)
+            if got is not None:
+                return got
             return {"url": url, "lang": None, "source": None, "has_subtitles": False, "rows": []}
     except HTTPException:
         raise

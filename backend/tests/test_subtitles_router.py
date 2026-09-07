@@ -133,11 +133,17 @@ def _clear_cache() -> None:
 
 
 @pytest.fixture(autouse=True)
-def _clean_subs_cache():
+def _clean_subs_cache(monkeypatch):
     """Order-proof: every test shares the module-global _subs_cache and the
     same video URL; a test that fails before its trailing _clear_cache()
     would otherwise poison the next one ('pt' served where 'en' expected).
-    Clearing up front makes each test deterministic regardless of order."""
+    Clearing up front makes each test deterministic regardless of order.
+
+    Also pins the caption-first fast path OFF: this module fakes only the
+    yt-dlp fallback (guarded_youtube_dl), and the fast path would otherwise
+    issue a real InnerTube request before the fake is ever reached. The fast
+    path itself is covered in test_subtitles_caption_first.py."""
+    monkeypatch.setenv("VODRIP_CAPTION_FIRST", "0")
     _clear_cache()
     yield
 
