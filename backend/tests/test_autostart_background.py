@@ -127,6 +127,20 @@ def test_background_widens_youtube_chat_pacing(monkeypatch):
     assert at._youtube_chat_interval() == at._YOUTUBE_CHAT_ACTIVE_INTERVAL_S * 2.5
 
 
+def test_youtube_chat_pacing_env_override(monkeypatch):
+    """VODRIP_YT_CHAT_*_INTERVAL_S re-tunes the pacing without a build. A bad
+    or non-positive value must warn and keep the default — never disable the
+    throttle, since 0 would mean unlimited chat starts per minute."""
+    env = at.YT_CHAT_ACTIVE_INTERVAL_ENV
+    monkeypatch.delenv(env, raising=False)
+    assert at._env_interval(env, 30.0) == 30.0
+    monkeypatch.setenv(env, "5")
+    assert at._env_interval(env, 30.0) == 5.0
+    for bad in ("abc", "", "-1", "0"):
+        monkeypatch.setenv(env, bad)
+        assert at._env_interval(env, 30.0) == 30.0
+
+
 def test_background_scheduler_budgets_and_cadence(monkeypatch):
     """Quiet mode: 1 YT ingest + 1 transcribe per pass, 6-min cadence."""
     monkeypatch.delenv("VODRIP_BACKGROUND", raising=False)
