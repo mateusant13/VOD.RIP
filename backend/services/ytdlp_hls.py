@@ -91,22 +91,40 @@ _HLS_FORWARD_KEYS = frozenset(
 
 
 class _YtdlpQuietLogger:
-    """Capture yt-dlp chatter; surface only at DEBUG."""
+    """Capture yt-dlp chatter; surface only at DEBUG.
+
+    One exception, monitoring-only: the subtitles PO-Token policy line. For
+    non-default clients yt-dlp reports it via report_warning (→ warning());
+    for the default clients it goes through write_debug, which reaches a logger
+    only when yt-dlp runs verbose — hence the debug() hook too. Without either,
+    a caption regression is invisible: the tracks are discarded and the extract
+    still succeeds. Nothing branches on the line.
+    """
 
     def __init__(self) -> None:
         self.lines: list[str] = []
 
     def debug(self, msg: object) -> None:
-        pass
+        # Default clients get the policy line via write_debug, not warning.
+        self._note_policy(msg)
 
     def info(self, msg: object) -> None:
         pass
 
     def warning(self, msg: object) -> None:
         self.lines.append(str(msg))
+        self._note_policy(msg)
 
     def error(self, msg: object) -> None:
         self.lines.append(str(msg))
+        self._note_policy(msg)
+
+    @staticmethod
+    def _note_policy(msg: object) -> None:
+        from services.youtube_diag import is_subs_pot_policy_error
+
+        if is_subs_pot_policy_error(msg):
+            logger.warning("SUBS_PO_TOKEN_POLICY observed: %s", msg)
 
 
 # fd-2 redirect is process-wide; concurrent extracts (warm storm + fallback
@@ -370,11 +388,18 @@ def _try_innertube_info(
 
 
 # Least bot-gated YouTube player-client ladder, shared by preview and full
-# downloads. android_vr/android are least bot-gated (no POT needed) and still
-# expose a muxed 360p + adaptive ladder; web_safari stays as POT last-resort.
+# downloads. android is the head: no POT needed, and it exposes a muxed 360p +
+# adaptive ladder (measured live on 21.26.364). web_safari is the POT last
+# resort for HLS. android_vr is demoted to LEGACY-FALLBACK position — yt-dlp
+# dropped it from its default clients in 2026.08.19 and 403s every format at
+# 1.65.10 since 2026.08.17, so it must never be the first thing tried; it stays
+# last because it still resolves videos the other two cannot.
+# (visionos is deliberately absent: it is yt-dlp's new anonymous default, but
+# an unsupported name in extractor_args is a hard ExtractorError, and
+# requirements.txt only floors yt-dlp at 2025.5.22.)
 # ponytail: yt-dlp queries every listed client sequentially and merges, so a
-# hard-walled video pays per-client time before failing (5 clients ~= 24s).
-YOUTUBE_LEAST_GATED_PLAYER_CLIENTS = ["android_vr", "android", "web_safari"]
+# hard-walled video pays per-client time before failing (3 clients ~= 14s).
+YOUTUBE_LEAST_GATED_PLAYER_CLIENTS = ["android", "web_safari", "android_vr"]
 
 
 def youtube_preview_ytdl_opts(
