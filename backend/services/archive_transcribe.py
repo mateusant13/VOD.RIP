@@ -4308,9 +4308,13 @@ _CHAT_STALE_TIMEDELTA = timedelta(hours=2)
 # download (heartbeat stays NULL) and keeps the 2h window.
 _CHAT_HEARTBEAT_STALE = timedelta(minutes=20)
 
-# YouTube chat-backfill pacing: min gap between chat video STARTS. A single
-# worker starts ≤5/min (burst 2 requests each: extract + chat download); the
-# 3-thread pool can run up to 3 concurrently, still under the measured
+# YouTube chat-backfill pacing: min gap between chat video STARTS. The
+# intervals below are the current production values (active 30 s = 2 starts/
+# min, quiet 60 s = 1/min; the 3-thread pool can overlap them, and each start
+# bursts 2 requests — extract + chat download). The historical 12 s floor
+# (≤5/min, sized against the measured 4-6/min per-IP limiter) was retired with
+# b2f86bf's slow-and-steady daemon; the env knobs below are the seam for
+# re-tuning it without a build.
 # Two lanes (user requirement): the interactive lane
 # (preview/download/click-chat/search/watch) NEVER consults this pace or the
 # bot gate — pacing exists only in the worker's background lane. While the
@@ -4323,8 +4327,28 @@ _CHAT_HEARTBEAT_STALE = timedelta(minutes=20)
 # racing. ponytail: per-process only — cross-process pacing needs a shared
 # lock file if worker_server and the in-process worker ever overlap on one
 # box.
-_YOUTUBE_CHAT_ACTIVE_INTERVAL_S = 30.0
-_YOUTUBE_CHAT_QUIET_INTERVAL_S = 60.0
+YT_CHAT_ACTIVE_INTERVAL_ENV = "VODRIP_YT_CHAT_ACTIVE_INTERVAL_S"
+YT_CHAT_QUIET_INTERVAL_ENV = "VODRIP_YT_CHAT_QUIET_INTERVAL_S"
+
+
+def _env_interval(name: str, default: float) -> float:
+    """Positive float env override; a bad value warns and keeps the default."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        val = float(raw)
+    except ValueError:
+        logger.warning("%s=%r is not a number — using %.0fs", name, raw, default)
+        return default
+    if val <= 0:
+        logger.warning("%s=%s must be > 0 — using %.0fs", name, raw, default)
+        return default
+    return val
+
+
+_YOUTUBE_CHAT_ACTIVE_INTERVAL_S = _env_interval(YT_CHAT_ACTIVE_INTERVAL_ENV, 30.0)
+_YOUTUBE_CHAT_QUIET_INTERVAL_S = _env_interval(YT_CHAT_QUIET_INTERVAL_ENV, 60.0)
 _APP_ACTIVITY_AGE_S = 60.0
 _youtube_chat_last_start = 0.0
 _youtube_chat_pace_lock = threading.Lock()
