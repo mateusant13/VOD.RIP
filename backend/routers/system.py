@@ -63,7 +63,10 @@ async def server_info():
     # include features so /api/info reflects opt-in state
     try:
         from services.feature_registry import get_enabled_map
-        _feats = get_enabled_map()
+        # get_enabled_map() is memoized; cold cache reads settings_mgr.get()
+        # (in-memory snapshot under the manager lock, may probe ffmpeg) —
+        # worker thread.
+        _feats = await asyncio.to_thread(get_enabled_map)
     except Exception:
         _feats = {}
     try:
@@ -86,7 +89,8 @@ async def asr_runtime_status() -> dict:
     """Report whether the optional speech runtime is installed."""
     from services.asr_runtime import runtime_status
 
-    return runtime_status()
+    # Reads the install marker file + stats the exe — blocking FS IO.
+    return await asyncio.to_thread(runtime_status)
 
 
 @router.post("/api/asr/runtime")
@@ -99,7 +103,7 @@ async def install_asr_runtime() -> dict:
     except Exception as exc:
         logger.warning("ASR runtime installation failed: %s", exc)
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return runtime_status()
+    return await asyncio.to_thread(runtime_status)
 
 
 @router.get("/api/errors/latest")
@@ -127,22 +131,30 @@ async def health():
     fields to None/False, never raises."""
     from services import archive_db
 
-    try:
-        pending = archive_db.has_pending_jobs()
-    except Exception:
-        pending = None
-    try:
-        worker = archive_db.worker_live(age_s=45, tag="transcribe")
-    except Exception:
-        worker = False
-    try:
-        background = archive_db.worker_live(age_s=90, tag="background")
-    except Exception:
-        background = False
-    try:
-        activity_age = archive_db.worker_heartbeat_age("app-activity")
-    except Exception:
-        activity_age = None
+    def _probe() -> tuple:
+        # Each sqlite read keeps its own degrade-to-None/False; the whole
+        # probe runs on one worker thread so a WAL-busy first-touch (the
+        # shared connection serialises behind the write lock) can never
+        # stall the event loop — /api/health is what supervisors watch.
+        try:
+            pending = archive_db.has_pending_jobs()
+        except Exception:
+            pending = None
+        try:
+            worker = archive_db.worker_live(age_s=45, tag="transcribe")
+        except Exception:
+            worker = False
+        try:
+            background = archive_db.worker_live(age_s=90, tag="background")
+        except Exception:
+            background = False
+        try:
+            activity_age = archive_db.worker_heartbeat_age("app-activity")
+        except Exception:
+            activity_age = None
+        return pending, worker, background, activity_age
+
+    pending, worker, background, activity_age = await asyncio.to_thread(_probe)
     try:
         # SUBS_PO_TOKEN_POLICY monitor (event-driven; see youtube_diag). A
         # rollout of the subtitles PO-Token policy silently discards caption

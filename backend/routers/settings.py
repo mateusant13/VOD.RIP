@@ -74,6 +74,21 @@ def _prioritize_new_channels(old: list, new: list) -> None:
 
 @router.get("/api/settings", response_model=AppSettings)
 async def get_settings():
+    # Every blocking store touch on this path (settings JSON read, the
+    # channel-snapshots sqlite read, the reconcile write-back) runs on a
+    # worker thread via asyncio.to_thread — NEVER on the event loop. sqlite's
+    # busy_timeout (10s) is an in-process C-level spin: one WAL-busy write
+    # frozen here stops ALL endpoints at once (the dev-backend wedge). The
+    # default to_thread pool is deliberate — the named INFO_EXECUTOR can be
+    # saturated by hung yt-dlp extracts and must not be able to starve
+    # settings. The reconcile's live-detection kicks are thread-safe by
+    # construction (lock + executor.submit + daemon thread; no loop affinity
+    # in routers/live._submit_refresh).
+    return _redact_ai_key(await asyncio.to_thread(_load_settings_with_reconcile))
+
+
+def _load_settings_with_reconcile() -> AppSettings:
+    """Sync body of GET /api/settings — runs on a worker thread (see caller)."""
     settings = settings_mgr.get()
     # Reconcile saved_channels with the browse index: every channel that ever
     # had a successful fetch lives in channel_snapshots, so a channel the user
@@ -123,7 +138,7 @@ async def get_settings():
                 logger.debug("live detection trigger skipped", exc_info=True)
     except Exception:  # noqa: BLE001 — reconcile must never fail the read
         logger.debug("channel index reconcile skipped", exc_info=True)
-    return _redact_ai_key(settings)
+    return settings
 
 
 @router.get("/api/settings/youtube-auth")
@@ -132,19 +147,32 @@ async def youtube_auth_status():
     from deps import INFO_EXECUTOR
     from services.youtube_auth import auth_status
 
-    s = settings_mgr.get()
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        INFO_EXECUTOR,
-        lambda: auth_status(
+    # settings_mgr.get() is blocking JSON IO (plus the ffmpeg autofill probe),
+    # so it resolves INSIDE the executor job, never on the loop.
+    def _job():
+        s = settings_mgr.get()
+        return auth_status(
             getattr(s, "youtube_auto_auth", True),
             s.youtube_cookies_browser or "",
-        ),
-    )
+        )
+    return await loop.run_in_executor(INFO_EXECUTOR, _job)
 
 
 @router.post("/api/settings", response_model=AppSettings)
 async def update_settings(update: SettingsUpdate):
+    # Same rule as GET /api/settings: every blocking store touch of the save
+    # (settings JSON read + atomic write, the mark_channel_priority /
+    # forget_channel_snapshots sqlite writes, the autostart registry call)
+    # runs on a worker thread — a WAL-busy sqlite write spins busy_timeout
+    # in-process, and on the event loop that freezes every endpoint at once.
+    # HTTPException raised by the body (the 400 guards) propagates through
+    # the await unchanged, so error shapes stay identical.
+    return _redact_ai_key(await asyncio.to_thread(_apply_settings_update, update))
+
+
+def _apply_settings_update(update: SettingsUpdate) -> AppSettings:
+    """Sync body of POST /api/settings — runs on a worker thread (see caller)."""
     current = settings_mgr.get()
     if update.download_threads is not None:
         current.download_threads = max(1, min(16, update.download_threads))
@@ -372,13 +400,17 @@ async def update_settings(update: SettingsUpdate):
             current.features = dict(update.features or {})
     settings_mgr.save(current)
     download_mgr.apply_settings(settings_mgr)
-    return _redact_ai_key(current)
+    return current
 
 
 @router.get("/api/settings/features")
 async def get_features():
     from services.feature_registry import get_enabled_map, get_manifest
-    return {"features": get_enabled_map(), "manifest": get_manifest()}
+    # get_enabled_map() is memoized; on a cold cache it reads settings via
+    # settings_mgr.get() (in-memory copy under the manager lock, which can
+    # queue behind a concurrent save's disk write, and may probe ffmpeg) —
+    # worker thread.
+    return {"features": await asyncio.to_thread(get_enabled_map), "manifest": get_manifest()}
 
 
 @router.put("/api/settings/features")
@@ -388,7 +420,8 @@ async def put_features(body: dict):
     if not isinstance(feats, dict):
         from fastapi import HTTPException
         raise HTTPException(status_code=400, detail="features dict required")
-    updated = set_features_bulk({k: bool(v) for k, v in feats.items()})
+    # set_features_bulk() is settings_mgr.get() + save() — blocking IO.
+    updated = await asyncio.to_thread(set_features_bulk, {k: bool(v) for k, v in feats.items()})
     return {"features": updated, "manifest": get_manifest()}
 
 
@@ -400,7 +433,8 @@ async def recommended_resources():
     UI exposes this as a one-click "Recommended" fill next to the fields."""
     from services.settings import recommended_resource_defaults
 
-    return recommended_resource_defaults()
+    # Probes fixed drives (shutil.disk_usage / EnumDrives) — blocking FS IO.
+    return await asyncio.to_thread(recommended_resource_defaults)
 
 
 @router.post("/api/pick-folder")
@@ -409,10 +443,13 @@ async def pick_folder():
         OS_EXECUTOR, pick_folder_sync
     )
     if path:
-        current = settings_mgr.get()
-        current.download_folder = path
-        current.download_folder_confirmed = True
-        settings_mgr.save(current)
+        # Same sync save as POST /api/settings — off the loop.
+        def _save_folder():
+            current = settings_mgr.get()
+            current.download_folder = path
+            current.download_folder_confirmed = True
+            settings_mgr.save(current)
+        await asyncio.to_thread(_save_folder)
     return {"path": path, "error": err}
 
 
@@ -424,9 +461,13 @@ async def open_folder(req: OpenFolderRequest):
     raw = (req.path or "").strip()
     if not raw:
         raise HTTPException(status_code=400, detail="path is required")
-    validated = validate_open_folder_path(raw, settings_mgr)
-    try:
+    # validate_open_folder_path reads settings + stats paths; open_folder_sync
+    # shells out to Explorer. Both blocking — worker thread.
+    def _reveal():
+        validated = validate_open_folder_path(raw, settings_mgr)
         open_folder_sync(validated)
+    try:
+        await asyncio.to_thread(_reveal)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except ValueError as e:

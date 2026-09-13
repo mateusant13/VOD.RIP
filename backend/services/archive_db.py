@@ -443,9 +443,19 @@ def _init_schema() -> None:
 def _ensure_schema_ready() -> None:
     """Guarantee the shared write connection is open and schema-migrated.
 
-    Lock order _lock -> _init_lock (never inverted): readers and writers both
-    funnel through here, so the one-time migration ALTERs never run twice and
-    a reader never observes a half-migrated DB."""
+    Lock order _lock -> _init_lock (never inverted): writers funnel through
+    here, so the one-time migration ALTERs never run twice and a reader never
+    observes a half-migrated DB.
+
+    Fast path (no locks): once _schema_ready is True for the current path it
+    is never reset while that path stays active (the rebind in _init_schema
+    clears the flag BEFORE assigning the new _conn_path), so the two plain
+    reads below can only skip when the schema is fully committed. Without
+    this, every fresh thread's first read serialises behind _lock — and a
+    WAL-busy write holds _lock while sqlite spins busy_timeout (10s) — so
+    even off-loop readers would wedge behind it (the dev-backend wedge)."""
+    if _schema_ready and _conn_path == str(_db_path()):
+        return
     with _lock:
         with _init_lock:
             _init_schema()
