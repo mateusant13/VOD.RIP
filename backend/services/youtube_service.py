@@ -467,12 +467,20 @@ def list_channel_videos_sync(
     playlist: PlaylistKind = "videos",
     enrich: bool = True,
     return_has_more: bool = False,
+    return_crawl_saturation: bool = False,
 ) -> list[dict[str, Any]]:
     """Channel tab listing (flat extract, sorted newest-first, <=limit rows).
 
     return_has_more: when True, return (rows, has_more) — has_more is True
     when the flat extract hit its playlistend bound (the tab likely has more
     entries beyond it), False when the tab was exhausted before the bound.
+
+    return_crawl_saturation (requires return_has_more): return
+    (rows, has_more, crawl_saturated) — the RAW saturation signal, free of
+    the show-more servability guard: True when the crawl touched its
+    playlistend bound at ANY requested depth, or when the tab extract failed
+    outright (coverage then unknown). Consumers that must not claim complete
+    coverage (deep transcript sweep) need this, not has_more.
     """
     import yt_dlp
 
@@ -524,6 +532,7 @@ def list_channel_videos_sync(
     # the streams response; upgrade path = fetch both tabs when playlist=streams.
     pl = playlist if playlist in ("videos", "shorts", "streams") else "videos"
     pl_url = channel_playlist_url(channel_ref, pl)
+    fetch_failed = False
     try:
         with guarded_youtube_dl_channel(base_opts) as ydl:
             info = ydl.extract_info(pl_url, download=False)
@@ -531,6 +540,7 @@ def list_channel_videos_sync(
     except Exception as exc:
         logger.debug("youtube playlist %s failed: %s", pl, exc)
         info = None
+        fetch_failed = True
 
     entries = (info or {}).get("entries") or []
     for e in entries:
@@ -618,7 +628,13 @@ def list_channel_videos_sync(
         # bound: once the requested depth reaches the ceiling a deeper ask is
         # clamped to the same crawl and can never serve new rows, so has_more
         # must go False there or show-more loops forever on empty pages.
-        has_more = list_order >= playlistend and int(limit) < YOUTUBE_PLAYLIST_CEILING
+        touched_bound = list_order >= playlistend
+        has_more = touched_bound and int(limit) < YOUTUBE_PLAYLIST_CEILING
+        if return_crawl_saturation:
+            # Raw view for coverage-honesty consumers: bound touched at any
+            # depth, or the tab never listed at all (failed extract =
+            # unknown coverage, must not read as "complete").
+            return filtered, has_more, (touched_bound or fetch_failed)
         return filtered, has_more
     return filtered
 

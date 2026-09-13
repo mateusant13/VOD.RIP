@@ -12,7 +12,7 @@
  */
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ExternalLink, FileText, Loader2, MessageSquare, RefreshCw, Search, X } from 'lucide-react';
-import { apiGet } from '../hooks/useApiClient';
+import { apiGet, apiPost } from '../hooks/useApiClient';
 import {
   EXPLORE_PANEL_BOX_MIN_H,
   EXPLORE_PANEL_BOX_MIN_W,
@@ -99,6 +99,28 @@ interface ArchiveSearchPopupProps {
 }
 
 type SearchStatus = 'idle' | 'loading' | 'done' | 'error';
+/** Deep channel-transcript sweep job (POST /api/archive/search/deep). */
+type DeepHit = {
+  id: string;
+  title: string;
+  url: string;
+  date: string | null;
+  ts?: number;
+  snippet: string;
+};
+type DeepJobStatus = {
+  status: 'running' | 'done' | 'error' | 'cancelled';
+  scanned: number;
+  total: number;
+  no_transcript: number;
+  truncated: boolean;
+  results: DeepHit[];
+  error?: string | null;
+};
+/** The deep sweep is destructive-ish traffic (it queues caption downloads
+ *  for a whole channel): the start button stays disabled until the literal
+ *  confirmation word is typed (trimmed/casefolded). */
+const DEEP_CONFIRM_WORD = 'confirmar';
 
 const POPUP_WIDTH = 460;
 /** Floating-mode seed height — the search panel is tall by default. */
@@ -221,6 +243,19 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
   const [remoteStatus, setRemoteStatus] = useState<'idle' | 'loading' | 'done' | 'error'>('idle');
   const [remoteError, setRemoteError] = useState<string | null>(null);
   const remoteGenRef = useRef(0);
+  /** Deep channel-transcript sweep: job id while running/finished, the
+  *  typed confirmation, and the latest polled snapshot. */
+  const [deepJobId, setDeepJobId] = useState<string | null>(null);
+  const [deepConfirm, setDeepConfirm] = useState('');
+  const [deepJob, setDeepJob] = useState<DeepJobStatus | null>(null);
+  const [deepError, setDeepError] = useState<string | null>(null);
+  const deepJobIdRef = useRef<string | null>(null);
+  /** Latched synchronously inside startDeepSearch before its first await —
+   *  gates the Start button through the POST round-trip (deepJobId only
+   *  flips after it resolves, which alone lets a double-click POST twice). */
+  const deepStartingRef = useRef(false);
+  const [deepStarting, setDeepStarting] = useState(false);
+  const deepJobRef = useRef<DeepJobStatus | null>(null);
   const mountedRef = useRef(true);
   const searchGenRef = useRef(0);
   const debounceRef = useRef<number | null>(null);
@@ -441,6 +476,17 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
     return slugs[0];
   }, [channelFilter, channelHint, hintDisabled, savedChannels]);
 
+  deepJobIdRef.current = deepJobId;
+  deepJobRef.current = deepJob;
+  useEffect(() => {
+    // A channel switch invalidates the panel's job view (the backend sweep
+    // keeps running and warms the shared transcript cache — harmless).
+    setDeepJobId(null);
+    setDeepJob(null);
+    setDeepError(null);
+    setDeepConfirm('');
+  }, [remoteYtHandle]);
+
   const togglePlatform = useCallback((p: string) => {
     setPlatformFilter((cur) => (cur.includes(p) ? cur.filter((x) => x !== p) : [...cur, p]));
   }, []);
@@ -588,6 +634,85 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
         setRemoteStatus('error');
       });
   }, [query, scopeActive, sourceFilter, platformFilter, kindFilter, remoteYtHandle]);
+
+  // Deep sweep polling — while a job is running, GET its status every 2s.
+  // The ref guard keeps a stale in-flight poll from resurrecting a job the
+  // user cancelled/switched away between ticks.
+  useEffect(() => {
+    if (!deepJobId) return;
+    let alive = true;
+    const tick = async () => {
+      if (deepJobIdRef.current !== deepJobId) return;
+      try {
+        const res = await apiGet<DeepJobStatus>(`/api/archive/search/deep/${deepJobId}`);
+        if (!alive || !mountedRef.current || deepJobIdRef.current !== deepJobId) return;
+        setDeepJob(res);
+        if (res.status === 'error') setDeepError(res.error ?? t('Deep search failed'));
+        if (res.status !== 'running') setDeepJobId(null);
+      } catch {
+        if (!alive || !mountedRef.current) return;
+        setDeepError(t('Deep search unavailable — is the backend running?'));
+        setDeepJobId(null);
+      }
+    };
+    void tick();
+    const timer = window.setInterval(tick, 2000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [deepJobId]);
+
+  const deepConfirmed = deepConfirm.trim().toLowerCase() === DEEP_CONFIRM_WORD;
+
+  const startDeepSearch = useCallback(async () => {
+    if (!remoteYtHandle || !query.trim() || deepJobId || !deepConfirmed) return;
+    // Synchronous in-flight latch: set BEFORE the first await so a
+    // double-click can't get past the guard twice (deepJobId only flips
+    // after the POST resolves — too late to gate a rapid second click).
+    if (deepStartingRef.current) return;
+    deepStartingRef.current = true;
+    setDeepStarting(true);
+    setDeepError(null);
+    setDeepJob(null);
+    try {
+      const res = await apiPost<{ job_id: string }>('/api/archive/search/deep', {
+        channel: remoteYtHandle,
+        query: query.trim(),
+      });
+      if (mountedRef.current) setDeepJobId(res.job_id);
+    } catch {
+      if (mountedRef.current) setDeepError(t('Deep search unavailable — is the backend running?'));
+    } finally {
+      deepStartingRef.current = false;
+      if (mountedRef.current) setDeepStarting(false);
+    }
+  }, [remoteYtHandle, query, deepJobId, deepConfirmed, t]);
+
+  const cancelDeepSearch = useCallback(async () => {
+    const jobId = deepJobId;
+    if (!jobId) return;
+    // Keep a terminal snapshot instead of nulling — the cancelled branch of
+    // the summary (with the i18n copy + last results) stays visible after a
+    // cancel, matching what a done/error sweep renders.
+    setDeepJob({
+      ...(deepJobRef.current ?? {
+        scanned: 0,
+        total: 0,
+        no_transcript: 0,
+        truncated: false,
+        results: [],
+        error: null,
+      }),
+      status: 'cancelled' as const,
+    });
+    setDeepJobId(null);
+    try {
+      await apiPost<{ ok: boolean }>(`/api/archive/search/deep/${jobId}/cancel`, {});
+    } catch {
+      // The poll already stopped locally; the backend sweep ends on its own.
+    }
+  }, [deepJobId]);
 
   // Resolve the hit's per-platform open targets (primary first) and hand
   // them to App, which picks the least-opened platform this session. arg[1]
@@ -1322,6 +1447,103 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                 </button>
               ))}
             </div>
+          )}
+        </div>
+      )}
+
+      {/* ── DEEP TRANSCRIPT SEARCH (full-channel sweep job) ── */}
+      {remoteYtHandle && query.trim().length >= 2 && (
+        <div className="flex flex-col gap-1.5 border-t-2 border-zinc-800 pt-1.5 min-h-0 flex-none max-h-[38%]">
+          <div className="flex items-center gap-1.5 shrink-0">
+            <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-500 shrink-0">
+              {t('Deep transcript search')}
+            </span>
+            {(deepJobId || deepStarting) && <Loader2 size={10} className="animate-spin text-zinc-500 shrink-0" />}
+            {deepJob && deepJob.status === 'running' && (
+              <span className="text-[9px] font-mono text-zinc-500 shrink-0" data-testid="deep-progress">
+                {t('Scanning {scanned} / {total}', { scanned: deepJob.scanned, total: deepJob.total })}
+              </span>
+            )}
+          </div>
+          <p className="text-[9px] font-mono text-zinc-600 shrink-0">
+            {t('Search transcripts of every video (uploads, shorts, streams)')}
+          </p>
+          {deepJobId || (deepJob && deepJob.status === 'running') ? (
+            <button
+              type="button"
+              onClick={() => void cancelDeepSearch()}
+              className="self-start text-[9px] font-mono uppercase tracking-widest border-2 border-zinc-700 bg-zinc-900/60 hover:border-red-500/60 text-zinc-300 px-2 py-1 transition-colors"
+            >
+              {t('Cancel')}
+            </button>
+          ) : (
+            <div className="flex items-center gap-1.5 shrink-0">
+              <input
+                value={deepConfirm}
+                onChange={(e) => setDeepConfirm(e.target.value)}
+                placeholder={DEEP_CONFIRM_WORD}
+                aria-label={t('Type {word} to enable', { word: DEEP_CONFIRM_WORD })}
+                className="min-w-0 flex-1 text-[10px] font-mono border-2 border-zinc-800 bg-black/40 px-1.5 py-1 text-zinc-200 focus:border-zinc-500 outline-none"
+              />
+              <button
+                type="button"
+                onClick={() => void startDeepSearch()}
+                disabled={!deepConfirmed || deepStarting}
+                title={deepConfirmed ? undefined : t('Type {word} to enable', { word: DEEP_CONFIRM_WORD })}
+                className={
+                  'shrink-0 text-[9px] font-mono uppercase tracking-widest border-2 px-2 py-1 transition-colors ' +
+                  (deepConfirmed && !deepStarting
+                    ? 'border-zinc-700 bg-zinc-900/60 hover:border-[#F03030] text-zinc-200'
+                    : 'border-zinc-800 bg-zinc-900/30 text-zinc-600 cursor-not-allowed')
+                }
+              >
+                {t('Start deep search')}
+              </button>
+            </div>
+          )}
+          {deepError && <p className="text-[9px] font-mono text-red-400/80 shrink-0">{deepError}</p>}
+          {deepJob && (deepJob.status === 'done' || deepJob.status === 'cancelled' || deepJob.status === 'error') && (
+            <>
+              <p className="text-[9px] font-mono text-zinc-600 shrink-0" data-testid="deep-summary">
+                {deepJob.status === 'cancelled'
+                  ? t('Deep search cancelled')
+                  : deepJob.results.length > 0
+                    ? t('{count} transcript matches · {scanned} scanned · {missing} without captions', {
+                        count: deepJob.results.length,
+                        scanned: deepJob.scanned,
+                        missing: deepJob.no_transcript,
+                      })
+                    : t('No transcript matches in {scanned} scanned videos', { scanned: deepJob.scanned })}
+                {deepJob.truncated ? ` · ${t('list truncated')}` : ''}
+              </p>
+              {deepJob.results.length > 0 && (
+                <div className="flex flex-col gap-1 overflow-y-auto custom-scrollbar pr-1 min-h-0 flex-1">
+                  {deepJob.results.map((r, i) => (
+                    <a
+                      key={`${r.id}-${i}`}
+                      href={r.ts != null ? `${r.url}?t=${r.ts}` : r.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-left border-2 border-zinc-800 bg-zinc-900/60 hover:border-zinc-500 p-1.5 flex flex-col gap-1 transition-colors"
+                    >
+                      <span className="flex items-center gap-1.5 min-w-0">
+                        <ExternalLink size={9} className="text-zinc-500 shrink-0" />
+                        <span className="text-[9px] font-bold uppercase truncate text-zinc-200 min-w-0 flex-1">
+                          {r.title}
+                        </span>
+                        {r.ts != null && (
+                          <span className="text-[9px] font-mono text-[#F03030] shrink-0">
+                            {formatArchiveOffset(r.ts)}
+                          </span>
+                        )}
+                        {r.date && <span className="text-[9px] font-mono text-zinc-500 shrink-0">{r.date}</span>}
+                      </span>
+                      <span className="text-[10px] text-zinc-500 break-words">{r.snippet}</span>
+                    </a>
+                  ))}
+                </div>
+              )}
+            </>
           )}
         </div>
       )}

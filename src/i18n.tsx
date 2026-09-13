@@ -311,6 +311,21 @@ const ptBR: Record<string, string> = {
   'No YouTube matches for "{query}"': 'Sem correspondências no YouTube para "{query}"',
   'Open in the player — download from there': 'Abrir no player — baixe a partir de lá',
   'click to open in the player': 'clique para abrir no player',
+  'Deep transcript search': 'Pesquisa profunda em transcrições',
+  'Search transcripts of every video (uploads, shorts, streams)':
+    'Pesquisa nas transcrições de todos os vídeos (envios, shorts, lives)',
+  'Type {word} to enable': 'Digite {word} para ativar',
+  'Start deep search': 'Iniciar pesquisa profunda',
+  'Scanning {scanned} / {total}': 'Analisando {scanned} / {total}',
+  'Deep search cancelled': 'Pesquisa profunda cancelada',
+  '{count} transcript matches · {scanned} scanned · {missing} without captions':
+    '{count} correspondências em transcrições · {scanned} analisados · {missing} sem legendas',
+  'No transcript matches in {scanned} scanned videos':
+    'Nenhuma correspondência em transcrições nos {scanned} vídeos analisados',
+  'list truncated': 'lista truncada',
+  'Deep search failed': 'A pesquisa profunda falhou',
+  'Deep search unavailable — is the backend running?':
+    'Pesquisa profunda indisponível — o backend está rodando?',
   'Chat from hit': 'Chat a partir do resultado',
   'Loading chat history...': 'Carregando histórico do chat...',
   'No archived chat from this moment.': 'Nenhum chat arquivado a partir deste momento.',
@@ -940,6 +955,21 @@ const es: Record<string, string> = {
   'video': 'Video',
   'chat': 'chat',
   'Open {title} in player': 'Abrir {title} en el reproductor',
+  'Deep transcript search': 'Búsqueda profunda en transcripciones',
+  'Search transcripts of every video (uploads, shorts, streams)':
+    'Busca en las transcripciones de todos los vídeos (subidos, shorts, directos)',
+  'Type {word} to enable': 'Escribe {word} para activar',
+  'Start deep search': 'Iniciar búsqueda profunda',
+  'Scanning {scanned} / {total}': 'Escaneando {scanned} / {total}',
+  'Deep search cancelled': 'Búsqueda profunda cancelada',
+  '{count} transcript matches · {scanned} scanned · {missing} without captions':
+    '{count} coincidencias en transcripciones · {scanned} escaneados · {missing} sin subtítulos',
+  'No transcript matches in {scanned} scanned videos':
+    'Sin coincidencias en transcripciones en los {scanned} vídeos escaneados',
+  'list truncated': 'lista truncada',
+  'Deep search failed': 'La búsqueda profunda falló',
+  'Deep search unavailable — is the backend running?':
+    'Búsqueda profunda no disponible — ¿se está ejecutando el backend?',
   'YouTube results': 'Resultados de YouTube',
   'No YouTube matches for "{query}"': 'Sin coincidencias en YouTube para "{query}"',
   'Open in the player — download from there': 'Abrir en el reproductor — descarga desde allí',

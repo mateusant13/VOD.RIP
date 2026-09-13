@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import type { Mock } from 'vitest';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import ArchiveSearchPopup from './ArchiveSearchPopup';
 import { todayIso } from '../archiveSearchUtils';
 import { setLanguage } from '../i18n';
@@ -24,9 +25,21 @@ const SAVED: SavedChannel = {
   updatedAt: '2026-08-01T00:00:00Z',
 };
 
-function mockFetch(hits: unknown[] = [], extra: Record<string, unknown> = {}, remote: unknown = undefined) {
+function mockFetch(
+  hits: unknown[] = [],
+  extra: Record<string, unknown> = {},
+  remote: unknown = undefined,
+  deep: unknown = undefined,
+) {
   const fn = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
+    if (url.includes('/api/archive/search/deep')) {
+      const body = typeof deep === 'function' ? (deep as (u: string) => unknown)(url) : deep ?? { job_id: 'job-1' };
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
     if (url.includes('/api/archive/search/remote')) {
       return new Response(
         JSON.stringify(remote === undefined ? { hits: [], error: null } : remote),
@@ -63,6 +76,7 @@ function searchUrlWith(fetchMock: ReturnType<typeof vi.fn>, needle: string): str
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.useRealTimers(); // deep tests fake the clock — never leak it
   setLanguage('en'); // the i18n module state is global — never leak a language into the next test
 });
 
@@ -1614,5 +1628,147 @@ describe('ArchiveSearchPopup batch-3', () => {
     expect(screen.queryByText('twitch row')).toBeNull();
     expect(onClose).not.toHaveBeenCalled();
     expect(screen.getByLabelText('Archive search')).toBeInTheDocument();
+  });
+});
+
+describe('ArchiveSearchPopup deep transcript search', () => {
+  const SAVED_GAVETA: SavedChannel = {
+    id: 'ch-gaveta',
+    displayName: 'gaveta',
+    kickSlug: '',
+    twitchSlug: '',
+    youtubeSlug: 'gaveta',
+    vodVideos: [],
+    clipVideos: [],
+    updatedAt: '2026-08-01T00:00:00Z',
+  };
+
+  /** Open the popup scoped to @gaveta with a query typed (the deep panel's
+   *  render gate: remote handle resolved + query >= 2 chars). */
+  async function openWithQuery(fetchMock: Mock) {
+    render(
+      <ArchiveSearchPopup
+        zIndex={7}
+        onClose={() => {}}
+        onOpenHit={() => {}}
+        savedChannels={[SAVED_GAVETA]}
+        initialChannel="gaveta"
+      />,
+    );
+    fireEvent.change(screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...'), {
+      target: { value: 'vale da estranheza' },
+    });
+    await waitFor(() => expect(searchUrlWith(fetchMock, '/api/archive/search/remote')).toBeTruthy());
+  }
+
+  const startBtn = () =>
+    screen.getByRole('button', { name: /Start deep search/i }) as HTMLButtonElement;
+
+  it('stays locked until the literal word confirmar is typed, then launches and renders the job', async () => {
+    let statusPolls = 0;
+    const fetchMock = mockFetch([], {}, { hits: [], error: null }, (url: string) => {
+      if (url.includes('/cancel')) return { ok: true };
+      if (url.includes('/api/archive/search/deep/job-1')) {
+        statusPolls += 1;
+        return statusPolls === 1
+          ? { status: 'running', scanned: 0, total: 3, no_transcript: 0, truncated: false, results: [] }
+          : {
+              status: 'done',
+              scanned: 3,
+              total: 3,
+              no_transcript: 1,
+              truncated: false,
+              results: [
+                { id: 'est1', title: 'SOTAQUE', url: 'https://youtu.be/est1', date: '2018-05-25', ts: 7,
+                  snippet: '…dar a césar o que é de…' },
+              ],
+            };
+      }
+      return { job_id: 'job-1' };
+    });
+    // Setup + gate checks run on real timers (RTL waitFor polls with timers —
+    // it can't advance under fake ones, cf. the repo's QueueTab precedent).
+    await openWithQuery(fetchMock);
+    expect(startBtn()).toBeInTheDocument();
+    expect(startBtn().disabled).toBe(true);
+    const confirmInput = screen.getByRole('textbox', { name: /Type confirmar to enable/i });
+    fireEvent.change(confirmInput, { target: { value: '  CONFIRMAR  ' } });
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    // Near-misses must NOT arm the gate.
+    fireEvent.change(confirmInput, { target: { value: 'confirm' } });
+    expect(startBtn().disabled).toBe(true);
+    fireEvent.change(confirmInput, { target: { value: 'confirmar' } });
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+
+    // From here the 2s poll interval is a fake-clock advance, not a sleep (L10).
+    vi.useFakeTimers();
+    await act(async () => {
+      fireEvent.click(startBtn());
+      await vi.advanceTimersByTimeAsync(0); // POST resolves -> poll effect -> running
+    });
+    expect(screen.getByText(/Scanning 0 \/ 3/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Start deep search/i })).toBeNull();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000); // next tick -> done + results
+    });
+    expect(screen.getByText(/dar a césar/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/1 transcript matches · 3 scanned · 1 without captions/),
+    ).toBeInTheDocument();
+    expect(screen.getByText('00:07')).toBeInTheDocument();
+    const post = fetchMock.mock.calls
+      .map((c) => c as unknown as [RequestInfo | URL, RequestInit | undefined])
+      .find((c) => String(c[0]).includes('/api/archive/search/deep') && c[1]?.method === 'POST')!;
+    expect(JSON.parse(String(post[1]?.body))).toEqual({ channel: 'gaveta', query: 'vale da estranheza' });
+    vi.useRealTimers();
+  });
+
+  it('double-click posts exactly once; cancel posts the cancel route, stops polling, keeps the snapshot', async () => {
+    let polls = 0;
+    let deepPosts = 0;
+    const fetchMock = mockFetch([], {}, { hits: [], error: null }, (url: string) => {
+      if (url.includes('/cancel')) return { ok: true };
+      if (url.includes('/api/archive/search/deep/job-1')) {
+        polls += 1;
+        return { status: 'running', scanned: 1, total: 3, no_transcript: 0, truncated: false, results: [] };
+      }
+      deepPosts += 1;
+      return { job_id: 'job-1' };
+    });
+    await openWithQuery(fetchMock);
+    fireEvent.change(screen.getByRole('textbox', { name: /Type confirmar to enable/i }), {
+      target: { value: 'confirmar' },
+    });
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+
+    vi.useFakeTimers();
+    // D2b: two synchronous clicks while the first POST is still in flight —
+    // the in-flight latch collapses them into ONE request.
+    await act(async () => {
+      fireEvent.click(startBtn());
+      fireEvent.click(startBtn());
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(deepPosts).toBe(1);
+    expect(screen.getByText(/Scanning 1 \/ 3/)).toBeInTheDocument();
+
+    // L9: cancel keeps a terminal snapshot (summary branch visible) + Start returns.
+    const cancel = screen.getByRole('button', { name: /^Cancel$/i });
+    await act(async () => {
+      fireEvent.click(cancel);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(
+      fetchMock.mock.calls.some((c) => String(c[0]).endsWith('/api/archive/search/deep/job-1/cancel')),
+    ).toBe(true);
+    expect(screen.getByTestId('deep-summary')).toHaveTextContent(/Deep search cancelled/);
+    expect(screen.getByRole('button', { name: /Start deep search/i })).toBeInTheDocument();
+    // Polling stopped: advancing the clock fires no further status GETs.
+    const pollsAfterCancel = polls;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2200);
+    });
+    expect(polls).toBe(pollsAfterCancel);
+    vi.useRealTimers();
   });
 });

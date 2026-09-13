@@ -3,7 +3,6 @@ Archive routes — read/write the local SQLite store (chat, transcripts, video
 index, dedupe, job queue). Consumers: ingestion adapters (YouTube/Twitch/Kick)
 and the search UI.
 """
-
 import asyncio
 import logging
 import re
@@ -11,6 +10,8 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -811,7 +812,7 @@ async def archive_search_remote(
             handle = str(entry.get("youtubeSlug") or "").strip() or None
             break
     if not handle:
-        return {"hits": [], "error": f"'{channel}' has no YouTube handle — add one in Settings"}
+        return {"hits": [], "error": f"'{channel}' has no YouTube handle — set one on this channel's card (pencil / Edit button → channel links)"}
     from services.youtube_service import search_channel_videos_sync
     from deps import INFO_EXECUTOR
 
@@ -1061,3 +1062,587 @@ async def export_chat(body: ChatExportRequest):
     if not path:
         raise HTTPException(status_code=404, detail="No chat history for this video")
     return {"path": path}
+
+
+# --- Deep channel-transcript search (background sweep jobs) -----------------
+
+# Searches the TRANSCRIPTS of every video of a channel (uploads + shorts +
+# streams), not just titles. It is deliberately a job, not a request: a full
+# sweep walks the channel tabs, skips videos already covered by the transcript
+# cache, and fetches only what is missing — bounded concurrency (2) and
+# yt-dlp pacing (1.5s) per the repo's YouTube bot-gate discipline. Fetched
+# transcripts are written through to the same archive_db.transcripts cache the
+# rest of the app uses (and mirrored into the subtitles LRU), so a second
+# query on the same channel never re-downloads captions.
+
+_DEEP_JOB_CAP = 50
+_DEEP_TAB_LIMIT = 1000  # per-tab enumeration ask (== playlist ceiling)
+_DEEP_RESULT_CAP_PER_VIDEO = 5
+_DEEP_SNIPPET_PAD = 120
+_DEEP_FETCH_CONCURRENCY = 2
+_DEEP_MIN_GAP_S = 1.5  # mirrors archive_ytdlp._ORIGINAL_MIN_GAP_S
+_DEEP_SQL_CHUNK = 500
+_DEEP_RUNNING_CAP = 2  # concurrent sweeps across ALL channels (bot-gate discipline)
+
+_deep_jobs: dict[str, dict] = {}
+_deep_jobs_lock = threading.Lock()
+# Fetch pacing is GLOBAL, not per-job: two sweeps from two clients must
+# still start yt-dlp calls >=_DEEP_MIN_GAP_S apart. Closure-local pace
+# would let each job blast YouTube independently.
+_deep_pace = {"last": 0.0}
+_deep_pace_lock = threading.Lock()
+
+def _deaccent(text: str) -> str:
+    """casefold + strip combining marks (á→a, ç→c) for accent-insensitive match."""
+    import unicodedata
+
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", text.casefold()) if not unicodedata.combining(c)
+    )
+
+
+def _deaccent_map(text: str) -> tuple[str, list[int]]:
+    """Like ``_deaccent`` but also returns an offset map: index in the
+    deaccented string -> index in the ORIGINAL ``text``.
+
+    NFKD casefold is not always length-preserving (ß→ss), so a match found
+    over the deaccented string cannot be blindly re-sliced on the original —
+    the offsets must be carried back through this map."""
+    import unicodedata
+
+    out: list[str] = []
+    map_: list[int] = []
+    for i, c in enumerate(text):
+        for d in unicodedata.normalize("NFKD", c.casefold()):
+            if not unicodedata.combining(d):
+                out.append(d)
+                map_.append(i)
+    return "".join(out), map_
+
+
+def _deep_snippet(text: str, start: int, end: int) -> str:
+    """±_DEEP_SNIPPET_PAD window around the match, ellipsised at each cut."""
+    lo = max(0, start - _DEEP_SNIPPET_PAD)
+    hi = min(len(text), end + _DEEP_SNIPPET_PAD)
+    prefix = "…" if lo > 0 else ""
+    suffix = "…" if hi < len(text) else ""
+    return prefix + text[lo:hi].strip() + suffix
+
+
+def _deep_match_segments(raw_query: str, segments: list[tuple[float, str]]) -> list[dict]:
+    """First <=5 matches of the query against (start_sec, text) segments.
+
+    LITERAL substring match over the deaccented/casefolded text (never
+    regex — pt-BR queries like 'R$ 10' or '$100' must match literally, and
+    no path may run a user-supplied pattern with the GIL held). Match
+    offsets are mapped back to ORIGINAL text indices so the snippet keeps
+    the accent characters; ts is the segment start in seconds."""
+    q = _deaccent(raw_query.strip())
+    if not q:
+        return []
+    out: list[dict] = []
+    for start_sec, text in segments:
+        deaccented, offmap = _deaccent_map(text)
+        idx = deaccented.find(q)
+        if idx < 0:
+            continue
+        # Map the match span back to original-text indices (the map is
+        # monotone non-decreasing; end-offset is the char AFTER the match).
+        orig_start = offmap[idx]
+        orig_end = offmap[idx + len(q) - 1] + 1
+        out.append(
+            {"ts": int(start_sec), "snippet": _deep_snippet(text, orig_start, orig_end)}
+        )
+        if len(out) >= _DEEP_RESULT_CAP_PER_VIDEO:
+            break
+    return out
+
+
+def _deep_enumerate(handle: str) -> tuple[list[dict], bool]:
+    """All channel videos (uploads+shorts+streams), newest-first, deduped.
+
+    Seam for tests. Each tab is listed via the guarded flat extract
+    (list_channel_videos_sync); truncated is True when any tab failed or
+    saturated the ceiling, or the merged set exceeded _DEEP_TAB_LIMIT — a
+    partial sweep must never claim full coverage.
+
+    The saturation asked for is the RAW crawl bound (list_order >=
+    playlistend), not the show-more `has_more`: this sweep always asks at
+    the 1000-row ceiling, where has_more is force-False by design (a deeper
+    ask could never serve new rows) and would otherwise hide truncation.
+    """
+    from services.youtube_service import list_channel_videos_sync
+
+    merged: dict[str, dict] = {}
+    truncated = False
+    for tab in ("videos", "shorts", "streams"):
+        try:
+            rows, _has_more, saturated = list_channel_videos_sync(
+                handle,
+                _DEEP_TAB_LIMIT,
+                playlist=tab,
+                enrich=False,
+                return_has_more=True,
+                return_crawl_saturation=True,
+            )
+        except Exception as exc:
+            logger.debug("deep enumerate tab %s failed: %s", tab, exc)
+            # A tab that errored yielded NOTHING — the result set is
+            # silently incomplete; report it as truncated (honest partial).
+            truncated = True
+            continue
+        truncated = truncated or bool(saturated) or len(rows) >= _DEEP_TAB_LIMIT
+        for v in rows:
+            vid = str(v.get("id") or "").strip()
+            if vid and vid not in merged:
+                merged[vid] = v
+    items = list(merged.values())
+
+    def _ts(v: dict) -> float:
+        raw = str(v.get("created_at") or "")
+        try:
+            return datetime.fromisoformat(raw).timestamp()
+        except ValueError:
+            return 0.0
+
+    items.sort(key=_ts, reverse=True)
+    if len(items) > _DEEP_TAB_LIMIT:
+        items = items[:_DEEP_TAB_LIMIT]
+        truncated = True
+    return items, truncated
+
+
+def _deep_fetch_transcript(video_id: str) -> dict:
+    """One caption fetch for the sweep; returns the subtitles payload.
+
+    Seam for tests. Raises on transport/bot-gate failure (the runner
+    classifies); an empty ``rows``/has_subtitles=False is a NO-CAPTIONS
+    verdict, not an error."""
+    from routers.subtitles import _fetch_subtitles, _subtitle_langs_default
+
+    langs = [x.strip() for x in _subtitle_langs_default().split(",") if x.strip()]
+    return _fetch_subtitles(f"https://www.youtube.com/watch?v={video_id}", langs)
+
+
+def _deep_store_transcript(video_id: str, payload: dict) -> list[tuple[float, str]]:
+    """Write-through the fetched captions into the shared transcript cache.
+
+    Same table/lang semantics as the ingest path (insert_transcript), plus
+    the subtitles LRU mirror (set for empty verdicts too) — the durable
+    cache is the DB. Returns the (start_sec, text) segments for matching."""
+    rows = [r for r in (payload.get("rows") or []) if (r.get("text") or "").strip()]
+    segments: list[tuple[float, str]] = []
+    # Mirror into the subtitles LRU BEFORE the no-captions early return, so
+    # an empty verdict (rows==[], has_subtitles=False) is cached server-side
+    # too — otherwise /subtitles re-fetches a video the sweep already probed
+    # (the DB holds no row to short-circuit on). Best-effort; the DB is the
+    # cache of record for real transcripts.
+    try:
+        from routers.subtitles import _MISS, _subs_cache
+
+        if _subs_cache.get(video_id) is _MISS:
+            _subs_cache.put(video_id, payload)
+    except Exception:
+        pass
+    if not rows:
+        return segments
+    try:
+        archive_db.insert_transcript(
+            "youtube",
+            video_id,
+            [
+                {
+                    "seg_idx": i,
+                    "start_sec": float(r.get("offset_sec") or 0.0),
+                    "end_sec": float(
+                        rows[i + 1].get("offset_sec")
+                        if i + 1 < len(rows)
+                        else (float(r.get("offset_sec") or 0.0) + 2.0)
+                    ),
+                    "text": str(r.get("text") or ""),
+                }
+                for i, r in enumerate(rows)
+            ],
+            lang=payload.get("lang"),
+        )
+    except Exception as exc:
+        logger.debug("deep transcript cache write failed for %s: %s", video_id, exc)
+    return [(float(r.get("offset_sec") or 0.0), str(r.get("text") or "")) for r in rows]
+
+
+def _deep_covered_ids(video_ids: list[str]) -> tuple[set[str], set[str]]:
+    """Batched pre-skip probe: (has_transcript, fresh no-captions marker).
+
+    Two IN-chunk SELECTs total — never per-video existence checks (an
+    800-video sweep would issue 800 round-trips otherwise)."""
+    covered: set[str] = set()
+    marked: set[str] = set()
+    now = datetime.now(timezone.utc)
+    for i in range(0, len(video_ids), _DEEP_SQL_CHUNK):
+        chunk = video_ids[i : i + _DEEP_SQL_CHUNK]
+        ph = ",".join("?" * len(chunk))
+        for r in archive_db.query(
+            f"SELECT DISTINCT video_id FROM transcripts WHERE platform='youtube' AND video_id IN ({ph})",
+            chunk,
+        ):
+            covered.add(str(r["video_id"]))
+        for r in archive_db.query(
+            "SELECT video_id, captions_unavailable_at FROM videos "
+            f"WHERE platform='youtube' AND video_id IN ({ph}) AND captions_unavailable_at IS NOT NULL",
+            chunk,
+        ):
+            try:
+                if now - datetime.fromisoformat(str(r["captions_unavailable_at"])) < timedelta(
+                    seconds=_deep_marker_fresh_s()
+                ):
+                    marked.add(str(r["video_id"]))
+            except (TypeError, ValueError):
+                pass  # unparseable stamp — treat as absent (retry once)
+    return covered, marked
+
+
+def _deep_marker_fresh_s() -> float:
+    from services.archive_scheduler import CAPTIONS_UNAVAILABLE_FRESH_S
+
+    return float(CAPTIONS_UNAVAILABLE_FRESH_S)
+
+
+def _deep_seed_video_rows(handle: str, videos: list[dict]) -> None:
+    """Ensure every swept video has a videos row so the no-captions marker
+    (UPDATE-only) can stick on it and hits carry title/date. Only missing
+    ids are upserted — archive fields are never touched either way."""
+    ids = [str(v.get("id") or "") for v in videos if v.get("id")]
+    existing: set[str] = set()
+    for i in range(0, len(ids), _DEEP_SQL_CHUNK):
+        chunk = ids[i : i + _DEEP_SQL_CHUNK]
+        ph = ",".join("?" * len(chunk))
+        for r in archive_db.query(
+            f"SELECT video_id FROM videos WHERE platform='youtube' AND video_id IN ({ph})",
+            chunk,
+        ):
+            existing.add(str(r["video_id"]))
+    for v in videos:
+        vid = str(v.get("id") or "")
+        if not vid or vid in existing:
+            continue
+        kind = {"video": "vod", "short": "short", "stream": "stream"}.get(
+            str(v.get("content_kind") or ""), "vod"
+        )
+        try:
+            archive_db.upsert_channel_video({
+                "platform": "youtube",
+                "video_id": vid,
+                "channel": str(v.get("channel") or handle),
+                "title": str(v.get("title") or ""),
+                "kind": kind,
+                "started_at": v.get("created_at"),
+                "duration_sec": v.get("duration"),
+                "duration_string": v.get("duration_string"),
+                "views": v.get("views"),
+                "thumbnail_url": v.get("thumbnail_url"),
+            })
+        except Exception as exc:
+            logger.debug("deep seed row failed for %s: %s", vid, exc)
+
+
+def _deep_set(job: dict, **fields: Any) -> None:
+    with _deep_jobs_lock:
+        job.update(fields)
+
+
+def _run_deep_job(job_id: str, handle: str, query: str) -> None:
+    """Sweep thread body: enumerate -> batch pre-skip -> cached matches ->
+    paced 2-way caption fetches -> write-through -> match. Per-video errors
+    skip+count; only a total enumeration failure errors the job."""
+    from services import yt_gate
+
+    with _deep_jobs_lock:
+        job = _deep_jobs.get(job_id)
+    if job is None:
+        return
+    cancel: threading.Event = job["cancel"]
+    results: list[dict] = []
+    counters = {"scanned": 0, "no_transcript": 0}
+    counters_lock = threading.Lock()
+
+    def _bump(scanned: int = 0, missing: int = 0) -> None:
+        """Counters are touched by both fetch workers — `+=` on a shared dict
+        is not atomic, so the update is serialised."""
+        with counters_lock:
+            counters["scanned"] += scanned
+            counters["no_transcript"] += missing
+
+    def _flush() -> None:
+        with counters_lock, _deep_jobs_lock:
+            job["scanned"] = counters["scanned"]
+            job["no_transcript"] = counters["no_transcript"]
+            job["results"] = list(results)
+
+    def _wait_gate() -> bool:
+        """Park while the IP-level bot gate is frozen. False = cancelled."""
+        while yt_gate.youtube_gate_active() and not cancel.is_set():
+            time.sleep(2.0)
+        return not cancel.is_set()
+
+    def _wait_pace() -> bool:
+        """Serialise fetch STARTS at >=_DEEP_MIN_GAP_S apart across ALL
+        sweeps (2 workers may overlap in flight, but YouTube never sees
+        back-to-back starts — even from a second concurrent job)."""
+        deadline = 0.0
+        with _deep_pace_lock:
+            now = time.monotonic()
+            start_at = max(now, _deep_pace["last"] + _DEEP_MIN_GAP_S)
+            _deep_pace["last"] = start_at
+            deadline = start_at
+        while time.monotonic() < deadline:
+            if cancel.is_set():
+                return False
+            time.sleep(0.1)
+        return not cancel.is_set()
+
+    def _add_result(v: dict, m: dict) -> None:
+        results.append({
+            "id": str(v.get("id") or ""),
+            "title": str(v.get("title") or ""),
+            "url": str(v.get("url") or f"https://www.youtube.com/watch?v={v.get('id')}"),
+            "date": (str(v.get("created_at") or "")[:10] or None),
+            "ts": m["ts"],
+            "snippet": m["snippet"],
+        })
+
+    try:
+        videos, truncated = _deep_enumerate(handle)
+        if cancel.is_set():
+            _deep_set(job, status="cancelled")
+            return
+        if not videos:
+            _deep_set(job, status="error", error="channel enumeration returned no videos")
+            return
+        with _deep_jobs_lock:
+            job["total"] = len(videos)
+            job["truncated"] = bool(truncated)
+        _deep_seed_video_rows(handle, videos)
+        ids = [str(v.get("id") or "") for v in videos]
+        covered, marked = _deep_covered_ids(ids)
+
+        # Pass 1 — cached transcripts: match straight from the DB, zero
+        # network. Marker-fresh videos are pre-skipped and counted.
+        to_fetch: list[dict] = []
+        for v in videos:
+            if cancel.is_set():
+                break
+            vid = str(v.get("id") or "")
+            if not vid:
+                continue
+            if vid in marked:
+                _bump(1, 1)
+                continue
+            if vid not in covered:
+                to_fetch.append(v)
+                continue
+            segments = [
+                (float(r.get("start_sec") or 0.0), str(r.get("text") or ""))
+                for r in archive_db.transcript_for("youtube", vid)
+            ]
+            _bump(1, 0 if segments else 1)
+            for m in _deep_match_segments(query, segments):
+                _add_result(v, m)
+        _flush()
+
+        # Pass 2 — the uncached tail: paced, 2-concurrent caption fetches.
+        def _handle_video(v: dict) -> None:
+            vid = str(v.get("id") or "")
+            if cancel.is_set() or not vid:
+                return
+            if not _wait_gate() or not _wait_pace():
+                return
+            try:
+                payload = _deep_fetch_transcript(vid)
+            except Exception as exc:
+                if yt_gate.classify_youtube_gate_error(exc):
+                    yt_gate.note_youtube_gate(str(exc)[:200])
+                    # The IP is gated — not this video. Do NOT stamp the
+                    # marker; park until the freeze lifts, then retry once.
+                    if _wait_gate() and _wait_pace():
+                        try:
+                            payload = _deep_fetch_transcript(vid)
+                        except Exception as exc2:
+                            logger.debug("deep fetch retry failed %s: %s", vid, exc2)
+                            if yt_gate.classify_youtube_gate_error(exc2):
+                                # STILL gated — this is IP state, not a
+                                # verdict about the video. Do not poison it
+                                # with a 24h marker; leave it for a later
+                                # sweep (the freeze is recorded instead).
+                                yt_gate.note_youtube_gate(str(exc2)[:200])
+                                _bump(1, 0)
+                                _flush()
+                                return
+                            _bump(1, 1)
+                            archive_db.mark_captions_unavailable("youtube", vid)
+                            _flush()
+                            return
+                    else:
+                        return
+                else:
+                    logger.debug("deep fetch failed %s: %s", vid, exc)
+                    # Failed fetches get the same negative marker as
+                    # no-captions verdicts — a re-sweep must pre-skip them
+                    # (marker expiry re-tests them after a day).
+                    _bump(1, 1)
+                    archive_db.mark_captions_unavailable("youtube", vid)
+                    _flush()
+                    return
+            segments = _deep_store_transcript(vid, payload)
+            _bump(1, 0 if segments else 1)
+            _flush()
+            if segments:
+                archive_db.clear_captions_unavailable("youtube", vid)
+            else:
+                archive_db.mark_captions_unavailable("youtube", vid)
+            for m in _deep_match_segments(query, segments):
+                _add_result(v, m)
+
+        with ThreadPoolExecutor(max_workers=_DEEP_FETCH_CONCURRENCY) as pool:
+            futures = [pool.submit(_handle_video, v) for v in to_fetch]
+            for f in futures:
+                try:
+                    f.result()
+                except Exception as exc:
+                    logger.debug("deep worker video failed: %s", exc)
+                if cancel.is_set():
+                    break
+        _flush()
+        if cancel.is_set():
+            _deep_set(job, status="cancelled")
+        else:
+            _deep_set(job, status="done")
+    except Exception as exc:
+        logger.warning("deep search job %s failed: %s", job_id, exc)
+        _flush()
+        _deep_set(job, status="error", error=str(exc)[:300])
+
+
+class DeepSearchRequest(BaseModel):
+    channel: str
+    query: str
+
+
+def _deep_prune_locked() -> None:
+    """Keep at most _DEEP_JOB_CAP jobs — oldest FINISHED first (never evict
+    a running sweep)."""
+    if len(_deep_jobs) <= _DEEP_JOB_CAP:
+        return
+    finished = sorted(
+        (jid for jid, j in _deep_jobs.items() if j["status"] != "running"),
+        key=lambda jid: _deep_jobs[jid]["started_at"],
+    )
+    for jid in finished[: max(0, len(_deep_jobs) - _DEEP_JOB_CAP)]:
+        _deep_jobs.pop(jid, None)
+
+
+def _deep_handle_norm(handle: str) -> str:
+    """Normalization used to key one-channel-per-run dedupe: case- and
+    @-insensitive ('@Whindersson' == 'whindersson')."""
+    return str(handle or "").strip().lstrip("@").casefold()
+
+
+def _deep_running_count_locked() -> int:
+    return sum(1 for j in _deep_jobs.values() if j["status"] == "running")
+
+
+@router.post("/api/archive/search/deep")
+async def archive_search_deep_start(body: DeepSearchRequest):
+    """Start a deep transcript sweep for one channel; returns {job_id}."""
+    from deps import settings_mgr  # lazy: keeps routers.archive import-light
+
+    channel = str(body.channel or "").strip()
+    query = str(body.query or "").strip()
+    if not channel:
+        raise HTTPException(status_code=400, detail="channel is required")
+    if len(query) < 2:
+        raise HTTPException(status_code=400, detail="query needs at least 2 characters")
+
+    handle: Optional[str] = None
+    try:
+        saved = settings_mgr.get().saved_channels or []
+    except Exception:
+        saved = []
+    target = channel.lower()
+    for entry in saved:
+        if not isinstance(entry, dict):
+            continue
+        slugs = [str(entry.get(k) or "").strip() for k in ("kickSlug", "twitchSlug", "youtubeSlug")]
+        if any(s.lower() == target for s in slugs if s):
+            handle = str(entry.get("youtubeSlug") or "").strip() or None
+            break
+    if not handle:
+        # Not a saved channel (or the FE sent a raw handle) — sweep the
+        # string as a YouTube handle/@handle directly.
+        handle = channel
+
+    norm = _deep_handle_norm(handle)
+    job_id = uuid.uuid4().hex
+    job = {
+        "status": "running",
+        "error": None,
+        "scanned": 0,
+        "total": 0,
+        "no_transcript": 0,
+        "truncated": False,
+        "results": [],
+        "cancel": threading.Event(),
+        "started_at": time.monotonic(),
+        "handle_norm": norm,
+    }
+    with _deep_jobs_lock:
+        # One sweep per channel: a second POST for a handle that already
+        # has a RUNNING sweep joins it instead of piling a duplicate
+        # download (the sweep matches every cached transcript anyway, so
+        # the running job will serve this query too).
+        for jid, existing in _deep_jobs.items():
+            if existing["status"] == "running" and existing.get("handle_norm") == norm:
+                return {"job_id": jid, "joined": True}
+        # Global cap: concurrent sweeps across DIFFERENT channels are
+        # still bounded (bot-gate discipline; pace is shared anyway).
+        if _deep_running_count_locked() >= _DEEP_RUNNING_CAP:
+            raise HTTPException(
+                status_code=409,
+                detail="deep search capacity reached — cancel a running sweep first",
+            )
+        _deep_jobs[job_id] = job
+        _deep_prune_locked()
+    threading.Thread(
+        target=_run_deep_job, args=(job_id, handle, query), daemon=True,
+        name=f"deep-search-{job_id[:8]}",
+    ).start()
+    return {"job_id": job_id}
+
+
+@router.get("/api/archive/search/deep/{job_id}")
+async def archive_search_deep_status(job_id: str):
+    """Progress + results for a deep sweep (FE polls this every ~2s)."""
+    with _deep_jobs_lock:
+        job = _deep_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown deep search job")
+        snapshot = {
+            "status": job["status"],
+            "scanned": job["scanned"],
+            "total": job["total"],
+            "no_transcript": job["no_transcript"],
+            "truncated": job["truncated"],
+            "results": list(job["results"]),
+            "error": job["error"],
+        }
+    return snapshot
+
+
+@router.post("/api/archive/search/deep/{job_id}/cancel")
+async def archive_search_deep_cancel(job_id: str):
+    """Ask a running sweep to stop; terminal jobs answer ok too (no-op)."""
+    with _deep_jobs_lock:
+        job = _deep_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown deep search job")
+        job["cancel"].set()
+    return {"ok": True}
