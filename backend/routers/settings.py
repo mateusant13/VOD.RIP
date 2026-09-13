@@ -126,7 +126,9 @@ def _load_settings_with_reconcile() -> AppSettings:
             settings = settings.model_copy(update={
                 "saved_channels": saved + missing,
             })
-            settings_mgr.save(settings)
+            # save() is a CAS merge — return its result, not the local
+            # pre-merge view, so GET answers with what actually stuck on disk.
+            settings = settings_mgr.save(settings)
             # New channels: kick live detection so LIVE badges show within
             # seconds instead of waiting for the frontend poll cycle.
             try:
@@ -398,7 +400,11 @@ def _apply_settings_update(update: SettingsUpdate) -> AppSettings:
             current.features = cur
         except Exception:
             current.features = dict(update.features or {})
-    settings_mgr.save(current)
+    # save() is a CAS merge: what landed on disk may carry a key a concurrent
+    # writer committed (see services/settings.py). Return that, not the local
+    # pre-merge view, so the AppSettings response reports what is actually
+    # persisted — otherwise the client's next read disagrees with this reply.
+    current = settings_mgr.save(current)
     download_mgr.apply_settings(settings_mgr)
     return current
 

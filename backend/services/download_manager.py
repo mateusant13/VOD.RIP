@@ -115,6 +115,14 @@ class DownloadManager:
         self._cleanup_info: Dict[str, dict] = {}
         self._worker_params: Dict[str, dict] = {}
         self._sse_queues: Dict[str, list] = {}
+        # Guards the executor OBJECT: read at every submit, replaced by
+        # set_max_workers. Deliberately separate from `self._lock`, which
+        # protects the download state maps and is held across sqlite calls —
+        # merging the two would put those maps behind a pool shutdown, and any
+        # lock held across a `busy_timeout` spin is the event-loop wedge this
+        # repo just fixed (23c600f9). Only in-memory work happens under it
+        # (queue put + thread spawn + flag set), so it never blocks meaningfully.
+        self._executor_lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._lock = threading.Lock()
         # Persistent history + queue — loaded on construction so the queue
@@ -746,7 +754,27 @@ class DownloadManager:
                     self._db.record_history(final_state)
 
         _start_stall_watchdog()
-        self._executor.submit(_download_worker)
+        self._submit(_download_worker)
+
+    def _submit(self, fn: Callable[[], None]) -> None:
+        """Schedule `fn` on whichever pool is current.
+
+        `set_max_workers` replaces the pool (changing download_threads in
+        Settings does exactly that, from a worker thread —
+        `routers/settings.py::update_settings`) while download/resume/remove
+         submit from others. Reading `self._executor` and submitting are two
+        steps, so an unsynchronised submit can grab the pool a nanosecond
+        after it was shut down and raise
+        `RuntimeError: cannot schedule new futures after shutdown` — which for
+        `_spawn_worker` means a queued download that never starts (and a 500).
+        Holding `_executor_lock` across the read+submit closes that window;
+        the swap path takes the same lock, and both bodies are pure in-memory
+        work (`submit` only queues + maybe spawns a thread; `shutdown
+        (wait=False)` does not join), so neither can block on sqlite or a
+        download.
+        """
+        with self._executor_lock:
+            self._executor.submit(fn)
 
     def pause(self, download_id: str) -> bool:
         abort_fns: List[Callable[[], None]] = []
@@ -1152,8 +1180,12 @@ class DownloadManager:
                 logger.warning("background delete failed for %s: %s", output_file, exc)
 
         try:
-            self._executor.submit(_run)
+            self._submit(_run)
         except RuntimeError:
+            # _submit takes the swap lock, so "pool shut down under us" can no
+            # longer happen; this now only covers a pool that cannot spawn a
+            # thread at all. Deleting the user's file synchronously is still
+            # better than silently leaving it behind.
             _run()
 
     def unregister_sse(self, download_id: str, queue):
@@ -1192,10 +1224,31 @@ class DownloadManager:
         return True
 
     def set_max_workers(self, max_workers: int) -> None:
+        """Resize the download pool (Settings > download_threads).
+
+        Compare-shutdown-rebind is three steps on shared state, so it runs
+        under the same `_executor_lock` `_submit` holds across read+submit:
+        without that, a submit could pick up the pool between `shutdown()`
+        and the rebind and raise `RuntimeError: cannot schedule new futures
+        after shutdown`. In-flight downloads keep finishing on the old pool —
+        `shutdown(wait=False)` does not join and must not: joining here would
+        block the settings request for the length of a video. Only the next
+        download uses the new width.
+
+        Note the read of `_max_workers` (a CPython private) is now under the
+        lock too, so the compare cannot race a concurrent swap.
+        """
         max_workers = max(1, min(16, int(max_workers)))
-        if max_workers != self._executor._max_workers:
-            self._executor.shutdown(wait=False)
+        with self._executor_lock:
+            if max_workers == self._executor._max_workers:
+                return
+            old = self._executor
             self._executor = ThreadPoolExecutor(max_workers=max_workers)
+            # Rebound BEFORE shutting the old pool down: any submit that
+            # already read `self._executor` is holding this lock and will
+            # finish first, and anything arriving later sees the new pool, so
+            # there is no window where the only live reference is dead.
+            old.shutdown(wait=False)
 
     def apply_settings(self, settings_mgr: "SettingsManager") -> None:
         self.set_max_workers(settings_mgr.get().download_threads)

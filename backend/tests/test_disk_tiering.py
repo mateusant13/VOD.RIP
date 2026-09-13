@@ -315,6 +315,9 @@ async def test_settings_route_persists_data_dir(client):
 
         def save(self, settings):
             self.saved = settings
+            # Real save() is a CAS merge and returns what actually persisted;
+            # the router feeds that back into the response.
+            return settings
 
     mgr = FakeMgr()
     # The route uses module-level names bound at import (from deps import

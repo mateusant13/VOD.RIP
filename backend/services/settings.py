@@ -73,26 +73,94 @@ class SettingsManager:
         if not self._settings_file.exists():
             self.save(self._settings)
 
+    def _normalize_loaded(self, data: dict) -> AppSettings:
+        """Build an AppSettings from a raw settings.json payload.
+
+        Shared by `_load()` (first read at import) and `_read_disk_settings()`
+        (the merge read inside save()) so both agree on what "the file says" —
+        same legacy defaults, same derived key flag, no phantom diffs.
+        """
+        if "download_folder_confirmed" not in data:
+            data["download_folder_confirmed"] = bool(
+                (data.get("download_folder") or "").strip()
+            )
+        if "video_encoder" not in data:
+            data["video_encoder"] = "auto"
+        settings = AppSettings(**data)
+        # The write-only key flag is derived from the actual key — never trust
+        # a stale persisted copy.
+        settings.ai_api_key_set = bool(settings.ai_api_key)
+        return settings
+
     def _load(self) -> AppSettings:
+        settings = None
         try:
             if self._settings_file.exists():
-                data = json.loads(self._settings_file.read_text(encoding="utf-8"))
-                if "download_folder_confirmed" not in data:
-                    data["download_folder_confirmed"] = bool(
-                        (data.get("download_folder") or "").strip()
-                    )
-                if "video_encoder" not in data:
-                    data["video_encoder"] = "auto"
-                settings = AppSettings(**data)
-                # The write-only key flag is derived from the actual key —
-                # never trust a stale persisted copy.
-                settings.ai_api_key_set = bool(settings.ai_api_key)
-                return settings
+                settings = self._normalize_loaded(
+                    json.loads(self._settings_file.read_text(encoding="utf-8"))
+                )
         except Exception:
-        # ponytail: best-effort — return AppSettings(**data)
-            pass
-        settings = AppSettings()
+        # ponytail: best-effort — fall back to defaults rather than crash boot
+            settings = None
+        if settings is None:
+            settings = AppSettings()
+        # Give the freshly-read state its own baseline: `get()` copies this
+        # object and `model_copy()` carries private attrs forward, so the
+        # first save after boot is already a three-way merge instead of a
+        # blind wholesale write. That matters for the second SettingsManager
+        # instance (`services/app_lifecycle.py`) — its `_load()` snapshot is
+        # the only thing telling its save which keys another writer committed
+        # since. Stamped here, not in `_normalize_loaded`, because the merge
+        # read inside save() also uses that helper and needs no baseline.
+        settings._vodrip_base = settings.model_copy(deep=True)
         return settings
+
+    def _read_disk_settings(self) -> Optional[AppSettings]:
+        """Strict read of settings.json for the merge pass in save().
+
+        Unlike `_load()` this NEVER swallows a parse/validation error into a
+        default object: a defaults-shaped object would look like "another
+        writer reset everything" and the merge would happily revert real user
+        settings. Returns None when the file is absent or unreadable, which
+        tells save() to write the caller's payload wholesale (there is no disk
+        state to preserve).
+
+        Plain file IO only — no sqlite, no archive_db lock, no network. That
+        is what makes it safe to call this under `self._lock` (see save()).
+        """
+        try:
+            if not self._settings_file.exists():
+                return None
+            return self._normalize_loaded(
+                json.loads(self._settings_file.read_text(encoding="utf-8"))
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _three_way_merge(
+        settings: AppSettings, disk: AppSettings
+    ) -> AppSettings:
+        """Layer on-disk commits the payload never touched back onto it.
+
+        Pure given (payload, disk, payload._vodrip_base); does no IO and takes
+        no lock, so it is directly testable. Returns `settings` unchanged (no
+        copy) when there is nothing to restore.
+        """
+        base = settings._vodrip_base
+        if base is None:
+            # No provenance → nothing can be attributed to a third writer →
+            # today's wholesale write.
+            return settings
+        restored = {
+            key: getattr(disk, key)
+            for key in type(settings).model_fields
+            if getattr(settings, key) == getattr(base, key)
+            and getattr(disk, key) != getattr(base, key)
+        }
+        if not restored:
+            return settings
+        return settings.model_copy(update=restored)
 
     def _autofill_ffmpeg_if_needed(self) -> None:
         """Detect ffmpeg once under lock; persist via atomic save."""
@@ -119,9 +187,68 @@ class SettingsManager:
             self._autofill_ffmpeg_if_needed()
             return self._settings.model_copy()
 
-    def save(self, settings: AppSettings):
+    def save(self, settings: AppSettings) -> AppSettings:
+        """Persist `settings` with last-writer-per-KEY semantics (CAS merge).
+
+        The old shape of this method was a wholesale replace of the file with
+        whatever object the caller held, and every caller builds that object by
+        read-modify-write (`get()` → set one field → `save()`). Two such
+        writers on different threads therefore lose one of them: `POST
+        /api/settings` changes field X, the cookie-bridge toggle changes field
+        Y, and whichever lands second reverts the first — for whole-object
+        fields like `features` or `saved_channels` the reverted entry never
+        comes back (P2 from the 23c600f9 review).
+
+        So this is a three-way merge against the state the caller read from:
+          * caller changed the key (payload != base)       → payload wins,
+            i.e. a genuine edit is still last-writer-wins;
+          * someone else committed the key (disk != base,
+            payload == base)                               → disk wins, so a
+            write never clobbers a field it never touched;
+          * nobody touched it                              → unchanged.
+
+        `base` (see `AppSettings._vodrip_base`) is the snapshot this payload
+        was derived from, and it rides on the object, NOT on the manager: a
+        writer's read and its save are separated by arbitrary work —
+        `routers/settings.py::_apply_settings_update` does sqlite writes with a
+        10 s busy_timeout between `get()` and `save()` — so any manager-level
+        "last known state" would be re-attributed to whichever writer happened
+        to commit in between. A payload with no provenance (hand-built object,
+        `__init__` seeding the file) keeps the old wholesale behaviour and
+        restores nothing.
+
+        Locking: `self._lock` is an RLock (`get()` →
+        `_autofill_ffmpeg_if_needed()` → `save()` re-enters) and is held across
+        the read + merge + atomic write below. That is deliberately the only IO
+        it spans — plain JSON file ops on a small file. NEVER widen it to
+        sqlite or to `archive_db._lock`: holding any lock across a
+        `busy_timeout` spin re-creates the event-loop wedge that 23c600f9 just
+        removed, and the CAS must stay file-level for exactly that reason.
+
+        Returns the object actually written (the merged result), so a caller
+        that cares can read back what stuck.
+        """
         with self._lock:
-            self._settings = settings
+            disk = self._read_disk_settings()
+            merged = settings
+            if disk is not None:
+                merged = self._three_way_merge(settings, disk)
+                # ai_api_key_set is derived from the key, never authored —
+                # recompute so a restored key can't desync its own flag.
+                merged.ai_api_key_set = bool(merged.ai_api_key)
+            # Baseline for this writer's NEXT save. It has to be a DEEP copy:
+            # it is what the merge diffs against, and a caller may mutate a
+            # nested container in place (`s = get(); s.features["x"] = True;
+            # save(s)`). Shallow-aliased, that edit would read as "unchanged"
+            # (payload == base) and another writer's value would revert it.
+            # The previous generation is detached FIRST because deep copy
+            # recurses through `_vodrip_base`: without the reset every save
+            # would chain one level deeper (window-geometry saves are frequent),
+            # leaking memory and making each copy slower.
+            merged._vodrip_base = None
+            snapshot = merged.model_copy(deep=True)
+            merged._vodrip_base = snapshot
+            self._settings = merged
             self._settings_dir.mkdir(parents=True, exist_ok=True)
             # Atomic write: write to temp file, then replace to avoid corruption
             tmp = None
@@ -132,7 +259,7 @@ class SettingsManager:
                     suffix=".tmp",
                 )
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(settings.model_dump_json(indent=2))
+                    f.write(merged.model_dump_json(indent=2))
                 os.replace(tmp_path, str(self._settings_file))
                 tmp = tmp_path
             finally:
@@ -163,6 +290,7 @@ class SettingsManager:
                 pass  # best-effort — invalidation must never break a save
             # One fresh ffmpeg probe re-armed per explicit save.
             self._ffmpeg_probe_failed = False
+            return merged
 
 
 # --- recommended resource defaults (Settings > Recommended) -----------------

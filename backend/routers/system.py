@@ -152,20 +152,26 @@ async def health():
             activity_age = archive_db.worker_heartbeat_age("app-activity")
         except Exception:
             activity_age = None
-        return pending, worker, background, activity_age
+        try:
+            # SUBS_PO_TOKEN_POLICY monitor (event-driven; see youtube_diag).
+            # A rollout of the subtitles PO-Token policy silently discards
+            # caption tracks, so supervisors need a greppable 'is it firing
+            # yet' signal — last sighting + count in the trailing hour.
+            # Best-effort like the rest of health: a hiccup degrades to None,
+            # never a 500.
+            # Off-loop for the same reason as the sqlite reads above: the
+            # FIRST call rehydrates the ring from the pot-policy JSONL
+            # (services/youtube_diag._pot_rehydrate), which is a real file
+            # read + parse of a growing log; on an already-loaded box that
+            # is exactly the kind of blocking IO the 23c600f9 pass moved.
+            from services.youtube_diag import subs_pot_policy_status
 
-    pending, worker, background, activity_age = await asyncio.to_thread(_probe)
-    try:
-        # SUBS_PO_TOKEN_POLICY monitor (event-driven; see youtube_diag). A
-        # rollout of the subtitles PO-Token policy silently discards caption
-        # tracks, so supervisors need a greppable 'is it firing yet' signal —
-        # last sighting + count in the trailing hour. Best-effort like the
-        # rest of health: a hiccup degrades to None, never a 500.
-        from services.youtube_diag import subs_pot_policy_status
+            subs_pot = subs_pot_policy_status()
+        except Exception:
+            subs_pot = None
+        return pending, worker, background, activity_age, subs_pot
 
-        subs_pot = subs_pot_policy_status()
-    except Exception:
-        subs_pot = None
+    pending, worker, background, activity_age, subs_pot = await asyncio.to_thread(_probe)
     return {
         "ok": True,
         "name": "VOD.RIP",

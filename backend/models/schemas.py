@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 from typing import Any, Dict, Optional, List
 from pathlib import Path
 
@@ -181,6 +181,17 @@ class AppSettings(BaseModel):
         "when_minimized": "normal",
         "when_closed": "normal",
     })
+    # --- persistence provenance (not a setting; never serialized) ----------
+    # SettingsManager.save() is a compare-and-swap merge (see
+    # services/settings.py): to tell "another writer committed key K since I
+    # read" apart from "the CALLER changed key K", a save needs the exact
+    # state its payload was read from. That baseline rides on the object
+    # itself, because the read and the write are separated by arbitrary work
+    # (sqlite busy_timeout) and a manager-level "last known" cannot be
+    # attributed to a writer. model_copy() carries private attrs forward, so
+    # get() -> mutate -> save() preserves provenance with no signature change
+    # at any of the 13 call sites.
+    _vodrip_base: Any = PrivateAttr(default=None)
 
 class SettingsUpdate(BaseModel):
     download_folder: Optional[str] = None
