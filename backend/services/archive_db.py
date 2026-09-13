@@ -3955,16 +3955,37 @@ def _tok_eq(a: str, b: str) -> bool:
 
 
 def _kind_match_sql(kinds: list[str], want_yt_video: bool, video: str) -> tuple[Optional[str], list[str]]:
-    """SQL for videos.kind, plus virtual kind=video (YouTube long-form, not shorts)."""
+    """SQL for videos.kind, plus virtual kind=video (YouTube long-form uploads).
+
+    The virtual 'video' kind is NOT one stored kind: a YouTube /videos-tab
+    upload reaches the index as kind='vod' on the deep-sweep path (routers/
+    archive.py maps content_kind 'video' -> 'vod') or as literal kind='video'
+    on the channel-index path (routers/channels.py), which is exactly why the
+    chip has to be virtual (neither value alone is a plain equality). It
+    therefore means 'this row is a YouTube upload that is not a short/clip and not a
+    broadcast' — live and stream must be excluded alongside short and clip,
+    or recorded broadcasts surface under a chip the owner reads as the
+    Videos tab. Non-YouTube rows never qualify: 'vod' on Twitch/Kick is a
+    recorded broadcast, not a YouTube upload. The virtual token is therefore
+    stripped from the stored-kind IN() list as well — 'video' is not a kind
+    any pass may match platform-agnostically (the plain list is also what
+    _semantic_search reads to decide whether a scope filter exists)."""
     col = f"{video}.kind" if video else "kind"
     plat = f"{video}.platform" if video else "platform"
     clauses: list[str] = []
     params: list[str] = []
-    if kinds:
-        clauses.append(f"{col} IN ({','.join('?' * len(kinds))})")
-        params.extend(kinds)
-    if want_yt_video:
-        clauses.append(f"({plat} = 'youtube' AND {col} NOT IN ('short', 'clip'))")
+    stored = [k for k in kinds if k != "video"]
+    if stored:
+        clauses.append(f"{col} IN ({','.join('?' * len(stored))})")
+        params.extend(stored)
+    # The virtual token in `kinds` carries the same meaning as the flag:
+    # accepting either makes it impossible to strip the token and end up
+    # with no kind predicate at all.
+    if want_yt_video or "video" in kinds:
+        clauses.append(
+            f"({plat} = 'youtube' AND {col} NOT IN "
+            "('short', 'clip', 'live', 'stream'))"
+        )
     if not clauses:
         return None, []
     if len(clauses) == 1:
