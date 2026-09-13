@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import ArchiveSearchPopup from './ArchiveSearchPopup';
+import ArchiveSearchPopup, { deepPollIsTerminal } from './ArchiveSearchPopup';
+import { ApiError } from '../hooks/useApiClient';
 import { todayIso } from '../archiveSearchUtils';
 import { setLanguage } from '../i18n';
 import type { SavedChannel } from '../types';
@@ -35,6 +36,7 @@ function mockFetch(
     const url = String(input);
     if (url.includes('/api/archive/search/deep')) {
       const body = typeof deep === 'function' ? (deep as (u: string) => unknown)(url) : deep ?? { job_id: 'job-1' };
+      if (body instanceof Response) return body; // deep handlers may fake non-200 HTTP
       return new Response(JSON.stringify(body), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
@@ -1770,5 +1772,111 @@ describe('ArchiveSearchPopup deep transcript search', () => {
     });
     expect(polls).toBe(pollsAfterCancel);
     vi.useRealTimers();
+  });
+
+  it('transient poll failure (500) keeps the job: banner shows, next healthy poll clears it and progress advances', async () => {
+    let statusPolls = 0;
+    const fetchMock = mockFetch([], {}, { hits: [], error: null }, (url: string) => {
+      if (url.includes('/cancel')) return { ok: true };
+      if (url.includes('/api/archive/search/deep/job-1')) {
+        statusPolls += 1;
+        if (statusPolls === 2) {
+          return new Response(JSON.stringify({ detail: 'internal error' }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return {
+          status: 'running',
+          scanned: Math.min(statusPolls, 2),
+          total: 3,
+          no_transcript: 0,
+          truncated: false,
+          results: [],
+        };
+      }
+      return { job_id: 'job-1' };
+    });
+    await openWithQuery(fetchMock);
+    fireEvent.change(screen.getByRole('textbox', { name: /Type confirmar to enable/i }), {
+      target: { value: 'confirmar' },
+    });
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+
+    vi.useFakeTimers();
+    await act(async () => {
+      fireEvent.click(startBtn());
+      await vi.advanceTimersByTimeAsync(0); // POST -> poll 1 (running 1/3)
+    });
+    expect(screen.getByText(/Scanning 1 \/ 3/)).toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000); // poll 2 -> HTTP 500
+    });
+    // Honest cause surfaces (500 maps to the dev backend hint), job survives.
+    expect(screen.getByText(/Backend not running/)).toBeInTheDocument();
+    expect(screen.getByText(/Scanning 1 \/ 3/)).toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000); // poll 3 healthy -> banner retires
+    });
+    expect(screen.getByText(/Scanning 2 \/ 3/)).toBeInTheDocument();
+    expect(screen.queryByText(/Backend not running/)).toBeNull();
+    vi.useRealTimers();
+  });
+
+  it('404 (job gone after backend restart) is terminal: banner shows the backend detail and polling stops', async () => {
+    let statusPolls = 0;
+    const fetchMock = mockFetch([], {}, { hits: [], error: null }, (url: string) => {
+      if (url.includes('/cancel')) return { ok: true };
+      if (url.includes('/api/archive/search/deep/job-1')) {
+        statusPolls += 1;
+        if (statusPolls === 2) {
+          return new Response(JSON.stringify({ detail: 'unknown deep search job' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return { status: 'running', scanned: 1, total: 3, no_transcript: 0, truncated: false, results: [] };
+      }
+      return { job_id: 'job-1' };
+    });
+    await openWithQuery(fetchMock);
+    fireEvent.change(screen.getByRole('textbox', { name: /Type confirmar to enable/i }), {
+      target: { value: 'confirmar' },
+    });
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+
+    vi.useFakeTimers();
+    await act(async () => {
+      fireEvent.click(startBtn());
+      await vi.advanceTimersByTimeAsync(0); // POST -> poll 1 (running)
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000); // poll 2 -> 404: job gone
+    });
+    expect(screen.getByText('unknown deep search job')).toBeInTheDocument();
+    // No zombie polling: the id was cleared, so the interval is gone.
+    const pollsAfterGone = statusPolls;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6000);
+    });
+    expect(statusPolls).toBe(pollsAfterGone);
+    vi.useRealTimers();
+  });
+});
+
+describe('deepPollIsTerminal', () => {
+  it('404/410 (job gone — backend restart or prune) is terminal: stop polling', () => {
+    expect(deepPollIsTerminal(new ApiError('Deep search job not found', 404))).toBe(true);
+    expect(deepPollIsTerminal(new ApiError('Gone', 410))).toBe(true);
+  });
+  it('other HTTP statuses are transient: keep deepJobId for the interval retry', () => {
+    expect(deepPollIsTerminal(new ApiError('boom', 500))).toBe(false);
+    expect(deepPollIsTerminal(new ApiError('rate limited', 429))).toBe(false);
+  });
+  it('plain Error (network/timeout hint from apiFetch) is transient', () => {
+    expect(deepPollIsTerminal(new Error('API not reachable. Quit VOD.RIP from the tray and reopen the app.'))).toBe(false);
+    expect(deepPollIsTerminal('not even an error')).toBe(false);
   });
 });

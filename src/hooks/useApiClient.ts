@@ -67,6 +67,17 @@ function apiErrorMessage(res: Response, fallback: string, path?: string): string
   return fallback;
 }
 
+/** HTTP failure from apiGet/apiPost/apiDelete: the honest apiErrorMessage text
+ *  plus the status code, so callers can tell a terminal 404/410 (resource
+ *  gone) from a transient blip. Network/timeout throws stay plain Error. */
+export class ApiError extends Error {
+  readonly status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
 async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
   let lastErr: unknown;
   // Retry network failures and our own timeout, but never retry a caller's
@@ -102,9 +113,13 @@ export async function apiGet<T>(path: string): Promise<T> {
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     const detail = formatApiDetail(err.detail) || `HTTP ${res.status}`;
-    throw new Error(apiErrorMessage(res, detail, path));
+    throw new ApiError(apiErrorMessage(res, detail, path), res.status);
   }
-  return res.json();
+  // A 2xx with a non-JSON body (dead proxy / stale dir serving HTML) must not
+  // leak a raw SyntaxError into the 13 surfaced caller catches.
+  return res.json().catch(() => {
+    throw new ApiError('Invalid JSON response from backend — check it is running and not proxied', res.status);
+  });
 }
 
 export async function apiPost<T>(path: string, body: unknown, init?: RequestInit): Promise<T> {
@@ -117,9 +132,11 @@ export async function apiPost<T>(path: string, body: unknown, init?: RequestInit
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     const detail = formatApiDetail(err.detail) || `HTTP ${res.status}`;
-    throw new Error(apiErrorMessage(res, detail, path));
+    throw new ApiError(apiErrorMessage(res, detail, path), res.status);
   }
-  return res.json();
+  return res.json().catch(() => {
+    throw new ApiError('Invalid JSON response from backend — check it is running and not proxied', res.status);
+  });
 }
 
 export async function apiDelete<T = void>(path: string, body?: unknown): Promise<T> {
@@ -131,7 +148,11 @@ export async function apiDelete<T = void>(path: string, body?: unknown): Promise
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     const detail = formatApiDetail(err.detail) || `HTTP ${res.status}`;
-    throw new Error(apiErrorMessage(res, detail));
+    throw new ApiError(apiErrorMessage(res, detail), res.status);
   }
-  return body !== undefined ? (res.json() as Promise<T>) : (undefined as T);
+  return body !== undefined
+    ? (res.json() as Promise<T>).catch(() => {
+        throw new ApiError('Invalid JSON response from backend — check it is running and not proxied', res.status);
+      })
+    : (undefined as T);
 }

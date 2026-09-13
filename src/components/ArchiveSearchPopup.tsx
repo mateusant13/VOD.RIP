@@ -12,7 +12,7 @@
  */
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ExternalLink, FileText, Loader2, MessageSquare, RefreshCw, Search, X } from 'lucide-react';
-import { apiGet, apiPost } from '../hooks/useApiClient';
+import { ApiError, apiGet, apiPost } from '../hooks/useApiClient';
 import {
   EXPLORE_PANEL_BOX_MIN_H,
   EXPLORE_PANEL_BOX_MIN_W,
@@ -159,6 +159,14 @@ const PLATFORM_ICON_NAME: Record<string, string> = {
   twitch: 'Twitch',
   kick: 'Kick',
 };
+
+/** Deep-poll failure classification: an HTTP 404/410 means the job is GONE
+ *  server-side (in-memory _deep_jobs — backend restart or prune), so polling
+ *  it again can never succeed. Anything else (transport blip, 5xx, timeout)
+ *  is transient — keep the job id and let the interval retry. */
+export function deepPollIsTerminal(err: unknown): boolean {
+  return err instanceof ApiError && (err.status === 404 || err.status === 410);
+}
 
 function videoTitle(video: ArchiveVideoRow | undefined, hit: ArchiveSearchHit): string {
   // WS-4: prefer the original (non-auto-translated) YouTube title when the
@@ -592,10 +600,10 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
         setChannelHint(res.channel_hint ?? null);
         setStatus('done');
       })
-      .catch(() => {
+      .catch((err: unknown) => {
         if (!mountedRef.current || gen !== searchGenRef.current) return;
         setHits([]);
-        setError(t('Archive search is unavailable — is the backend running?'));
+        setError(err instanceof Error ? err.message : t('Archive search is unavailable — is the backend running?'));
         setStatus('error');
       });
   }, [query, channelFilter, platformFilter, kindFilter, dateFrom, dateTo, retryTick, sourceFilter, scopeActive, scopeVideoId, everyDay, langFilter, hintDisabled, searchMode, userFilter]);
@@ -627,10 +635,10 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
         setRemoteError(res.error ?? null);
         setRemoteStatus('done');
       })
-      .catch(() => {
+      .catch((err: unknown) => {
         if (!mountedRef.current || gen !== remoteGenRef.current) return;
         setRemoteHits([]);
-        setRemoteError(t('YouTube search unavailable'));
+        setRemoteError(err instanceof Error ? err.message : t('YouTube search unavailable'));
         setRemoteStatus('error');
       });
   }, [query, scopeActive, sourceFilter, platformFilter, kindFilter, remoteYtHandle]);
@@ -647,12 +655,19 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
         const res = await apiGet<DeepJobStatus>(`/api/archive/search/deep/${deepJobId}`);
         if (!alive || !mountedRef.current || deepJobIdRef.current !== deepJobId) return;
         setDeepJob(res);
+        // A healthy poll retires the transient-blip banner: with retention the
+        // job id survives the failure, so without this the red line would sit
+        // over live progress and the done summary forever.
+        setDeepError(null);
         if (res.status === 'error') setDeepError(res.error ?? t('Deep search failed'));
         if (res.status !== 'running') setDeepJobId(null);
-      } catch {
+      } catch (err: unknown) {
         if (!alive || !mountedRef.current) return;
-        setDeepError(t('Deep search unavailable — is the backend running?'));
-        setDeepJobId(null);
+        // Transport blip → keep deepJobId (the sweep runs server-side and the
+        // 2s interval re-polls); but 404/410 = job gone (backend restart or
+        // in-memory-job prune) → stop polling a dead id, clear the job.
+        setDeepError(err instanceof Error ? err.message : t('Deep search unavailable — is the backend running?'));
+        if (deepPollIsTerminal(err)) setDeepJobId(null);
       }
     };
     void tick();
@@ -681,8 +696,8 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
         query: query.trim(),
       });
       if (mountedRef.current) setDeepJobId(res.job_id);
-    } catch {
-      if (mountedRef.current) setDeepError(t('Deep search unavailable — is the backend running?'));
+    } catch (err: unknown) {
+      if (mountedRef.current) setDeepError(err instanceof Error ? err.message : t('Deep search unavailable — is the backend running?'));
     } finally {
       deepStartingRef.current = false;
       if (mountedRef.current) setDeepStarting(false);

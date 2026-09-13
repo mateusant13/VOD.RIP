@@ -1008,6 +1008,8 @@ export default function App() {
   /** True after saved channels were hydrated once (localStorage wins over API). */
   const channelsHydratedRef = useRef(false);
   const channelUiPersistReadyRef = useRef(false);
+  /** One-shot guard so a failed initial /api/settings schedules exactly one retry. */
+  const settingsRetryScheduledRef = useRef(false);
   const [pickingFolder, setPickingFolder] = useState(false);
   const initialChannelUi = useMemo(() => loadStoredChannelUi(), []);
   // Platform filter for channel browsing — persisted in settings + localStorage.
@@ -1531,9 +1533,9 @@ export default function App() {
           );
           if (resumePlay)
             void video.play().then(() => setPreviewPlaying(true)).catch(() => {});
-        }).catch(() => {
+        }).catch((err: unknown) => {
           if (seekId === previewSeekInflightRef.current) {
-            setError("MSE seek failed");
+            setError(err instanceof Error ? err.message : t('MSE seek failed'));
             previewSeekTargetRef.current = null;
           }
         });
@@ -2644,8 +2646,8 @@ export default function App() {
                   hls.loadSource(playbackUrl);
                   hls.startLoad();
                 })
-                .catch(() => {
-                  setError(t('Preview playback failed — try again'));
+                .catch((err: unknown) => {
+                  setError(err instanceof Error ? err.message : t('Preview playback failed — try again'));
                   setPreviewVideoLoading(false);
                   previewStartedRef.current = false;
                   markPreviewError(previewPageUrl, 'playback');
@@ -5888,8 +5890,16 @@ export default function App() {
           restorePanelLayout(pl);
         }
       }
-    } catch {
-      hydrateSavedChannelsOnce(null);
+    } catch (err: unknown) {
+      console.warn('[settings] initial load failed', err);
+      if (!settingsRetryScheduledRef.current) {
+        // The backend may still be booting when the UI mounts — retry once
+        // shortly instead of silently stranding the app on stale settings.
+        settingsRetryScheduledRef.current = true;
+        window.setTimeout(() => { void loadSettings(); }, 2500);
+      } else {
+        hydrateSavedChannelsOnce(null);
+      }
     } finally {
       channelUiPersistReadyRef.current = true;
       panelLayoutPersistReadyRef.current = true;

@@ -81,8 +81,8 @@ export default function CookieBridgeSection({
       setStatus(s);
       onStatusChange?.(s);
       setError(null);
-    } catch {
-      setError(t('Cookie Bridge API unreachable.'));
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : t('Cookie Bridge API unreachable.'));
     }
     try {
       const t_ = await apiGet<{ token: string }>('/api/session/cookies/token');
@@ -117,8 +117,8 @@ export default function CookieBridgeSection({
       if (res.cleared > 0) {
         await refresh();
       }
-    } catch {
-      setError(t('Could not clear stored cookies — backend unreachable?'));
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : t('Could not clear stored cookies — backend unreachable?'));
     }
     setClearing(false);
   };
@@ -133,8 +133,8 @@ export default function CookieBridgeSection({
         {},
       );
       setStatus({ ...status, enabled: res.enabled });
-    } catch {
-      setError(t('Could not toggle Cookie Bridge — backend unreachable?'));
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : t('Could not toggle Cookie Bridge — backend unreachable?'));
     }
     setBusy(false);
   };
@@ -155,8 +155,8 @@ export default function CookieBridgeSection({
       } else {
         await refresh();
       }
-    } catch {
-      setError(t('Could not reach the backend to start install.'));
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : t('Could not reach the backend to start install.'));
     }
     setSilentInstalling(false);
   };

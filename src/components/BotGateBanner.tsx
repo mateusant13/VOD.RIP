@@ -76,8 +76,8 @@ export default function BotGateBanner({
       if (!res.ok) {
         setError(res.error ? t('cookieAuto.failed', { error: res.error }) : t('cookieAuto.failedGeneric'));
       }
-    } catch {
-      setError(t('Could not reach the backend to start install.'));
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : t('Could not reach the backend to start install.'));
     }
     setInstalling(false);
   };

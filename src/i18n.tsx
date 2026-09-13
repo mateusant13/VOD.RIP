@@ -489,6 +489,7 @@ const ptBR: Record<string, string> = {
   "Open Twitch's clip editor — {len}s ending at {time}": "Abrir o editor de clipes do Twitch — {len}s terminando em {time}",
   // ── Live player popup ─────────────────────────────────────
   'HLS not supported in this browser': 'HLS não suportado neste navegador',
+  'Failed to load the player module — reload the page': 'Falha ao carregar o módulo do player — recarregue a página',
   'Live playback failed — try again': 'Falha na reprodução ao vivo — tente novamente',
   'No response from server': 'Sem resposta do servidor',
   'Live session is taking too long to start': 'A sessão ao vivo está demorando muito para iniciar',
@@ -1132,6 +1133,7 @@ const es: Record<string, string> = {
   'Select at least {min}s': 'Selecciona al menos {min}s',
   "Open Twitch's clip editor — {len}s ending at {time}": 'Abrir el editor de clips de Twitch — {len}s que terminan en {time}',
   'HLS not supported in this browser': 'HLS no es compatible con este navegador',
+  'Failed to load the player module — reload the page': 'Error al cargar el módulo del reproductor — recarga la página',
   'Live playback failed — try again': 'Error de reproducción en vivo — inténtalo de nuevo',
   'No response from server': 'Sin respuesta del servidor',
   'Live session is taking too long to start': 'La sesión en vivo está tardando demasiado en iniciarse',

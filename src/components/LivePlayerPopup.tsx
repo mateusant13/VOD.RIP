@@ -1144,8 +1144,13 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     if (!hlsCtorRef.current) {
       try {
         hlsCtorRef.current = (await import('hls.js')).default;
-      } catch {
-        setError(t('HLS not supported in this browser'));
+      } catch (err: unknown) {
+        // Every realistic failure of this one-line dynamic import is a chunk
+        // load failure (dead temp dir / network hiccup); its raw message is
+        // technical English with an internal asset URL — not actionable. Keep
+        // it in the console only; the user gets the friendly reload hint.
+        console.warn('[live-player] hls.js chunk load failed', err);
+        setError(t('Failed to load the player module — reload the page'));
         setLoading(false);
         markPreviewError();
         return null;
