@@ -24,6 +24,7 @@ from httpx import ASGITransport, AsyncClient
 from app import app
 from routers import channels
 from services import channel_cache
+from services.archive_db import touch_channel_snapshot, upsert_channel_video
 
 
 def _vods_pool(prefix: str, total: int, platform: str = "Twitch") -> list[dict]:
@@ -157,6 +158,40 @@ def _paged_services(monkeypatch):
     return calls, pools
 
 
+def _seed_youtube_warm_index(pools: dict[str, list[dict]]) -> None:
+    """Put the YouTube disk index in the post-warm state.
+
+    1a55922 shipped the cold-YouTube contract (routers/channels.py, "Cold
+    YouTube: a live crawl is slow + bot-gated"): a never-synced channel
+    serves page 1 from the empty index with has_more=False and is filled by
+    a background warm, outside the request. Seeding index rows + a fresh
+    snapshot puts the channel in the post-warm state that makes the router
+    skip the live crawl — and that skip is what keeps the walks below
+    deterministic: without the seed the async warm lands mid-walk, inserts
+    rows at the NEWEST end of the date-desc merged list, shifts every
+    offset window and re-serves ids (the 100-duplicate symptom this file
+    exists to catch — a seeding race, not a merge bug). The CEILING-depth
+    row count also matches the page-count assertions and mirrors a
+    completed sync's volume in production, but the determinism is a
+    property of the seed as a whole, not of the exact depth or the
+    snapshot touch by themselves. Precedent for index seeding:
+    0cb3493 in test_original_titles.py."""
+    for r in pools["youtube_vods"][-channels.YOUTUBE_PLAYLIST_CEILING:]:
+        upsert_channel_video({
+            "platform": "youtube",
+            "video_id": r["id"],
+            "channel": "gaveta",
+            "title": r["title"],
+            "kind": "vod",
+            "started_at": r["created_at"],
+            "duration_sec": r["duration"],
+            "duration_string": r["duration_string"],
+            "views": r["views"],
+            "thumbnail_url": r["thumbnail_url"],
+        })
+    touch_channel_snapshot("youtube", "@gaveta")
+
+
 @pytest.fixture
 async def client():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
@@ -252,6 +287,13 @@ async def test_vods_twitch_walk_until_ceiling_stops(client, _paged_services):
 
 @pytest.mark.asyncio
 async def test_vods_youtube_walk_until_ceiling_stops(client, _paged_services):
+    """Ceiling stop on the post-warm index (see _seed_youtube_warm_index):
+    pages 1..9 carry has_more from the 1000-row index depth, page 10 serves
+    the final 100 with has_more=False at the ceiling. The live-crawl fake
+    path stays pinned by the shorts walk below (same fake, same crawl
+    saturation semantics)."""
+    _, pools = _paged_services
+    _seed_youtube_warm_index(pools)
     ids, pages_with_more, last = await _walk(
         client, lambda l, p: _videos_url(l, p, "YouTube"), 100
     )
@@ -339,7 +381,15 @@ async def test_shorts_paginate_until_exhausted(client, _paged_services):
 async def test_multi_platform_pages_merge_without_duplicates(client, _paged_services):
     """All three platforms at once: pages walk the merged list; identical ids
     across platforms can't occur here, but the same id must never appear
-    twice within the walk."""
+    twice within the walk.
+
+    YouTube enters through the post-warm index (_seed_youtube_warm_index) —
+    a cold walk would let the background warm insert rows mid-walk and shift
+    the offset windows, testing a race instead of the merge invariant.
+    Kick/Twitch stay cold: their deeper fetches only append older rows to
+    the date-desc list, so served windows stay append-only."""
+    _, pools = _paged_services
+    _seed_youtube_warm_index(pools)
     ids, pages_with_more, last = await _walk(
         client, lambda l, p: _videos_url(l, p, "Kick,Twitch,YouTube"), 100
     )
