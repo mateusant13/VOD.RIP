@@ -90,8 +90,9 @@ class AppSettings(BaseModel):
     cache_dir: str = ""
     # Data root for transcripts/chat (archive DB + WAL/SHM). '' = auto ->
     # the fastest usable drive (<fastest>\VOD.RIP-data); an explicit path
-    # wins. VODRIP_DATA_DIR env overrides both. Takes effect after restart —
-    # the DB is moved by the relocation plumbing.
+    # wins. VODRIP_DATA_DIR env overrides both. Takes effect on the next DB
+    # touch after save (restart also picks it up); the DB itself is moved by
+    # the relocation plumbing.
     data_dir: str = ""
     youtube_cookies_file: str = ""
     youtube_cookies_browser: str = ""

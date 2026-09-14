@@ -257,27 +257,53 @@ CREATE TABLE IF NOT EXISTS worker_heartbeats (
 """
 
 
+def _data_dir_inputs() -> tuple[str, str, Optional[Path]]:
+    """Every input that can change the data-root precedence answer.
+
+    `VODRIP_DATA_DIR` (the env tier), `VODRIP_APP_DATA` (the root of the
+    fallback tier) and `disk_hygiene._auto_data_dir` — the SECOND cache in
+    the chain, pinned once the auto branch has probed the drives. Omitting
+    that last one used to freeze the whole precedence at its first
+    resolution: a later data-dir change fell through to a memo hit and the
+    DB path never moved. The settings tier is deliberately absent — reading
+    it is the cost this memo exists to remove, so
+    `SettingsManager.save()` drops the memo instead.
+    """
+    from services import disk_hygiene  # lazy: keeps module import light
+
+    return (
+        os.environ.get("VODRIP_DATA_DIR", ""),
+        os.environ.get("VODRIP_APP_DATA", ""),
+        disk_hygiene._auto_data_dir,
+    )
+
+
 def _db_path() -> Path:
     override = os.environ.get("VODRIP_ARCHIVE_DB", "").strip()
     if override:
         return Path(override)
     # Gap 3a: data_dir() reads settings (a model_copy of the whole 12k-line
     # AppSettings) — re-resolving it on every DB touch made warm panel opens
-    # scale with payload size. Memoized on the env inputs (cheap) + invalidated
-    # by SettingsManager.save() (same lazy pattern as feature_registry), so the
-    # runtime data-disk pick still rebinds via _init_schema's path compare.
+    # scale with payload size. Memoized on the inputs above (cheap attribute
+    # and env reads, no probing) + invalidated by SettingsManager.save()
+    # (same lazy pattern as feature_registry), so the runtime data-disk pick
+    # still rebinds via _init_schema's path compare.
     global _DB_PATH_MEMO
-    key = (os.environ.get("VODRIP_DATA_DIR", ""), os.environ.get("VODRIP_APP_DATA", ""))
+    key = _data_dir_inputs()
     if _DB_PATH_MEMO is not None and _DB_PATH_MEMO[0] == key:
         return _DB_PATH_MEMO[1]
     from services.disk_hygiene import data_dir  # lazy: keeps module import light
 
     path = data_dir() / "archive.db"
-    _DB_PATH_MEMO = (key, path)
+    # Re-read the inputs AFTER resolving: the auto branch populates
+    # disk_hygiene._auto_data_dir as a side effect, and the key must
+    # describe the state that produced `path` — storing the pre-resolution
+    # witness would cost one pointless memo miss on the next call.
+    _DB_PATH_MEMO = (_data_dir_inputs(), path)
     return path
 
 
-_DB_PATH_MEMO: tuple[tuple[str, str], Path] | None = None
+_DB_PATH_MEMO: tuple[tuple[str, str, Optional[Path]], Path] | None = None
 
 
 def invalidate_db_path_cache() -> None:
@@ -742,78 +768,92 @@ def _migrate_transcript_data(conn: sqlite3.Connection) -> None:
     Both steps mutate rows whose embeddings may already be stored, so every
     touched id has its vector deleted in batches (missing_embedding_segments
     re-enqueues them; the inline backfill re-embeds against the new data).
+
+    Owns and commits its transaction (same `with conn:` convention as
+    _migrate_fts_contentless): readers go through the per-thread WAL
+    connection, so an uncommitted backfill would stay invisible to a caller
+    that runs this standalone instead of from _init_schema.
+
+    Precondition: the caller must have no uncommitted DML of its own pending
+    on `conn` — `with conn:` commits the whole open transaction on exit, so a
+    caller's half-written work would be published with it. Every caller here
+    either starts a clean connection (_init_schema's migration pass) or has
+    already committed.
     """
-    # (1) entity unescape + turn-marker strip.
-    legacy = conn.execute(
-        "SELECT id, text FROM transcripts "
-        "WHERE text LIKE '%&amp;%' OR text LIKE '%&lt;%' OR text LIKE '%&gt;%'"
-    ).fetchall()
-    mutated_ids: list[int] = []
-    for r in legacy:
-        clean = _clean_legacy_transcript_text(r["text"])
-        if clean != r["text"]:
-            conn.execute(
-                "UPDATE transcripts SET text = ? WHERE id = ?", (clean, r["id"])
-            )
-            mutated_ids.append(r["id"])
-    # (2) lang backfill from the video's channel language family. Only
-    # known families (pt/en/es) are stamped — the exclusion only fires for
-    # them; raw codes ('ja', ...) keep NULL so the tally never mistakes a
-    # derived tag for independent evidence.
-    # The UPDATE itself takes SQLite's write lock for its whole scan, so
-    # it is gated behind a reader-only EXISTS probe: on a current corpus
-    # (every lang already stamped) no write lock is ever taken — a fresh
-    # backend process used to hold a multi-minute write lock on connect,
-    # stalling the archive worker and every other writer on the DB.
-    need_lang = conn.execute(
-        """SELECT 1 FROM transcripts t WHERE t.lang IS NULL AND EXISTS (
-               SELECT 1 FROM videos v
-               WHERE v.platform = t.platform AND v.video_id = t.video_id
-                 AND v.channel_language IS NOT NULL AND v.channel_language != ''
-                 AND lower(substr(v.channel_language, 1,
-                      instr(v.channel_language || '-', '-') - 1)) IN ('pt','en','es')
-           ) LIMIT 1"""
-    ).fetchone()
-    if need_lang is not None:
-        # Collect the ids BEFORE the sweep — after it, lang IS NULL no
-        # longer matches the same predicate.
-        lang_rows = conn.execute(
-            """SELECT t.id FROM transcripts t WHERE t.lang IS NULL AND EXISTS (
+    with conn:
+        # (1) entity unescape + turn-marker strip.
+        legacy = conn.execute(
+            "SELECT id, text FROM transcripts "
+            "WHERE text LIKE '%&amp;%' OR text LIKE '%&lt;%' OR text LIKE '%&gt;%'"
+        ).fetchall()
+        mutated_ids: list[int] = []
+        for r in legacy:
+            clean = _clean_legacy_transcript_text(r["text"])
+            if clean != r["text"]:
+                conn.execute(
+                    "UPDATE transcripts SET text = ? WHERE id = ?", (clean, r["id"])
+                )
+                mutated_ids.append(r["id"])
+        # (2) lang backfill from the video's channel language family. Only
+        # known families (pt/en/es) are stamped — the exclusion only fires for
+        # them; raw codes ('ja', ...) keep NULL so the tally never mistakes a
+        # derived tag for independent evidence.
+        # The UPDATE itself takes SQLite's write lock for its whole scan, so
+        # it is gated behind a reader-only EXISTS probe: on a current corpus
+        # (every lang already stamped) no write lock is ever taken — a fresh
+        # backend process used to hold a multi-minute write lock on connect,
+        # stalling the archive worker and every other writer on the DB. The
+        # probe stays a SELECT, and pysqlite opens `with conn:`'s transaction
+        # lazily at the first DML, so that property survives the block.
+        need_lang = conn.execute(
+            """SELECT 1 FROM transcripts t WHERE t.lang IS NULL AND EXISTS (
                    SELECT 1 FROM videos v
                    WHERE v.platform = t.platform AND v.video_id = t.video_id
                      AND v.channel_language IS NOT NULL AND v.channel_language != ''
                      AND lower(substr(v.channel_language, 1,
                           instr(v.channel_language || '-', '-') - 1)) IN ('pt','en','es')
-               )"""
-        ).fetchall()
-        mutated_ids.extend(r["id"] for r in lang_rows)
-        conn.execute(
-            """UPDATE transcripts SET lang = (
-                   SELECT lower(substr(v.channel_language, 1,
-                          instr(v.channel_language || '-', '-') - 1))
-                   FROM videos v
-                   WHERE v.platform = transcripts.platform
-                     AND v.video_id = transcripts.video_id
-                     AND v.channel_language IS NOT NULL AND v.channel_language != ''
-               )
-               WHERE lang IS NULL AND EXISTS (
-                   SELECT 1 FROM videos v2
-                   WHERE v2.platform = transcripts.platform
-                     AND v2.video_id = transcripts.video_id
-                     AND lower(substr(v2.channel_language, 1,
-                          instr(v2.channel_language || '-', '-') - 1))
-                         IN ('pt','en','es')
-               )"""
-        )
-    # Batched vector invalidation: chunked to stay under
-    # SQLITE_MAX_VARIABLE_NUMBER.
-    for i in range(0, len(mutated_ids), _SQLITE_IN_CHUNK):
-        chunk = mutated_ids[i : i + _SQLITE_IN_CHUNK]
-        conn.execute(
-            f"DELETE FROM transcript_embeddings WHERE transcript_id "
-            f"IN ({','.join('?' * len(chunk))})",
-            chunk,
-        )
+               ) LIMIT 1"""
+        ).fetchone()
+        if need_lang is not None:
+            # Collect the ids BEFORE the sweep — after it, lang IS NULL no
+            # longer matches the same predicate.
+            lang_rows = conn.execute(
+                """SELECT t.id FROM transcripts t WHERE t.lang IS NULL AND EXISTS (
+                       SELECT 1 FROM videos v
+                       WHERE v.platform = t.platform AND v.video_id = t.video_id
+                         AND v.channel_language IS NOT NULL AND v.channel_language != ''
+                         AND lower(substr(v.channel_language, 1,
+                              instr(v.channel_language || '-', '-') - 1)) IN ('pt','en','es')
+                   )"""
+            ).fetchall()
+            mutated_ids.extend(r["id"] for r in lang_rows)
+            conn.execute(
+                """UPDATE transcripts SET lang = (
+                       SELECT lower(substr(v.channel_language, 1,
+                              instr(v.channel_language || '-', '-') - 1))
+                       FROM videos v
+                       WHERE v.platform = transcripts.platform
+                         AND v.video_id = transcripts.video_id
+                         AND v.channel_language IS NOT NULL AND v.channel_language != ''
+                   )
+                   WHERE lang IS NULL AND EXISTS (
+                       SELECT 1 FROM videos v2
+                       WHERE v2.platform = transcripts.platform
+                         AND v2.video_id = transcripts.video_id
+                         AND lower(substr(v2.channel_language, 1,
+                              instr(v2.channel_language || '-', '-') - 1))
+                             IN ('pt','en','es')
+                   )"""
+            )
+        # Batched vector invalidation: chunked to stay under
+        # SQLITE_MAX_VARIABLE_NUMBER.
+        for i in range(0, len(mutated_ids), _SQLITE_IN_CHUNK):
+            chunk = mutated_ids[i : i + _SQLITE_IN_CHUNK]
+            conn.execute(
+                f"DELETE FROM transcript_embeddings WHERE transcript_id "
+                f"IN ({','.join('?' * len(chunk))})",
+                chunk,
+            )
 
 
 def _ensure_spam_column(conn: sqlite3.Connection) -> None:

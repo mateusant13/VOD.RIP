@@ -229,6 +229,7 @@ class SettingsManager:
         that cares can read back what stuck.
         """
         with self._lock:
+            prev = self._settings
             disk = self._read_disk_settings()
             merged = settings
             if disk is not None:
@@ -236,6 +237,14 @@ class SettingsManager:
                 # ai_api_key_set is derived from the key, never authored —
                 # recompute so a restored key can't desync its own flag.
                 merged.ai_api_key_set = bool(merged.ai_api_key)
+            # The auto data-dir pick is pinned in disk_hygiene._auto_data_dir
+            # (resolved once per process), and the DB path memo keys on it.
+            # Only an ACTUAL EFFECTIVE CHANGE — a merged value that differs
+            # from the previously persisted state captured in `prev` — may
+            # un-pin it: saves fire constantly (window geometry, toggles),
+            # and dropping the pin on every one would re-run the drive
+            # inventory on the next DB touch for no reason.
+            data_dir_changed = merged.data_dir != prev.data_dir
             # Baseline for this writer's NEXT save. It has to be a DEEP copy:
             # it is what the merge diffs against, and a caller may mutate a
             # nested container in place (`s = get(); s.features["x"] = True;
@@ -281,11 +290,25 @@ class SettingsManager:
             # ponytail: best-effort — invalidation must never break a save
                 pass
             # Gap 3a: the archive DB path memo reads settings.data_dir — any
-            # save may change the data-disk pick, so drop the memo too.
+            # save may change the data-disk pick, so drop the memo too. Lazy
+            # import, same pattern as feature_registry above.
             try:
                 from services.archive_db import invalidate_db_path_cache
 
                 invalidate_db_path_cache()
+            except Exception:
+                pass  # best-effort — invalidation must never break a save
+            # When this save actually edited data_dir, also drop the auto
+            # pick (the fallback the explicit value replaces): both caches
+            # must move together, or the next resolution re-answers from the
+            # stale pin (see disk_hygiene.invalidate_auto_data_dir_cache).
+            # Separate try block: a failure here must neither skip the reset
+            # nor undo the memo drop.
+            try:
+                if data_dir_changed:
+                    from services.disk_hygiene import invalidate_auto_data_dir_cache
+
+                    invalidate_auto_data_dir_cache()
             except Exception:
                 pass  # best-effort — invalidation must never break a save
             # One fresh ffmpeg probe re-armed per explicit save.

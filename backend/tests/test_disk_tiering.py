@@ -285,7 +285,8 @@ def test_router_db_path_follows_data_dir(monkeypatch):
 
 def test_data_dir_auto_pick_resolves_once(monkeypatch):
     """The auto pick is cached per process: a later drive change must not
-    move the DB path mid-session (data disk takes effect after restart)."""
+    move the DB path mid-session (data disk takes effect on the next DB
+    touch after save)."""
     monkeypatch.delenv("VODRIP_DATA_DIR", raising=False)
     monkeypatch.setattr(disk_hygiene, "_auto_data_dir", None)
     calls = {"n": 0}

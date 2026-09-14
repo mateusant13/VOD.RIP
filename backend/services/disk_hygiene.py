@@ -147,8 +147,9 @@ def _get_appdata_dir() -> Path:
 # (matching the Settings > Storage "Auto (fastest: X:)" label). Resolved
 # lazily on first use (which may probe drives for ~seconds) and cached —
 # data_dir() runs on every DB open, so it must never re-probe. The env and
-# settings branches above stay live; only the auto fallback is pinned, which
-# matches the "takes effect after restart" contract for the data-disk pick.
+# settings branches above stay live; only the auto fallback is pinned,
+# matching the "effective on the next DB touch after save (restart also
+# picks it up)" contract for the data-disk pick.
 _auto_data_dir: Optional[Path] = None
 
 
@@ -181,6 +182,21 @@ def data_dir() -> Path:
             Path(drive) / "VOD.RIP-data" if drive else _get_appdata_dir()
         )
     return _auto_data_dir
+
+
+def invalidate_auto_data_dir_cache() -> None:
+    """Drop the pinned auto data-dir pick so the next `data_dir()` re-probes.
+
+    Only owner of the reset: the pin is deliberate (the data-disk pick is
+    documented as "takes effect after restart"), so callers exist to make the
+    cache coherent when that pick is actually edited — `SettingsManager.save()`
+    when `data_dir` changes, and tests that exercise the auto branch. The
+    archive DB path memo keys on this attribute (`archive_db._data_dir_inputs`),
+    so clearing it invalidates the memo too; never clear one without the
+    other.
+    """
+    global _auto_data_dir
+    _auto_data_dir = None
 
 
 # --- AI-models folder (model weight home) ----------------------------------
