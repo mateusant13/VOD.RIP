@@ -116,6 +116,9 @@ type DeepHit = {
 };
 type DeepJobStatus = {
   status: 'running' | 'done' | 'error' | 'cancelled';
+  /** True only while status is 'running' AND the sweep is parked (backend
+   *  72c8fbe). Older payloads omit the key — falsy reads as "not paused". */
+  paused?: boolean;
   scanned: number;
   total: number;
   no_transcript: number;
@@ -271,6 +274,12 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
    *  flips after it resolves, which alone lets a double-click POST twice). */
   const deepStartingRef = useRef(false);
   const [deepStarting, setDeepStarting] = useState(false);
+  /** Same synchronous-latch pattern as deepStartingRef: a pause/resume POST
+   *  in flight must not accept a second click (and must not stack against
+   *  the next poll flipping `paused`). The state twin mirrors deepStarting:
+   *  refs can't drive `disabled`, React needs state to re-render. */
+  const deepPausingRef = useRef(false);
+  const [deepPausing, setDeepPausing] = useState(false);
   const deepJobRef = useRef<DeepJobStatus | null>(null);
   const mountedRef = useRef(true);
   const searchGenRef = useRef(0);
@@ -691,11 +700,21 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
         if (res.status !== 'running') setDeepJobId(null);
       } catch (err: unknown) {
         if (!alive || !mountedRef.current) return;
-        // Transport blip → keep deepJobId (the sweep runs server-side and the
-        // 2s interval re-polls); but 404/410 = job gone (backend restart or
-        // in-memory-job prune) → stop polling a dead id, clear the job.
+        // 404/410 = job gone (backend restart or in-memory-job prune): stop
+        // polling the dead id AND retire the snapshot the way
+        // cancelDeepSearch does — leaving it 'running' (possibly 'paused')
+        // would keep the controls row and paused badge mounted as zombies:
+        // their clicks fall through to the !jobId no-op and nothing ever
+        // unmounts them. Anything else is a transport blip → keep
+        // deepJobId (the sweep runs server-side and the interval re-polls).
+        if (deepPollIsTerminal(err)) {
+          setDeepJob((prev) => (prev ? { ...prev, status: 'error' as const } : prev));
+          setDeepJobId(null);
+        }
+        // The honest cause goes on the banner either way; on the terminal
+        // branch it is the last word about the dead job, and the next
+        // sweep's start clears it (startDeepSearch resets deepError).
         setDeepError(err instanceof Error ? err.message : t('Deep search unavailable — is the backend running?'));
-        if (deepPollIsTerminal(err)) setDeepJobId(null);
       }
     };
     void tick();
@@ -756,6 +775,38 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
       // The poll already stopped locally; the backend sweep ends on its own.
     }
   }, [deepJobId]);
+
+  /** Park (pause) or unpark (resume) the running sweep — POST .../pause and
+   *  .../resume answer {ok:true}; 404 (job gone) / 409 (already terminal)
+   *  surface through deepError like every other ApiError. The local flip is
+   *  optimistic (matches cancelDeepSearch's snapshot style); the next 2s
+   *  poll overwrites it with server truth — and if the job is gone the poll
+   *  retires the whole snapshot (see the tick's terminal-error branch), so
+   *  the optimistic `paused` can never outlive the job it describes. */
+  const pauseResumeDeepSearch = useCallback(async (pause: boolean) => {
+    const jobId = deepJobId;
+    if (!jobId || deepPausingRef.current) return;
+    deepPausingRef.current = true;
+    setDeepPausing(true);
+    setDeepError(null);
+    try {
+      await apiPost<{ ok: boolean }>(
+        `/api/archive/search/deep/${jobId}/${pause ? 'pause' : 'resume'}`,
+        {},
+      );
+      // Identity guard (mirrors the tick's deepJobIdRef checks at :690/:693):
+      // a slow POST resolving after this job was cancelled/replaced must not
+      // stamp the NEW job's snapshot.
+      if (mountedRef.current && deepJobIdRef.current === jobId) {
+        setDeepJob((prev) => (prev && prev.status === 'running' ? { ...prev, paused: pause } : prev));
+      }
+    } catch (err: unknown) {
+      if (mountedRef.current) setDeepError(err instanceof Error ? err.message : t('Deep search unavailable — is the backend running?'));
+    } finally {
+      deepPausingRef.current = false;
+      if (mountedRef.current) setDeepPausing(false);
+    }
+  }, [deepJobId, t]);
 
   // Resolve the hit's per-platform open targets (primary first) and hand
   // them to App, which picks the least-opened platform this session. arg[1]
@@ -1510,18 +1561,47 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                 {t('Scanning {scanned} / {total}', { scanned: deepJob.scanned, total: deepJob.total })}
               </span>
             )}
+            {/* Poll carries paused=true only while the sweep is parked; the
+             *  progress number above keeps showing the frozen scan count. */}
+            {deepJob && deepJob.status === 'running' && deepJob.paused && (
+              <span
+                className="text-[9px] font-mono uppercase tracking-widest text-yellow-500 shrink-0"
+                data-testid="deep-paused-badge"
+              >
+                {t('Paused')}
+              </span>
+            )}
           </div>
           <p className="text-[9px] font-mono text-zinc-600 shrink-0">
             {t('Search transcripts of every video (uploads, shorts, streams)')}
           </p>
           {deepJobId || (deepJob && deepJob.status === 'running') ? (
-            <button
-              type="button"
-              onClick={() => void cancelDeepSearch()}
-              className="self-start text-[9px] font-mono uppercase tracking-widest border-2 border-zinc-700 bg-zinc-900/60 hover:border-red-500/60 text-zinc-300 px-2 py-1 transition-colors"
-            >
-              {t('Cancel')}
-            </button>
+            <div className="flex items-center gap-1.5 shrink-0">
+              {/* Pause⇄Resume lives beside Cancel: one control whose label
+               *  follows the polled `paused` flag (pauseResumeDeepSearch also
+               *  flips the snapshot optimistically, so the swap is immediate
+               *  even before the next 2s tick confirms it). deepPausing is
+               *  the state twin of the ref latch — a POST in flight disables
+               *  the button and announces itself via aria-busy. */}
+              {deepJob && deepJob.status === 'running' && (
+                <button
+                  type="button"
+                  onClick={() => void pauseResumeDeepSearch(!deepJob.paused)}
+                  disabled={deepPausing}
+                  aria-busy={deepPausing}
+                  className="text-[9px] font-mono uppercase tracking-widest border-2 border-zinc-700 bg-zinc-900/60 hover:border-yellow-500/60 text-zinc-300 px-2 py-1 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {deepJob.paused ? t('Resume') : t('Pause')}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => void cancelDeepSearch()}
+                className="text-[9px] font-mono uppercase tracking-widest border-2 border-zinc-700 bg-zinc-900/60 hover:border-red-500/60 text-zinc-300 px-2 py-1 transition-colors"
+              >
+                {t('Cancel')}
+              </button>
+            </div>
           ) : (
             <div className="flex items-center gap-1.5 shrink-0">
               <input
@@ -1548,48 +1628,65 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
             </div>
           )}
           {deepError && <p className="text-[9px] font-mono text-red-400/80 shrink-0">{deepError}</p>}
+          {/* Running: a live header (filtered count or a searching indicator —
+           *  never "no results" while the sweep still paces). The indicator
+           *  names the sweep's MEDIUM ("transcripts"), not the filtered row
+           *  count: with the transcription chip off the count line would be
+           *  misleading, so the searching copy shows by design either way. */}
+          {deepJob && deepJob.status === 'running' && (
+            <p className="text-[9px] font-mono text-zinc-600 shrink-0" data-testid="deep-live">
+              {deepResults.length > 0
+                ? t('{count} transcript matches · {scanned} scanned · {missing} without captions', {
+                    count: deepResults.length,
+                    scanned: deepJob.scanned,
+                    missing: deepJob.no_transcript,
+                  })
+                : t('Searching transcripts…')}
+              {deepJob.truncated ? ` · ${t('list truncated')}` : ''}
+            </p>
+          )}
           {deepJob && (deepJob.status === 'done' || deepJob.status === 'cancelled' || deepJob.status === 'error') && (
-            <>
-              <p className="text-[9px] font-mono text-zinc-600 shrink-0" data-testid="deep-summary">
-                {deepJob.status === 'cancelled'
-                  ? t('Deep search cancelled')
-                  : deepResults.length > 0
-                    ? t('{count} transcript matches · {scanned} scanned · {missing} without captions', {
-                        count: deepResults.length,
-                        scanned: deepJob.scanned,
-                        missing: deepJob.no_transcript,
-                      })
-                    : t('No transcript matches in {scanned} scanned videos', { scanned: deepJob.scanned })}
-                {deepJob.truncated ? ` · ${t('list truncated')}` : ''}
-              </p>
-              {deepResults.length > 0 && (
-                <div className="flex flex-col gap-1 overflow-y-auto custom-scrollbar pr-1 min-h-0 flex-1">
-                  {deepResults.map((r, i) => (
-                    <a
-                      key={`${r.id}-${i}`}
-                      href={r.ts != null ? `${r.url}?t=${r.ts}` : r.url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-left border-2 border-zinc-800 bg-zinc-900/60 hover:border-zinc-500 p-1.5 flex flex-col gap-1 transition-colors"
-                    >
-                      <span className="flex items-center gap-1.5 min-w-0">
-                        <ExternalLink size={9} className="text-zinc-500 shrink-0" />
-                        <span className="text-[9px] font-bold uppercase truncate text-zinc-200 min-w-0 flex-1">
-                          {r.title}
-                        </span>
-                        {r.ts != null && (
-                          <span className="text-[9px] font-mono text-[#F03030] shrink-0">
-                            {formatArchiveOffset(r.ts)}
-                          </span>
-                        )}
-                        {r.date && <span className="text-[9px] font-mono text-zinc-500 shrink-0">{r.date}</span>}
+            <p className="text-[9px] font-mono text-zinc-600 shrink-0" data-testid="deep-summary">
+              {deepJob.status === 'cancelled'
+                ? t('Deep search cancelled')
+                : deepResults.length > 0
+                  ? t('{count} transcript matches · {scanned} scanned · {missing} without captions', {
+                      count: deepResults.length,
+                      scanned: deepJob.scanned,
+                      missing: deepJob.no_transcript,
+                    })
+                  : t('No transcript matches in {scanned} scanned videos', { scanned: deepJob.scanned })}
+              {deepJob.truncated ? ` · ${t('list truncated')}` : ''}
+            </p>
+          )}
+          {/* Rows render INCREMENTALLY: the gate is the row list itself, not
+           *  a terminal status — hits appear per poll while the sweep runs. */}
+          {deepResults.length > 0 && (
+            <div className="flex flex-col gap-1 overflow-y-auto custom-scrollbar pr-1 min-h-0 flex-1">
+              {deepResults.map((r, i) => (
+                <a
+                  key={`${r.id}-${i}`}
+                  href={r.ts != null ? `${r.url}?t=${r.ts}` : r.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-left border-2 border-zinc-800 bg-zinc-900/60 hover:border-zinc-500 p-1.5 flex flex-col gap-1 transition-colors"
+                >
+                  <span className="flex items-center gap-1.5 min-w-0">
+                    <ExternalLink size={9} className="text-zinc-500 shrink-0" />
+                    <span className="text-[9px] font-bold uppercase truncate text-zinc-200 min-w-0 flex-1">
+                      {r.title}
+                    </span>
+                    {r.ts != null && (
+                      <span className="text-[9px] font-mono text-[#F03030] shrink-0">
+                        {formatArchiveOffset(r.ts)}
                       </span>
-                      <span className="text-[10px] text-zinc-500 break-words">{r.snippet}</span>
-                    </a>
-                  ))}
-                </div>
-              )}
-            </>
+                    )}
+                    {r.date && <span className="text-[9px] font-mono text-zinc-500 shrink-0">{r.date}</span>}
+                  </span>
+                  <span className="text-[10px] text-zinc-500 break-words">{r.snippet}</span>
+                </a>
+              ))}
+            </div>
           )}
         </div>
       )}

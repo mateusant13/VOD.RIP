@@ -323,6 +323,8 @@ const ptBR: Record<string, string> = {
     '{count} correspondências em transcrições · {scanned} analisados · {missing} sem legendas',
   'No transcript matches in {scanned} scanned videos':
     'Nenhuma correspondência em transcrições nos {scanned} vídeos analisados',
+  'Paused': 'Pausada',
+  'Searching transcripts…': 'Analisando transcrições…',
   'list truncated': 'lista truncada',
   'Deep search failed': 'A pesquisa profunda falhou',
   'Deep search unavailable — is the backend running?':
@@ -969,6 +971,8 @@ const es: Record<string, string> = {
     '{count} coincidencias en transcripciones · {scanned} escaneados · {missing} sin subtítulos',
   'No transcript matches in {scanned} scanned videos':
     'Sin coincidencias en transcripciones en los {scanned} vídeos escaneados',
+  'Paused': 'Pausada',
+  'Searching transcripts…': 'Escaneando transcripciones…',
   'list truncated': 'lista truncada',
   'Deep search failed': 'La búsqueda profunda falló',
   'Deep search unavailable — is the backend running?':

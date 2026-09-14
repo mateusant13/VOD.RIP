@@ -118,11 +118,11 @@ describe('ArchiveSearchPopup', () => {
   });
 
   it('close button stacks above the resize handles (corner handle must not eat the click)', () => {
-    // jsdom has no layout/hit-testing, so assert the CSS contract: the
-    // floating panel's shadow-2xl band grows the corner resize blocks up to
-    // ~52px INSIDE the panel (clipsOverflow hug), and the ne block sits
-    // exactly on top of the close button — it eats every click there unless
-    // the header row (which hosts the button) paints above the z-50 handles.
+    // jsdom has no layout/hit-testing, so assert the CSS contract instead:
+    // whatever size the corner resize blocks end up being (they overlap the
+    // close button at any non-zero height, and that height is being tuned on
+    // another branch), the header row hosting the button must paint above
+    // every z-stamped handle — that z-order is the click-eating backstop.
     mockFetch();
     const { container } = render(
       <ArchiveSearchPopup zIndex={7} onClose={() => {}} onOpenHit={() => {}} />,
@@ -2016,6 +2016,355 @@ describe('ArchiveSearchPopup deep transcript search', () => {
     fireEvent.click(screen.getByRole('button', { name: 'chat' }));
     await waitFor(() => expect(screen.queryByText(/YouTube results/)).toBeNull());
     expect(remoteCalls()).toBe(2);
+  });
+
+  /** Poll snapshots for the pause tests: one mutable `paused` mirrors the
+   *  server's park flag — pause/resume POSTs flip it, the 2s status GET
+   *  carries it back (status stays 'running' while parked). `pauseStatus`
+   *  fakes a rejected pause POST (409 = sweep already terminal);
+   *  `goneAfterPolls` 404s the status GET from that poll onward (backend
+   *  restart / job prune). */
+  function pausableSweep(opts: { pauseStatus?: number; goneAfterPolls?: number } = {}) {
+    const state = { paused: false, posts: [] as string[], polls: 0 };
+    const deep = (url: string) => {
+      if (url.includes('/pause')) {
+        state.posts.push('pause');
+        if (opts.pauseStatus) {
+          return new Response(JSON.stringify({ detail: 'deep search job is done — nothing to pause' }), {
+            status: opts.pauseStatus,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        state.paused = true;
+        return { ok: true };
+      }
+      if (url.includes('/resume')) {
+        state.posts.push('resume');
+        state.paused = false;
+        return { ok: true };
+      }
+      if (url.includes('/cancel')) return { ok: true };
+      if (url.includes('/api/archive/search/deep/job-1')) {
+        state.polls += 1;
+        if (opts.goneAfterPolls && state.polls > opts.goneAfterPolls) {
+          return new Response(JSON.stringify({ detail: 'unknown deep search job' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return {
+          status: 'running',
+          paused: state.paused,
+          scanned: 1,
+          total: 3,
+          no_transcript: 0,
+          truncated: false,
+          results: [],
+        };
+      }
+      return { job_id: 'job-1' };
+    };
+    return { deep, state };
+  }
+
+  /** Arm the confirm gate and launch the sweep (fake timers from here). */
+  async function launchSweep() {
+    fireEvent.change(screen.getByRole('textbox', { name: /Type confirmar to enable/i }), {
+      target: { value: 'confirmar' },
+    });
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    vi.useFakeTimers();
+    await act(async () => {
+      fireEvent.click(startBtn());
+      await vi.advanceTimersByTimeAsync(0); // POST resolves -> first poll
+    });
+  }
+
+  it('renders deep hits INCREMENTALLY while the sweep still runs (no done-gate on rows)', async () => {
+    let polls = 0;
+    const fetchMock = mockFetch([], {}, { hits: [], error: null }, (url: string) => {
+      if (url.includes('/cancel') || url.includes('/pause') || url.includes('/resume')) return { ok: true };
+      if (url.includes('/api/archive/search/deep/job-1')) {
+        polls += 1;
+        // Two polls arrive BEFORE done: first carries 2 rows, second 3.
+        const results = polls === 1 ? DEEP_ROWS.slice(0, 2) : DEEP_ROWS.slice(0, 3);
+        return {
+          status: 'running',
+          scanned: polls,
+          total: 3,
+          no_transcript: 0,
+          truncated: false,
+          results,
+        };
+      }
+      return { job_id: 'job-1' };
+    });
+    await openWithQuery(fetchMock);
+    await launchSweep();
+
+    // Poll 1: the two rows are already on screen, the sweep is NOT done.
+    expect(screen.getByText('STREAM ROW')).toBeInTheDocument();
+    expect(screen.getByText('VOD ROW')).toBeInTheDocument();
+    expect(screen.queryByText('UNKNOWN ROW')).toBeNull();
+    // Honest live header: filtered count while running (never "no results").
+    expect(screen.getByTestId('deep-live')).toHaveTextContent(/2 transcript matches · 1 scanned/);
+    expect(screen.queryByTestId('deep-summary')).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000); // poll 2 -> third row appears
+    });
+    expect(screen.getByText('UNKNOWN ROW')).toBeInTheDocument();
+    expect(screen.getByTestId('deep-live')).toHaveTextContent(/3 transcript matches · 2 scanned/);
+    vi.useRealTimers();
+  });
+
+  it('empty-while-running shows a searching indicator, not "no results"', async () => {
+    const { deep } = pausableSweep();
+    const fetchMock = mockFetch([], {}, { hits: [], error: null }, deep);
+    await openWithQuery(fetchMock);
+    await launchSweep();
+    expect(screen.getByTestId('deep-live')).toHaveTextContent(/Searching transcripts…/);
+    expect(screen.queryByText(/No transcript matches/)).toBeNull();
+    vi.useRealTimers();
+  });
+
+  it('Pause posts /pause, the label flips to Resume, the confirming poll shows the paused badge', async () => {
+    const { deep, state } = pausableSweep();
+    const fetchMock = mockFetch([], {}, { hits: [], error: null }, deep);
+    await openWithQuery(fetchMock);
+    await launchSweep();
+
+    const pauseBtn = screen.getByRole('button', { name: /^Pause$/i });
+    await act(async () => {
+      fireEvent.click(pauseBtn);
+      await vi.advanceTimersByTimeAsync(0); // POST resolves -> optimistic flip
+    });
+    expect(
+      fetchMock.mock.calls.some(
+        (c) =>
+          String(c[0]).endsWith('/api/archive/search/deep/job-1/pause') &&
+          (c as unknown as [unknown, RequestInit?])[1]?.method === 'POST',
+      ),
+    ).toBe(true);
+    expect(state.posts).toEqual(['pause']);
+    // The 200 already swapped the control (no wait for the next tick).
+    expect(screen.getByRole('button', { name: /^Resume$/i })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Pause$/i })).toBeNull();
+
+    // The next poll confirms parked:true — the badge appears beside the
+    // (frozen) progress numbers, which keep rendering honestly.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+    expect(screen.getByTestId('deep-paused-badge')).toHaveTextContent(/Paused/);
+    expect(screen.getByTestId('deep-progress')).toHaveTextContent(/Scanning 1 \/ 3/);
+    vi.useRealTimers();
+  });
+
+  it('Resume posts /resume; paused badge renders in pt-BR as "Pausada"', async () => {
+    const { deep, state } = pausableSweep();
+    state.paused = true; // the sweep is parked before the component starts polling
+    const fetchMock = mockFetch([], {}, { hits: [], error: null }, deep);
+    await openWithQuery(fetchMock);
+    await launchSweep();
+
+    // Poll reported paused: Resume label + badge. The store-driven
+    // re-render is flushed inside act (fake timers are running — no
+    // advance, so no extra poll fires).
+    expect(screen.getByTestId('deep-paused-badge')).toHaveTextContent(/Paused/);
+    act(() => setLanguage('pt-BR'));
+    expect(screen.getByTestId('deep-paused-badge')).toHaveTextContent(/Pausada/);
+    const resumeBtn = screen.getByRole('button', { name: /Retomar/i });
+
+    await act(async () => {
+      fireEvent.click(resumeBtn);
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(
+      fetchMock.mock.calls.some(
+        (c) =>
+          String(c[0]).endsWith('/api/archive/search/deep/job-1/resume') &&
+          (c as unknown as [unknown, RequestInit?])[1]?.method === 'POST',
+      ),
+    ).toBe(true);
+    expect(state.posts).toEqual(['resume']);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000); // poll confirms unparked
+    });
+    expect(screen.queryByTestId('deep-paused-badge')).toBeNull();
+    vi.useRealTimers();
+  });
+
+  it('no Pause control once the sweep is done', async () => {
+    const fetchMock = mockFetch([], {}, { hits: [], error: null }, doneSweep({
+      status: 'done', scanned: 3, total: 3, no_transcript: 1, truncated: false, results: DEEP_ROWS,
+    }));
+    await openWithQuery(fetchMock);
+    await runToDone();
+    expect(screen.queryByRole('button', { name: /^Pause$/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /^Resume$/i })).toBeNull();
+    expect(screen.queryByTestId('deep-paused-badge')).toBeNull();
+    vi.useRealTimers();
+  });
+
+  it('pause POST 409: the backend detail surfaces, the optimistic flip does NOT happen, next healthy poll clears the banner', async () => {
+    const { deep, state } = pausableSweep({ pauseStatus: 409 });
+    const fetchMock = mockFetch([], {}, { hits: [], error: null }, deep);
+    await openWithQuery(fetchMock);
+    await launchSweep();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /^Pause$/i }));
+      await vi.advanceTimersByTimeAsync(0); // POST rejects with 409
+    });
+    expect(state.posts).toEqual(['pause']);
+    // 409 carries no special status mapping in apiErrorMessage — the raw
+    // detail is what the user sees.
+    expect(screen.getByText(/nothing to pause/)).toBeInTheDocument();
+    // The flip only happens on 200: the sweep never parked, so no Resume
+    // label and no badge.
+    expect(screen.getByRole('button', { name: /^Pause$/i })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Resume$/i })).toBeNull();
+    expect(screen.queryByTestId('deep-paused-badge')).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000); // healthy poll retires the banner
+    });
+    expect(screen.queryByText(/nothing to pause/)).toBeNull();
+    expect(screen.getByTestId('deep-live')).toBeInTheDocument();
+    vi.useRealTimers();
+  });
+
+  it('pause succeeds but the job 404s on the NEXT poll: no zombie — controls unmount, badge gone, cause stays on the banner', async () => {
+    const { deep, state } = pausableSweep({ goneAfterPolls: 1 });
+    const fetchMock = mockFetch([], {}, { hits: [], error: null }, deep);
+    await openWithQuery(fetchMock);
+    await launchSweep(); // poll 1: running, unparked
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /^Pause$/i }));
+      await vi.advanceTimersByTimeAsync(0); // POST ok -> optimistic parked flip
+    });
+    expect(screen.getByTestId('deep-paused-badge')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^Resume$/i })).toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000); // poll 2 -> 404: job gone
+    });
+    // P2-1: the tick retired the snapshot — badge and Pause/Resume are gone
+    // (pre-fix they stayed mounted forever, clicks no-op'ing on !jobId).
+    expect(screen.queryByTestId('deep-paused-badge')).toBeNull();
+    expect(screen.queryByTestId('deep-progress')).toBeNull();
+    expect(screen.queryByRole('button', { name: /^Resume$/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /^Pause$/i })).toBeNull();
+    // The cause is the banner's last word (cleared when the next sweep starts).
+    expect(screen.getByText('unknown deep search job')).toBeInTheDocument();
+    const pollsAfterGone = state.polls;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6000);
+    });
+    expect(state.polls).toBe(pollsAfterGone); // and no zombie polling
+    vi.useRealTimers();
+  });
+
+  it('in-flight pause POST latches the button (disabled + aria-busy) and a double-click sends exactly one POST', async () => {
+    // A Response whose json() never settles keeps apiPost pending forever,
+    // so the deepPausing window is deterministic under fake timers.
+    // ponytail: executor form — tsconfig lib predates ES2024 Promise.withResolvers
+    const hang = new Promise<unknown>(() => {
+      /* never settles on purpose */
+    });
+    class HangResponse extends Response {
+      json(): Promise<unknown> {
+        return hang;
+      }
+    }
+    const fetchMock = mockFetch([], {}, { hits: [], error: null }, (url: string) => {
+      if (url.includes('/pause')) return new HangResponse();
+      if (url.includes('/api/archive/search/deep/job-1')) {
+        return { status: 'running', paused: false, scanned: 1, total: 3, no_transcript: 0, truncated: false, results: [] };
+      }
+      return { job_id: 'job-1' };
+    });
+    await openWithQuery(fetchMock);
+    await launchSweep();
+
+    const pauseBtn = screen.getByRole('button', { name: /^Pause$/i });
+    await act(async () => {
+      fireEvent.click(pauseBtn);
+      fireEvent.click(pauseBtn); // second click lands while the POST is in flight
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const btn = screen.getByRole('button', { name: /^Pause$/i });
+    expect(btn).toBeDisabled();
+    expect(btn).toHaveAttribute('aria-busy', 'true');
+    expect(
+      fetchMock.mock.calls.filter((c) => String(c[0]).endsWith('/api/archive/search/deep/job-1/pause')),
+    ).toHaveLength(1);
+    vi.useRealTimers();
+  });
+
+  it('a slow job-1 pause POST resolving after cancel+relaunch cannot stamp job-2 (identity guard)', async () => {
+    // ponytail: executor form — tsconfig lib predates ES2024 Promise.withResolvers
+    let settlePause!: (body: unknown) => void;
+    const pauseJson = new Promise<unknown>((resolve) => {
+      settlePause = resolve;
+    });
+    class HangResponse extends Response {
+      json(): Promise<unknown> {
+        return pauseJson;
+      }
+    }
+    let starts = 0;
+    const fetchMock = mockFetch([], {}, { hits: [], error: null }, (url: string) => {
+      if (url.includes('/pause')) return new HangResponse();
+      if (url.includes('/cancel')) return { ok: true };
+      if (url.includes('/api/archive/search/deep/job-1')) {
+        return { status: 'running', paused: false, scanned: 1, total: 3, no_transcript: 0, truncated: false, results: [] };
+      }
+      if (url.includes('/api/archive/search/deep/job-2')) {
+        return { status: 'running', paused: false, scanned: 2, total: 3, no_transcript: 0, truncated: false, results: [] };
+      }
+      starts += 1; // the two launch POSTs: first job-1, then the relaunch job-2
+      return { job_id: starts === 1 ? 'job-1' : 'job-2' };
+    });
+    await openWithQuery(fetchMock);
+    await launchSweep(); // job-1 polls 'Scanning 1 / 3'
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /^Pause$/i }));
+      await vi.advanceTimersByTimeAsync(0); // POST sent, json() hangs in flight
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000); // job-1 poll 2 (still running)
+    });
+
+    // Cancel retires the snapshot; the typed 'confirmar' survives, so the
+    // relaunch is a single click — new job id job-2.
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /^Cancel$/i }));
+      await vi.advanceTimersByTimeAsync(0); // cancel POST resolves
+    });
+    await act(async () => {
+      fireEvent.click(startBtn());
+      await vi.advanceTimersByTimeAsync(0); // POST job-2 -> its first poll lands
+    });
+    expect(screen.getByTestId('deep-progress')).toHaveTextContent(/Scanning 2 \/ 3/);
+    expect(screen.queryByTestId('deep-paused-badge')).toBeNull();
+
+    // The stale job-1 POST finally "succeeds". Without the identity guard
+    // (deepJobIdRef.current === jobId in the success block) this stamps
+    // paused:true onto JOB-2 — badge + wrong Resume label on a live sweep.
+    await act(async () => {
+      settlePause({ ok: true });
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.queryByTestId('deep-paused-badge')).toBeNull();
+    expect(screen.getByRole('button', { name: /^Pause$/i })).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some((c) => String(c[0]).endsWith('/api/archive/search/deep/job-2/pause')),
+    ).toBe(false);
+    vi.useRealTimers();
   });
 });
 
