@@ -10,8 +10,8 @@ Covers:
 - The LiveCaptioner loop with mocked playlist/segment fetch + stubbed parakeet
   decode: blocks assemble in order, the window rolls, the seen-set skips
   re-downloads, refcount start/stop, offline event, gate 503.
-- The parakeet wiring itself (VAD regions -> _transcribe_batch_parakeet ->
-  concatenated text) with the ASR functions stubbed.
+- The ASR runtime seam: _transcribe_window serialises the window to the
+  loopback worker, _warm_asr starts it — both with asr_runtime stubbed.
 - SSE endpoint shape via the existing router-test pattern (ASGITransport for
   validation/gate, direct generator drive for frame forwarding + release).
 """
@@ -205,9 +205,6 @@ def _install_pipeline(monkeypatch, pipeline: _FakePipeline, **kw):
     monkeypatch.setattr(live_captions, "_fetch", pipeline.fetch)
     monkeypatch.setattr(live_captions, "_decode_audio_bytes", pipeline.decode)
     monkeypatch.setattr(live_captions, "_transcribe_window", lambda audio, dur: (pipeline.transcribe_window(audio, dur), None))
-    # Mock the ASR thread prewarm so it doesn't load real models
-    from services import archive_transcribe as _at
-    monkeypatch.setattr(_at, "prewarm_parakeet", lambda: True)
     # Pin caption_low_latency=False so tests use _FLUSH_FAIL_LIMIT=3
     from models.schemas import AppSettings as _AppSettings
     _fake_settings = _AppSettings(caption_low_latency=False)
@@ -549,48 +546,51 @@ async def test_captioner_drops_stale_backlog_and_resyncs_to_live_edge(monkeypatc
 
 
 # ---------------------------------------------------------------------------
-# Parakeet wiring (ASR functions stubbed)
+# ASR runtime seam (asr_runtime stubbed)
 # ---------------------------------------------------------------------------
 
 
-def test_transcribe_window_uses_parakeet_path(monkeypatch):
-    """VAD speech regions -> _parakeet_model + _transcribe_batch_parakeet ->
-    concatenated text + detected lang; empty VAD yields no caption text."""
-    from services import archive_transcribe as at
+def test_transcribe_window_delegates_to_asr_runtime(monkeypatch):
+    """The base process never loads ASR locally: the decoded window is
+    serialised to raw float32 bytes and handed to asr_runtime.transcribe_window
+    verbatim; the (text, lang) pair comes back from the worker untouched."""
+    from services import asr_runtime
     from services import live_captions
 
     audio = np.zeros(16000 * 3, dtype=np.float32)
-    monkeypatch.setattr(at, "vad_speech_seconds", lambda a: [(0.1, 2.9)])
-    monkeypatch.setattr(at, "_parakeet_model", lambda: object())
-    monkeypatch.setattr(
-        at, "_transcribe_batch_parakeet",
-        lambda rec, a, chunks, lang: [
-            ([{"text": "olá", "start_sec": 0.1, "end_sec": 1.2},
-              {"text": "pessoal", "start_sec": 1.2, "end_sec": 2.0}], "pt"),
-            ([], "pt"),  # a silent chunk produces no items
-        ],
-    )
+    seen: dict = {}
+
+    def fake_transcribe(payload):
+        seen["payload"] = payload
+        return "olá pessoal", "pt"
+
+    monkeypatch.setattr(asr_runtime, "transcribe_window", fake_transcribe)
     text, detected_lang = live_captions._transcribe_window(audio, 3.0)
+    assert seen["payload"] == audio.tobytes()
     assert text == "olá pessoal"
     assert detected_lang == "pt"
 
-    monkeypatch.setattr(at, "vad_speech_seconds", lambda a: [])
-    text, detected_lang = live_captions._transcribe_window(audio, 3.0)
-    assert text == ""
-    assert detected_lang is None
 
-
-def test_warm_asr_preloads_engine_and_vad_once(monkeypatch):
-    """The worker pre-warms via prewarm_parakeet (resident pin + model + VAD +
-    CUDA EP prime) at start so the first flush is not a 2-6s cold load."""
-    from services import archive_transcribe as at
+def test_warm_asr_starts_the_asr_runtime_server(monkeypatch):
+    """Pre-warm launches the loopback ASR server via ensure_server (the model
+    must never load in-process here). A launch failure degrades to False —
+    the first flush retries lazily instead of killing the caption start."""
+    from services import asr_runtime
     from services import live_captions
 
     calls: list[str] = []
-    monkeypatch.setattr(at, "prewarm_parakeet", lambda: (calls.append("prewarm"), True)[-1])
-    result = live_captions._warm_asr()
-    assert result is True
-    assert calls == ["prewarm"]
+    monkeypatch.setattr(
+        asr_runtime, "ensure_server",
+        lambda: (calls.append("ensure"), 9999)[-1],
+    )
+    assert live_captions._warm_asr() is True
+    assert calls == ["ensure"]
+
+    def boom():
+        raise RuntimeError("no runtime asset")
+
+    monkeypatch.setattr(asr_runtime, "ensure_server", boom)
+    assert live_captions._warm_asr() is False
 
 
 @pytest.mark.anyio

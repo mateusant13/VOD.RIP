@@ -3,11 +3,14 @@
 Run from the backend directory with:
     python -m pytest tests/test_upstream_stall.py -q -p no:cacheprovider
 
-Network is stubbed with fake streaming responses — the wall-clock deadline,
-the blocked-read watchdog, and the requests fallback are exercised
-deterministically (no live upstream).
+Network is stubbed at the seam production actually uses: `_http_get_bytes`
+fetches through the pooled session (`_get_upstream_session().get(...)`) and
+only reaches module-level `requests.get` when the pool object does not expose
+`get` (the degraded fallback branch). Patching the factory — not
+`curl_cffi.requests.get`, which the pooled path never calls — keeps every
+fetch fake-side; a seam drift then fails loudly instead of letting the
+watchdog logic go untested (a silently bypassed fake hits the real network).
 """
-import sys
 import threading
 import time
 from pathlib import Path
@@ -59,6 +62,21 @@ class _FakeResp:
         self._unblock.set()
 
 
+class _FakePool:
+    """Stand-in for the pooled curl_cffi/requests session of
+    `_get_upstream_session()` — the seam `_http_get_bytes` really calls."""
+
+    def __init__(self, resp: _FakeResp):
+        self.resp = resp
+        self.calls = 0
+        self.kwargs: dict = {}
+
+    def get(self, url, **kw):
+        self.calls += 1
+        self.kwargs = kw
+        return self.resp
+
+
 def _mk_session(sid: str, **over) -> session_mod.PreviewSession:
     kwargs = dict(
         session_id=sid,
@@ -78,14 +96,10 @@ def _mk_session(sid: str, **over) -> session_mod.PreviewSession:
 
 
 def _force_requests_fallback(monkeypatch) -> None:
-    # Make `from curl_cffi import requests` raise ImportError so
-    # _http_get_bytes takes the `import requests` fallback path. The None
-    # sys.modules halt only triggers once the parent attribute is removed
-    # (importlib skips submodule loading when the parent already has it).
-    import curl_cffi
-
-    monkeypatch.setitem(sys.modules, "curl_cffi.requests", None)
-    monkeypatch.delattr(curl_cffi, "requests", raising=False)
+    # Take the `else: import requests; resp = requests.get(...)` branch: the
+    # pool object must not expose `get` (an attribute-less instance is exactly
+    # what the hasattr check in _http_get_bytes routes away from pooling).
+    monkeypatch.setattr(hls_mod, "_get_upstream_session", lambda: object())
 
 
 def _wait_closed(resp: _FakeResp, timeout: float = 3.0) -> None:
@@ -98,23 +112,24 @@ def test_stalled_read_aborts_at_budget(monkeypatch) -> None:
     """A 0 B/s stalled playlist fetch raises RuntimeError at the budget."""
     monkeypatch.setattr(hls_mod, "_UPSTREAM_PLAYLIST_DEADLINE_SEC", 1.0)
     resp = _FakeResp([], stall=True)
-    captured: dict = {}
+    pool = _FakePool(resp)
+    monkeypatch.setattr(hls_mod, "_get_upstream_session", lambda: pool)
 
-    def fake_get(url, **kw):
-        captured.update(kw)
-        return resp
+    start = time.monotonic()
+    with pytest.raises(RuntimeError, match="stalled/timed out"):
+        hls_mod._http_get_bytes(_mk_session("s1"), PLAYLIST_URL)
+    elapsed = time.monotonic() - start
 
-    with patch("curl_cffi.requests.get", fake_get):
-        start = time.monotonic()
-        with pytest.raises(RuntimeError, match="stalled/timed out"):
-            hls_mod._http_get_bytes(_mk_session("s1"), PLAYLIST_URL)
-        elapsed = time.monotonic() - start
-
+    assert pool.calls == 1, "the pooled session must be the fetch seam"
     assert elapsed < 5.0, f"stall aborted too slowly: {elapsed:.1f}s"
-    assert captured["timeout"] == (
+    assert pool.kwargs["timeout"] == (
         session_mod._UPSTREAM_CONNECT_TIMEOUT_SEC,
         hls_mod._UPSTREAM_READ_TIMEOUT_SEC,
     ), "per-read timeout must be the module constant (was hardcoded 90/60)"
+    connect, read = pool.kwargs["timeout"]
+    assert 0 < connect and 0 < read <= 15, (
+        f"sane per-request timeout bounds (magic guard against constant drift): got {pool.kwargs['timeout']}"
+    )
     _wait_closed(resp)
     assert resp.closed, "aborted response must be closed by the cleanup thread"
 
@@ -124,34 +139,36 @@ def test_stalled_segment_uses_segment_budget(monkeypatch) -> None:
     monkeypatch.setattr(hls_mod, "_UPSTREAM_SEGMENT_DEADLINE_SEC", 0.5)
     monkeypatch.setattr(hls_mod, "_UPSTREAM_PLAYLIST_DEADLINE_SEC", 30.0)
     resp = _FakeResp([], stall=True)
+    pool = _FakePool(resp)
+    monkeypatch.setattr(hls_mod, "_get_upstream_session", lambda: pool)
 
-    def fake_get(url, **kw):
-        return resp
+    start = time.monotonic()
+    with pytest.raises(RuntimeError, match="stalled/timed out"):
+        hls_mod._http_get_bytes(_mk_session("s2"), SEGMENT_URL)
+    elapsed = time.monotonic() - start
 
-    with patch("curl_cffi.requests.get", fake_get):
-        start = time.monotonic()
-        with pytest.raises(RuntimeError, match="stalled/timed out"):
-            hls_mod._http_get_bytes(_mk_session("s2"), SEGMENT_URL)
-        elapsed = time.monotonic() - start
-
+    assert pool.calls == 1, "the pooled session must be the fetch seam"
     assert elapsed < 5.0, f"segment stall must use the segment budget: {elapsed:.1f}s"
+    connect, read = pool.kwargs["timeout"]
+    assert 0 < connect and 0 < read <= 15, (
+        f"sane per-request timeout bounds (magic guard against constant drift): got {pool.kwargs['timeout']}"
+    )
 
 
 def test_fast_response_still_succeeds(monkeypatch) -> None:
     """A healthy fast response is untouched by the deadline machinery."""
     monkeypatch.setattr(hls_mod, "_UPSTREAM_PLAYLIST_DEADLINE_SEC", 1.0)
     resp = _FakeResp([BODY, b"#EXTINF:6.000,\nhttp://93.184.216.34/seg-2.ts\n"])
+    pool = _FakePool(resp)
+    monkeypatch.setattr(hls_mod, "_get_upstream_session", lambda: pool)
 
-    def fake_get(url, **kw):
-        return resp
+    start = time.monotonic()
+    data, ctype, headers, status = hls_mod._http_get_bytes(
+        _mk_session("s3"), PLAYLIST_URL
+    )
+    elapsed = time.monotonic() - start
 
-    with patch("curl_cffi.requests.get", fake_get):
-        start = time.monotonic()
-        data, ctype, headers, status = hls_mod._http_get_bytes(
-            _mk_session("s3"), PLAYLIST_URL
-        )
-        elapsed = time.monotonic() - start
-
+    assert pool.calls == 1, "the pooled session must be the fetch seam"
     assert elapsed < 1.0
     assert data == BODY + b"#EXTINF:6.000,\nhttp://93.184.216.34/seg-2.ts\n"
     assert status == 200
