@@ -14,12 +14,20 @@ import unittest.mock as um
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 # ── Minimal yt_dlp to let imports through ──
-# Snapshot the real modules first: the fake replaces them only for the
+# Snapshot the real modules first: the fakes replace them only for the
 # preview_service import below, and the cleanup must RESTORE them (not pop).
 # Evicting the real yt_dlp while the already-loaded real `yt_dlp.version`
 # submodule stays cached breaks the parent's `version` attribute binding on
 # re-import — later `import yt_dlp` yields a module with no `.version`
-# (routers/system.py /api/ytdlp/status then raises AttributeError).
+# (routers/system.py /api/ytdlp/status then raises AttributeError). The same
+# reason covers services.youtube_innertube / services.youtube_service: in a
+# merged run those are ALREADY live modules — the liveness chain is an
+# earlier-collected `from app import app` pulling routers, and
+# routers/channels.py:50/:54 import them at module level (ytdlp_download's
+# innertube imports are all lazy in-function). Popping a live module hands
+# every later importer a SECOND instance with fresh _LAST_PLAYABILITY /
+# _ORIGINAL_META_CACHE state — monkeypatches then land on one copy while
+# production code reads the other.
 _ORIG_YTDLP_MODS = {
     name: sys.modules.get(name)
     for name in (
@@ -27,6 +35,8 @@ _ORIG_YTDLP_MODS = {
         "yt_dlp.utils",
         "yt_dlp.postprocessor",
         "yt_dlp.postprocessor.ffmpeg",
+        "services.youtube_service",
+        "services.youtube_innertube",
     )
 }
 yt_dlp_mod = types.ModuleType("yt_dlp")
@@ -49,7 +59,6 @@ sys.modules["yt_dlp.postprocessor"] = pp_mod
 sys.modules["yt_dlp"] = yt_dlp_mod
 sys.modules["services.youtube_service"] = um.MagicMock()
 sys.modules["services.youtube_innertube"] = um.MagicMock()
-sys.modules["models.preview"] = um.MagicMock()
 
 from services.preview_service import (
     _put_session_snapshot,
@@ -57,22 +66,16 @@ from services.preview_service import (
     _SESSION_SNAPSHOT,
 )
 
-# The MagicMock substitutions above were only needed for that import.
-# Leaving them in sys.modules poisons every later test module: collection is
-# alphabetical, so each test_youtube_* module would import the mocks and
-# fail wholesale (assert <MagicMock ...> == ...). Drop them immediately.
+# The MagicMock substitutions above were only needed for that import and must
+# not be left behind: collection is alphabetical, so each test_youtube_* module
+# would import the mocks and fail wholesale (assert <MagicMock ...> == ...).
 # The fake yt_dlp (bare ModuleType, __spec__ is None) must go too: transformers
 # calls importlib.util.find_spec("yt_dlp") at import time (reached lazily via
 # faster_whisper -> ctranslate2 -> transformers in the transcribe worker) and
 # raises ValueError on a spec-less sys.modules entry.
-for _poisoned in (
-    "services.youtube_service",
-    "services.youtube_innertube",
-    "models.preview",
-):
-    sys.modules.pop(_poisoned, None)
-# Restore the real yt_dlp modules (or drop the fakes when the real ones were
-# never loaded) — see _ORIG_YTDLP_MODS above for why pop() alone is unsafe.
+# Restore-or-drop (never drop-only): if the real module was already loaded when
+# this file started, putting it back keeps ONE instance alive for every later
+# importer; if it wasn't, dropping the fake lets the first real import win.
 for _name, _mod in _ORIG_YTDLP_MODS.items():
     if _mod is not None:
         sys.modules[_name] = _mod
