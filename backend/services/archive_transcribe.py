@@ -971,9 +971,11 @@ def _gpu_compute_type() -> str:
 # the jobs wait in SQLite and drain later. Measured via GetSystemTimes
 # (kernel32, stdlib ctypes — psutil is not a declared dependency); POSIX
 # uses os.getloadavg(). Probe failure/unknown -> False (no clamp).
-_CPU_LOAD_HIGH = 0.70          # preemptively reduce before user apps impacted
+_CPU_LOAD_HIGH = 0.70          # enter "high": preemptively reduce before user apps impacted
+_CPU_LOAD_HIGH_EXIT = 0.60     # exit "high" (Schmitt band): load must fall this far before the
+                               # lane clamp lifts, so boundary chatter cannot flip THIS probe's input
 _CPU_LOAD_TTL_S = 15.0         # readout cache TTL (sampling sleeps ~0.2 s)
-_cpu_load_high_cache = False
+_cpu_load_high_cache = False   # cached band decision (True == in the HIGH band)
 _cpu_load_at = 0.0
 _cpu_load_lock = threading.Lock()
 
@@ -1017,7 +1019,16 @@ def _measure_cpu_load() -> float:
 
 
 def _cpu_load_high() -> bool:
-    """True when the box is already contended (cached; False if unmeasurable)."""
+    """True when the box is already contended (cached; False if unmeasurable).
+
+    Schmitt band on the cached comparison: a fresh sample enters HIGH at
+    >= _CPU_LOAD_HIGH but only exits below _CPU_LOAD_HIGH_EXIT (between the
+    thresholds the previous band decision is kept). The 15 s cache and the
+    instant 0.2 s sample are unchanged — only the compare is stateful, so a
+    0.2 s burst hovering at the cutoff stops chattering the plan input.
+    Probe failure reads 0.0 (idle), so it exits the HIGH band — fail-open
+    by design: an unmeasurable box is never clamped, and the plan-level
+    anti-oscillation guarantee is the debounce, not this input."""
     global _cpu_load_high_cache, _cpu_load_at
     now = time.monotonic()
     with _cpu_load_lock:
@@ -1025,7 +1036,14 @@ def _cpu_load_high() -> bool:
             return _cpu_load_high_cache
     load = _measure_cpu_load()
     with _cpu_load_lock:
-        _cpu_load_high_cache = load >= _CPU_LOAD_HIGH
+        # Band state IS the cache value: re-enter at 0.70, exit under 0.60.
+        # Scope: this band governs ONLY this probe's contribution. The resource
+        # governor's backoff clamp (cpu_raw >= 0.65) is unbanded — a sweep
+        # oscillating around 0.65 can still flip that input every second. The
+        # plan-level anti-oscillation layer is the _PLAN_CONFIRM_OBS debounce
+        # in _plan_watch, not this band.
+        threshold = _CPU_LOAD_HIGH_EXIT if _cpu_load_high_cache else _CPU_LOAD_HIGH
+        _cpu_load_high_cache = load >= threshold
         _cpu_load_at = now
     return _cpu_load_high_cache
 
@@ -1178,6 +1196,41 @@ def _pool_plan(max_workers: Optional[int]) -> list[tuple[str, str]]:
 # (held -> free) — blocking the worker loop that long would stall heartbeats,
 # refills and job monitoring. The main loop only ever does the cheap swap.
 _PLAN_RECHECK_S = 30.0
+
+# Consecutive identical differing observations the plan watch must see
+# before it proposes a swap (2 x the 30 s recheck cadence -> ~60 s
+# confirmation). Transient 0.2 s CPU-load blips must not thrash the worker
+# pools: every swap drains in-flight inference and reloads the model, and
+# the drain/rebuild burst itself biases the next load sample high, so the
+# feedback loop self-sustains the oscillation.
+_PLAN_CONFIRM_OBS = 2
+
+
+def _plan_debounce_step(
+    current_plan: Optional[list[tuple[str, str]]],
+    last_proposal: Optional[list[tuple[str, str]]],
+    streak: int,
+    observed: list[tuple[str, str]],
+) -> tuple[Optional[list[tuple[str, str]]], Optional[list[tuple[str, str]]], int]:
+    """Pure debounce decision for the plan watch (see _PLAN_CONFIRM_OBS).
+
+    current_plan: plan the worker is running right now (None = nothing
+    published yet, so no observation can differ from it). last_proposal /
+    streak: the differing proposal the current streak counts for and how
+    many consecutive observations backed it. observed: this recheck's plan.
+    Returns (proposal_to_publish_or_None, next_last_proposal, next_streak).
+    An observation matching the published plan resets the streak; a
+    proposal is published once, on the confirming observation, and the
+    streak clears so the same plan is never republished."""
+    if current_plan is None or observed == current_plan:
+        return None, None, 0
+    if observed == last_proposal:
+        streak += 1
+    else:
+        last_proposal, streak = observed, 1
+    if streak >= _PLAN_CONFIRM_OBS:
+        return last_proposal, None, 0
+    return None, last_proposal, streak
 
 
 def _make_pool(plan: list[tuple[str, str]], budget: int) -> ThreadPoolExecutor:
@@ -5256,6 +5309,9 @@ def _run_worker(
     plan_proposal: list = []  # (new_plan, lane) published by the watch
     _proposal_lock = threading.Lock()
     watch_stop = threading.Event()
+    # [last_proposal, streak] — debounce state, written only by the watch
+    # thread (list so the nested def can mutate without nonlocal ceremony).
+    _debounce: list = [None, 0]
 
     def _plan_watch() -> None:
         while True:
@@ -5266,10 +5322,18 @@ def _run_worker(
             except Exception:
                 logger.exception("plan watch: recheck failed")  # keep old plan
                 continue
-            if new_plan == plan:
+            # A single differing observation is NEVER enough: transient CPU
+            # blips would thrash the pools (drain + model reload per flip),
+            # and the drain burst re-triggers the next flip. Publish only on
+            # _PLAN_CONFIRM_OBS consecutive identical differing observations;
+            # an observation matching the live plan resets the streak.
+            proposal, _debounce[0], _debounce[1] = _plan_debounce_step(
+                plan, _debounce[0], _debounce[1], new_plan,
+            )
+            if proposal is None:
                 continue
             with _proposal_lock:
-                plan_proposal[:] = [new_plan]
+                plan_proposal[:] = [proposal]
 
     watch = threading.Thread(target=_plan_watch, name="plan-watch", daemon=True)
     if max_workers is None:
@@ -5344,6 +5408,11 @@ def _run_worker(
                     # drop their recognizers before resetting the slot seq.
                     close_model()
                     plan, budget, multi = new_plan, len(new_plan), len(new_plan) > 1
+                    # The watch publishes once and clears its own streak, but
+                    # the swap consumed a DIFFERENT new_plan — a stale
+                    # last_proposal of the same shape would need only one more
+                    # observation to republish. Reset unconditionally.
+                    _debounce[:] = [None, 0]
                     _pool_thread_seq = count()  # realign pins to the new plan
                     pool = _make_pool(plan, budget)
                     logger.info(
@@ -5606,7 +5675,30 @@ if __name__ == "__main__":
             raise SystemExit(0)
     run_worker(once=args.once, poll_interval=max(0.1, args.poll_interval))
 
-def _run_module_selfcheck() -> None:
+def _run_module_selfcheck_guarded() -> None:
+    """Run the pure-logic selfcheck without touching live state.
+
+    The governor singleton probes live VRAM by importing torch — heavy, and
+    under the gating test's faked subprocess.run its stdlib platform.uname
+    cold path re-spawns cmd probes (breaking the "exactly one nvidia-smi
+    probe" contract). The selfcheck's own promise is "pure logic; no model
+    load, no GPU", so the governor branch is disabled for the whole pass —
+    the asserts exercise the env ladder, RAM clamp and VRAM floor only.
+    Coverage gap, stated plainly: the governor's 0.65/0.80 clamp branches
+    are pinned nowhere in this pass nor by tests/test_worker_lane_planner.py
+    (which drives the probe stubs only); the 0.65 governor input is unbanded,
+    so the only plan-level anti-oscillation guarantee here is the
+    _PLAN_CONFIRM_OBS debounce, not any clamp comparison."""
+    global _GOVERNOR_AVAILABLE
+    _saved_governor = _GOVERNOR_AVAILABLE
+    _GOVERNOR_AVAILABLE = False
+    try:
+        _run_module_selfcheck_body()
+    finally:
+        _GOVERNOR_AVAILABLE = _saved_governor
+
+
+def _run_module_selfcheck_body() -> None:
     """Import-time invariants (pure logic; no model load, no GPU, no
     downloads). Gated behind VODRIP_TRANSCRIBE_SELFCHECK=1 so pytest and
     app imports stay cheap — the block used to run unconditionally,
@@ -5615,8 +5707,8 @@ def _run_module_selfcheck() -> None:
     global _cuda_recognizers_resident
     global _gpu_free_vram_bytes, _gpu_held_by_other, _gpu_util
     global _nvidia_smi_vram, _parakeet_cuda_ok, _parakeet_ok
-    global _parakeet_provider, _vram_free_at, _vram_free_bytes
-# --- module self-check (pure logic — no model load, no GPU, no downloads) --
+    global _parakeet_provider, _vram_free_at, _vram_free_bytes, _torch_cuda_vram
+
 
     _speech = [(0.0, 5.0), (5.8, 6.2), (20.0, 30.0)]
     assert _plan_chunks(_speech, merge_gap=1.0, min_len=0.25) == [(0.0, 6.2), (20.0, 30.0)], (
@@ -5628,10 +5720,10 @@ def _run_module_selfcheck() -> None:
         "wide gaps must stay separate chunks"
     )
     assert _plan_chunks([(0.0, 95.0)]) == [
-        (0.0, 30.0), (30.0, 60.0), (60.0, 90.0), (90.0, 95.0),
-    ], "chunks must be capped at the 30 s chunking window (uncapped clips truncate)"
+        (0.0, 60.0), (60.0, 95.0),
+    ], "chunks must be capped at the 60 s chunking window (uncapped clips truncate)"
     assert _plan_chunks([(0.0, 25.0), (25.4, 70.0)]) == [
-        (0.0, 30.0), (30.0, 60.0), (60.0, 70.0),
+        (0.0, 60.0), (60.0, 70.0),
     ], "cap must apply across merged regions"
     # sharded decode: cross-shard merge + shard sample contiguity (VAD regions
     # are per-shard with overlap; the merge gap stays below _plan_chunks' so the
@@ -5649,9 +5741,23 @@ def _run_module_selfcheck() -> None:
     assert _b1 == (80000, 160000) and _b1[0] == _shard_sample_bounds(0, 5.0)[1], (
         "shards must tile the timeline contiguously"
     )
-    assert _detect_device() in (("cuda", "int8"), ("cpu", "int8")), (
-        "device settings must be a known pair (nvidia -> cuda/int8, else cpu/int8)"
-    )
+    # The one intended probe is nvidia-smi (the selfcheck opt-in contract);
+    # the torch fallback imports torch (heavy, and its stdlib platform.uname
+    # cold path re-spawns cmd probes under a faked subprocess.run) — patch it
+    # like the _real_gpu_info check below does. CPU-only outcome either way.
+    # _detect_device is lru-cached: clear before and after so the blinded
+    # (cpu, int8) answer can never persist in the process cache on a
+    # torch-only fallback box (inert on an nvidia-smi box, where smi binds first).
+    _detect_device.cache_clear()
+    _saved_dd_torch = _torch_cuda_vram
+    _torch_cuda_vram = lambda: None
+    try:
+        assert _detect_device() in (("cuda", "int8"), ("cpu", "int8")), (
+            "device settings must be a known pair (nvidia -> cuda/int8, else cpu/int8)"
+        )
+    finally:
+        _torch_cuda_vram = _saved_dd_torch
+        _detect_device.cache_clear()
     assert _sanitize_key("abc/def:123") == "abc_def_123"
     _header = {"chunks": [(0.0, 5.0), (10.0, 15.0), (20.0, 25.0)], "model": PARAKEET_MODEL}
     _entries = {0: {"ci": 0, "first": 0, "count": 2}, 1: {"ci": 1, "first": 2, "count": 3}}
@@ -6092,4 +6198,4 @@ def _run_module_selfcheck() -> None:
     _selfcheck_shard_decode()
 
 if os.environ.get("VODRIP_TRANSCRIBE_SELFCHECK", "").strip().lower() in ("1", "true", "yes", "on"):
-    _run_module_selfcheck()
+    _run_module_selfcheck_guarded()

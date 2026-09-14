@@ -43,10 +43,10 @@ LIVE_BUDGET_S = 0.1
 # The probe URLs rotate one-per-sample so a single run covers every distinct
 # offload shape the app uses; adding an endpoint here is how its liveness gets
 # pinned.
-#   /api/health       to_thread(_probe)           sqlite reads + health fields
+#   /api/health       run_in_executor(LIVENESS)  sqlite reads + health fields
 #   /api/info         run_in_executor(INFO_EXEC)  named pool
 #   GET /api/settings to_thread(reconcile)        sqlite read + settings write
-#   /api/asr/runtime  to_thread(runtime_status)   pure filesystem stat
+#   /api/asr/runtime  run_in_executor(LIVENESS)  pure filesystem stat
 _PROBE_URLS = (
     "/api/health",
     "/api/info",
@@ -142,11 +142,11 @@ async def test_liveness_endpoints_stay_live_during_busy_settings_save(client):
 
     Four endpoints are probed, one per distinct offload shape, so a wedge in
     any single one of them is caught by the same run:
-      /api/health       - asyncio.to_thread(_probe) (sqlite reads + health fields)
+      /api/health       - run_in_executor(LIVENESS_EXECUTOR, _probe) (sqlite reads + health fields)
       /api/info         - run_in_executor(INFO_EXECUTOR)
       GET /api/settings - asyncio.to_thread(_load_settings_with_reconcile),
                           which both reads sqlite and WRITES settings.json
-      /api/asr/runtime  - asyncio.to_thread(runtime_status), pure filesystem IO
+      /api/asr/runtime  - run_in_executor(LIVENESS_EXECUTOR, runtime_status), pure filesystem IO
     """
     db_path = Path(os.environ["VODRIP_ARCHIVE_DB"])
     loop = asyncio.get_running_loop()

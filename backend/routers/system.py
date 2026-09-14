@@ -10,7 +10,7 @@ import platform
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 
-from deps import OS_EXECUTOR, settings_mgr
+from deps import LIVENESS_EXECUTOR, OS_EXECUTOR, settings_mgr
 from utils import media_type_for_path, validate_local_media_path
 
 logger = logging.getLogger(__name__)
@@ -65,8 +65,10 @@ async def server_info():
         from services.feature_registry import get_enabled_map
         # get_enabled_map() is memoized; cold cache reads settings_mgr.get()
         # (in-memory snapshot under the manager lock, may probe ffmpeg) —
-        # worker thread.
-        _feats = await asyncio.to_thread(get_enabled_map)
+        # liveness pool (never the shared default to_thread pool).
+        _feats = await asyncio.get_running_loop().run_in_executor(
+            LIVENESS_EXECUTOR, get_enabled_map,
+        )
     except Exception:
         _feats = {}
     try:
@@ -89,8 +91,11 @@ async def asr_runtime_status() -> dict:
     """Report whether the optional speech runtime is installed."""
     from services.asr_runtime import runtime_status
 
-    # Reads the install marker file + stats the exe — blocking FS IO.
-    return await asyncio.to_thread(runtime_status)
+    # Reads the install marker file + stats the exe — blocking FS IO;
+    # liveness pool (this endpoint is in the supervisor probe rotation).
+    return await asyncio.get_running_loop().run_in_executor(
+        LIVENESS_EXECUTOR, runtime_status,
+    )
 
 
 @router.post("/api/asr/runtime")
@@ -98,12 +103,19 @@ async def install_asr_runtime() -> dict:
     """Download and install the optional speech runtime on explicit request."""
     from services.asr_runtime import ensure_runtime, runtime_status
 
+    loop = asyncio.get_running_loop()
     try:
-        await asyncio.to_thread(ensure_runtime)
+        # Minutes-long blocking download + multi-GB verify/extract (serialized
+        # by its own _install_lock anyway) — default pool, never LIVENESS:
+        # 4 install calls would saturate the 4 liveness workers and queue
+        # /api/health behind app work, the exact starvation the pool exists
+        # to prevent.
+        await loop.run_in_executor(None, ensure_runtime)
     except Exception as exc:
         logger.warning("ASR runtime installation failed: %s", exc)
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return await asyncio.to_thread(runtime_status)
+    # Sub-second FS stat after the install — back on the liveness pool.
+    return await loop.run_in_executor(LIVENESS_EXECUTOR, runtime_status)
 
 
 @router.get("/api/errors/latest")
@@ -171,7 +183,11 @@ async def health():
             subs_pot = None
         return pending, worker, background, activity_age, subs_pot
 
-    pending, worker, background, activity_age, subs_pot = await asyncio.to_thread(_probe)
+    pending, worker, background, activity_age, subs_pot = (
+        await asyncio.get_running_loop().run_in_executor(
+            LIVENESS_EXECUTOR, _probe,
+        )
+    )
     return {
         "ok": True,
         "name": "VOD.RIP",

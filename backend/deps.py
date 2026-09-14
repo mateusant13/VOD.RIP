@@ -55,6 +55,17 @@ GESTURE_WARM_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="wa
 # Native OS actions (Explorer, folder picker) — keep off the default pool so
 # downloads/metadata work cannot queue "show in folder" behind long tasks.
 OS_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="os")
+# Liveness probes (/api/health _probe, /api/info, /api/asr/runtime reads) —
+# the supervisor/watchdog path. Dedicated tiny pool so a burst of the app's
+# own asyncio.to_thread work (every remaining to_thread site shares the
+# DEFAULT executor) can never queue the health probe behind app work and
+# fake a dead app (the old watchdog-restart failure class). 4 workers:
+# the pool runs only sub-second reads — the multi-minute ASR install goes
+# to the default pool. Module-global like every pool here: never shut down
+# at request/lifespan scope; interpreter exit reclaims the idle threads.
+# Context note: loop.run_in_executor does NOT copy contextvars (to_thread
+# does), so no ContextVar-dependent call belongs on these endpoints.
+LIVENESS_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="liveness")
 
 # ── Warm-work global cap ────────────────────────────────────────────────
 # Boot warm storm spans WARM(3)+GESTURE(2)+FULL(1)+ANON(2)+sync-wave(2) and

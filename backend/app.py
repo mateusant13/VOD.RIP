@@ -1021,6 +1021,12 @@ async def _app_lifespan(_app: FastAPI):
         shutdown_downloads_and_children()
     except Exception:
         logger.exception("shutdown during API lifespan")
+    # NOTE: LIVENESS_EXECUTOR (import-time module global like every other
+    # deps.py pool) is intentionally NEVER shut down here: the TestClient
+    # re-enters the lifespan per test and a shutdown would irreversibly
+    # poison GET /api/health for the rest of the pytest process ("cannot
+    # schedule new futures after shutdown"). Interpreter exit reclaims the
+    # 4 idle threads.
 
 
 app = FastAPI(title="Kick & Twitch Downloader", version=__version__, lifespan=_app_lifespan)
