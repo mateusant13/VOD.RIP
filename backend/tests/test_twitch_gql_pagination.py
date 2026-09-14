@@ -13,6 +13,7 @@ Run from backend/: python -m pytest tests/test_twitch_gql_pagination.py -q -p no
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, ".")
 
@@ -42,25 +43,41 @@ def _videos_page(ids, has_next: bool, cursor: str | None) -> dict:
     }
 
 
-def _clip_node(slug: str) -> dict:
+# Era-window fixtures must age relative to `now`: a hardcoded date walks past
+# the `older_than_days` cutoff and the crawl's date-stop starts firing on page
+# 1. 20 days sits mid-window for the tests below (older 30d / newer 14d).
+_CLIP_AGE_SEC = 20 * 86400.0
+
+
+def _iso_ago(seconds: float) -> str:
+    ts = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+    return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _clip_node(slug: str, age_sec: float = _CLIP_AGE_SEC) -> dict:
     return {
         "slug": slug,
         "id": f"id-{slug}",
         "title": f"Clip {slug}",
         "durationSeconds": 20,
-        "createdAt": "2026-08-01T00:00:00Z",
+        "createdAt": _iso_ago(age_sec),
         "viewCount": 5,
         "thumbnailURL": f"https://thumb/{slug}",
         "url": f"https://clips.twitch.tv/{slug}",
     }
 
 
-def _clips_page(ids, has_next: bool) -> dict:
+def _clips_page(ids, has_next: bool, age_step_sec: float = 0.0) -> dict:
+    # `age_step_sec` keeps a page's edges newest-first in slug order, so the
+    # service's created_at sort cannot shuffle the fixture.
     return {
         "user": {
             "clips": {
                 "pageInfo": {"hasNextPage": has_next, "endCursor": "c"},
-                "edges": [{"node": _clip_node(i)} for i in ids],
+                "edges": [
+                    {"node": _clip_node(i, _CLIP_AGE_SEC + n * age_step_sec)}
+                    for n, i in enumerate(ids)
+                ],
             }
         }
     }
@@ -179,16 +196,15 @@ def test_clips_era_window_scales_depth_and_returns_deep_fetch(monkeypatch) -> No
     """Era crawls (older_than_days>0) must go deep enough for show-more pages:
     with a 300-clip request the in-window target scales past 100 and the whole
     deep fetch is returned (the API layer window-filters + slices)."""
-    import time as _time
-
-    now = _time.time()
     pages_served = {"n": 0}
 
     def fake_persisted(op, hash_, variables):
         pages_served["n"] += 1
         # One huge page with more to come — era crawl should keep going.
+        # Hourly-spaced edges make this a genuinely date-ordered bucket (like
+        # Twitch's real newest-first pages) rather than one tied timestamp.
         return _clips_page(
-            [f"e{i}" for i in range(100)], has_next=True
+            [f"e{i}" for i in range(100)], has_next=True, age_step_sec=3600.0
         )
 
     monkeypatch.setattr(gql, "_gql_persisted", fake_persisted)
@@ -202,4 +218,3 @@ def test_clips_era_window_scales_depth_and_returns_deep_fetch(monkeypatch) -> No
     assert len(clips) == 400  # 4 pages of 100, in_window_target met
     assert pages_served["n"] == 4
     assert all(c["id"].startswith("id-e") for c in clips)
-    _ = now

@@ -656,7 +656,11 @@ def _rotate_live_twitch_session(session_id: str, player_type: Optional[str]) -> 
     # pre_idle is elapsed-seconds at peek time (pre IS the session object;
     # get_session already renewed last_access). Fallback: peek miss means the
     # caller's get_session is not the registry's — derive from the session.
-    idle = pre_idle if (pre_idle is not None and pre is session) else max(0.0, time.time() - session.last_access)
+    # No last_access at all (a session the registry never stamped) has nothing
+    # to age against, so count it as freshly used rather than crashing.
+    last_access = getattr(session, "last_access", None)
+    aged_idle = max(0.0, time.time() - last_access) if last_access is not None else 0.0
+    idle = pre_idle if (pre_idle is not None and pre is session) else aged_idle
     return {
         "ok": True,
         "player_type": probed["player_type"],

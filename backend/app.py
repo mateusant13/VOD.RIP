@@ -20,10 +20,12 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request
+from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from deps import settings_mgr, download_mgr
 from routers import (
@@ -1074,6 +1076,44 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# The clip-assist endpoints are called by a content script whose Origin is
+# genuinely https://clips.twitch.tv, and the browser preflights them (they
+# carry Content-Type: application/json). The localhost-only CORSMiddleware
+# above rejects that preflight with 400 "Disallowed CORS origin" before the
+# @router.options handlers in routers/twitch_clips.py can ever run.
+#
+# Rather than widen the global policy for every route, this narrow ASGI layer
+# (registered below, so it sits OUTSIDE CORSMiddleware and sees the request
+# first) answers the preflight for exactly those two paths using the same
+# response the routes already define. The interception test is byte-for-byte
+# CORSMiddleware's own condition — OPTIONS plus an
+# Access-Control-Request-Method header — so this layer is inert for plain
+# OPTIONS, for GET/POST, and for every other path: those still get the
+# localhost-only policy and still 400 on a disallowed origin.
+_CLIP_PREFLIGHT_PATHS = frozenset({"/api/debug/clip-events", "/api/twitch/clips/record"})
+
+
+class ClipPreflightMiddleware:
+    """Serve the clips.twitch.tv preflight ahead of the global CORS gate."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if (
+            scope["type"] == "http"
+            and scope["method"] == "OPTIONS"
+            and scope["path"] in _CLIP_PREFLIGHT_PATHS
+            and "access-control-request-method" in Headers(scope=scope)
+        ):
+            response = twitch_clips._clip_cors_preflight()
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(ClipPreflightMiddleware)
 
 assert_ytdlp_safe()
 
