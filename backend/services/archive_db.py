@@ -3071,6 +3071,33 @@ _TITLES_MAX_TOKENS = 16
 _SPAM_DOWNWEIGHT = 0.2
 _SPAM_MIN_TOKENS = 4
 _SPAM_MAX_UNIQUE_TOKENS = 2
+# Grammatical filler words (pt-BR + EN), pre-folded to the lowercase,
+# accent-stripped shape `_fold_tokens` produces. They are in half the catalog,
+# so a title that carries ONLY them is not evidence of a match: 'dai a cesar o
+# que é de cesaras' surfaced 403 unrelated titles at score 1/4 (they all
+# contain 'que'), occupying ranks 11-60 of the real archive's result page.
+# Used by the title-coverage score only — never by the content tiers, phrase
+# or AND patterns, which must keep every word the user typed.
+_STOPWORDS = frozenset({
+    # pt-BR articles, contractions, prepositions, pronouns, copula. The
+    # 1-2 char entries are unreachable through the title pass (it filters
+    # tokens to len>=3 before this set is consulted) but are kept: the
+    # _token_expansions seed gate and any future caller consult the set
+    # directly, and 'a'/'o'/'e'/'de'... are exactly as filler as their
+    # longer siblings.
+    "a", "o", "e", "de", "da", "do", "das", "dos", "no", "na", "nos", "vos",
+    "em", "um", "uma", "que", "se", "nao", "ser", "sua", "seu",
+    "minha", "meu", "pra", "pro", "por", "com", "sem", "para", "muito",
+    "mais", "menos", "isso", "isto", "aquilo", "esse", "essa", "este",
+    "esta", "eu", "foi", "ja", "me", "te", "as", "os", "aos", "ao",
+    "voce", "quem", "onde", "como", "mim",
+    # EN high-frequency function words (mixed-language channels are
+    # common). 'sim' and 'for' are deliberately NOT here: 'sim' is a real
+    # content word in game chat ("sim!" / SIM racing) and 'for' is a
+    # homograph of Portuguese 'for' (subjunctive of ser) — a channel
+    # searching either must keep full coverage.
+    "the", "and", "with", "that", "this", "you", "are", "was", "not",
+})
 
 
 def _span_query_has_signal(
@@ -3361,6 +3388,18 @@ def search(
             for t in missing:
                 for term, _ in _token_expansions(t, span_vocabs, span_bigrams, q_freq):
                     q_keep_tokens.add(term)
+    # The floor compares TOKENS, so both sides must live in the same spelling
+    # space. The FTS5 index folds diacritics ('cesar' matches 'César', and
+    # 'transcricao' matches 'transcrição' — unicode61 strips marks into the
+    # BASE letter, ç→c) while the raw row text does not: folding only one
+    # side made 60 of the archive's 61 real 'cesar' transcript segments
+    # vanish from 'dai a cesar o que é de cesaras' — they spelled 'César'
+    # and carried no ASCII 'cesar' token. Raw spellings are KEPT alongside
+    # the folded ones (scripts the fold cannot touch must still compare
+    # equal to themselves), so the floor can only ever get more permissive
+    # here. This is deliberately NOT the phonetic _ACCENT_FOLD (ç→s): the
+    # floor asks what the index matched, not what the word sounds like.
+    q_keep_tokens |= {_strip_diacritics(t) for t in q_keep_tokens}
     if mode == "exact":
         pattern = {}
         and_pattern = None
@@ -3493,6 +3532,9 @@ def search(
                 # page with "vale"-only mentions.
                 if q_keep_tokens:
                     row_toks = set(re.findall(r"[^\W_]+", h["text"].casefold()))
+                    row_toks |= {
+                        _strip_diacritics(t) for t in row_toks if not t.isascii()
+                    }
                     if not row_toks.intersection(q_keep_tokens):
                         continue
             # Repetitive-token rows (hype/autocaption spam) are not
@@ -3531,9 +3573,11 @@ def search(
             # No ÷tmax normalization: a title matching only a common token
             # of a 4-word query ('quem foi que gritou' → "foi") used to
             # normalize to 1.0 and outrank every genuine partial content
-            # hit. Score stays matched/len(q_tokens) with partial flagged,
-            # so a 1.0 means a full title match and the global merge sorts
-            # the rest (a "foi"-only title ranks at 0.25 with the partials).
+            # hit. Score stays matched/len(content tokens) with partial
+            # flagged on FULL query coverage (stopwords included), so a
+            # 1.0-and-complete title really carries every typed word and
+            # the global merge sorts the rest (a "foi"-only title ranks at
+            # 0.25 among the partials).
             merged.extend(title_rows)
     # Dedupe by (platform, video_id), capping ~3 hits per video, then slice.
     # Relevance is the primary order: complete matches (partial False —
@@ -3615,6 +3659,21 @@ def _fold_tokens(text: str) -> list[str]:
     return [t for t in re.split(r"[^a-z0-9]+", folded) if t]
 
 
+def _strip_diacritics(text: str) -> str:
+    """Case-folded NFD accent-strip: 'Transcrição' → 'transcricao'.
+
+    A Unicode NFKD/NFD fold that drops combining marks — the exact
+    equivalent of FTS5's default unicode61 tokenizer, which folds
+    diacritics into base letters. Unlike the phonetic _ACCENT_FOLD
+    table (where ç→s), ç→c here, because the floor compares against
+    what the FTS index actually matched, not against pronunciation."""
+    import unicodedata
+    return "".join(
+        c for c in unicodedata.normalize("NFD", str(text or "").casefold())
+        if unicodedata.category(c) != "Mn"
+    )
+
+
 def _titles_search(
     q: str,
     fetch: int,
@@ -3656,6 +3715,15 @@ def _titles_search(
     q_tokens = [t for t in q_tokens if len(t) >= 3][:_TITLES_MAX_TOKENS]
     if not q_tokens:
         return []
+    # Title COVERAGE is scored on the content words only. Stopwords are in
+    # half the catalog, so a title that carries nothing else proves nothing:
+    # 'dai a cesar o que é de cesaras' surfaced 403 unrelated titles at
+    # 1/4 each — every one of them matched on 'que' alone — and they filled
+    # ranks 11-60 of the page. An all-stopword query falls back to the full
+    # token list (nothing would score otherwise), and the `exact` branch
+    # below keeps the unfiltered list: a literal title phrase must require
+    # every word the user typed.
+    q_scored = [t for t in q_tokens if t not in _STOPWORDS] or q_tokens
     freq = q_freq or {}
     sql = ("SELECT platform, video_id, channel, title, original_title, "
            "started_at AS date, kind AS video_kind, channel_language FROM videos")
@@ -3705,12 +3773,18 @@ def _titles_search(
             needle = " ".join(q_tokens)
             if needle not in " ".join(toks) and q.strip().casefold() not in hay:
                 continue
-            matched = len(q_tokens)
+            # A literal phrase hit carries every typed word, stopwords
+            # included; both counters follow so score stays 1.0 and the
+            # partial flag stays False.
+            matched = den = matched_all = len(q_tokens)
         else:
-            matched = sum(
-                1
-                for qt in q_tokens
-                if any(
+            # COVERAGE (the score) is counted on the content words only;
+            # COMPLETENESS (the partial flag) on every typed token — a
+            # title that covers 'vale' but not the stopword 'meu' of
+            # 'vale meu' is still a partial match, not a full one, even
+            # though the content denominator gives it 1.0.
+            def covers(qt: str) -> bool:
+                return any(
                     tt == qt
                     or (
                         len(qt) >= 4
@@ -3720,10 +3794,12 @@ def _titles_search(
                     or _tok_eq(tt, qt)
                     for tt in toks
                 )
-            )
+            matched = sum(1 for qt in q_scored if covers(qt))
+            den = len(q_scored)
+            matched_all = sum(1 for qt in q_tokens if covers(qt))
         if not matched:
             continue
-        score = matched / len(q_tokens)
+        score = matched / den
         display = original or title
         out.append({
             "kind": "title",
@@ -3738,7 +3814,7 @@ def _titles_search(
             "date": r["date"],
             "video_kind": r["video_kind"],
             "channel_language": r["channel_language"],
-            "partial": matched < len(q_tokens),
+            "partial": matched_all < len(q_tokens),
             "_rowid": f"t:{r['platform']}:{r['video_id']}",
             "_raw": score,
         })
@@ -5392,6 +5468,14 @@ def _token_expansions(
     token). Tests call this helper with 3 args, so None falls back to
     building it here."""
     if len(token) < 3:
+        return [(token, 0)]
+    # Fuzzy noise gate: 3-char seeds and stopword seeds expand into words
+    # the user never meant ('dai' -> dist-1 'dia', which then leaks into
+    # the relevance floor's keep-set via the backfill below search()). The
+    # seed itself still searches (distance 0); only its neighbourhood is
+    # suppressed. Applies uniformly: tiers, span variants, keep-backfill,
+    # and the ai corrector all share this one function.
+    if len(token) < 4 or _strip_diacritics(token) in _STOPWORDS:
         return [(token, 0)]
     now = time.monotonic()
     dbp = str(_db_path())
