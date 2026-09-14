@@ -32,10 +32,12 @@ import {
   ARCHIVE_LANGS,
   ARCHIVE_PLATFORMS,
   ARCHIVE_SOURCES,
+  ARCHIVE_SOURCE_DEFAULTS,
   ARCHIVE_SOURCE_LABELS,
   buildArchiveVodUrl,
   buildSearchUrl,
   enrichKindCounts,
+  kindChipMatchesRow,
   formatArchiveOffset,
   formatRelativeDate,
   highlightQuerySpans,
@@ -107,6 +109,10 @@ type DeepHit = {
   date: string | null;
   ts?: number;
   snippet: string;
+  /** Stored video kind from the SEARCH vocabulary ('vod' | 'short' |
+   *  'stream'). The backend OMITS the key when the kind is unknown, so
+   *  absent means "unclassifiable" — never "does not match". */
+  video_kind?: string | null;
 };
 type DeepJobStatus = {
   status: 'running' | 'done' | 'error' | 'cancelled';
@@ -191,8 +197,10 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
   const [channelFilter, setChannelFilter] = useState(initialChannel ?? '');
   const [platformFilter, setPlatformFilter] = useState<string[]>([]);
   const [kindFilter, setKindFilter] = useState<string[]>([]);
-  /** Multi-select content sources; all three ON by default. */
-  const [sourceFilter, setSourceFilter] = useState<ArchiveSource[]>([...ARCHIVE_SOURCES]);
+  /** Multi-select content sources; transcripts + chat ON, title OFF (the
+   *  noisiest pass is opt-in). This is NOT "all sources" — see
+   *  ARCHIVE_SOURCE_DEFAULTS for why that has to go on the wire explicitly. */
+  const [sourceFilter, setSourceFilter] = useState<ArchiveSource[]>([...ARCHIVE_SOURCE_DEFAULTS]);
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
   /** True = ignore the stored date range (default). A date pick unchecks it;
@@ -292,6 +300,19 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
     if (platformFilter.length === 0) return hits;
     return hits.filter((h) => hitPlatforms(h).some((p) => platformFilter.includes(p)));
   }, [hits, platformFilter]);
+
+  /** Deep-sweep rows obey the chips, like every other section.
+   *  SOURCE axis: the sweep scans transcripts only — it never runs a chat or
+   *  title pass — so the whole section is empty once TRANSCRIPTION is off.
+   *  KIND axis: unlike the list results (filtered server-side), the sweep
+   *  payload is enumerated kind-blind, so the section re-checks each row's
+   *  `video_kind` through the shared helper. A row whose video_kind is
+   *  absent is unknown (backend omits the key) and stays visible. */
+  const deepResults = useMemo(() => {
+    if (!deepJob) return [];
+    if (!sourceFilter.includes('transcript')) return [];
+    return deepJob.results.filter((r) => kindChipMatchesRow(kindFilter, r.video_kind));
+  }, [deepJob, kindFilter, sourceFilter]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -561,6 +582,11 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
     const gen = ++searchGenRef.current;
     setStatus('loading');
     setError(null);
+    // NOTE: the previous hits stay in state during the refetch — the list is
+    // gated on `status !== 'loading'` below instead of being cleared here.
+    // Clearing would also drop `langsPresent` (derived from `hits`), which
+    // unmounts the language chips mid-flight and strands a lang selection the
+    // user cannot cancel.
     // Date inputs can hold partial/typed garbage; invalid values become unset.
     // everyDay=true ignores the stored range (default; a date pick unchecks it).
     // With the range active, a start date without an end closes at today —
@@ -610,14 +636,16 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
 
   // Remote YouTube channel-title search: the local index only holds the
   // newest ~100 uploads per saved channel (the panel fetch cap), so old
-  // series are unreachable locally. Runs only when every source is
-  // selected (the "both"-equivalent default), and only when the scope
-  // resolves to a saved channel with a YouTube handle.
+  // series are unreachable locally. Runs only when BOTH the transcript and
+  // chat sources are selected (the remote pass is not source-scoped, so a
+  // narrowed selection would show rows the chips just excluded), and only
+  // when the scope resolves to a saved channel with a YouTube handle. The
+  // title chip is irrelevant here — it never widens this pair.
   useEffect(() => {
     remoteGenRef.current += 1;
     const excludedPlatform = platformFilter.length > 0 && !platformFilter.includes('youtube');
     const excludedKind = kindFilter.length > 0 && !kindFilter.includes('vod');
-    const allSources = sourceFilter.length === ARCHIVE_SOURCES.length;
+    const allSources = sourceFilter.includes('transcript') && sourceFilter.includes('chat');
     if (!query || scopeActive || !allSources || excludedPlatform || excludedKind || !remoteYtHandle) {
       setRemoteHits([]);
       setRemoteStatus('idle');
@@ -1148,8 +1176,9 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                           : [...cur, s];
                         // Never empty out — an empty source set would
                         // silently mean "all" on the backend (param
-                        // omitted), reading as a bug.
-                        return next.length > 0 ? next : [...ARCHIVE_SOURCES];
+                        // omitted), which now includes the title pass. Reset
+                        // to the opening default instead (titles stay off).
+                        return next.length > 0 ? next : [...ARCHIVE_SOURCE_DEFAULTS];
                       })
                     }
                     className={`px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
@@ -1298,8 +1327,10 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
 
       {/* ── HITS — incremental: only `visibleCount` rows are mounted; the
           scroll handler reveals the next chunk so an uncapped literal search
-          stays smooth. ── */}
-      {displayHits.length > 0 && (
+          stays smooth. Hidden while a refetch is in flight: with a 100k-row
+          literal limit the window is seconds long, and the old rows under new
+          chip state read as "the chips did nothing". ── */}
+      {status !== 'loading' && displayHits.length > 0 && (
         <div
           ref={hitsScrollRef}
           onScroll={() => {
@@ -1522,18 +1553,18 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
               <p className="text-[9px] font-mono text-zinc-600 shrink-0" data-testid="deep-summary">
                 {deepJob.status === 'cancelled'
                   ? t('Deep search cancelled')
-                  : deepJob.results.length > 0
+                  : deepResults.length > 0
                     ? t('{count} transcript matches · {scanned} scanned · {missing} without captions', {
-                        count: deepJob.results.length,
+                        count: deepResults.length,
                         scanned: deepJob.scanned,
                         missing: deepJob.no_transcript,
                       })
                     : t('No transcript matches in {scanned} scanned videos', { scanned: deepJob.scanned })}
                 {deepJob.truncated ? ` · ${t('list truncated')}` : ''}
               </p>
-              {deepJob.results.length > 0 && (
+              {deepResults.length > 0 && (
                 <div className="flex flex-col gap-1 overflow-y-auto custom-scrollbar pr-1 min-h-0 flex-1">
-                  {deepJob.results.map((r, i) => (
+                  {deepResults.map((r, i) => (
                     <a
                       key={`${r.id}-${i}`}
                       href={r.ts != null ? `${r.url}?t=${r.ts}` : r.url}

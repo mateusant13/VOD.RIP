@@ -66,12 +66,21 @@ export const ARCHIVE_FILTER_KINDS = ['vod', 'clip', 'short', 'video'] as const;
 
 /**
  * Content sources offered as multi-select filter chips. 'both' is NOT an
- * option anymore — every source is toggled individually and all are ON by
- * default (the backend's default 'both' = everything). Selected set is
- * sent comma-joined; all-three collapses to omitted (backend default).
+ * option — every source is toggled individually. 'video' is the backend's
+ * title-text-only pass (rows come back kind='title'), so its chip is labelled
+ * 'title' to keep it apart from the VIDEO *kind* chip. Selected set goes
+ * comma-joined; only the complete triple collapses to the omitted param
+ * (backend default 'both' = everything — titles included).
  */
-export const ARCHIVE_SOURCES = ['transcript', 'chat'] as const;
+export const ARCHIVE_SOURCES = ['transcript', 'chat', 'video'] as const;
 export type ArchiveSource = (typeof ARCHIVE_SOURCES)[number];
+
+/** Opening selection: transcripts + chat ON, title matches OFF. Titles are the
+ *  noisiest pass (no offset, no snippet context), so they stay an explicit
+ *  opt-in. This set is NOT the collapse set below, so the default goes on the
+ *  wire as `source=transcript,chat` — omitting it would let the backend's
+ *  'both' default re-add title rows. */
+export const ARCHIVE_SOURCE_DEFAULTS: readonly ArchiveSource[] = ['transcript', 'chat'];
 
 /** Transcript language filter values sent to /api/archive/search?lang=… */
 export const ARCHIVE_LANGS = ['pt', 'en', 'es'] as const;
@@ -92,11 +101,15 @@ export const ARCHIVE_KIND_LABELS: Record<ArchiveKind, string> = {
 };
 
 /** i18n keys for the source-filter labels. The query PARAM values stay
- * stable (video|transcript|chat — buildSearchUrl joins them comma-separated
- * when a proper subset is selected; all-three is omitted = backend 'both'). */
+ * stable (transcript|chat|video — buildSearchUrl joins the selection
+ * comma-joined; ONLY the full triple is omitted, which is the backend's
+ * 'both' = everything including titles). 'video' is the token the backend
+ * uses for the title pass; the chip reads 'title' because that is what the
+ * rows are. */
 export const ARCHIVE_SOURCE_LABELS: Record<ArchiveSource, string> = {
   transcript: 'transcription',
   chat: 'chat',
+  video: 'title',
 };
 
 /** Upper-case label for a kind value; unknown/empty stays as-is. */
@@ -104,6 +117,56 @@ export function kindLabel(kind: string | null | undefined): string {
   if (!kind) return '';
   const label = ARCHIVE_KIND_LABELS[kind as ArchiveKind];
   return label ?? String(kind);
+}
+
+/**
+ * Deep-payload `video_kind` → the kind chips that accept a row of that kind.
+ *
+ * CONTRACT (backend routers/archive.py, DEEP-SWEEP dicts only): `video_kind`
+ * is optional and its value comes from the SEARCH vocabulary 'vod' | 'short'
+ * | 'stream'. Within the deep payload the sweep's content_kind 'video' is
+ * mapped to 'vod' server-side (same map as the DB seeder), which is why the
+ * virtual VIDEO chip reads 'vod' here — the claim "no literal
+ * 'video'/'clip'/'live' value is ever emitted" holds for the DEEP-SWEEP rows
+ * ONLY. DB CHECK and list hits do emit those literals (the list is filtered
+ * server-side by _kind_match_sql instead); this helper is deep-rows-only, so
+ * it never sees them. 'live'/'stream' chips both mean a recorded broadcast.
+ *
+ * A kind outside this table is unclassifiable client-side → treated like an
+ * absent kind (see kindChipMatchesRow), never like a mismatch.
+ */
+const KIND_CHIPS_BY_VIDEO_KIND: Record<string, readonly string[]> = {
+  vod: ['vod', 'video'],
+  short: ['short'],
+  stream: ['live', 'stream'],
+};
+// 'stream' → ['live','stream'] is deliberately UNSATISFIABLE by the chip
+// set: ARCHIVE_FILTER_KINDS has no 'live'/'stream' chips (search is VOD-only
+// by design), so no selection can ever include either literal and a stream
+// row stays hidden under every filterable chip. This mirrors the virtual-video
+// clause in _kind_match_sql (kind NOT IN ('short','clip','live','stream')).
+// Keep the entry — without it a stream row would look unclassifiable, take
+// the absent/unknown-kind fallback in kindChipMatchesRow, and stay visible.
+
+/**
+ * Does a deep-sweep row satisfy the selected kind chips? The list results are
+ * filtered server-side by `_kind_match_sql`; the sweep payload is not, so the
+ * section re-checks here against the locked vocabulary above.
+ *
+ * Empty selection = no kind filter = everything. An ABSENT `videoKind` means
+ * the payload carries no kind (the key is omitted for unknown), which is NOT
+ * a mismatch — hide it and a chip looks like it deleted the section, the
+ * exact symptom this filter fixes. Unknown rows therefore stay visible under
+ * any selection (forward-compatible with older backends).
+ */
+export function kindChipMatchesRow(
+  kinds: readonly string[],
+  videoKind: string | null | undefined,
+): boolean {
+  if (kinds.length === 0) return true;
+  const chips = videoKind ? KIND_CHIPS_BY_VIDEO_KIND[videoKind.toLowerCase()] : undefined;
+  if (!chips) return true;
+  return chips.some((chip) => kinds.includes(chip));
 }
 
 /**
@@ -178,9 +241,11 @@ export interface ArchiveSearchFilterParams {
   /** Empty = all kinds; multiple join as comma-separated. */
   kinds?: readonly string[] | null;
   /**
-   * Selected content sources (multi-select). Empty/null/undefined → all
-   * (backend default 'both'). Sent comma-joined when a proper subset is
-   * selected ("video,transcript").
+   * Selected content sources (multi-select). Sent comma-joined for any
+   * selection that is NOT the complete triple ("transcript,chat" is the UI
+   * default and DOES go on the wire — titles off). Empty/null/undefined →
+   * all (backend default 'both'); the full triple collapses to the omitted
+   * param for the same reason.
    */
   source?: ArchiveSource[] | null;
   /** Scope the search to a single archived video id; omitted when unset. */
@@ -216,10 +281,15 @@ export function buildSearchUrl(p: ArchiveSearchFilterParams): string {
   const kinds = (p.kinds ?? []).filter(Boolean);
   if (kinds.length > 0) params.set('kind', kinds.join(','));
   const sources = (p.source ?? []).filter(Boolean);
-  // All-three (or empty) = backend default 'both' — omit the param; a
-  // proper subset goes comma-joined ("video,transcript").
-  if (sources.length > 0 && sources.length < ARCHIVE_SOURCES.length) {
-    params.set('source', sources.join(','));
+  // ONLY the complete triple (or an empty selection) collapses to the omitted
+  // param — omission is the backend's 'both', which re-adds the title pass.
+  // The UI default (transcript+chat, title OFF) is a proper subset and must
+  // therefore go on the wire explicitly, or "titles off by default" would be
+  // a no-op. Order is normalised to ARCHIVE_SOURCES so the URL depends on the
+  // selected SET, not the click sequence (the backend parses a set).
+  const selected = new Set<ArchiveSource>(sources);
+  if (selected.size > 0 && ARCHIVE_SOURCES.some((s) => !selected.has(s))) {
+    params.set('source', ARCHIVE_SOURCES.filter((s) => selected.has(s)).join(','));
   }
   if (p.videoId) params.set('video_id', p.videoId);
   const dateFrom = p.dateFrom && isValidDateParam(p.dateFrom) ? p.dateFrom : null;

@@ -348,6 +348,44 @@ describe('ArchiveSearchPopup', () => {
     expect(screen.getByText('1 result')).toBeInTheDocument();
   });
 
+  it('hides the previous rows while a chip refetch is in flight', async () => {
+    // The fetch window: the literal search asks for 100k rows, so a chip
+    // click costs seconds. Old rows rendered under NEW chip state for that
+    // whole window read as "the chips do nothing" — the list must blank (and
+    // the spinner show) until the response lands.
+    let calls = 0;
+    let resolvePending: ((res: Response) => void) | null = null;
+    const json = (body: unknown) =>
+      new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/archive/videos')) return json(ARCHIVE_VIDEOS);
+      if (url.includes('/api/archive/search')) {
+        calls += 1;
+        // First search resolves normally; the chip-triggered refetch stays
+        // in flight until the test releases it.
+        if (calls === 1) return json({ hits: [HIT], enriching: [] });
+        return new Promise<Response>((resolve) => {
+          resolvePending = resolve;
+        });
+      }
+      return json({});
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
+    const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
+    fireEvent.change(input, { target: { value: 'zebra' } });
+    const row = await screen.findByRole('button', { name: /zebra stripes/i });
+    expect(row).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'VOD' }));
+    await waitFor(() => expect(calls).toBe(2));
+    expect(screen.queryByRole('button', { name: /zebra stripes/i })).toBeNull();
+
+    resolvePending!(json({ hits: [], enriching: [] }));
+    await screen.findByText(/No results for "zebra"/);
+  });
+
   it('onOpenHit receives resolvable per-platform targets (primary first)', async () => {
     const fetchMock = mockFetch([{ ...HIT, platforms: ['twitch', 'youtube'] }]);
     const onOpenHit = vi.fn();
@@ -385,8 +423,10 @@ describe('ArchiveSearchPopup', () => {
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     expect(screen.getByRole('button', { name: 'transcrição' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'chat' })).toBeInTheDocument();
-    // No 'ambos'/'both' chip anymore — every source is a real toggle, all ON.
+    // No 'ambos'/'both' chip — every source is a real toggle. Title is the
+    // third chip and starts OFF (asserted by the chip tests below).
     expect(screen.queryByRole('button', { name: 'ambos' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'título' })).toHaveAttribute('aria-pressed', 'false');
     const input = screen.getByPlaceholderText(/PESQUISAR/);
     fireEvent.change(input, { target: { value: 'zebra' } });
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
@@ -396,39 +436,47 @@ describe('ArchiveSearchPopup', () => {
     setLanguage('es');
     await waitFor(() => expect(screen.getByRole('button', { name: 'transcripción' })).toBeInTheDocument());
     expect(screen.getByRole('button', { name: 'chat' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'título' })).toBeInTheDocument();
     expect(within(row).getByText('transcripción')).toBeInTheDocument();
   });
 
-  it('source filter: all on sends no source, deselecting one sends the CSV subset', async () => {
+  it('source filter: title OFF by default sends transcript,chat; the full triple sends no source', async () => {
     const fetchMock = mockFetch();
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
     fireEvent.change(input, { target: { value: 'zebra' } });
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
-    expect(searchUrlWith(fetchMock, 'q=zebra')).not.toContain('source=');
+    // The opening selection (transcripts + chat, title OFF) MUST be explicit
+    // on the wire: omitting `source` is the backend's 'both', which re-runs
+    // the title pass — "off by default" would otherwise be a no-op.
+    expect(searchUrlWith(fetchMock, 'q=zebra')).toContain('source=transcript%2Cchat');
 
-    // Deselect transcription → chat alone goes as a single source
-    // (URLSearchParams percent-encodes nothing here — one value).
+    // Turning TITLE on completes the triple → the param collapses away.
+    fireEvent.click(screen.getByRole('button', { name: 'title' }));
+    await waitFor(() => {
+      const urls = searchUrls(fetchMock).filter((u) => u.includes('q=zebra'));
+      expect(urls[urls.length - 1]).not.toContain('source=');
+    });
+
+    // Turning it back off restores the default subset.
+    fireEvent.click(screen.getByRole('button', { name: 'title' }));
+    await waitFor(() =>
+      expect(searchUrlWith(fetchMock, 'q=zebra&source=transcript%2Cchat')).toBeTruthy(),
+    );
+
+    // Deselect transcription → chat alone (single value, nothing to join).
     fireEvent.click(screen.getByRole('button', { name: 'transcription' }));
     await waitFor(() =>
       expect(searchUrlWith(fetchMock, 'q=zebra&source=chat')).toBeTruthy(),
     );
 
     // Deselect chat too — the last chip can't be removed (never-empty
-    // guard), so the filter snaps back to all and the param disappears.
+    // guard), so it snaps back to the OPENING default, not to all three:
+    // the reset must not silently re-enable the title pass.
     fireEvent.click(screen.getByRole('button', { name: 'chat' }));
-    await waitFor(() => {
-      const urls = searchUrls(fetchMock).filter((u) => u.includes('q=zebra'));
-      expect(urls[urls.length - 1]).not.toContain('source=');
-    });
-
-    // Re-select both — back to all, the param disappears again.
-    fireEvent.click(screen.getByRole('button', { name: 'transcription' }));
-    fireEvent.click(screen.getByRole('button', { name: 'chat' }));
-    await waitFor(() => {
-      const urls = searchUrls(fetchMock).filter((u) => u.includes('q=zebra'));
-      expect(urls[urls.length - 1]).not.toContain('source=');
-    });
+    await waitFor(() =>
+      expect(searchUrlWith(fetchMock, 'q=zebra&source=transcript%2Cchat')).toBeTruthy(),
+    );
   });
 
   it('semantic toggle: off by default, on sends semantic=1, disabled without transcription', async () => {
@@ -444,7 +492,9 @@ describe('ArchiveSearchPopup', () => {
     fireEvent.click(toggle);
     // The lang filter defaults to '' (all languages) — chips are opt-in.
     // URLSearchParams appends semantic before mode; assert the wire contract.
-    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra&semantic=1&mode=semantic')).toBeTruthy());
+    await waitFor(() =>
+      expect(searchUrlWith(fetchMock, 'q=zebra&source=transcript%2Cchat&semantic=1&mode=semantic')).toBeTruthy(),
+    );
 
     // Concept search covers transcripts only — deselecting transcription disables it.
     fireEvent.click(screen.getByRole('button', { name: 'transcription' }));
@@ -455,7 +505,7 @@ describe('ArchiveSearchPopup', () => {
     fireEvent.click(screen.getByRole('button', { name: 'transcription' }));
     await waitFor(() => expect(screen.getByRole('button', { name: 'CONTEXT' })).not.toBeDisabled());
     await waitFor(() =>
-      expect(searchUrlWith(fetchMock, 'q=zebra&semantic=1&mode=semantic')).toBeTruthy(),
+      expect(searchUrlWith(fetchMock, 'q=zebra&source=transcript%2Cchat&semantic=1&mode=semantic')).toBeTruthy(),
     );
   });
 
@@ -567,7 +617,7 @@ describe('ArchiveSearchPopup', () => {
     // Picking a date unchecks it and applies the range.
     fireEvent.change(screen.getByLabelText('From date'), { target: { value: '2026-07-30' } });
     await waitFor(() =>
-      expect(searchUrlWith(fetchMock, 'q=zebra&date_from=2026-07-30')).toBeTruthy(),
+      expect(searchUrlWith(fetchMock, 'q=zebra&source=transcript%2Cchat&date_from=2026-07-30')).toBeTruthy(),
     );
     expect(screen.getByRole('button', { name: 'EVERY DAY' })).toHaveAttribute('aria-pressed', 'false');
 
@@ -582,7 +632,7 @@ describe('ArchiveSearchPopup', () => {
     // Unchecking re-applies the still-stored date.
     fireEvent.click(screen.getByRole('button', { name: 'EVERY DAY' }));
     await waitFor(() =>
-      expect(searchUrlWith(fetchMock, 'q=zebra&date_from=2026-07-30')).toBeTruthy(),
+      expect(searchUrlWith(fetchMock, 'q=zebra&source=transcript%2Cchat&date_from=2026-07-30')).toBeTruthy(),
     );
   });
 
@@ -597,7 +647,7 @@ describe('ArchiveSearchPopup', () => {
     fireEvent.click(screen.getByRole('button', { name: 'EVERY DAY' }));
     await waitFor(() =>
       expect(
-        searchUrlWith(fetchMock, `q=zebra&date_from=${today}&date_to=${today}`),
+        searchUrlWith(fetchMock, `q=zebra&source=transcript%2Cchat&date_from=${today}&date_to=${today}`),
       ).toBeTruthy(),
     );
     // The seeded date is visible in the input, and the toggle stays off.
@@ -617,7 +667,7 @@ describe('ArchiveSearchPopup', () => {
     fireEvent.change(screen.getByLabelText('From date'), { target: { value: '2026-07-30' } });
     await waitFor(() =>
       expect(
-        searchUrlWith(fetchMock, `q=zebra&date_from=2026-07-30&date_to=${todayIso()}`),
+        searchUrlWith(fetchMock, `q=zebra&source=transcript%2Cchat&date_from=2026-07-30&date_to=${todayIso()}`),
       ).toBeTruthy(),
     );
 
@@ -647,7 +697,7 @@ describe('ArchiveSearchPopup', () => {
     expect(screen.getByRole('button', { name: 'EN' })).toBeInTheDocument();
 
     fireEvent.click(ptBtn);
-    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra&lang=pt')).toBeTruthy());
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra&source=transcript%2Cchat&lang=pt')).toBeTruthy());
     expect(ptBtn).toHaveAttribute('aria-pressed', 'true');
 
     // Clicking again clears the filter.
@@ -1305,7 +1355,7 @@ describe('ArchiveSearchPopup USER filter', () => {
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const user = screen.getByLabelText('Chat author');
     fireEvent.change(user, { target: { value: 'Scriptingkata' } });
-    for (const name of ['transcription', 'chat']) {
+    for (const name of ['transcription', 'chat', 'title']) {
       expect(screen.getByRole('button', { name })).toBeDisabled();
       expect(screen.getByRole('button', { name })).toHaveAttribute(
         'title',
@@ -1340,13 +1390,16 @@ describe('ArchiveSearchPopup batch-3', () => {
     channel: 'srdogg',
   };
 
-  it('source chips: 2 chips, deselecting transcription leaves chat only, disables CONTEXT', async () => {
+  it('source chips: 3 chips, title OFF by default, deselecting transcription leaves chat only and disables CONTEXT', async () => {
     const fetchMock = mockFetch([]);
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
-    // All source chips are ON by default (aria-pressed) — no 'video' chip.
+    // Transcripts + chat are ON; the new TITLE chip starts OFF.
     for (const name of ['transcription', 'chat']) {
       expect(screen.getByRole('button', { name })).toHaveAttribute('aria-pressed', 'true');
     }
+    expect(screen.getByRole('button', { name: 'title' })).toHaveAttribute('aria-pressed', 'false');
+    // The chip is labelled by what the rows ARE (titles), not by the backend
+    // token ('video') — which would collide with the VIDEO *kind* chip.
     expect(screen.queryByRole('button', { name: 'video' })).toBeNull();
     // Deselect transcription → chat-only subset.
     fireEvent.click(screen.getByRole('button', { name: 'transcription' }));
@@ -1863,6 +1916,106 @@ describe('ArchiveSearchPopup deep transcript search', () => {
     });
     expect(statusPolls).toBe(pollsAfterGone);
     vi.useRealTimers();
+  });
+
+  /** A finished sweep carrying three rows: an excluded kind, an included kind,
+   *  and one with no video_kind at all (the backend does not emit the field
+   *  yet — see the assertion below). */
+  const DEEP_ROWS = [
+    { id: 's1', title: 'STREAM ROW', url: 'https://youtu.be/s1', date: null, ts: 1,
+      snippet: 'stream snippet', video_kind: 'stream' },
+    { id: 'v1', title: 'VOD ROW', url: 'https://youtu.be/v1', date: null, ts: 2,
+      snippet: 'vod snippet', video_kind: 'vod' },
+    { id: 'u1', title: 'UNKNOWN ROW', url: 'https://youtu.be/u1', date: null, ts: 3,
+      snippet: 'unknown snippet' },
+  ];
+
+  function doneSweep(deep: unknown) {
+    return (url: string) => {
+      if (url.includes('/cancel')) return { ok: true };
+      if (url.includes('/api/archive/search/deep/job-1')) return deep;
+      return { job_id: 'job-1' };
+    };
+  }
+
+  /** Launch the sweep and let it finish; returns after the rows render. */
+  async function runToDone() {
+    fireEvent.change(screen.getByRole('textbox', { name: /Type confirmar to enable/i }), {
+      target: { value: 'confirmar' },
+    });
+    await waitFor(() => expect(startBtn().disabled).toBe(false));
+    vi.useFakeTimers();
+    await act(async () => {
+      fireEvent.click(startBtn());
+      await vi.advanceTimersByTimeAsync(0); // POST resolves -> first poll -> done
+    });
+  }
+
+  it('deep sweep rows obey the kind chip (VIDEO excludes streams, keeps unknown kinds)', async () => {
+    const fetchMock = mockFetch([], {}, { hits: [], error: null }, doneSweep({
+      status: 'done', scanned: 3, total: 3, no_transcript: 1, truncated: false, results: DEEP_ROWS,
+    }));
+    await openWithQuery(fetchMock);
+    await runToDone();
+
+    // No kind chip: every row is visible.
+    expect(screen.getByText('STREAM ROW')).toBeInTheDocument();
+    expect(screen.getByText('VOD ROW')).toBeInTheDocument();
+    expect(screen.getByText('UNKNOWN ROW')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'VIDEO' }));
+
+    // 'stream' is in the virtual token's exclusion set (the same NOT IN list
+    // the backend applies), so the row disappears with the chip.
+    expect(screen.queryByText('STREAM ROW')).toBeNull();
+    expect(screen.getByText('VOD ROW')).toBeInTheDocument();
+    // WHY the unknown-kind row stays: the deep payload has no video_kind yet,
+    // and "not sent" is not "does not match" — hiding it would make the chip
+    // look like it deleted results, exactly the bug being fixed.
+    expect(screen.getByText('UNKNOWN ROW')).toBeInTheDocument();
+    // The header count is the FILTERED length, so the summary can no longer
+    // claim three matches above a two-row list.
+    expect(
+      screen.getByText(/2 transcript matches · 3 scanned · 1 without captions/),
+    ).toBeInTheDocument();
+    vi.useRealTimers();
+  });
+
+  it('deep sweep section empties when the transcription source chip is off', async () => {
+    const fetchMock = mockFetch([], {}, { hits: [], error: null }, doneSweep({
+      status: 'done', scanned: 3, total: 3, no_transcript: 1, truncated: false, results: DEEP_ROWS,
+    }));
+    await openWithQuery(fetchMock);
+    await runToDone();
+    expect(screen.getByText('VOD ROW')).toBeInTheDocument();
+
+    // The sweep is transcript-only traffic — it never runs a chat or title
+    // pass, so excluding transcripts must empty this section, not leave it up.
+    fireEvent.click(screen.getByRole('button', { name: 'transcription' }));
+    expect(screen.queryByText('VOD ROW')).toBeNull();
+    expect(screen.queryByText('UNKNOWN ROW')).toBeNull();
+    expect(
+      screen.getByText(/No transcript matches in 3 scanned videos/),
+    ).toBeInTheDocument();
+    vi.useRealTimers();
+  });
+
+  it('remote YouTube section is gated on transcript+chat, never on the title chip', async () => {
+    const fetchMock = mockFetch([], {}, { hits: [], error: null });
+    const remoteCalls = () =>
+      fetchMock.mock.calls.filter((c) => String(c[0]).includes('/api/archive/search/remote')).length;
+    await openWithQuery(fetchMock);
+    // Title OFF (the default) does NOT suppress the remote pass.
+    expect(remoteCalls()).toBe(1);
+
+    fireEvent.click(screen.getByRole('button', { name: 'title' }));
+    await waitFor(() => expect(remoteCalls()).toBe(2));
+
+    // Dropping chat does — the remote rows are not source-scoped, so showing
+    // them under a narrowed selection would contradict the chips.
+    fireEvent.click(screen.getByRole('button', { name: 'chat' }));
+    await waitFor(() => expect(screen.queryByText(/YouTube results/)).toBeNull());
+    expect(remoteCalls()).toBe(2);
   });
 });
 

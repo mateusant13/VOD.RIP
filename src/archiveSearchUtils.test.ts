@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import {
   ARCHIVE_FILTER_KINDS,
   ARCHIVE_KINDS,
+  ARCHIVE_SOURCE_DEFAULTS,
+  ARCHIVE_SOURCES,
   buildArchiveVodUrl,
   buildSearchUrl,
   firstMatchIndex,
@@ -11,6 +13,7 @@ import {
   highlightQuerySpans,
   hitPlatforms,
   isValidDateParam,
+  kindChipMatchesRow,
   kindLabel,
   pickLeastOpenedTarget,
   resolveOpenTargets,
@@ -193,7 +196,7 @@ describe('buildSearchUrl', () => {
     expect(url).toBe('/api/archive/search?q=x&mode=exact&limit=30');
   });
 
-  it('emits source as CSV subset, omits when all selected or empty, and videoId when set', () => {
+  it('emits source as CSV subset, omits only the full triple or empty, and videoId when set', () => {
     expect(buildSearchUrl({ query: 'x', source: ['transcript'] })).toBe(
       '/api/archive/search?q=x&source=transcript&mode=exact&limit=30',
     );
@@ -203,8 +206,18 @@ describe('buildSearchUrl', () => {
     expect(buildSearchUrl({ query: 'x', videoId: 'abc123' })).toBe(
       '/api/archive/search?q=x&video_id=abc123&mode=exact&limit=30',
     );
-    // All sources selected = backend default 'both' — param omitted.
-    expect(buildSearchUrl({ query: 'x', source: ['transcript', 'chat'], videoId: 'v1' })).toBe(
+    // The UI default (transcript+chat, title OFF) MUST go on the wire:
+    // omission is the backend's 'both', which re-runs the title pass.
+    expect(buildSearchUrl({ query: 'x', source: [...ARCHIVE_SOURCE_DEFAULTS] })).toBe(
+      '/api/archive/search?q=x&source=transcript%2Cchat&mode=exact&limit=30',
+    );
+    // Normalised to ARCHIVE_SOURCES order, so the URL depends on the selected
+    // set and not on the order the user clicked the chips in.
+    expect(buildSearchUrl({ query: 'x', source: ['video', 'chat'] })).toBe(
+      '/api/archive/search?q=x&source=chat%2Cvideo&mode=exact&limit=30',
+    );
+    // ONLY the complete triple = backend default 'both' — param omitted.
+    expect(buildSearchUrl({ query: 'x', source: [...ARCHIVE_SOURCES], videoId: 'v1' })).toBe(
       '/api/archive/search?q=x&video_id=v1&mode=exact&limit=30',
     );
     // Empty selection = same default — omitted.
@@ -283,6 +296,48 @@ describe('kindLabel', () => {
     expect(kindLabel('')).toBe('');
     expect(kindLabel(null)).toBe('');
     expect(kindLabel(undefined)).toBe('');
+  });
+});
+
+describe('kindChipMatchesRow', () => {
+  it('treats an empty selection as "no filter"', () => {
+    expect(kindChipMatchesRow([], 'stream')).toBe(true);
+  });
+
+  it('maps the deep video_kind=vod under both the VOD and virtual VIDEO chips', () => {
+    // The sweep's content_kind 'video' is normalised to 'vod' server-side,
+    // so 'vod' is the only value a YouTube-upload row can carry.
+    expect(kindChipMatchesRow(['video'], 'vod')).toBe(true);
+    expect(kindChipMatchesRow(['vod'], 'vod')).toBe(true);
+    expect(kindChipMatchesRow(['clip'], 'vod')).toBe(false);
+  });
+
+  it('hides a stream row under every filterable chip', () => {
+    // The deep contract emits 'stream', but search deliberately offers no
+    // LIVE chip (ARCHIVE_FILTER_KINDS is VOD-only) — so a recorded broadcast
+    // must disappear whatever the user picks. This is the leak the VIDEO chip
+    // used to have: streams showing under a Videos-tab filter.
+    expect(kindChipMatchesRow(['short'], 'short')).toBe(true);
+    for (const chip of ARCHIVE_FILTER_KINDS) {
+      expect(kindChipMatchesRow([chip], 'stream')).toBe(false);
+    }
+  });
+
+  it('an absent video_kind is unknown, not a mismatch — the row stays visible', () => {
+    // WHY: the backend OMITS the key when the kind is unknown, and a chip
+    // that hid those rows would look like it deleted the whole section —
+    // indistinguishable from the bug this filter fixes.
+    expect(kindChipMatchesRow(['vod'], undefined)).toBe(true);
+    expect(kindChipMatchesRow(['vod'], null)).toBe(true);
+  });
+
+  it('a kind outside the contract vocabulary stays visible too (forward compat)', () => {
+    expect(kindChipMatchesRow(['vod'], 'movie')).toBe(true);
+  });
+
+  it('the chip set is a union: any selected chip accepts the row', () => {
+    expect(kindChipMatchesRow(['clip', 'video'], 'vod')).toBe(true);
+    expect(kindChipMatchesRow(['clip', 'short'], 'stream')).toBe(false);
   });
 });
 
