@@ -262,19 +262,36 @@ def _fake_platform_services(monkeypatch):
 @pytest.mark.asyncio
 async def test_channel_payload_prefers_original_title(_fake_platform_services, _scratch_archive_db):
     """A fresh walk surfaces the backfilled original (fetched items win the
-    merge, so _overlay_original_titles must copy the index original onto them)."""
+    merge, so _overlay_original_titles must copy the index original onto them).
+
+    The previous sync's rows are seeded directly rather than earned from a
+    first request: since 1a55922 a cold YouTube channel is served from the
+    (empty) index and crawled in the BACKGROUND, so request 1 never walks
+    synchronously under ASGITransport. A forced request on the now-warm index
+    is the fresh walk that exercises the overlay — the fetched y1 has no
+    original_title, so it only surfaces "O Titulo Original" if
+    _overlay_original_titles copies the index row's original onto it."""
+    for i in range(1, 4):
+        upsert_channel_video({
+            "platform": "youtube",
+            "video_id": f"y{i}",
+            "channel": "gaveta",
+            "title": f"YT {i}",
+            "started_at": "2026-08-01T00:00:00Z",
+            "duration_sec": 300,
+            "kind": "vod",
+        })
+    # Simulate a previous sync's backfill on the index row.
+    set_original_title("youtube", "y1", "O Titulo Original", "pt")
     params = {
         "url": "gaveta", "limit": "100", "days": "0", "platforms": "YouTube",
         "content": "vods", "youtube_slug": "@gaveta",
     }
     url = "/api/channel/videos?" + "&".join(f"{k}={v}" for k, v in params.items())
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-        first = await ac.get(url)
-        assert first.status_code == 200
-        # Simulate a previous sync's backfill on the index row.
-        set_original_title("youtube", "y1", "O Titulo Original", "pt")
-        second = await ac.get(url + "&force=1")
-        items = {v["id"]: v for v in second.json()["videos"]}
+        resp = await ac.get(url + "&force=1")
+        assert resp.status_code == 200
+        items = {v["id"]: v for v in resp.json()["videos"]}
         assert items["y1"]["title"] == "O Titulo Original"
         assert items["y1"]["original_title"] == "O Titulo Original"
         assert items["y1"]["original_language"] == "pt"
