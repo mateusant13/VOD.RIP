@@ -15,6 +15,38 @@ export const EXPLORE_VIDEO_ASPECT_DEFAULT = 16 / 9;
 export const EXPLORE_PANEL_BOX_MIN_W = 320;
 export const EXPLORE_PANEL_BOX_MIN_H = 280;
 const CARD_BORDER_PX = 2;
+/** Standard diagonal grab block (px) — also the hard cap for clipped hosts.
+ *  For hosts whose handles can paint OUTSIDE their border (overflow
+ *  visible/clip-with-margin), the block is anchored at the band's outer edge,
+ *  so only `max(0, size - (2 + band))` of it (≤8px at 12–16px paddings) ever
+ *  sits over panel content; a real opaque band grows it (18px multi-platform
+ *  stack → 20px block, 0px intrusion). For hosts that CLIP their handles
+ *  (`overflow: hidden` — the archive search popup) the block hugs the padding
+ *  box and its ENTIRE size sits over content, so it is clamped to the host's
+ *  tightest padding edge — the nw/ne/sw corner hugging the top is just as
+ *  exposed as sw hugging the bottom. The clamp is authoritative: a 4px-gutter
+ *  host gets a 4px corner, never the standard 16px — swallowing a footer
+ *  button is worse than a small grip. `p-3` = 12px on the search popups → the
+ *  usual clipped size, still within the 12–16px grip-target range. A clipped
+ *  host with zero padding yields a 0px corner: no safe gutter exists for it,
+ *  and every handle host in the repo pads its panel ≥4px. */
+const RESIZE_CORNER_PX = 16;
+
+/** Corner grab block size (px) — the only handle dimension that can bite into
+ *  a host's content box (the e/s edge strips stop at the padding box).
+ *  `clipsOverflow`: handles hug the padding box → clamp to `gutterPx`, the
+ *  host's tightest padding edge, so the block provably stops at the content
+ *  box. Otherwise: standard size, growing with a real opaque band so the
+ *  diagonal cursor spans it (intrusion ≤ size - (2 + band) ≤ 8px at typical
+ *  12–16px paddings; the 18px multi-platform stack → 20px → 0px). */
+export function panelResizeCornerSize(
+  clipsOverflow: boolean,
+  bandPx: number,
+  gutterPx: number,
+): number {
+  if (!clipsOverflow) return Math.max(RESIZE_CORNER_PX, bandPx + CARD_BORDER_PX);
+  return Math.min(RESIZE_CORNER_PX, Math.max(0, gutterPx));
+}
 
 export type ResizeEdge = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
 
@@ -33,18 +65,54 @@ export function panelResizeHandleInset(compact: boolean): number {
   return CARD_BORDER_PX + (compact ? 4 : 6);
 }
 
-/** Widest offset (px) in a computed box-shadow list — the colored band width.
- *  platformCardShadow uses 4px compact / 6px non-compact per platform, up to
- *  8/18px for the multi-platform default stack; the live player uses a 6px
- *  dark shadow. The resize strips must reach this outer edge so hovering any
- *  pixel of the band shows the resize cursor. */
+/** Widest OPAQUE band (px) in a computed box-shadow list — the colored ring the
+ *  resize strips must reach so hovering any of its pixels shows the resize
+ *  cursor: platformCardShadow uses 4px compact / 6px non-compact per platform,
+ *  up to 8/18px for the multi-platform default stack; the live player uses a
+ *  6px dark shadow.
+ *
+ *  Only `0px`-blur layers count. A blurred drop shadow (Tailwind `shadow-2xl` =
+ *  `0 25px 50px -12px`) is a soft falloff, not a band you can aim at — and its
+ *  blur/offset numbers are huge, so taking the widest px token anywhere in the
+ *  string used to report 50px here. That inflated the corner blocks of every
+ *  `shadow-2xl` host (the archive search popup) and pushed them over the
+ *  popup's own footer controls. A blurred layer therefore contributes 0.
+ *
+ *  Layers are split on top-level commas (color functions contain commas) and
+ *  their px tokens read positionally: [offset-x, offset-y, blur, spread]. */
 export function maxBoxShadowBandPx(boxShadow: string): number {
+  // Input contract: getComputedStyle(...).boxShadow serializations only —
+  // every length px-suffixed, colors may carry commas. Author-style unitless
+  // lengths are NOT parsed; browsers always serialize computed lengths with
+  // units, and the unitless shape then harmlessly yields 0.
   let max = 0;
-  const re = /(-?\d*\.?\d+)px/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(boxShadow)) !== null) {
-    const v = Math.abs(parseFloat(m[1]));
-    if (v > max) max = v;
+  let depth = 0;
+  let layer = '';
+  const layers: string[] = [];
+  for (const ch of boxShadow) {
+    if (ch === '(') depth++;
+    else if (ch === ')') depth--;
+    if (ch === ',' && depth === 0) {
+      layers.push(layer);
+      layer = '';
+    } else {
+      layer += ch;
+    }
+  }
+  layers.push(layer);
+  for (const l of layers) {
+    if (!/\d/.test(l)) continue;
+    const nums: number[] = [];
+    const re = /(-?\d*\.?\d+)px/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(l)) !== null) nums.push(parseFloat(m[1]));
+    // A shadow with any blur is a soft falloff, not a grabbable band.
+    if (nums.length >= 3 && nums[2] !== 0) continue;
+    if (/inset/.test(l)) continue;
+    // Positional lengths past the blur slot: [x, y, blur, spread?].
+    const extents = [Math.abs(nums[0] ?? 0), Math.abs(nums[1] ?? 0)];
+    if (nums.length >= 4) extents.push(Math.abs(nums[3]));
+    for (const v of extents) if (v > max) max = v;
   }
   return max;
 }
@@ -222,6 +290,10 @@ export function PanelResizeHandles({
   // the multi-platform default stack; the live player uses a 6px dark shadow)
   // so the strips always reach the band's outer edge, not just the 2px border.
   const [bandPx, setBandPx] = useState(0);
+  // Smallest padding on any edge: corner blocks hug the padding box on all
+  // four corners (nw/ne the top edge, ne/se the right…), so the tightest edge
+  // is the one that constrains them.
+  const [gutterPx, setGutterPx] = useState(RESIZE_CORNER_PX);
   useLayoutEffect(() => {
     // The containing block (offsetParent) is the panel the handles are
     // positioned against — the DOM parent may be an inner scroll container.
@@ -233,6 +305,14 @@ export function PanelResizeHandles({
     const margin = parseFloat(cs.overflowClipMargin) || 0;
     setClipsOverflow(cs.overflow === 'hidden' || (cs.overflow === 'clip' && margin < CARD_BORDER_PX));
     setBandPx(maxBoxShadowBandPx(cs.boxShadow));
+    setGutterPx(
+      Math.min(
+        parseFloat(cs.paddingTop) || 0,
+        parseFloat(cs.paddingRight) || 0,
+        parseFloat(cs.paddingBottom) || 0,
+        parseFloat(cs.paddingLeft) || 0,
+      ),
+    );
   });
 
   // Cursor is applied directly per edge (not group-hover): the handle is always
@@ -253,9 +333,11 @@ export function PanelResizeHandles({
   const bandOff = clipsOverflow ? 0 : CARD_BORDER_PX + bandPx;
   const bandW = Math.max(bandOff, 6);
   const cornerOff = bandOff;
-  // 16×16 for every real band (≤14px); only the 18px multi-platform default
-  // stack needs a slightly larger corner to still cover its corner block.
-  const cornerSize = Math.max(16, bandPx + 2);
+  // Clipped hosts hug the padding box, so the block's ENTIRE area covers panel
+  // content: clamp to the host's tightest padding edge (12px for a p-3 popup)
+  // — it provably stops at the content-box edge instead of swallowing the
+  // footer's Cancel button. Non-clipped hosts keep the band-following size.
+  const cornerSize = panelResizeCornerSize(clipsOverflow, bandPx, gutterPx);
 
   const edgeProps = (edge: ResizeEdge, style: CSSProperties, hoverCursorClass: string) => ({
     'data-panel-resize': true as const,

@@ -86,6 +86,29 @@ describe('maxBoxShadowBandPx', () => {
     expect(maxBoxShadowBandPx('none')).toBe(0);
     expect(maxBoxShadowBandPx('')).toBe(0);
   });
+
+  it('ignores blurred drop shadows — a soft falloff is not a grabbable band', () => {
+    // Tailwind shadow-2xl, the archive search popup's shadow. Both computed
+    // token orders; the 25px offset / 50px blur / -12px spread used to be read
+    // as a 50px band, inflating the corner blocks over the popup's footer.
+    expect(maxBoxShadowBandPx('rgb(0 0 0 / 0.25) 0px 25px 50px -12px')).toBe(0);
+    expect(maxBoxShadowBandPx('rgba(0, 0, 0, 0.25) 0px 25px 50px -12px')).toBe(0);
+    expect(maxBoxShadowBandPx('0 25px 50px -12px rgb(0 0 0 / 0.25)')).toBe(0);
+    // Stacked soft shadows (shadow-sm) stay 0.
+    expect(
+      maxBoxShadowBandPx(
+        'rgb(0 0 0 / 0.1) 0px 1px 3px 0px, rgb(0 0 0 / 0.1) 0px 1px 2px -1px',
+      ),
+    ).toBe(0);
+    // Hard band + soft drop shadow: only the band counts.
+    expect(
+      maxBoxShadowBandPx(
+        'rgb(145, 70, 255) 6px 6px 0px 0px, rgb(0 0 0 / 0.25) 0px 25px 50px -12px',
+      ),
+    ).toBe(6);
+    // Inset layers never extend the outside edge.
+    expect(maxBoxShadowBandPx('inset 0 0 0 4px rgb(224, 30, 90)')).toBe(0);
+  });
 });
 
 describe('makeRafMoveLoop', () => {
