@@ -1348,6 +1348,12 @@ def _deep_seed_video_rows(handle: str, videos: list[dict]) -> None:
 def _deep_set(job: dict, **fields: Any) -> None:
     with _deep_jobs_lock:
         job.update(fields)
+        if fields.get("status") not in (None, "running"):
+            # Every terminal transition unparks: a paused-then-cancelled
+            # (or done/errored) job must never serve stale paused=true.
+            ev = job.get("paused")
+            if ev is not None:
+                ev.clear()
 
 
 def _run_deep_job(job_id: str, handle: str, query: str) -> None:
@@ -1378,6 +1384,15 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
             job["no_transcript"] = counters["no_transcript"]
             job["results"] = list(results)
 
+    paused: threading.Event = job["paused"]
+
+    def _wait_pause() -> bool:
+        """Park while the sweep is paused. Cancel still wins: the loop
+        re-checks cancel so a paused sweep stays cancellable."""
+        while paused.is_set() and not cancel.is_set():
+            time.sleep(0.2)
+        return not cancel.is_set()
+
     def _wait_gate() -> bool:
         """Park while the IP-level bot gate is frozen. False = cancelled."""
         while yt_gate.youtube_gate_active() and not cancel.is_set():
@@ -1401,18 +1416,24 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
         return not cancel.is_set()
 
     def _add_result(v: dict, m: dict) -> None:
-        results.append({
+        hit = {
             "id": str(v.get("id") or ""),
             "title": str(v.get("title") or ""),
             "url": str(v.get("url") or f"https://www.youtube.com/watch?v={v.get('id')}"),
             "date": (str(v.get("created_at") or "")[:10] or None),
             "ts": m["ts"],
             "snippet": m["snippet"],
-        })
+        }
+        kind = str(v.get("content_kind") or "").strip()
+        if kind:
+            # Same vocabulary as the videos.kind rows the unified search
+            # ships (vod, not video) — the FE kind chips compose over it.
+            hit["video_kind"] = {"video": "vod"}.get(kind, kind)
+        results.append(hit)
 
     try:
         videos, truncated = _deep_enumerate(handle)
-        if cancel.is_set():
+        if not _wait_pause():
             _deep_set(job, status="cancelled")
             return
         if not videos:
@@ -1429,7 +1450,7 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
         # network. Marker-fresh videos are pre-skipped and counted.
         to_fetch: list[dict] = []
         for v in videos:
-            if cancel.is_set():
+            if cancel.is_set() or not _wait_pause():
                 break
             vid = str(v.get("id") or "")
             if not vid:
@@ -1454,6 +1475,8 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
             vid = str(v.get("id") or "")
             if cancel.is_set() or not vid:
                 return
+            if not _wait_pause():
+                return
             if not _wait_gate() or not _wait_pace():
                 return
             try:
@@ -1463,7 +1486,8 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
                     yt_gate.note_youtube_gate(str(exc)[:200])
                     # The IP is gated — not this video. Do NOT stamp the
                     # marker; park until the freeze lifts, then retry once.
-                    if _wait_gate() and _wait_pace():
+                    # A paused sweep must not burn a pace slot here either.
+                    if _wait_pause() and _wait_gate() and _wait_pace():
                         try:
                             payload = _deep_fetch_transcript(vid)
                         except Exception as exc2:
@@ -1590,6 +1614,7 @@ async def archive_search_deep_start(body: DeepSearchRequest):
         "no_transcript": 0,
         "truncated": False,
         "results": [],
+        "paused": threading.Event(),
         "cancel": threading.Event(),
         "started_at": time.monotonic(),
         "handle_norm": norm,
@@ -1627,6 +1652,7 @@ async def archive_search_deep_status(job_id: str):
             raise HTTPException(status_code=404, detail="unknown deep search job")
         snapshot = {
             "status": job["status"],
+            "paused": job["status"] == "running" and job["paused"].is_set(),
             "scanned": job["scanned"],
             "total": job["total"],
             "no_transcript": job["no_transcript"],
@@ -1645,4 +1671,39 @@ async def archive_search_deep_cancel(job_id: str):
         if job is None:
             raise HTTPException(status_code=404, detail="unknown deep search job")
         job["cancel"].set()
+    return {"ok": True}
+
+
+@router.post("/api/archive/search/deep/{job_id}/pause")
+async def archive_search_deep_pause(job_id: str):
+    """Park a running sweep (workers sleep at the per-video boundaries, no
+    new REMOTE fetches start — pace/gate reservations are never burned).
+    Unknown job → 404; a finished job has nothing to park → 409."""
+    with _deep_jobs_lock:
+        job = _deep_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown deep search job")
+        if job["status"] != "running":
+            raise HTTPException(
+                status_code=409,
+                detail=f"deep search job is {job['status']} — nothing to pause",
+            )
+        job["paused"].set()
+    return {"ok": True}
+
+
+@router.post("/api/archive/search/deep/{job_id}/resume")
+async def archive_search_deep_resume(job_id: str):
+    """Unpark a paused sweep. Unknown job → 404; a finished job has
+    nothing to resume → 409."""
+    with _deep_jobs_lock:
+        job = _deep_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown deep search job")
+        if job["status"] != "running":
+            raise HTTPException(
+                status_code=409,
+                detail=f"deep search job is {job['status']} — nothing to resume",
+            )
+        job["paused"].clear()
     return {"ok": True}
