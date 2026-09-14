@@ -18,6 +18,7 @@ from services.archive_db import (
     insert_transcript,
     search,
     set_original_title,
+    touch_channel_snapshot,
     upsert_channel_video,
 )
 from services.archive_ytdlp import backfill_original_titles
@@ -297,3 +298,50 @@ async def test_channel_payload_prefers_original_title(_fake_platform_services, _
         assert items["y1"]["original_language"] == "pt"
         # Un-backfilled rows keep their walk title.
         assert items["y2"]["title"] == "YT 2"
+
+
+@pytest.mark.asyncio
+async def test_warm_index_payload_pins_original_title_without_refetch(
+    _fake_platform_services, _scratch_archive_db
+):
+    """WS-4 coverage gap: a NON-forced request over a fresh, populated index
+    never walks the platforms, so every payload row is built by
+    _row_to_payload_item — the warm path the forced test above cannot pin
+    (there the fetched items win the merge and only _overlay_original_titles
+    runs). Seed the index + a fresh snapshot, request without force, and
+    require the original title on the served row; a row without an original
+    must keep its stored walk title (the fallback side of the same branch).
+    The fake fetcher must stay uncalled — any synchronous walk here would
+    mean the row no longer comes from _row_to_payload_item."""
+    for vid, title in (("w1", "The END of Physical Media | Gaveta"), ("w2", "Second Walk Title")):
+        upsert_channel_video({
+            "platform": "youtube",
+            "video_id": vid,
+            "channel": "gaveta",
+            "title": title,
+            "started_at": "2026-08-01T00:00:00Z",
+            "duration_sec": 300,
+            "kind": "vod",
+        })
+    # Simulate a previous sync's backfill on the index row (0cb3493 seeding
+    # pattern: the original lives only in the DB, never in the walk title).
+    set_original_title("youtube", "w1", "O FIM da Mídia Física | Gaveta", "pt")
+    # Fresh snapshot -> YouTube is neither fetched nor background-refreshed;
+    # the request is served entirely from the accumulated index.
+    touch_channel_snapshot("youtube", "@gaveta")
+    params = {
+        "url": "gaveta", "limit": "100", "days": "0", "platforms": "YouTube",
+        "content": "vods", "youtube_slug": "@gaveta",
+    }
+    url = "/api/channel/videos?" + "&".join(f"{k}={v}" for k, v in params.items())
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        resp = await ac.get(url)
+        assert resp.status_code == 200
+        items = {v["id"]: v for v in resp.json()["videos"]}
+        # Warm-index row carries the original, NOT the walk-title fallback.
+        assert items["w1"]["title"] == "O FIM da Mídia Física | Gaveta"
+        assert items["w1"]["original_title"] == "O FIM da Mídia Física | Gaveta"
+        assert items["w1"]["original_language"] == "pt"
+        # Fallback side: no original -> stored walk title survives.
+        assert items["w2"]["title"] == "Second Walk Title"
+    assert _fake_platform_services == []
