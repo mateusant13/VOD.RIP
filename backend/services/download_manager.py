@@ -630,11 +630,21 @@ class DownloadManager:
                 self._notify_sse(download_id, "error", str(e))
                 _cleanup_output()
             except ytdlp_service.PausedError:
+                notify = False
                 with self._lock:
-                    state.status = "Paused"
-                    params_snapshot = dict(self._worker_params.get(download_id) or {})
-                self._db.upsert_queue_entry(state, params_snapshot or None)
-                self._notify_sse(download_id, "status", "Paused")
+                    # Notify only on a real transition. pause() already wrote
+                    # "Paused" and emitted it, so re-emitting here would give
+                    # the UI a second Paused event for one user action.
+                    if state.status != "Paused":
+                        state.status = "Paused"
+                        notify = True
+                    # No queue write here: the finally block below is the single
+                    # Paused persistence point, and it takes the ownership check
+                    # and the write inside one lock hold. Persisting from here
+                    # too was both redundant and a TOCTOU — a discard landing
+                    # between the check and the write resurrected the row.
+                if notify:
+                    self._notify_sse(download_id, "status", "Paused")
             except ytdlp_service.CancelledError:
                 stall_msg = stall_holder.get("error")
                 if stall_msg:
@@ -644,10 +654,20 @@ class DownloadManager:
                     self._notify_sse(download_id, "error", stall_msg)
                     _cleanup_output()
                 else:
+                    # Notify only on a real transition, and OUTSIDE the lock:
+                    # _notify_sse takes _lock itself, so calling it while the
+                    # worker holds it self-deadlocks (same class as the pause
+                    # unwind fixed below). Only cancel() publishes the terminal
+                    # status itself; discard_from_queue/remove_history leave it
+                    # to this handler, which is why the transition cannot be
+                    # skipped here.
+                    notify = False
                     with self._lock:
                         if state.status != "Cancelled":
                             state.status = "Cancelled"
-                            self._notify_sse(download_id, "status", "Cancelled")
+                            notify = True
+                    if notify:
+                        self._notify_sse(download_id, "status", "Cancelled")
                     _cleanup_output()
             # ponytail: survival guarantee for download worker
             except Exception as e:
@@ -665,11 +685,16 @@ class DownloadManager:
                     _cleanup_output()
                     return
                 if pause_event.is_set() and not cancel_event.is_set():
+                    notify = False
                     with self._lock:
-                        state.status = "Paused"
-                        params_snapshot = dict(self._worker_params.get(download_id) or {})
-                    self._db.upsert_queue_entry(state, params_snapshot or None)
-                    self._notify_sse(download_id, "status", "Paused")
+                        if state.status != "Paused":
+                            state.status = "Paused"
+                            notify = True
+                        # Same shape as the PausedError handler: the gated
+                        # persist happens once in the finally block, under the
+                        # same lock hold as the ownership check.
+                    if notify:
+                        self._notify_sse(download_id, "status", "Paused")
                     return
                 logger.exception(
                     "Download worker failure for %s", download_id, exc_info=e
@@ -728,18 +753,43 @@ class DownloadManager:
                     )
                     cleanup = self._cleanup_info.get(download_id) or {}
                     temp_dirs: List[str] = list(cleanup.get("temp_dirs") or [])
+                    # Ownership gate. `_worker_params[download_id]` IS the
+                    # ownership token: this worker registered it. start_download
+                    # writes a FRESH dict into the slot (restart-resume = a new
+                    # generation, identity fails); a live resume -> _spawn_worker
+                    # reuses the SAME dict on purpose (the paused runtime was
+                    # kept for it). _purge_download_runtime pops the slot. Only
+                    # identity — not membership — distinguishes "my runtime" from
+                    # "replaced or claimed"; tearing down on a shared token would
+                    # destroy the resumed generation's state.
                     if state.status == "Paused":
-                        self._abort_fns[download_id] = []
-                        with self._lock:
-                            params_snapshot = dict(self._worker_params.get(download_id) or {})
-                        self._db.upsert_queue_entry(final_state, params_snapshot or None)
+                        # Check + write under this single lock hold, so a claim
+                        # landing here cannot interleave: _purge_download_runtime
+                        # needs _lock to revoke the token. This is the one and
+                        # only Paused persistence point (the except handlers
+                        # above deliberately leave the write to here — the crash
+                        # window they'd otherwise own is a worker that dies
+                        # between setting "Paused" and reaching finally, which
+                        # loses the queue row either way).
+                        if self._worker_params.get(download_id) is params:
+                            self._abort_fns[download_id] = []
+                            params_snapshot = dict(params)
+                            self._db.upsert_queue_entry(
+                                final_state, params_snapshot or None
+                            )
+                        else:
+                            self._abort_fns.pop(download_id, None)
                         return
                     self._sse_queues.pop(download_id, None)
                     self._cancel_events.pop(download_id, None)
                     self._pause_events.pop(download_id, None)
                     self._abort_fns.pop(download_id, None)
                     self._cleanup_info.pop(download_id, None)
-                    self._worker_params.pop(download_id, None)
+                    # `_worker_params` is NOT popped here. It is released with
+                    # the terminal write below, which is what keeps that write
+                    # claimable: a discard/remove_history/cancel that purges the
+                    # runtime in the meantime both revokes the token and thereby
+                    # suppresses the history row it would otherwise resurrect.
                     if state.status not in _DONE_STATUSES:
                         self._downloads.pop(download_id, None)
                 try:
@@ -748,10 +798,16 @@ class DownloadManager:
                 # ponytail: cleanup survival — remove_temp_dirs can raise OSError
                 except OSError:
                     pass
+                # Stops the postprocess poller BEFORE the terminal write: a live
+                # poller can upsert the queue row from a progress tick and would
+                # re-add what remove_queue_entry just deleted.
                 _stop_poller()
-                if final_state.status in _DONE_STATUSES:
-                    self._db.remove_queue_entry(download_id)
-                    self._db.record_history(final_state)
+                with self._lock:
+                    if self._worker_params.get(download_id) is params:
+                        self._worker_params.pop(download_id, None)
+                        if final_state.status in _DONE_STATUSES:
+                            self._db.remove_queue_entry(download_id)
+                            self._db.record_history(final_state)
 
         _start_stall_watchdog()
         self._submit(_download_worker)
@@ -1101,7 +1157,14 @@ class DownloadManager:
                 temp_dirs = list(cleanup.get("temp_dirs") or [])
                 if temp_dirs:
                     remove_temp_dirs(temp_dirs)
+            # Purge + row deletes are ordered after the worker's single terminal
+            # lock hold (both take _lock), so whichever claim path runs here sees
+            # the row the other left: revoke the token first and the worker's
+            # gated write is skipped; let the worker write first and these deletes
+            # remove what it persisted. Discard has to clear history as well as
+            # the queue row — remove_history already drops history itself.
             self._purge_download_runtime(download_id)
+            self._db.drop_history(download_id)
             self._db.remove_queue_entry(download_id)
             return True
         return self.remove_history(download_id)
