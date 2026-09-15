@@ -431,6 +431,16 @@ def _init_schema() -> None:
             pass
     if not _schema_ready:
         _conn.executescript(SCHEMA)
+        # F6: drop the orphaned broken view from the live DB. A one-time bad
+        # call to _load_vocab_uncached("messages_fts") built
+        #   CREATE VIRTUAL TABLE messages_fts_vocab USING fts5vocab(messages_fts_fts,'row')
+        # (reference to a NON-EXISTENT messages_fts_fts), so querying it
+        # raised "no such fts5 table". IF NOT EXISTS on the next good run
+        # could never repair it; DROP here reclaims the name. Idempotent.
+        try:
+            _conn.execute("DROP TABLE IF EXISTS messages_fts_vocab")
+        except sqlite3.Error:
+            pass
         _ensure_kind_column(_conn)
         _ensure_kind_check_includes_stream(_conn)
         _ensure_channel_columns(_conn)
@@ -5213,7 +5223,20 @@ def _load_vocab_uncached(
     table: str, now: float
 ) -> Optional[dict[int, list[tuple[str, int]]]]:
     """The rebuild body: recreate the fts5vocab view if needed, read the
-    top-N tokens bucketed by length, and store the snapshot."""
+    top-N tokens bucketed by length, and store the snapshot.
+    F6 guard: `table` must be a CONTENT table ("messages"/"transcripts"),
+    never its FTS index ({"messages_fts", ...}) — feeding "#{table}_fts" of
+    an _fts table would build "{name}_fts_fts" and create an orphaned
+    broken view (the live-DB messages_fts_vocab bug). Refusing the suffix
+    returns the "vocab unavailable" fallback instead of poisoning the DB.
+    """
+    if table.endswith("_fts"):
+        logger.warning(
+            "_load_vocab_uncached called with FTS table %r — refusing "
+            "(vocab views are built from CONTENT tables, not their index)",
+            table,
+        )
+        return None
     get_conn().execute(
         f"CREATE VIRTUAL TABLE IF NOT EXISTS {table}_vocab "
         f"USING fts5vocab({table}_fts, 'row')"

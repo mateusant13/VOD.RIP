@@ -424,9 +424,9 @@ describe('ArchiveSearchPopup', () => {
     expect(screen.getByRole('button', { name: 'transcrição' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'chat' })).toBeInTheDocument();
     // No 'ambos'/'both' chip — every source is a real toggle. Title is the
-    // third chip and starts OFF (asserted by the chip tests below).
+    // third chip and starts ON by default (F7), like the other two.
     expect(screen.queryByRole('button', { name: 'ambos' })).toBeNull();
-    expect(screen.getByRole('button', { name: 'título' })).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByRole('button', { name: 'título' })).toHaveAttribute('aria-pressed', 'true');
     const input = screen.getByPlaceholderText(/PESQUISAR/);
     fireEvent.change(input, { target: { value: 'zebra' } });
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
@@ -440,42 +440,40 @@ describe('ArchiveSearchPopup', () => {
     expect(within(row).getByText('transcripción')).toBeInTheDocument();
   });
 
-  it('source filter: title OFF by default sends transcript,chat; the full triple sends no source', async () => {
+  it('source filter: title ON by default omits source (full triple = both); toggling exposes it', async () => {
     const fetchMock = mockFetch();
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
     fireEvent.change(input, { target: { value: 'zebra' } });
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
-    // The opening selection (transcripts + chat, title OFF) MUST be explicit
-    // on the wire: omitting `source` is the backend's 'both', which re-runs
-    // the title pass — "off by default" would otherwise be a no-op.
-    expect(searchUrlWith(fetchMock, 'q=zebra')).toContain('source=transcript%2Cchat');
+    // The opening selection (transcripts + chat + video, titles ON — F7) is
+    // the full triple = the backend's 'both', so the param is OMITTED:
+    // omission is exactly 'both', which runs the title pass.
+    expect(searchUrlWith(fetchMock, 'q=zebra')).not.toContain('source=');
 
-    // Turning TITLE on completes the triple → the param collapses away.
+    // Turning TITLE off reduces to transcript,chat → the param appears.
+    fireEvent.click(screen.getByRole('button', { name: 'title' }));
+    await waitFor(() =>
+      expect(searchUrlWith(fetchMock, 'q=zebra&source=transcript%2Cchat')).toBeTruthy(),
+    );
+
+    // Turning it back on restores the full triple → the param collapses away.
     fireEvent.click(screen.getByRole('button', { name: 'title' }));
     await waitFor(() => {
       const urls = searchUrls(fetchMock).filter((u) => u.includes('q=zebra'));
       expect(urls[urls.length - 1]).not.toContain('source=');
     });
 
-    // Turning it back off restores the default subset.
-    fireEvent.click(screen.getByRole('button', { name: 'title' }));
-    await waitFor(() =>
-      expect(searchUrlWith(fetchMock, 'q=zebra&source=transcript%2Cchat')).toBeTruthy(),
-    );
-
-    // Deselect transcription → chat alone (single value, nothing to join).
+    // Deselect transcription → chat+video (comma-joined, normalised order).
     fireEvent.click(screen.getByRole('button', { name: 'transcription' }));
     await waitFor(() =>
-      expect(searchUrlWith(fetchMock, 'q=zebra&source=chat')).toBeTruthy(),
+      expect(searchUrlWith(fetchMock, 'q=zebra&source=chat%2Cvideo')).toBeTruthy(),
     );
 
-    // Deselect chat too — the last chip can't be removed (never-empty
-    // guard), so it snaps back to the OPENING default, not to all three:
-    // the reset must not silently re-enable the title pass.
+    // Deselect chat too → only title remains (single value, nothing to join).
     fireEvent.click(screen.getByRole('button', { name: 'chat' }));
     await waitFor(() =>
-      expect(searchUrlWith(fetchMock, 'q=zebra&source=transcript%2Cchat')).toBeTruthy(),
+      expect(searchUrlWith(fetchMock, 'q=zebra&source=video')).toBeTruthy(),
     );
   });
 
@@ -492,20 +490,21 @@ describe('ArchiveSearchPopup', () => {
     fireEvent.click(toggle);
     // The lang filter defaults to '' (all languages) — chips are opt-in.
     // URLSearchParams appends semantic before mode; assert the wire contract.
+    // Default source (full triple, titles ON — F7) is omitted = backend 'both'.
     await waitFor(() =>
-      expect(searchUrlWith(fetchMock, 'q=zebra&source=transcript%2Cchat&semantic=1&mode=semantic')).toBeTruthy(),
+      expect(searchUrlWith(fetchMock, 'q=zebra&semantic=1&mode=semantic')).toBeTruthy(),
     );
 
     // Concept search covers transcripts only — deselecting transcription disables it.
     fireEvent.click(screen.getByRole('button', { name: 'transcription' }));
     await waitFor(() => expect(screen.getByRole('button', { name: 'CONTEXT' })).toBeDisabled());
-    expect(searchUrlWith(fetchMock, 'q=zebra&source=chat')).not.toContain('semantic=');
+    expect(searchUrlWith(fetchMock, 'q=zebra&source=chat%2Cvideo')).not.toContain('semantic=');
 
     // Re-selecting transcription re-enables it (state preserved).
     fireEvent.click(screen.getByRole('button', { name: 'transcription' }));
     await waitFor(() => expect(screen.getByRole('button', { name: 'CONTEXT' })).not.toBeDisabled());
     await waitFor(() =>
-      expect(searchUrlWith(fetchMock, 'q=zebra&source=transcript%2Cchat&semantic=1&mode=semantic')).toBeTruthy(),
+      expect(searchUrlWith(fetchMock, 'q=zebra&semantic=1&mode=semantic')).toBeTruthy(),
     );
   });
 
@@ -617,7 +616,7 @@ describe('ArchiveSearchPopup', () => {
     // Picking a date unchecks it and applies the range.
     fireEvent.change(screen.getByLabelText('From date'), { target: { value: '2026-07-30' } });
     await waitFor(() =>
-      expect(searchUrlWith(fetchMock, 'q=zebra&source=transcript%2Cchat&date_from=2026-07-30')).toBeTruthy(),
+      expect(searchUrlWith(fetchMock, 'q=zebra&date_from=2026-07-30')).toBeTruthy(),
     );
     expect(screen.getByRole('button', { name: 'EVERY DAY' })).toHaveAttribute('aria-pressed', 'false');
 
@@ -632,7 +631,7 @@ describe('ArchiveSearchPopup', () => {
     // Unchecking re-applies the still-stored date.
     fireEvent.click(screen.getByRole('button', { name: 'EVERY DAY' }));
     await waitFor(() =>
-      expect(searchUrlWith(fetchMock, 'q=zebra&source=transcript%2Cchat&date_from=2026-07-30')).toBeTruthy(),
+      expect(searchUrlWith(fetchMock, 'q=zebra&date_from=2026-07-30')).toBeTruthy(),
     );
   });
 
@@ -647,7 +646,7 @@ describe('ArchiveSearchPopup', () => {
     fireEvent.click(screen.getByRole('button', { name: 'EVERY DAY' }));
     await waitFor(() =>
       expect(
-        searchUrlWith(fetchMock, `q=zebra&source=transcript%2Cchat&date_from=${today}&date_to=${today}`),
+        searchUrlWith(fetchMock, `q=zebra&date_from=${today}&date_to=${today}`),
       ).toBeTruthy(),
     );
     // The seeded date is visible in the input, and the toggle stays off.
@@ -667,7 +666,7 @@ describe('ArchiveSearchPopup', () => {
     fireEvent.change(screen.getByLabelText('From date'), { target: { value: '2026-07-30' } });
     await waitFor(() =>
       expect(
-        searchUrlWith(fetchMock, `q=zebra&source=transcript%2Cchat&date_from=2026-07-30&date_to=${todayIso()}`),
+        searchUrlWith(fetchMock, `q=zebra&date_from=2026-07-30&date_to=${todayIso()}`),
       ).toBeTruthy(),
     );
 
@@ -697,7 +696,7 @@ describe('ArchiveSearchPopup', () => {
     expect(screen.getByRole('button', { name: 'EN' })).toBeInTheDocument();
 
     fireEvent.click(ptBtn);
-    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra&source=transcript%2Cchat&lang=pt')).toBeTruthy());
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra&lang=pt')).toBeTruthy());
     expect(ptBtn).toHaveAttribute('aria-pressed', 'true');
 
     // Clicking again clears the filter.
@@ -1390,24 +1389,23 @@ describe('ArchiveSearchPopup batch-3', () => {
     channel: 'srdogg',
   };
 
-  it('source chips: 3 chips, title OFF by default, deselecting transcription leaves chat only and disables CONTEXT', async () => {
+  it('source chips: 3 chips, all ON by default (titles included), deselecting transcription leaves chat+video and disables CONTEXT', async () => {
     const fetchMock = mockFetch([]);
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
-    // Transcripts + chat are ON; the new TITLE chip starts OFF.
-    for (const name of ['transcription', 'chat']) {
+    // All three chips are ON by default (F7: titles on the default surface).
+    for (const name of ['transcription', 'chat', 'title']) {
       expect(screen.getByRole('button', { name })).toHaveAttribute('aria-pressed', 'true');
     }
-    expect(screen.getByRole('button', { name: 'title' })).toHaveAttribute('aria-pressed', 'false');
     // The chip is labelled by what the rows ARE (titles), not by the backend
     // token ('video') — which would collide with the VIDEO *kind* chip.
     expect(screen.queryByRole('button', { name: 'video' })).toBeNull();
-    // Deselect transcription → chat-only subset.
+    // Deselect transcription → chat+video subset (no transcript for CONTEXT).
     fireEvent.click(screen.getByRole('button', { name: 'transcription' }));
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
     fireEvent.change(input, { target: { value: 'zebra' } });
-    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra&source=chat')).toBeTruthy());
+    await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra&source=chat%2Cvideo')).toBeTruthy());
     expect(screen.getByRole('button', { name: 'CONTEXT' })).toBeDisabled();
-    // Semantic never reaches the wire for chat-only filters.
+    // Semantic never reaches the wire for non-transcript filters.
     expect(searchUrls(fetchMock).every((u) => !u.includes('semantic='))).toBe(true);
   });
 

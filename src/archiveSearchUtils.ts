@@ -75,12 +75,13 @@ export const ARCHIVE_FILTER_KINDS = ['vod', 'clip', 'short', 'video'] as const;
 export const ARCHIVE_SOURCES = ['transcript', 'chat', 'video'] as const;
 export type ArchiveSource = (typeof ARCHIVE_SOURCES)[number];
 
-/** Opening selection: transcripts + chat ON, title matches OFF. Titles are the
- *  noisiest pass (no offset, no snippet context), so they stay an explicit
- *  opt-in. This set is NOT the collapse set below, so the default goes on the
- *  wire as `source=transcript,chat` — omitting it would let the backend's
- *  'both' default re-add title rows. */
-export const ARCHIVE_SOURCE_DEFAULTS: readonly ArchiveSource[] = ['transcript', 'chat'];
+/** Opening selection: transcripts + chat + title matches ON. Titles are part
+ *  of the default search surface — the owner directive is "busca por título
+ *  funcionando em kick/twitch/youtube", and a default where titles never
+ *  appear without a manual chip click fails it. (All three on the wire is
+ *  exactly the backend's 'both', so buildSearchUrl omits the param — the two
+ *  are equivalent.) */
+export const ARCHIVE_SOURCE_DEFAULTS: readonly ArchiveSource[] = ['transcript', 'chat', 'video'];
 
 /** Transcript language filter values sent to /api/archive/search?lang=… */
 export const ARCHIVE_LANGS = ['pt', 'en', 'es'] as const;

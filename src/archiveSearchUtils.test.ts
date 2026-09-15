@@ -206,10 +206,11 @@ describe('buildSearchUrl', () => {
     expect(buildSearchUrl({ query: 'x', videoId: 'abc123' })).toBe(
       '/api/archive/search?q=x&video_id=abc123&mode=exact&limit=30',
     );
-    // The UI default (transcript+chat, title OFF) MUST go on the wire:
-    // omission is the backend's 'both', which re-runs the title pass.
+    // The UI default (transcript+chat+video, titles ON — F7) is the full
+    // triple = the backend's 'both', so buildSearchUrl OMITS the param
+    // (omission is exactly 'both', which runs the title pass).
     expect(buildSearchUrl({ query: 'x', source: [...ARCHIVE_SOURCE_DEFAULTS] })).toBe(
-      '/api/archive/search?q=x&source=transcript%2Cchat&mode=exact&limit=30',
+      '/api/archive/search?q=x&mode=exact&limit=30',
     );
     // Normalised to ARCHIVE_SOURCES order, so the URL depends on the selected
     // set and not on the order the user clicked the chips in.

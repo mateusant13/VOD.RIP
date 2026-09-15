@@ -27,6 +27,7 @@ Requires a scratch DB; run from backend/:
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
 from pathlib import Path
 
@@ -356,3 +357,42 @@ async def test_search_runs_in_worker_thread(monkeypatch):
 def threading_main():
     import threading as _th
     return _th.main_thread()
+
+
+# ---------------------------------------------------------------- F6
+def test_load_vocab_refuses_fts_suffix_table():
+    """F6: _load_vocab_uncached must refuse a table ending in '_fts' — the
+    broken live-DB messages_fts_vocab was built by feeding the FTS index
+    name, which formed a virtual table referencing a non-existent
+    '{table}_fts_fts'. The guard returns the 'vocab unavailable' fallback
+    (None) instead of poisoning the schema."""
+    import time as _t
+    assert archive_db._load_vocab_uncached("messages_fts", _t.monotonic()) is None
+    assert archive_db._load_vocab_uncached("transcripts_fts", _t.monotonic()) is None
+    # Real content tables still work.
+    assert archive_db._load_vocab_uncached("messages", _t.monotonic()) is not None
+
+
+def test_orphan_messages_fts_vocab_dropped_on_schema_ensure():
+    """F6: the orphaned broken messages_fts_vocab view (references the
+    non-existent messages_fts_fts) is DROPPED at schema-ensure, so the
+    name is reclaimed and the regression query stops raising."""
+    conn = archive_db.get_conn()
+    with conn:
+        # Reproduce the live-DB orphan: the broken view, whose construction
+        # the guard now prevents.
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_vocab "
+            "USING fts5vocab(messages_fts_fts, 'row')"
+        )
+    # Re-run schema-ensure (idempotent path) so the DROP executes.
+    with archive_db._lock:
+        with archive_db._init_lock:
+            archive_db._schema_ready = False
+    archive_db._ensure_schema_ready()
+    # The orphan must be gone -> the query now raises no such table (not the
+    # old 'no such fts5 table' referencing the phantom _fts index).
+    with pytest.raises(sqlite3.OperationalError) as exc:
+        archive_db.query("SELECT count(*) AS n FROM messages_fts_vocab")
+    assert "no such table" in str(exc.value).lower()
+    assert "messages_fts_vocab" in str(exc.value)
