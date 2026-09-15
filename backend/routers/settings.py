@@ -234,6 +234,12 @@ def _apply_settings_update(update: SettingsUpdate) -> AppSettings:
         current.window_geometry = update.window_geometry
     if update.saved_channels is not None:
         _prioritize_new_channels(current.saved_channels, update.saved_channels)
+        # Snapshot the PRE-EXISTING channel ids up front: every later
+        # sub-block that wants "which channels are newly added" reads this
+        # set (the various old_ids local re-assignments after the
+        # `current.saved_channels = update.saved_channels` overwrite would
+        # otherwise see the NEW list and never flag an addition).
+        prior_cids = {str(c.get("id") or "") for c in (current.saved_channels or [])}
         # Instant previews are keyed by channel id — drop preview files of
         # channels removed from the saved list so stale media never lingers.
         try:
@@ -301,6 +307,23 @@ def _apply_settings_update(update: SettingsUpdate) -> AppSettings:
             )
         except Exception:
             logger.debug("channel-add preview warm skipped", exc_info=True)
+        # New channel: fire a caption-ingest pump right away so its FULL
+        # scope (uploads+shorts+streams, NOT just the vod/clip URL lists the
+        # old path used) is captured without waiting for the next periodic
+        # pass. Runs on its own daemon thread — the save (already off the
+        # event loop via asyncio.to_thread) returns before the first fetch,
+        # and the sweep dedupes via the per-channel pump lock.
+        try:
+            from routers.archive import _start_caption_ingest_channel
+
+            for ch in (update.saved_channels or []):
+                cid = str(ch.get("id") or "")
+                if cid and cid not in prior_cids:
+                    slug = str(ch.get("youtubeSlug") or "").strip()
+                    if slug:
+                        _start_caption_ingest_channel(slug)
+        except Exception:
+            logger.debug("channel-add caption ingest kick skipped", exc_info=True)
     if update.channel_kick_enabled is not None:
         current.channel_kick_enabled = bool(update.channel_kick_enabled)
     if update.channel_twitch_enabled is not None:

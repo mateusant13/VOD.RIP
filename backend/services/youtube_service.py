@@ -464,12 +464,19 @@ def list_channel_videos_sync(
     channel_ref: str,
     limit: int = 50,
     *,
+    start: int = 0,
     playlist: PlaylistKind = "videos",
     enrich: bool = True,
     return_has_more: bool = False,
     return_crawl_saturation: bool = False,
 ) -> list[dict[str, Any]]:
     """Channel tab listing (flat extract, sorted newest-first, <=limit rows).
+
+    start: window offset into the tab's newest-first ordering. When >0 the
+    extract asks yt-dlp for playlist_items [start+1, start+playlistend], so
+    a caller can page past the first _DEEP_TAB_LIMIT (1000) rows a window
+    asks for. Default 0 preserves the exact previous behavior (no
+    playlist_items overrides the tab's natural first window).
 
     return_has_more: when True, return (rows, has_more) — has_more is True
     when the flat extract hit its playlistend bound (the tab likely has more
@@ -520,6 +527,13 @@ def list_channel_videos_sync(
     from services.youtube_session import apply_ytdlp_cookie_opts
 
     apply_ytdlp_cookie_opts(base_opts, session, auto_auth=auto_auth)
+
+    # Windowed pagination: a start>0 ask selects playlist_items
+    # [start+1, start+playlistend] inside the SAME playlistend cap (per-
+    # window bound), so a caller can page past the first ceiling-deep
+    # window. Omitting it for start==0 keeps the previous behavior exact.
+    if int(start) > 0:
+        base_opts["playlist_items"] = f"{int(start) + 1}-{int(start) + playlistend}"
 
     all_videos: dict[str, dict[str, Any]] = {}
     channel_id: Optional[str] = None

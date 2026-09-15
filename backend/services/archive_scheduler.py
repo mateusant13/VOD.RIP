@@ -294,48 +294,33 @@ def _ingest_one_youtube(video_id: str) -> None:
 
 
 def _ingest_youtube(channel: dict) -> None:
+    """Per-pass YouTube caption ingest for one saved channel.
+
+    Scope is the FULL enumerated uploads+shorts+streams list (not the
+    vod/clip URL lists, and shorts are NOT skipped a priori), walked from a
+    persistent deep_jobs cursor so the backlog is drained incrementally
+    across passes instead of re-crawling each time. The actual sweep lives
+    in routers.archive (the same paced/gated caption machinery deep search
+    uses), lazy-imported here to avoid the archive->scheduler import cycle
+    (archive.py imports us at module top)."""
     if not _platform_enabled(channel, "youtube"):
         return
     # Bot-gate freeze: no extract attempts until it lifts — every attempt
     # fails fast behind the wall (re-arming the freeze) and piles another
-    # job row into the panel. Mirrors the instant-preview scheduler's gate
-    # skip; the 1h in-memory _yt_attempted_at backoff remains the fast path
-    # once the gate clears.
+    # job row into the panel. The pump's own per-video pacing and the 1h
+    # in-memory _yt_attempted_at backoff remain the fast path once the gate
+    # clears.
     from services.yt_gate import youtube_gate_active
 
     if youtube_gate_active():
         return
-    yt_budget = _yt_ingest_budget()
-    with _yt_lock:
-        if len(_yt_inflight) >= yt_budget:
-            return  # budget full — a later pass picks the rest
-    urls = list(channel.get("vodVideos") or []) + list(channel.get("clipVideos") or [])
-    if not urls:
+    handle = str(channel.get("youtubeSlug") or channel.get("youtube") or "").strip()
+    if not handle:
         return
-    spawned = 0
-    for item in urls:
-        if spawned >= yt_budget:
-            break
-        url = _entry_url(item)
-        if not url or "/shorts/" in url:
-            continue  # shorts have no captions/chat to archive
-        vid = _video_id_from_url(url)
-        if not _VIDEO_ID_RE.fullmatch(vid):
-            continue
-        if _youtube_covered(vid):
-            continue
-        now = time.monotonic()
-        if now - _yt_attempted_at.get(vid, 0.0) < YOUTUBE_RETRY_BACKOFF_S:
-            continue
-        with _yt_lock:
-            if vid in _yt_inflight:
-                continue
-            _yt_inflight.add(vid)
-        _yt_attempted_at[vid] = now
-        threading.Thread(
-            target=_ingest_one_youtube, args=(vid,), daemon=True
-        ).start()
-        spawned += 1
+    # Lazy import keeps the archive->scheduler dependency one-directional.
+    from routers.archive import _run_channel_caption_ingest
+
+    _run_channel_caption_ingest(handle, budget=_yt_ingest_budget())
 
 
 def _chat_job_guard(platform: str, video_id: str, *, retry_fresh_failed: bool = False) -> bool:
