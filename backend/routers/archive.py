@@ -1721,6 +1721,11 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
     results: list[dict] = []
     counters = {"scanned": 0, "no_transcript": 0}
     counters_lock = threading.Lock()
+    # Persisted cursor: how far _scanned_ (so a post-restart resume, or a
+    # status poll that finds no in-memory job, recovers a truthful position).
+    # Throttled to _DEEP_CURSOR_EVERY rows so a long backlog never writes the
+    # table on every single video.
+    _last_persisted_scanned = 0
 
     def _bump(scanned: int = 0, missing: int = 0) -> None:
         """Counters are touched by both fetch workers — `+=` on a shared dict
@@ -1729,11 +1734,42 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
             counters["scanned"] += scanned
             counters["no_transcript"] += missing
 
+    def _persist() -> None:
+        """Best-effort deep_jobs upsert for THIS sweep (id = job_id). Called
+        throttled from the scan loops and unconditionally at every terminal
+        transition and after enumerate, so a crash/restart loses at most a
+        _DEEP_CURSOR_EVERY window of cursor progress (transcripts themselves
+        are already persisted via _deep_store_transcript)."""
+        try:
+            with _deep_jobs_lock:
+                _scanned, _no_transcript = counters["scanned"], counters["no_transcript"]
+                _total = job.get("total", 0)
+                _trunc = int(bool(job.get("truncated", False)))
+                _status = job.get("status", "running")
+                _err = job.get("error")
+            _deep_jobs_put({
+                "id": job_id, "kind": "deep",
+                "handle": handle, "handle_norm": _deep_handle_norm(handle),
+                "query": query, "status": _status,
+                "scanned": _scanned, "total": _total, "cursor": _scanned,
+                "truncated": _trunc, "no_transcript": _no_transcript,
+                "error": _err,
+            })
+        except Exception as exc:
+            logger.debug("deep persist failed %s: %s", job_id, exc)
+
     def _flush() -> None:
+        nonlocal _last_persisted_scanned
         with counters_lock, _deep_jobs_lock:
             job["scanned"] = counters["scanned"]
             job["no_transcript"] = counters["no_transcript"]
             job["results"] = list(results)
+        # Throttle the persisted cursor to _DEEP_CURSOR_EVERY scanned rows;
+        # terminal transitions call _persist() directly (unthrottled) right
+        # before they flip job status.
+        if job["scanned"] - _last_persisted_scanned >= _DEEP_CURSOR_EVERY:
+            _last_persisted_scanned = job["scanned"]
+            _persist()
 
     paused: threading.Event = job["paused"]
 
@@ -1796,15 +1832,18 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
         videos, truncated, enumerated_total = _deep_enumerate(handle)
         if not _wait_pause():
             _deep_set(job, status="cancelled")
+            _persist()
             return
         if not videos:
             _deep_set(job, status="error", error="channel enumeration returned no videos")
+            _persist()
             return
         with _deep_jobs_lock:
             job["total"] = len(videos)
             job["truncated"] = bool(truncated)
             job["enumerated_total"] = enumerated_total
         _deep_seed_video_rows(handle, videos)
+        _persist()  # record total/enumerated_total up front
         ids = [str(v.get("id") or "") for v in videos]
         videos_by_id = {
             str(v.get("id") or ""): v
@@ -1825,6 +1864,14 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
 
         # Pass 1 — cached transcripts: match straight from the DB, zero
         # network. Marker-fresh videos are pre-skipped and counted.
+        #
+        # Restart-resume is handled by transcript persistence + the covered
+        # probe below: a prefix the prior run already stored is `covered`
+        # here, so pass 1 re-matches its cached segments (cheap DB read, the
+        # ephemeral hits are rebuilt fresh) and pass 2 never re-fetches it —
+        # only genuinely-uncovered videos hit the network. The persisted
+        # `resume_cursor` is what status recovery reports (see
+        # archive_search_deep_status).
         to_fetch: list[dict] = []
         for v in videos:
             if cancel.is_set() or not _wait_pause():
@@ -1917,10 +1964,12 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
             _deep_set(job, status="cancelled")
         else:
             _deep_set(job, status="done")
+        _persist()
     except Exception as exc:
         logger.warning("deep search job %s failed: %s", job_id, exc)
         _flush()
         _deep_set(job, status="error", error=str(exc)[:300])
+        _persist()
 
 
 class DeepSearchRequest(BaseModel):
@@ -1983,14 +2032,41 @@ async def archive_search_deep_start(body: DeepSearchRequest):
 
     norm = _deep_handle_norm(handle)
     job_id = uuid.uuid4().hex
+    # Restart-resume: a prior sweep that died mid-run persisted its cursor
+    # (kind='deep', same channel+query, still 'running'). Re-hydrate it so
+    # the status poll recovers the position and the fresh sweep skips the
+    # already-scanned prefix instead of re-fetching/re-scanning it. The
+    # transcripts themselves survive restart already; cursor resume avoids
+    # even re-reading their cached segments for the covered prefix.
+    resume_cursor = 0
+    resume_scanned = 0
+    resume_no_transcript = 0
+    resume_total = 0
+    try:
+        _ensure_deep_jobs_table()
+        prev = archive_db.query(
+            """SELECT id, scanned, total, cursor, no_transcript
+               FROM deep_jobs WHERE kind='deep' AND handle_norm=? AND query=?
+                 AND status='running' ORDER BY updated_at DESC LIMIT 1""",
+            (norm, query),
+        )
+        if prev:
+            resume_cursor = int(prev[0]["cursor"] or 0)
+            resume_scanned = int(prev[0]["scanned"] or 0)
+            resume_no_transcript = int(prev[0]["no_transcript"] or 0)
+            resume_total = int(prev[0]["total"] or 0)
+    except Exception as exc:
+        logger.debug("deep resume lookup failed: %s", exc)
+
     job = {
         "status": "running",
         "error": None,
-        "scanned": 0,
-        "total": 0,
-        "no_transcript": 0,
+        "scanned": resume_scanned,
+        "total": resume_total,
+        "no_transcript": resume_no_transcript,
         "truncated": False,
         "results": [],
+        "resume_cursor": resume_cursor,
         "paused": threading.Event(),
         "cancel": threading.Event(),
         "started_at": time.monotonic(),
@@ -2026,7 +2102,37 @@ async def archive_search_deep_status(job_id: str):
     with _deep_jobs_lock:
         job = _deep_jobs.get(job_id)
         if job is None:
-            raise HTTPException(status_code=404, detail="unknown deep search job")
+            # Restart-resume: no in-memory job (backend came back up, or the
+            # job was pruned) but the sweep persisted its row — serve the
+            # recovered position instead of a 404 so the FE can keep polling.
+            try:
+                _ensure_deep_jobs_table()
+                rows = archive_db.query(
+                    """SELECT id, status, scanned, total, cursor, truncated,
+                              no_transcript, error
+                       FROM deep_jobs WHERE id=? LIMIT 1""",
+                    (job_id,),
+                )
+            except Exception:
+                rows = []
+            if not rows:
+                raise HTTPException(status_code=404, detail="unknown deep search job")
+            r = rows[0]
+            # Hit results are ephemeral match output (not independently
+            # persisted); a DB-recovered job reports its position + status
+            # truthfully with an empty results list — the client re-runs the
+            # query (transcripts persist) if it wants the hits again.
+            return {
+                "status": r["status"],
+                "paused": False,
+                "scanned": int(r["scanned"] or 0),
+                "total": int(r["total"] or 0),
+                "no_transcript": int(r["no_transcript"] or 0),
+                "truncated": bool(int(r["truncated"] or 0)),
+                "results": [],
+                "error": r["error"],
+                "resumed": True,
+            }
         snapshot = {
             "status": job["status"],
             "paused": job["status"] == "running" and job["paused"].is_set(),
@@ -2036,6 +2142,7 @@ async def archive_search_deep_status(job_id: str):
             "truncated": job["truncated"],
             "results": list(job["results"]),
             "error": job["error"],
+            "resumed": bool(job.get("resume_cursor")),
         }
     return snapshot
 

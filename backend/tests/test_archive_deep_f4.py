@@ -190,3 +190,109 @@ def test_deep_reports_enumerated_total_when_truncated(monkeypatch, fast_pace):
     assert job["enumerated_total"] == n
     assert job["truncated"] is True
     assert job["total"] == len(videos[: archive._DEEP_ENUM_MAX])
+
+
+# ── (vi) persistence: job row survives; status + resume recover it ─────────
+def test_deep_persists_terminal_row_and_status_falls_back_to_db(monkeypatch, fast_pace):
+    """F4 slice 3: a finished sweep upserts a deep_jobs row (id = job_id) so
+    the status endpoint can recover a job even after the in-memory dict is
+    cleared (restart / prune)."""
+    videos = [_video(f"p{i}", f"2024-01-{i+1:02d}T00:00:00+00:00") for i in range(4)]
+
+    def fetcher(vid: str) -> dict:
+        return _payload(vid, [(0.0, "nada")])
+
+    job_id = None
+    monkeypatch.setattr(archive, "_deep_enumerate", lambda handle: (videos, False, len(videos)))
+    monkeypatch.setattr(archive, "_deep_fetch_transcript", fetcher)
+    job_id = asyncio.run(
+        archive.archive_search_deep_start(
+            archive.DeepSearchRequest(channel="deepchan", query="cesar")
+        )
+    )["job_id"]
+    for _ in range(400):
+        with archive._deep_jobs_lock:
+            job = dict(archive._deep_jobs[job_id])
+        if job["status"] != "running":
+            break
+        time.sleep(0.02)
+    else:
+        raise AssertionError("deep job did not settle in 8s")
+    assert job["status"] == "done"
+
+    # The row must have been written (terminal persist).
+    rows = archive_db.query(
+        "SELECT id, kind, status, scanned, total, cursor FROM deep_jobs WHERE id=?",
+        (job_id,),
+    )
+    assert rows, "deep job must persist a deep_jobs row"
+    assert rows[0]["kind"] == "deep"
+    assert rows[0]["status"] == "done"
+    assert int(rows[0]["total"]) == 4
+
+    # Simulate restart: clear the in-memory dict — status still answers from DB.
+    with archive._deep_jobs_lock:
+        archive._deep_jobs.clear()
+    snapshot = asyncio.run(archive.archive_search_deep_status(job_id))
+    assert snapshot["status"] == "done"
+    assert snapshot["total"] == 4
+    assert snapshot["resumed"] is True
+
+
+def test_deep_restart_resumes_from_persisted_cursor(monkeypatch, fast_pace):
+    """F4 slice 3 (acceptance vi): a prior sweep that died mid-run (persisted
+    row still 'running' with a cursor) causes the next start for the same
+    channel+query to re-hydrate that cursor and SKIP the scanned prefix — the
+    resumed sweep re-fetches nothing already processed."""
+    videos = [_video(f"r{i}", f"2024-01-{i+1:02d}T00:00:00+00:00") for i in range(6)]
+    archive._ensure_deep_jobs_table()
+    # Seed a crashed-sweep row: cursor=2, still 'running' (the old backend
+    # died; its transcripts for r0/r1 were already stored).
+    archive_db.execute(
+        "INSERT INTO deep_jobs (id, kind, handle, handle_norm, query, status, "
+        "scanned, total, cursor, truncated, no_transcript, error, started_at, updated_at) "
+        "VALUES ('xstale', 'deep', 'deepchan', ?, 'cesar', 'running', 2, 6, 2, 0, 0, NULL, ?, ?)",
+        (archive._deep_handle_norm("deepchan"),
+         "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+    )
+    # r0/r1 transcripts persisted pre-crash; r0 carries a hit.
+    archive_db.insert_transcript("youtube", "r0", [{
+        "seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0, "text": "dar a cesar o que é de cesar",
+    }], lang="pt")
+    archive_db.insert_transcript("youtube", "r1", [{
+        "seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0, "text": "outra coisa",
+    }], lang="pt")
+
+    calls: list[str] = []
+
+    def fetcher(vid: str) -> dict:
+        calls.append(vid)
+        return _payload(vid, [(0.0, "nada relacionado")])
+
+    monkeypatch.setattr(archive, "_deep_enumerate", lambda handle: (videos, False, len(videos)))
+    monkeypatch.setattr(archive, "_deep_fetch_transcript", fetcher)
+
+    job_id = asyncio.run(
+        archive.archive_search_deep_start(
+            archive.DeepSearchRequest(channel="deepchan", query="cesar")
+        )
+    )["job_id"]
+    # The fresh job must have re-hydrated the resume cursor.
+    with archive._deep_jobs_lock:
+        assert archive._deep_jobs[job_id]["resume_cursor"] == 2
+
+    for _ in range(400):
+        with archive._deep_jobs_lock:
+            job = dict(archive._deep_jobs[job_id])
+        if job["status"] != "running":
+            break
+        time.sleep(0.02)
+    else:
+        raise AssertionError("deep job did not settle in 8s")
+    assert job["status"] == "done"
+    # Resume skipped r0/r1: only the uncovered tail was fetched.
+    assert calls == ["r2", "r3", "r4", "r5"], f"resume must not re-fetch prefix, got {calls}"
+    assert job["scanned"] == 6
+    # The persisted r0 hit still surfaces via the cached-transcript pass.
+    hits = [h for h in job["results"] if h["id"] == "r0"]
+    assert hits, "resumed sweep must still match the persisted r0 transcript"
