@@ -70,7 +70,7 @@ def isolate_deep_jobs():
 
 def _run(monkeypatch, videos, fetcher) -> tuple[str, dict]:
     """Patch seams, start the job through the endpoint + thread, return job."""
-    monkeypatch.setattr(archive, "_deep_enumerate", lambda handle: (videos, False))
+    monkeypatch.setattr(archive, "_deep_enumerate", lambda handle: (videos, False, len(videos)))
     monkeypatch.setattr(archive, "_deep_fetch_transcript", fetcher)
     import asyncio
 
@@ -122,7 +122,7 @@ def test_sweep_finds_deaccented_hit_and_caches_transcript(monkeypatch, fast_pace
 
     # Oracle (stargazer review): second query on the same channel performs
     # ZERO fresh caption downloads — coverage is read batched from the DB.
-    monkeypatch.setattr(archive, "_deep_enumerate", lambda handle: (videos, False))
+    monkeypatch.setattr(archive, "_deep_enumerate", lambda handle: (videos, False, len(videos)))
     fetch_calls_after = len(calls)
     _, job2 = _run(monkeypatch, videos, fetcher)
     assert job2["status"] == "done"
@@ -187,7 +187,7 @@ def test_cancel_stops_sweep(monkeypatch, fast_pace):
     calls: list[str] = []
     import asyncio
 
-    monkeypatch.setattr(archive, "_deep_enumerate", lambda handle: (videos, False))
+    monkeypatch.setattr(archive, "_deep_enumerate", lambda handle: (videos, False, len(videos)))
 
     def fetcher(vid: str) -> dict:
         calls.append(vid)
@@ -233,7 +233,7 @@ def test_status_and_cancel_404_unknown_job():
     assert exc.value.status_code == 404
 
 
-def test_matcher_unit_deaccent_snippet_cap():
+def test_matcher_unit_deaccent_snippet_all_occurrences():
     segs = [
         (0.0, "x" * 200 + " DAR A CÉSAR O QUE É DE CÉSAR " + "y" * 200),
         (30.0, "outra fala com cesar mesmo"),
@@ -243,8 +243,10 @@ def test_matcher_unit_deaccent_snippet_cap():
         (150.0, "sexta cesar"),
     ]
     out = archive._deep_match_segments("César", segs)
-    assert len(out) == archive._DEEP_RESULT_CAP_PER_VIDEO == 5
-    assert [o["ts"] for o in out] == [0, 30, 60, 90, 120]
+    # Every occurrence is returned — no per-video cap (F4c). The first
+    # segment has TWO ("césar" twice), the rest one each -> 7 total.
+    assert len(out) == 7
+    assert [o["ts"] for o in out] == [0, 0, 30, 60, 90, 120, 150]
     first = out[0]["snippet"]
     assert first.startswith("…") and first.endswith("…")
     body = first.strip("…")
@@ -276,8 +278,8 @@ def test_enumerate_dedupes_sorts_and_reports_truncation(monkeypatch):
 
     calls: list[dict] = []
 
-    def fake_list(handle, limit, *, playlist, enrich, return_has_more, return_crawl_saturation=False):
-        calls.append({"playlist": playlist, "limit": limit})
+    def fake_list(handle, limit, *, playlist, enrich, return_has_more, return_crawl_saturation=False, start=0):
+        calls.append({"playlist": playlist, "limit": limit, "start": start})
         assert return_has_more and return_crawl_saturation, "deep must ask the raw signal"
         if playlist == "videos":
             # unsorted on purpose; v2 also appears in shorts (cross-tab dupe)
@@ -285,38 +287,47 @@ def test_enumerate_dedupes_sorts_and_reports_truncation(monkeypatch):
                     _video("v1", "2024-01-01T00:00:00+00:00"),
                     _video("v2", "2024-01-02T00:00:00+00:00")], False, False
         if playlist == "shorts":
-            # dupe v2 + newer v5; saturated=True with FEW rows — the raw
-            # crawl bound, independent of has_more (L4)
-            return [_video("v5", "2024-01-05T00:00:00+00:00"),
-                    _video("v2", "2024-01-02T00:00:00+00:00", title="dupe")], False, True
+            # first window saturated (raw crawl bound, independent of
+            # has_more — L4); the walk pages forward and the second window
+            # resolves it to covered (no truncation from THIS tab).
+            if start == 0:
+                return [_video("v5", "2024-01-05T00:00:00+00:00"),
+                        _video("v2", "2024-01-02T00:00:00+00:00", title="dupe")], False, True
+            return [], False, False
         # streams tab explodes — honest partial (L3)
         raise RuntimeError("bot gate on tab crawl")
 
     monkeypatch.setattr(youtube_service, "list_channel_videos_sync", fake_list)
-    items, truncated = archive._deep_enumerate("deepchan")
+    items, truncated, _total = archive._deep_enumerate("deepchan")
     assert [v["id"] for v in items] == ["v5", "v3", "v2", "v1"], "deduped, newest-first"
-    assert truncated is True, "saturated tab + failed tab must report truncation"
+    assert truncated is True, "failed tab must report truncation"
     assert {c["playlist"] for c in calls} == {"videos", "shorts", "streams"}
+    assert {c["start"] for c in calls if c["playlist"] == "shorts"} == {0, archive._DEEP_TAB_LIMIT}
 
     # A clean crawl (nothing saturated, no errors, under ceiling) stays
     # truncated=False — the flag must not latch on.
-    def clean_list(handle, limit, *, playlist, enrich, return_has_more, return_crawl_saturation=False):
+    def clean_list(handle, limit, *, playlist, enrich, return_has_more, return_crawl_saturation=False, start=0):
         return [_video(f"{playlist}1", "2024-01-01T00:00:00+00:00")], False, False
 
     monkeypatch.setattr(youtube_service, "list_channel_videos_sync", clean_list)
-    items, truncated = archive._deep_enumerate("deepchan")
-    assert truncated is False and len(items) == 3
+    items, truncated, total = archive._deep_enumerate("deepchan")
+    assert truncated is False and len(items) == 3 and total == 3
 
-    # A full tab (>= _DEEP_TAB_LIMIT rows) is truncation even without the
-    # saturation signal.
-    def full_list(handle, limit, *, playlist, enrich, return_has_more, return_crawl_saturation=False):
-        rows = [_video(f"{playlist}{i}", f"2023-01-01T00:00:{i % 60:02d}+00:00")
-                for i in range(archive._DEEP_TAB_LIMIT)]
-        return rows, False, False
+    # A tab of exactly _DEEP_TAB_LIMIT rows saturates window 1, and the
+    # EMPTY window 2 resolves it — fully covered, NOT truncated (a second
+    # page covers it; acceptance iii).
+    def full_list(handle, limit, *, playlist, enrich, return_has_more, return_crawl_saturation=False, start=0):
+        if start == 0:
+            rows = [_video(f"{playlist}{i}", f"2023-01-01T00:00:{i % 60:02d}+00:00")
+                    for i in range(archive._DEEP_TAB_LIMIT)]
+            return rows, False, True  # bound hit -> saturated
+        return [], False, False  # empty second page -> exhausted
 
     monkeypatch.setattr(youtube_service, "list_channel_videos_sync", full_list)
-    items, truncated = archive._deep_enumerate("deepchan")
-    assert truncated is True and len(items) == archive._DEEP_TAB_LIMIT
+    items, truncated, total = archive._deep_enumerate("deepchan")
+    assert truncated is False
+    # 3 tabs x 1000 distinct rows, all resolved to covered by empty page 2.
+    assert total == 3 * archive._DEEP_TAB_LIMIT == len(items)
 
 
 def test_same_channel_start_joins_running_job_and_cap_409(monkeypatch):

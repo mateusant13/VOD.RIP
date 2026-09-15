@@ -65,6 +65,18 @@ def _reset_caches():
         archive_db.execute("DELETE FROM deep_jobs")
     except Exception:
         pass
+    # The archive DB is the shared session store (see conftest) — transcripts
+    # and no-captions markers written by an earlier module in the merged run
+    # would make _deep_covered_ids pre-skip these tests' ids and break their
+    # exact remote-fetch-count assertions. Wipe YouTube coverage state so each
+    # caption test sees a cold store regardless of module/test order.
+    try:
+        archive_db.execute("DELETE FROM transcripts WHERE platform='youtube'")
+        archive_db.execute(
+            "UPDATE videos SET captions_unavailable_at=NULL WHERE platform='youtube'"
+        )
+    except Exception:
+        pass
     yield
     archive._deep_enumerate_cache.clear()
 
@@ -83,7 +95,7 @@ def test_caption_pump_fetches_shorts_and_full_scope(monkeypatch, fast_pace):
         calls.append(vid)
         return _payload(vid, [(0.0, "césar aqui")])
 
-    monkeypatch.setattr(archive, "_deep_enumerate", lambda handle: (videos, False))
+    monkeypatch.setattr(archive, "_deep_enumerate", lambda handle: (videos, False, len(videos)))
     monkeypatch.setattr(archive, "_deep_fetch_transcript", fetcher)
 
     stats = archive._run_channel_caption_ingest("deepchan", budget=10)
@@ -109,7 +121,7 @@ def test_caption_pump_respects_budget_and_advances_cursor(monkeypatch, fast_pace
         calls.append(vid)
         return _payload(vid, [(0.0, "nada relacionado")])
 
-    monkeypatch.setattr(archive, "_deep_enumerate", lambda handle: (videos, False))
+    monkeypatch.setattr(archive, "_deep_enumerate", lambda handle: (videos, False, len(videos)))
     monkeypatch.setattr(archive, "_deep_fetch_transcript", fetcher)
 
     stats1 = archive._run_channel_caption_ingest("deepchan", budget=2)

@@ -123,3 +123,62 @@ def test_videos_saturation_false_at_ceiling_depth(monkeypatch) -> None:
     rows2, has_more2 = _call("@gaveta", 999, entries=1000, monkeypatch=monkeypatch)
     assert len(rows2) == 999
     assert has_more2 is True
+
+
+def test_videos_windowed_pagination_selects_playlist_items(monkeypatch) -> None:
+    """F4 deep-ALL pagination seam: a caller that asks `start>0` selects a
+    playlist_items window [start+1, start+playlistend] in the yt-dlp opts;
+    start==0 omits the override entirely (previous behavior preserved)."""
+    _stub_session(monkeypatch)
+    seen: list[dict] = []
+
+    def wintab_info(opts: dict) -> dict:
+        seen.append(dict(opts))
+        # yt-dlp, given a playlist_items window, returns only that slice's
+        # entries; a window with no start override returns the full bound.
+        win = opts.get("playlist_items")
+        total = list(range(1200))
+        if win:
+            a, _, b = win.partition("-")
+            picked = total[int(a) - 1 : int(b)]
+        else:
+            picked = total[: ys.YOUTUBE_PLAYLIST_CEILING]
+        return {
+            "channel_id": "UCx",
+            "entries": [
+                {
+                    "id": f"v{i}",
+                    "title": f"VOD {i}",
+                    "url": f"https://www.youtube.com/watch?v=v{i}",
+                    "view_count": 100,
+                    "duration": 400,
+                    "upload_date": "20260801",
+                }
+                for i in picked
+            ],
+        }
+
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel", lambda opts: _fake_guard(wintab_info(opts)))
+
+    # Window 1: start=0 — NO playlist_items override, first ceiling rows.
+    w1, has_more1, sat1 = ys.list_channel_videos_sync(
+        "@gaveta", 1000, playlist="videos", enrich=False,
+        return_has_more=True, return_crawl_saturation=True,
+    )
+    assert "playlist_items" not in seen[-1], "start=0 must not override playlist_items"
+    assert len(w1) == 1000
+    assert w1[0]["id"] == "v0"
+    assert sat1 is True  # 1200 > 1000 -> more yet
+
+    # Window 2: start=1000 -> playlist_items "1001-2000" (start+1..start+1000).
+    w2, has_more2, sat2 = ys.list_channel_videos_sync(
+        "@gaveta", 1000, start=1000, playlist="videos", enrich=False,
+        return_has_more=True, return_crawl_saturation=True,
+    )
+    assert seen[-1]["playlist_items"] == f"1001-{1000 + ys.YOUTUBE_PLAYLIST_CEILING}"
+    assert [r["id"] for r in w2] == [f"v{i}" for i in range(1000, 1200)]
+    assert sat2 is False  # window covered the tail
+
+    # Together the two windows cover all 1200 ids exactly once.
+    ids = [r["id"] for r in w1 + w2]
+    assert len(ids) == 1200 and len(set(ids)) == 1200

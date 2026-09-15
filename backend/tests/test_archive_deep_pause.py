@@ -68,7 +68,7 @@ def isolate_deep_jobs():
 
 def _start(monkeypatch, videos, fetcher) -> str:
     """Patch seams, start the job, return the id WITHOUT waiting for settle."""
-    monkeypatch.setattr(archive, "_deep_enumerate", lambda handle: (videos, False))
+    monkeypatch.setattr(archive, "_deep_enumerate", lambda handle: (videos, False, len(videos)))
     monkeypatch.setattr(archive, "_deep_fetch_transcript", fetcher)
     return asyncio.run(
         archive.archive_search_deep_start(

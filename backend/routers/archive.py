@@ -1077,7 +1077,11 @@ async def export_chat(body: ChatExportRequest):
 
 _DEEP_JOB_CAP = 50
 _DEEP_TAB_LIMIT = 1000  # per-tab enumeration ask (== playlist ceiling)
-_DEEP_RESULT_CAP_PER_VIDEO = 5
+# Hard cap on the DEDUPED merged enumeration across all three tabs. The
+# sweep pages each tab past the first window (see _deep_enumerate) so a
+# channel with >1000 uploads searchable deep is walked exhaustively up to
+# this bound; truncation is reported honestly when the merge exceeds it.
+_DEEP_ENUM_MAX = 5000
 _DEEP_SNIPPET_PAD = 120
 _DEEP_FETCH_CONCURRENCY = 2
 _DEEP_MIN_GAP_S = 1.5  # mirrors archive_ytdlp._ORIGINAL_MIN_GAP_S
@@ -1146,13 +1150,16 @@ def _deep_snippet(text: str, start: int, end: int) -> str:
 
 
 def _deep_match_segments(raw_query: str, segments: list[tuple[float, str]]) -> list[dict]:
-    """First <=5 matches of the query against (start_sec, text) segments.
+    """EVERY occurrence of the query in (start_sec, text) segments.
 
     LITERAL substring match over the deaccented/casefolded text (never
     regex — pt-BR queries like 'R$ 10' or '$100' must match literally, and
     no path may run a user-supplied pattern with the GIL held). Match
     offsets are mapped back to ORIGINAL text indices so the snippet keeps
-    the accent characters; ts is the segment start in seconds."""
+    the accent characters; ts is the segment start in seconds. Returns one
+    hit per occurrence (a caption may contain the query multiple times) —
+    there is no per-video result cap: a deep query must surface every match
+    it is asked about."""
     q = _deaccent(raw_query.strip())
     if not q:
         return []
@@ -1160,58 +1167,152 @@ def _deep_match_segments(raw_query: str, segments: list[tuple[float, str]]) -> l
     for start_sec, text in segments:
         deaccented, offmap = _deaccent_map(text)
         idx = deaccented.find(q)
-        if idx < 0:
-            continue
-        # Map the match span back to original-text indices (the map is
-        # monotone non-decreasing; end-offset is the char AFTER the match).
-        orig_start = offmap[idx]
-        orig_end = offmap[idx + len(q) - 1] + 1
-        out.append(
-            {"ts": int(start_sec), "snippet": _deep_snippet(text, orig_start, orig_end)}
-        )
-        if len(out) >= _DEEP_RESULT_CAP_PER_VIDEO:
-            break
+        while idx >= 0:
+            # Map the match span back to original-text indices (the map is
+            # monotone non-decreasing; end-offset is the char AFTER the
+            # match).
+            orig_start = offmap[idx]
+            orig_end = offmap[idx + len(q) - 1] + 1
+            out.append(
+                {"ts": int(start_sec), "snippet": _deep_snippet(text, orig_start, orig_end)}
+            )
+            # Advance past this match so overlapping repeats (e.g. "aaa" in
+            # "aaaa") still count each occurrence.
+            idx = deaccented.find(q, idx + len(q))
     return out
 
 
-def _deep_enumerate(handle: str) -> tuple[list[dict], bool]:
+def _deep_match_chat(raw_query: str, video_ids: list[str]) -> list[dict]:
+    """Query matches against archived CHAT messages of the swept videos.
+
+    Plain chunked SELECT over the messages table (owned/compatible with the
+    archive_db API — we call the public query() only, never its internals).
+    Returns one hit {"video_id", "ts", "snippet", "source": "chat"} per
+    message whose text contains the query as a deaccented substring. A
+    message counts as a single hit (its whole text is the snippet).
+    """
+    q = _deaccent(raw_query.strip())
+    if not q or not video_ids:
+        return []
+    hits: list[dict] = []
+    for i in range(0, len(video_ids), _DEEP_SQL_CHUNK):
+        chunk = video_ids[i : i + _DEEP_SQL_CHUNK]
+        ph = ",".join("?" * len(chunk))
+        for r in archive_db.query(
+            "SELECT video_id, offset_sec, text FROM messages "
+            f"WHERE platform='youtube' AND video_id IN ({ph})",
+            chunk,
+        ):
+            text = str(r["text"] or "")
+            if q in _deaccent(text):
+                hits.append({
+                    "video_id": str(r["video_id"] or ""),
+                    "ts": int(float(r["offset_sec"] or 0.0)),
+                    "snippet": _deep_snippet(text, 0, len(text)),
+                    "source": "chat",
+                })
+    return hits
+
+
+def _deep_match_titles(raw_query: str, video_ids: list[str]) -> list[dict]:
+    """Query matches against video TITLES of the swept videos.
+
+    Matches the deaccented concatenation of `title` and `original_title`
+    (covers non-YT-dlp ingest that stored the raw uploader title separately).
+    Returns one hit {"video_id", "ts": 0, "snippet", "source": "title"} per
+    matching video. First-placed because it neither needs a fetch nor a
+    transcript — it always answers from the videos table.
+    """
+    q = _deaccent(raw_query.strip())
+    if not q or not video_ids:
+        return []
+    hits: list[dict] = []
+    for i in range(0, len(video_ids), _DEEP_SQL_CHUNK):
+        chunk = video_ids[i : i + _DEEP_SQL_CHUNK]
+        ph = ",".join("?" * len(chunk))
+        for r in archive_db.query(
+            "SELECT video_id, title, original_title FROM videos "
+            f"WHERE platform='youtube' AND video_id IN ({ph})",
+            chunk,
+        ):
+            title = f"{str(r['title'] or '')} {str(r['original_title'] or '')}".strip()
+            if title and q in _deaccent(title):
+                hits.append({
+                    "video_id": str(r["video_id"] or ""),
+                    "ts": 0,
+                    "snippet": _deep_snippet(title, 0, len(title)),
+                    "source": "title",
+                })
+    return hits
+
+
+def _deep_enumerate(handle: str) -> tuple[list[dict], bool, int]:
     """All channel videos (uploads+shorts+streams), newest-first, deduped.
 
-    Seam for tests. Each tab is listed via the guarded flat extract
-    (list_channel_videos_sync); truncated is True when any tab failed or
-    saturated the ceiling, or the merged set exceeded _DEEP_TAB_LIMIT — a
-    partial sweep must never claim full coverage.
+    Seam for tests. Returns (items, truncated, enumerated_total): *items* is
+    the deduped newest-first list (capped at _DEEP_ENUM_MAX), *truncated* is
+    True when any tab failed, any window saturated its bound, or the merged
+    set exceeded the hard cap (a partial sweep must never claim full
+    coverage), and *enumerated_total* is the deduped merged COUNT BEFORE the
+    hard-cap cut — consumers use it to report how far the crawl really got.
+
+    Pagination: each tab is paged in _DEEP_TAB_LIMIT windows via the
+    guarded flat extract's `start` offset (playlist_items window starting at
+    `start+1`). A saturated window (raw crawl == the window bound) MAY have
+    more pages behind it, so the walk pages forward; it STOPS when a window
+    reports `saturated == False` (the tab is genuinely exhausted — a fully
+    covered by the pages walked so far). Because a first saturated window is
+    resolved by a later covered window, truncation is NOT set merely for
+    seeing saturation — it is set only when the walk cannot cover the whole
+    tab: a window errored, or the merged crawl hit the hard _DEEP_ENUM_MAX
+    cap while a tab still reported saturation (the while-else below).
 
     The saturation asked for is the RAW crawl bound (list_order >=
-    playlistend), not the show-more `has_more`: this sweep always asks at
-    the 1000-row ceiling, where has_more is force-False by design (a deeper
-    ask could never serve new rows) and would otherwise hide truncation.
+    playlistend), not the show-more `has_more`: this sweep asks at the
+    1000-row ceiling, where has_more is force-False by design (a deeper ask
+    could never serve new rows) and would otherwise hide truncation.
     """
     from services.youtube_service import list_channel_videos_sync
 
     merged: dict[str, dict] = {}
     truncated = False
     for tab in ("videos", "shorts", "streams"):
-        try:
-            rows, _has_more, saturated = list_channel_videos_sync(
-                handle,
-                _DEEP_TAB_LIMIT,
-                playlist=tab,
-                enrich=False,
-                return_has_more=True,
-                return_crawl_saturation=True,
-            )
-        except Exception as exc:
-            logger.debug("deep enumerate tab %s failed: %s", tab, exc)
-            # A tab that errored yielded NOTHING — the result set is
-            # silently incomplete; report it as truncated (honest partial).
+        offset = 0
+        while offset < _DEEP_ENUM_MAX:
+            try:
+                rows, _has_more, saturated = list_channel_videos_sync(
+                    handle,
+                    _DEEP_TAB_LIMIT,
+                    start=offset,
+                    playlist=tab,
+                    enrich=False,
+                    return_has_more=True,
+                    return_crawl_saturation=True,
+                )
+            except Exception as exc:
+                logger.debug("deep enumerate tab %s window %s failed: %s", tab, offset, exc)
+                # A window that errored yielded NOTHING — the result set is
+                # silently incomplete; report it as truncated (honest
+                # partial) and stop paging this tab.
+                truncated = True
+                break
+            for v in rows:
+                vid = str(v.get("id") or "").strip()
+                if vid and vid not in merged:
+                    merged[vid] = v
+            if len(merged) >= _DEEP_ENUM_MAX:
+                # Hard cap — the tab (or cross-tab merge) has more we did
+                # not crawl. Honest partial.
+                truncated = True
+                break
+            if not bool(saturated):
+                break  # tab exhausted: fully covered by pages walked
+            offset += _DEEP_TAB_LIMIT
+        else:
+            # while exited at the offset cap while the tab NEVER reported
+            # non-saturated — deeper windows exist beyond the cap we did
+            # not crawl. Truncated.
             truncated = True
-            continue
-        truncated = truncated or bool(saturated) or len(rows) >= _DEEP_TAB_LIMIT
-        for v in rows:
-            vid = str(v.get("id") or "").strip()
-            if vid and vid not in merged:
-                merged[vid] = v
     items = list(merged.values())
 
     def _ts(v: dict) -> float:
@@ -1222,10 +1323,8 @@ def _deep_enumerate(handle: str) -> tuple[list[dict], bool]:
             return 0.0
 
     items.sort(key=_ts, reverse=True)
-    if len(items) > _DEEP_TAB_LIMIT:
-        items = items[:_DEEP_TAB_LIMIT]
-        truncated = True
-    return items, truncated
+    enumerated_total = len(items)
+    return items, truncated, enumerated_total
 
 
 def _deep_fetch_transcript(video_id: str) -> dict:
@@ -1475,7 +1574,7 @@ def _run_channel_caption_ingest(
         cached = _deep_enumerate_cache.get(norm)
         if cached is None or now - cached[0] >= _DEEP_ENUM_CACHE_TTL_S:
             try:
-                videos, truncated = _deep_enumerate(handle)
+                videos, truncated, _enumerated_total = _deep_enumerate(handle)
             except Exception as exc:
                 logger.debug("caption ingest enumerate failed for %s: %s", handle, exc)
                 return {"scanned": 0, "no_transcript": 0, "error": str(exc)[:200]}
@@ -1675,6 +1774,7 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
             "date": (str(v.get("created_at") or "")[:10] or None),
             "ts": m["ts"],
             "snippet": m["snippet"],
+            "source": m.get("source", "transcript"),
         }
         kind = str(v.get("content_kind") or "").strip()
         if kind:
@@ -1683,8 +1783,17 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
             hit["video_kind"] = {"video": "vod"}.get(kind, kind)
         results.append(hit)
 
+    def _add_source_hits(videos_by_id: dict[str, dict], source_matches: list[dict]) -> None:
+        """Chat/title hits carry only video_id; resolve them to the swept
+        video dict (fallback: an empty video stub) so _add_result can ship
+        a uniform hit shape."""
+        for m in source_matches:
+            vid = m.get("video_id") or ""
+            v = videos_by_id.get(vid) or {"id": vid, "title": None, "url": None, "created_at": None}
+            _add_result(v, m)
+
     try:
-        videos, truncated = _deep_enumerate(handle)
+        videos, truncated, enumerated_total = _deep_enumerate(handle)
         if not _wait_pause():
             _deep_set(job, status="cancelled")
             return
@@ -1694,9 +1803,25 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
         with _deep_jobs_lock:
             job["total"] = len(videos)
             job["truncated"] = bool(truncated)
+            job["enumerated_total"] = enumerated_total
         _deep_seed_video_rows(handle, videos)
         ids = [str(v.get("id") or "") for v in videos]
+        videos_by_id = {
+            str(v.get("id") or ""): v
+            for v in videos
+            if str(v.get("id") or "")
+        }
         covered, marked = _deep_covered_ids(ids)
+
+        # Pass 0 — titles + chat. Run ONCE over the FULL swept id set (not
+        # just the uncached tail): a query present only in a title or in a
+        # chat message must hit even when the video's transcript is already
+        # cached or entirely absent. Both are pure DB reads (no fetch, no
+        # transcript) so they bound the query's recall without cost.
+        if not cancel.is_set() and _wait_pause():
+            _add_source_hits(videos_by_id, _deep_match_titles(query, ids))
+            _add_source_hits(videos_by_id, _deep_match_chat(query, ids))
+            _flush()
 
         # Pass 1 — cached transcripts: match straight from the DB, zero
         # network. Marker-fresh videos are pre-skipped and counted.
