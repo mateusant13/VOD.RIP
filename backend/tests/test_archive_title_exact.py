@@ -242,3 +242,117 @@ def test_exact_transcript_substring_pairs_survive(_seeded):
     assert by_video["Mzybv0Yme-A"] == 8, by_video
     assert by_video["S4ZB3xTaFDc"] == 4, by_video
     assert by_video["wsKyA8ifjMI"] == 3, by_video
+
+
+# ---------------------------------------------------------------- F5.2
+def test_exact_skips_fuzzy_bigram_work(_seeded, monkeypatch):
+    """F5.2 exact fast-path: exact + transcript-in-scope must NOT walk the
+    fuzzy expansion machinery (_token_expansions / _load_bigrams) nor call
+    _fuzzy_pattern — the OR pattern is discarded by the exact override, so
+    those COUNT(*) probes on million-row tables are pure waste. Split-phrase
+    span recall for vocab-absent tokens is still preserved via the
+    span_exact_tokens probe (asserted separately)."""
+    import time as _t
+
+    # A transcript corpus where 'vale'/'estranheza' are present but a term
+    # the exact probe needs is absent, so the span gate has real work.
+    archive_db.insert_transcript(
+        "youtube", "f5-span",
+        [
+            {"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0, "text": "todo mundo cai no vale"},
+            {"seg_idx": 1, "start_sec": 1.0, "end_sec": 2.0, "text": "da estranheza quando fala"},
+        ],
+    )
+    archive_db.upsert_video({
+        "platform": "youtube", "video_id": "f5-span", "channel": "gaveta",
+        "title": "F5 span", "started_at": "2026-08-01T12:00:00Z", "kind": "vod",
+    })
+    # Re-prime the vocab so the split-phrase span gate has data to probe.
+    archive_db._load_vocab_uncached("transcripts", _t.monotonic())
+
+    bigram_calls: list = []
+    orig_bigrams = archive_db._load_bigrams
+
+    def counting_bigrams(tables):
+        bigram_calls.append(tables)
+        return orig_bigrams(tables)
+
+    monkeypatch.setattr(archive_db, "_load_bigrams", counting_bigrams)
+    orig_fuzzy = archive_db._fuzzy_pattern
+
+    def no_fuzzy(*a, **k):
+        raise AssertionError("_fuzzy_pattern must not run on the exact fast path")
+
+    monkeypatch.setattr(archive_db, "_fuzzy_pattern", no_fuzzy)
+
+    hits = _exact("vale da estranheza", source="transcript", video_id="f5-span", limit=1000)
+    # Split phrase across adjacent segments must still be found (span gate).
+    span = next(
+        (h for h in hits if h["video_id"] == "f5-span" and h["kind"] == "transcript"),
+        None,
+    )
+    assert span is not None, "exact split-phrase span recall must survive the fast path"
+    assert "estranheza" in span["text"].casefold()
+    # And the fuzzy bigram machinery must NOT have been touched.
+    assert bigram_calls == [], f"_load_bigrams ran on the exact fast path: {bigram_calls}"
+
+
+# ---------------------------------------------------------------- F5.3
+def test_rowcount_cache_reflects_writes(_seeded):
+    """F5.3: the row-count cache is flushed by content writes, so a search
+    immediately after insert_transcript / insert_messages sees the new rows
+    (no 2s stale cache serving a pre-insert vocab)."""
+    # Clear the cache so the baseline probes below are REAL counts, not
+    # whatever a prior test left cached (module-scoped DB: counts grow).
+    archive_db._rowcount_cache.clear()
+
+    n0 = archive_db._table_row_count("transcripts")
+    assert "transcripts" in archive_db._rowcount_cache
+    archive_db.insert_transcript(
+        "youtube", "rc-vid",
+        [{"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0,
+          "text": "frase unica e deterministica para contagem de transcricao rc38"}],
+        lang="pt",
+    )
+    # The write hook popped the cache entry -> next probe re-counts.
+    assert "transcripts" not in archive_db._rowcount_cache
+    assert archive_db._table_row_count("transcripts") == n0 + 1
+
+    n1 = archive_db._table_row_count("messages")
+    assert "messages" in archive_db._rowcount_cache
+    archive_db.insert_messages(
+        "youtube", "rc-vid",
+        [{"offset_sec": 1.0, "username": "u", "text": "mensagem unica e deterministica rc38"}],
+    )
+    assert "messages" not in archive_db._rowcount_cache
+    assert archive_db._table_row_count("messages") == n1 + 1
+
+
+# ---------------------------------------------------------------- F5.1
+async def test_search_runs_in_worker_thread(monkeypatch):
+    """F5.1: the search handler must run archive_db.search in a non-main
+    thread via asyncio.to_thread (Rule 2026-09-13: no sync sqlite inside an
+    async handler). Proves the running thread is not the event-loop/main
+    thread, matching the existing asyncio handler test style."""
+    from routers.archive import archive_search
+
+    called_in = {"thread": None}
+    orig = archive_db.search
+
+    def tracked(*a, **k):
+        import threading as _th
+        called_in["thread"] = _th.current_thread()
+        return orig(*a, **k)
+
+    monkeypatch.setattr(archive_db, "search", tracked)
+    resp = await archive_search(q="vale da estranheza", limit=20, source="both")
+    assert "hits" in resp
+    t = called_in["thread"]
+    assert t is not None, "archive_db.search must have been called"
+    assert t is not threading_main(), "search must run off the main thread"
+    assert t.name != "MainThread", "search must run off the main thread"
+
+
+def threading_main():
+    import threading as _th
+    return _th.main_thread()
