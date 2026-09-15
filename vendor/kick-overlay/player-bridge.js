@@ -8,7 +8,20 @@ const V = document.getElementById('v');
 const params = new URLSearchParams(location.search);
 const HLS_MODE = params.get('m') === 'hls';
 const PLAYER_TOKEN = params.get('token');
-const PARENT_ORIGIN = 'https://www.twitch.tv';
+// The embed's parent page. Historically twitch.tv only; since 0.8.2 the
+// same bridge also runs over youtube.com pages (the overlay's YT layer).
+// The actual origin is LEARNED from the first token-valid message — the
+// shared secret (PLAYER_TOKEN, minted per page by the content script) is
+// what authenticates the parent, not a hardcoded host — so replies never
+// need '*'. Until a valid message arrives, twitch.tv is the default.
+const PARENT_ORIGINS = new Set([
+  'https://www.twitch.tv',
+  'https://www.youtube.com',
+  'https://m.youtube.com',
+  'https://youtube.com',
+  'https://youtu.be',
+]);
+let PARENT_ORIGIN = 'https://www.twitch.tv';
 const beacon = (ev, data) => {
   try {
     chrome.runtime.sendMessage({ __koDiag: { ev, data } }, () => void chrome.runtime.lastError);
@@ -27,15 +40,36 @@ const post = (m) => {
   }
 };
 
+// Keyboard relay (0.8.6, pain 2): when focus lives INSIDE the extension-page
+// iframe (after the user clicks the player — the host's document-level
+// keydown capture never sees those presses, because the event targets the
+// chrome-extension:// frame's own document), forward the overlay-relevant
+// keys up so the content script issues the same seek/fullscreen it would for
+// a keypress on the Twitch page. Only the keys the host's onOverlayKeydown
+// whitelists (f / arrowleft / arrowright) are relayed, so the native YT
+// controls (space = play/pause, and every other key) are left untouched.
+// 'f' maps to the host's fullscreen toggle. preventDefault keeps the frame
+// from also acting on the arrow (e.g. scrolling the page body).
+const RELAY_KEYS = new Set(['f', 'arrowleft', 'arrowright']);
+window.addEventListener('keydown', (ev) => {
+  const k = String(ev.key).toLowerCase();
+  if (!RELAY_KEYS.has(k) || ev.ctrlKey || ev.metaKey || ev.altKey || ev.shiftKey) return;
+  const t = ev.target;
+  if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+  try { ev.preventDefault(); } catch { /* ignore */ }
+  post({ t: 'key', k });
+});
+
 if (HLS_MODE) {
   // ---- HLS engine (YouTube layer) ------------------------------------------
   // Same bridge protocol as IVS: {t:'load'|'play'|'pause'|'mute'|'volume'|
   // 'seek'|'seekToLive'|'getState'} in, {t:'ready'} + ~1/s {t:'st'} + {t:'ev'}
   // out. hls.js plays the innertube hlsManifestUrl; native controls visible.
   V.controls = true; // native controls give the yt layer the embed-era UX
-  // liveBackBufferLength: 20 keeps ~20s of media behind the live edge so the
-  // content script's arrow/bar seek has a real live-window to rewind into
-  // (the bar spans [edge - window, edge]).
+  // 0.8.6 pain-1: the yt rewind window is TUNED, not whatever the playlist
+  // grants — liveBackBufferLength anchors the ~20s seekable window the bar,
+  // the "LIVE -Ns" pill and the edge-clamp all promise (0.8.5 left it at the
+  // hls.js default, so the window was shorter than the UI implied).
   const h = new Hls({ maxBufferLength: 30, liveSyncDurationCount: 3, liveBackBufferLength: 20 });
   let currentUrl = null;
   let reloaded = false;
@@ -47,15 +81,7 @@ if (HLS_MODE) {
     if (!isFinite(pos) || pos < 0 || pos >= 1e15) pos = 0;
     let lat = 0;
     try {
-      if (V.seekable && V.seekable.length) {
-        lat = V.seekable.end(V.seekable.length - 1) - pos;
-        // For a live HLS stream the seekable range is the buffered live
-        // window; report THAT as the bar duration so the content script's
-        // seekbar spans [edge - window, edge] instead of the growing full
-        // timeline. The seek clamp below keeps the playhead in this range.
-        const win = V.seekable.end(V.seekable.length - 1) - V.seekable.start(0);
-        if (isFinite(win) && win > 0) dur = win;
-      }
+      if (V.seekable && V.seekable.length) lat = V.seekable.end(V.seekable.length - 1) - pos;
     } catch { /* not ready */ }
     if (!isFinite(lat) || lat < 0) lat = 0;
     const levels = h.levels || [];
@@ -70,7 +96,11 @@ if (HLS_MODE) {
       w: l.width,
       h: l.height,
     }));
-    const state = V.paused ? (V.readyState === 0 ? 'Idle' : 'Paused') : 'Playing';
+    // A drained live stream ends the element and then sits paused forever, so
+    // 'Ended' gets its own name: the content side maps an unknown state to
+    // NOT-live, which is what stops a dead YouTube layer from pinning a black
+    // box over the deleted Twitch player.
+    const state = V.ended ? 'Ended' : V.paused ? (V.readyState === 0 ? 'Idle' : 'Paused') : 'Playing';
     return {
       state,
       paused: V.paused,
@@ -86,9 +116,10 @@ if (HLS_MODE) {
   };
   const sendSt = () => post({ t: 'st', st: st() });
   window.addEventListener('message', (ev) => {
-    if (ev.source !== window.parent || ev.origin !== PARENT_ORIGIN) return;
+    if (ev.source !== window.parent || !PARENT_ORIGINS.has(ev.origin)) return;
     const m = ev.data && ev.data.__koKick;
     if (!m || m._koToken !== PLAYER_TOKEN) return;
+    PARENT_ORIGIN = ev.origin; // answers follow the page that owns us
     switch (m.t) {
       case 'load':
         try {
@@ -115,18 +146,18 @@ if (HLS_MODE) {
         break;
       case 'seek':
         if (Number.isFinite(m.s) && m.s >= 0 && m.s < 1e15) {
+          // Clamp into the actual seekable range (the live window), never
+          // past the live edge — an un-clamped currentTime there silently
+          // snaps back to the buffer head on the next 'st' (0.8.5: arrow
+          // overshoot left the playhead visibly jittering instead of live).
+          let lo = 0, hi = m.s;
           try {
-            // Clamp to the actual buffered range so a seek never lands outside
-            // the live window the engine actually holds (the frame honors the
-            // hls.js liveBackBufferLength window).
             if (V.seekable && V.seekable.length) {
-              const s0 = V.seekable.start(0);
-              const s1 = V.seekable.end(V.seekable.length - 1);
-              V.currentTime = Math.max(s0, Math.min(s1, m.s));
-            } else {
-              V.currentTime = m.s;
+              lo = V.seekable.start(0);
+              hi = V.seekable.end(V.seekable.length - 1);
             }
-          } catch { /* seekable not ready — let the browser clamp */ }
+          } catch { /* not ready */ }
+          V.currentTime = Math.max(lo, Math.min(hi, m.s));
         }
         break;
       case 'seekToLive':
@@ -137,6 +168,25 @@ if (HLS_MODE) {
       case 'quality':
         if (m.q === 'auto') h.currentLevel = -1;
         else if (Number.isInteger(m.q) && m.q >= 0 && m.q < h.levels.length) h.currentLevel = m.q;
+        break;
+      // Vertical quality menu (0.8.2): the REAL hls.js levels, not a static
+      // guess list. 'levels' mirrors the {t:'st'} qualities shape; the menu
+      // adds its own Auto row.
+      case 'getLevels':
+        post({
+          t: 'levels',
+          levels: (h.levels || []).map((l, i) => ({
+            id: i,
+            name: l.height ? `${l.height}p` : `${l.width || ''}w`,
+            w: l.width,
+            h: l.height,
+          })),
+        });
+        break;
+      case 'setLevel':
+        if (m.l === 'auto') h.currentLevel = -1;
+        else if (Number.isInteger(m.l) && m.l >= 0 && m.l < (h.levels || []).length) h.currentLevel = m.l;
+        sendSt(); // the checkmark follows the engine, not the click
         break;
       case 'getState':
         sendSt();
@@ -261,9 +311,10 @@ function sendSt() {
 }
 
 window.addEventListener('message', (ev) => {
-  if (ev.source !== window.parent || ev.origin !== PARENT_ORIGIN) return;
+  if (ev.source !== window.parent || !PARENT_ORIGINS.has(ev.origin)) return;
   const m = ev.data && ev.data.__koKick;
   if (!m || m._koToken !== PLAYER_TOKEN) return;
+  PARENT_ORIGIN = ev.origin; // answers follow the page that owns us
   switch (m.t) {
     case 'load':
       try {
@@ -290,9 +341,6 @@ window.addEventListener('message', (ev) => {
     case 'volume':
       try { p.setVolume(m.v); } catch (e) { /* ignore */ }
       break;
-    case 'seek':
-      try { p.seekTo(m.s); } catch (e) { /* outside window */ }
-      break;
     case 'seekToLive':
       try {
         const lat = p.getLiveLatency();
@@ -313,6 +361,35 @@ window.addEventListener('message', (ev) => {
           }
         }
       } catch (e) { /* quality menu is best-effort */ }
+      break;
+    // Vertical quality menu (0.8.2): IVS's real quality ladder, same
+    // {id,name,w,h} shape the 'st' message carries.
+    case 'getLevels': {
+      let levels = [];
+      try {
+        levels = p.getQualities().map((quality, id) => ({
+          id,
+          name: quality.name,
+          w: quality.width,
+          h: quality.height,
+        }));
+      } catch (e) { /* not ready yet */ }
+      post({ t: 'levels', levels });
+      break;
+    }
+    case 'setLevel':
+      try {
+        if (m.l === 'auto') {
+          p.setAutoQualityMode(true);
+        } else if (Number.isInteger(m.l) && m.l >= 0) {
+          const selected = p.getQualities()[m.l];
+          if (selected) {
+            p.setAutoQualityMode(false);
+            p.setQuality(selected);
+          }
+        }
+      } catch (e) { /* quality menu is best-effort */ }
+      sendSt(); // the checkmark follows the engine, not the click
       break;
     case 'getState':
       sendSt();

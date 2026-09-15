@@ -118,14 +118,29 @@ async function kickStatus(slug) {
   // Storage writes hot-apply in the content script via storage.onChanged —
   // no page reload needed.
   $('enabled').addEventListener('change', async (e) => {
-    st.enabled = e.target.checked;
-    await writeState(st);
+    const fresh = await readState();
+    fresh.enabled = e.target.checked;
+    await writeState(fresh);
   });
 
   $('player').addEventListener('change', async (e) => {
     const v = e.target.value;
-    st.player = v === 'twitch' ? 'twitch' : v === 'youtube' ? 'youtube' : 'kick';
-    await writeState(st);
+    // Re-read immediately before writing: the popup-open st snapshot goes
+    // stale the moment another tab or the overlay-side saveState() writes
+    // (mute/progress), and writing the whole stale object would clobber that
+    // back (P5) — and can manufacture a player === prev.player echo that the
+    // content script's retry gate must then survive. Merge onto the freshest.
+    const fresh = await readState();
+    fresh.player = v === 'twitch' ? 'twitch' : v === 'youtube' ? 'youtube' : 'kick';
+    // 0.8.6 pain-4: an explicit popup re-pick must read as retry intent even
+    // when the value is unchanged since the last write (a same-value write
+    // after a session-only yt->kick fallback must re-mint). fresh.playerAt
+    // is the intent marker the content script keys on; nothing else (volume/
+    // mapping echoes, the overlay's own saveState) ever stamps it. A user
+    // who re-picks YouTube immediately — the natural reaction to a failed
+    // hand-back — is no longer swallowed by a 30s backoff.
+    fresh.playerAt = Date.now();
+    await writeState(fresh);
     if (v === 'youtube' && !$('yt').value.trim()) {
       $('status').textContent = 'YouTube needs a channel: paste URL, @handle or UC… above.';
     } else {
@@ -137,8 +152,14 @@ async function kickStatus(slug) {
     if (!slug) return;
     const kick = $('kick').value.trim().toLowerCase();
     const yt = $('yt').value.trim();
-    if (!st.mappings) st.mappings = {};
-    const prev = st.mappings[slug];
+    // Re-read AFTER any pending write (the player select above, another tab's
+    // saveState) — the popup-open `st` snapshot (which carries st.player) goes
+    // stale the moment anything writes; mutating and writing it would clobber
+    // the fresh player back AND manufacture the same-value echo the retry gate
+    // exists to survive (0.8.6 pain-4 / P5). Mutate ONLY the mapping fields.
+    const fresh = await readState();
+    if (!fresh.mappings) fresh.mappings = {};
+    const prev = fresh.mappings[slug];
     const base = prev && typeof prev === 'object' ? prev : {};
     if (kick || yt) {
       // Clearing a field must clear it (the old `kick || base.kick` kept a
@@ -158,11 +179,11 @@ async function kickStatus(slug) {
       } else {
         delete next.ytId;
       }
-      st.mappings[slug] = next;
+      fresh.mappings[slug] = next;
     } else {
-      delete st.mappings[slug];
+      delete fresh.mappings[slug];
     }
-    await writeState(st);
+    await writeState(fresh);
     window.close();
   });
 })();
