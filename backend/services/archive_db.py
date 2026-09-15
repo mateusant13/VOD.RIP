@@ -3597,14 +3597,43 @@ def search(
     # eat the page or the per-video slots.
     merged = _collapse_transcript_dupes(merged)
     if mode == "exact":
-        phrase = " ".join(raw_q.casefold().split())
-        if phrase:
-            def _contiguous_phrase(h):
-                blob = " ".join(f"{h.get('text') or ''} {h.get('title') or ''}".casefold().split())
-                return phrase in blob
-            merged = [h for h in merged if _contiguous_phrase(h)]
-            for h in merged:
-                h["partial"] = False
+        # EXACT post-filter: every typed token must be covered somewhere in
+        # the hit's folded text+title, not as a single contiguous phrase.
+        # Research doc F2: the old filter required `phrase in blob` over a
+        # contiguous, token-joined casefold of text+title, so cross-segment
+        # phrases and repeated lines ("vale da estranheza" appearing across
+        # several captions at different timestamps) were cut — 23 hits vs
+        # 25 real lines. Contiguity is a ranking bonus, never an acceptance
+        # gate. Keeps `partial=False` on survivors; a query with an extra
+        # word still fails because every q_token must be covered.
+        # The query tokens are FOLDED here (not search-scope raw casefold):
+        # search's q_tokens keeps accents, but the hit text is folded — an
+        # un-folded 'flexões'/'póstuma'/'gráficos' would never equal the
+        # folded 'flexoes'/'postuma'/'graficos' token (research doc F1).
+        # EVERY folded token is required (no len>=3 cut), matching
+        # _titles_search's exact branch: the literal-phrase invariant — a
+        # query with an extra short/stopword word must not match.
+        exact_q = _fold_tokens(q)[:_TITLES_MAX_TOKENS]
+        def _exact_covers(h) -> bool:
+            toks = _fold_tokens(f"{h.get('text') or ''} {h.get('title') or ''}")
+            if not toks:
+                return False
+            return all(
+                any(
+                    tt == qt
+                    or (
+                        len(qt) >= 4
+                        and q_freq.get(qt, 0) <= _PREFIX_GATE_FREQ
+                        and qt in tt
+                    )
+                    or _tok_eq(tt, qt)
+                    for tt in toks
+                )
+                for qt in exact_q
+            )
+        merged = [h for h in merged if _exact_covers(h)]
+        for h in merged:
+            h["partial"] = False
     # The per-video cap exists so a common fuzzy word never lets one video
     # flood the default result page. A caller asking for a big batch (the
     # FE's "infinite literal results" mode sends ~2000) wants every match
@@ -3708,11 +3737,18 @@ def _titles_search(
     ponytail: when videos grows past ~10k rows, move to an FTS5
     external-content titles table with a unicode61 tokenizer and reuse the
     tier/merge machinery of the content tables."""
-    q_tokens = _fold_tokens(q)
+    q_folded = _fold_tokens(q)
     # 1-2 char tokens are substring noise in titles ("da" ⊂ "day", "mudam").
     # The content passes keep them for phrase adjacency; here they only
-    # match half the catalog. An all-short query simply skips the pass.
-    q_tokens = [t for t in q_tokens if len(t) >= 3][:_TITLES_MAX_TOKENS]
+    # match half the catalog except in EXACT literal-phrase mode, where a
+    # title must carry EVERY word the user typed — 'vale o da estranheza'
+    # must NOT match "vale da estranheza", so the 1-2 char tokens ('o',
+    # 'da') stay in the acceptance set. Fuzzy/scored coverage uses the
+    # len>=3 set below.
+    if exact:
+        q_tokens = q_folded[:_TITLES_MAX_TOKENS]
+    else:
+        q_tokens = [t for t in q_folded if len(t) >= 3][:_TITLES_MAX_TOKENS]
     if not q_tokens:
         return []
     # Title COVERAGE is scored on the content words only. Stopwords are in
@@ -3750,12 +3786,15 @@ def _titles_search(
     if date_to:
         where.append("date(started_at) <= date(?)")
         params.append(date_to)
-    if exact:
-        # Exact title queries only need rows containing every token; this
-        # avoids walking the whole catalog for a guaranteed no-match.
-        for token in q_tokens:
-            where.append("(lower(title) LIKE ? OR lower(original_title) LIKE ?)")
-            params.extend((f"%{token}%", f"%{token}%"))
+    # NOTE: no pre-filter for `exact` here. A per-token `lower(title) LIKE ?`
+    # probe receives an already accent-folded query token against a raw --
+    # only lowercased, not diacritic-folded -- column, so accented titles
+    # (kick 'derrota flexões', twitch 'investigação póstuma', youtube
+    # 'gráficos ruins…', 'Edição de vídeo nos GAMES') never reach the Python
+    # fold below and yield 0 hits (research doc F1). The videos table is
+    # small; the full walk + Python fold costs ~12 ms (doc §3.1), so we drop
+    # the LIKE prefilter for exact and let _fold_tokens do the folding on
+    # BOTH sides in the loop.
     if where:
         sql += " WHERE " + " AND ".join(where)
     out: list[dict] = []
@@ -3769,9 +3808,28 @@ def _titles_search(
         if not toks:
             continue
         if exact:
-            hay = f"{title} {original}".casefold()
-            needle = " ".join(q_tokens)
-            if needle not in " ".join(toks) and q.strip().casefold() not in hay:
+            # EXACT coverage: every typed token must be covered -- equality,
+            # _tok_eq, or (absent/low-freq token) a >=4-char SUBSTRING of a
+            # title token -- across the folded title+original. Research doc
+            # F2: the old test was a CONTIGUOUS needle ("needle in
+            # ' '.join(toks)"), so 'games vida' never matched "TOP 10 GAMES
+            # da vida!" (tokens scattered) and 'estranheza games'/'graficos
+            # ruins vale' never matched rq7SIAPbgX4. Contiguity is a SCORE
+            # bonus, not an acceptance gate. Using every q_tokens (not just
+            # q_scored) keeps the literal-phrase invariant: a query with an
+            # extra word MUST NOT match a phrase title.
+            def covers_all(qt: str) -> bool:
+                return any(
+                    tt == qt
+                    or (
+                        len(qt) >= 4
+                        and freq.get(qt, 0) <= _PREFIX_GATE_FREQ
+                        and qt in tt
+                    )
+                    or _tok_eq(tt, qt)
+                    for tt in toks
+                )
+            if not all(covers_all(qt) for qt in q_tokens):
                 continue
             # A literal phrase hit carries every typed word, stopwords
             # included; both counters follow so score stays 1.0 and the
