@@ -170,3 +170,75 @@ def test_exact_source_both_keeps_title_and_transcript(_seeded):
     kinds = {h["kind"] for h in hits}
     assert "transcript" in kinds
     assert "title" in kinds
+
+
+# ---------------------------------------------------------------- F2c
+# Real Gaveta "vale da estranheza" transcript rows from the live H: archive
+# (verified 2026-09-15). Pairs like (76.789, 76.799) are YouTube auto-caption
+# full + partial cues: DIFFERENT text a few ms apart, where one is a substring
+# of the other. The pre-F2c collapse dropped the shorter (truncated) sibling,
+# hiding legitimate repeat mentions. The doc's exhaustive truth counts both
+# members (25 rows across 4 videos; e.g. 6xK0oVBaV0Q "76.8(×2)").
+_F2C_SEGS = {
+    "6xK0oVBaV0Q": [
+        (62, 73.479, "Cheque, ele tá despertando um sentimento parecido com o que o vale da estranheza"),
+        (63, 76.789, "parecido com o que o vale da estranheza"),
+        (64, 76.799, "parecido com o que o vale da estranheza desperta nas pessoas. vale da"),
+        (197, 212.640, "acho que ele não cai no tal do vale da estranheza, que eu tinha falado do"),
+        (241, 253.799, "muito horrorosos, muito estranhos, assim, vale da estranheza, Lord Farquad,"),
+        (242, 256.030, "assim, vale da estranheza, Lord Farquad,"),
+        (243, 256.040, "assim, vale da estranheza, Lord Farquad, nossa, como ele ele é feito para ser"),
+        (521, 537.360, "ele mudou. E eu acho que esse é o tal do Vale da estranheza que eles criaram,"),
+        (522, 538.829, "Vale da estranheza que eles criaram,"),
+        (523, 538.839, "Vale da estranheza que eles criaram, porque a gente tá vendo uma animação com"),
+    ],
+    "Mzybv0Yme-A": [
+        (217, 229.879, "bem bonito, bem gostoso no vale da estranheza, se encher o vale da"),
+        (218, 231.309, "estranheza, se encher o vale da"),
+        (219, 231.319, "estranheza, se encher o vale da estranheza de água e fala assim"),
+        (479, 469.599, "mas sem usar efeitos especiais. Quer ver um outro exemplo de Vale da estranheza?"),
+        (480, 471.350, "um outro exemplo de Vale da estranheza?"),
+        (481, 471.360, "um outro exemplo de Vale da estranheza? E esse esse é ofensivo"),
+        (944, 916.839, "escolha artística terrível, que ele realmente entra no vale da estranheza,"),
+        (945, 918.230, "realmente entra no vale da estranheza,"),
+        (946, 918.240, "realmente entra no vale da estranheza, ele ele entra num problema que é o"),
+    ],
+    "S4ZB3xTaFDc": [
+        (715, 729.440, "que é pior ainda, assim como o vale da estranheza, se você bota um negócio que"),
+        (729, 743.240, "da sua consciência, do seu cérebro, que é onde vive o Vale da Estranheza, ele"),
+        (730, 745.030, "é onde vive o Vale da Estranheza, ele"),
+        (731, 745.040, "é onde vive o Vale da Estranheza, ele entra em circuito, ele"),
+    ],
+    "wsKyA8ifjMI": [
+        (537, 681.079, "Para mim eles entram mais no vale da estranheza. Eu não consigo lembrar de"),
+        (541, 685.120, "nenhum Pokémon que que entre no Vale da estranheza. Todos eles são muito"),
+        (4487, 5625.360, "coisa com barba se cando no Vale da estranheza. Eu eu fiz um react disso."),
+    ],
+}
+
+
+def test_exact_transcript_substring_pairs_survive(_seeded):
+    """F2c: transcript rows that are substring pairs at ~same moment (whisper/
+    auto-caption full+partial cues a few ms apart) are legitimate DISTINCT
+    mentions. The pre-fix collapse dropped the shorter sibling; now each of
+    the 25 real 'vale da estranheza' rows must surface in exact+both."""
+    for vid, segs in _F2C_SEGS.items():
+        archive_db.upsert_video({
+            "platform": "youtube", "video_id": vid, "channel": "gaveta",
+            "title": f"Video {vid}", "started_at": "2026-08-01T12:00:00Z", "kind": "vod",
+        })
+        archive_db.insert_transcript(
+            "youtube", vid,
+            [{"seg_idx": si, "start_sec": st, "end_sec": st + 1.5, "text": tx}
+             for si, st, tx in segs],
+        )
+    hits = _exact("vale da estranheza", source="both", channel="gaveta", limit=1000)
+    tr = [h for h in hits if h["kind"] == "transcript"]
+    from collections import Counter
+    by_video = Counter(h["video_id"] for h in tr)
+    # Doc §0 exhaustive truth: 10, 8, 4, 3 rows per video — each distinct
+    # transcript row (incl. the substring pairs) must survive the collapse.
+    assert by_video["6xK0oVBaV0Q"] == 10, by_video
+    assert by_video["Mzybv0Yme-A"] == 8, by_video
+    assert by_video["S4ZB3xTaFDc"] == 4, by_video
+    assert by_video["wsKyA8ifjMI"] == 3, by_video

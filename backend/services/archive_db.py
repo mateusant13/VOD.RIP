@@ -1941,14 +1941,16 @@ TRANSCRIPT_DUPE_MIN_GAP_SEC = 1.0
 def _collapse_transcript_dupes(hits: list[dict]) -> list[dict]:
     """Drop transcript hits that repeat the same moment of the same video:
     identical (offset, text) rows (duplicate caption rows in the archive —
-    re-fetched VTTs re-inserted instead of upserting), one caption that is
-    a substring of another at the same offset (whisper split artifacts —
-    the longer caption survives), or identical text < 1s later (YouTube
-    caption overlap, same rule as _dedupe_transcript_rows).
+    re-fetched VTTs re-inserted instead of upserting) or identical text
+    < 1s later (YouTube caption overlap, same rule as _dedupe_transcript_rows).
 
     The search merge only dedupes by per-video cap, so duplicate caption
     rows used to eat cap slots and show the same sentence twice in a row.
-    Preserves the input order of the survivors."""
+    Distinct rows whose text merely OVERLAPS (one a truncated whisper
+    fragment of the other, e.g. auto-caption full + partial cues a few ms
+    apart) are legitimate mentions and are kept even when the shorter text
+    is a substring of the longer — each is a separate real row at a
+    different offset. Preserves the input order of the survivors."""
     by_video: dict[tuple[str, str], list[dict]] = {}
     for h in hits:
         if h.get("hit_kind") == "transcript" or h.get("kind") == "transcript":
@@ -1970,24 +1972,6 @@ def _collapse_transcript_dupes(hits: list[dict]) -> list[dict]:
                 < TRANSCRIPT_DUPE_MIN_GAP_SEC
             ):
                 dropped.add(id(h))
-                continue
-            # Same-moment (≤50ms) caption pair where one text is a
-            # substring of the other: whisper emitted the same sentence
-            # twice, once truncated. Keep the longer caption, whichever
-            # row arrives first.
-            replaced_idx: Optional[int] = None
-            for k_idx, k in enumerate(kept):
-                if abs(float(k.get("offset_sec") or 0.0) - off) < 0.05:
-                    kt = str(k.get("text") or "")
-                    if text == kt or (text and kt and (text in kt or kt in text)):
-                        replaced_idx = -1 if len(text) <= len(kt) else k_idx
-                        break
-            if replaced_idx == -1:
-                dropped.add(id(h))
-                continue
-            if replaced_idx is not None:
-                dropped.add(id(kept[replaced_idx]))
-                kept[replaced_idx] = h  # in-place: keeps the time order
                 continue
             kept.append(h)
     if not dropped:
