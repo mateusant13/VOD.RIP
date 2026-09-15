@@ -1083,9 +1083,25 @@ _DEEP_FETCH_CONCURRENCY = 2
 _DEEP_MIN_GAP_S = 1.5  # mirrors archive_ytdlp._ORIGINAL_MIN_GAP_S
 _DEEP_SQL_CHUNK = 500
 _DEEP_RUNNING_CAP = 2  # concurrent sweeps across ALL channels (bot-gate discipline)
+# Caption-ingest persistent cursor: keep the per-channel cursor fresh every
+# N videos so a crash/restart loses at most that many caption fetches.
+_DEEP_CURSOR_EVERY = 20
+# Scope refresh TTL for the caption-ingest cursor store: the scheduler pass
+# re-enumerates a channel's tabs at most once per interval, so a long
+# backlog never re-crawls all three tabs on every 180s pass.
+_DEEP_ENUM_CACHE_TTL_S = 180.0
 
 _deep_jobs: dict[str, dict] = {}
 _deep_jobs_lock = threading.Lock()
+# Lazy deep_jobs-table ensure (per resolved DB path so a test that rebinds
+# VODRIP_ARCHIVE_DB still creates the table on its fresh scratch DB).
+_deep_jobs_tables_ok: set[str] = set()
+# Per-channel in-memory enumerate cache (monotonic ts, items, truncated).
+_deep_enumerate_cache: dict[str, tuple[float, list[dict], bool]] = {}
+# Per-channel caption-ingest locks: settings channel-add and the scheduler
+# pass may race on the same channel's cursor — serialize the sweep pump.
+_caption_ingest_locks: dict[str, threading.Lock] = {}
+_caption_ingest_locks_guard = threading.Lock()
 # Fetch pacing is GLOBAL, not per-job: two sweeps from two clients must
 # still start yt-dlp calls >=_DEEP_MIN_GAP_S apart. Closure-local pace
 # would let each job blast YouTube independently.
@@ -1343,6 +1359,242 @@ def _deep_seed_video_rows(handle: str, videos: list[dict]) -> None:
             })
         except Exception as exc:
             logger.debug("deep seed row failed for %s: %s", vid, exc)
+
+
+# --- deep_jobs persistence table --------------------------------------------
+#
+# One table backs BOTH consumers of the same monotonic caption work — deep
+# channel-search sweeps (kind='deep') and the channel-add/scheduler caption
+# ingest (kind='caption'). A cursor = index into the deduped newest-first
+# enumerated video list: the index of the next video to process. Persisting
+# it lets a restart resume mid-sweep instead of re-crawling every caption.
+# The table lives OUTSIDE archive_db.SCHEMA (that file is SearchFix's) — we
+# create it additively/idempotently through the app's schema-ready EXECUTE
+# path, so it needs no schema migration hook.
+_DEEP_JOBS_DDL = """
+CREATE TABLE IF NOT EXISTS deep_jobs (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL DEFAULT 'deep',
+    handle TEXT NOT NULL,
+    handle_norm TEXT NOT NULL,
+    query TEXT NOT NULL,
+    status TEXT NOT NULL,
+    scanned INTEGER NOT NULL DEFAULT 0,
+    total INTEGER NOT NULL DEFAULT 0,
+    cursor INTEGER,
+    truncated INTEGER NOT NULL DEFAULT 0,
+    no_transcript INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
+
+
+def _ensure_deep_jobs_table() -> None:
+    """Lazy-create deep_jobs on the resolved DB path. Keyed per DB path so a
+    test that rebinds VODRIP_ARCHIVE_DB to a fresh scratch DB still gets the
+    table (an unconditional module-global cache would skip it)."""
+    path = str(archive_db._db_path())
+    if path in _deep_jobs_tables_ok:
+        return
+    archive_db.execute(_DEEP_JOBS_DDL)
+    _deep_jobs_tables_ok.add(path)
+
+
+def _deep_jobs_put(row: dict) -> None:
+    """Upsert one deep_jobs row (deep-store cursor/resume state)."""
+    _ensure_deep_jobs_table()
+    archive_db.execute(
+        """INSERT INTO deep_jobs
+             (id, kind, handle, handle_norm, query, status, scanned, total,
+              cursor, truncated, no_transcript, error, started_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             kind=excluded.kind, handle=excluded.handle,
+             handle_norm=excluded.handle_norm, query=excluded.query,
+             status=excluded.status, scanned=excluded.scanned,
+             total=excluded.total, cursor=excluded.cursor,
+             truncated=excluded.truncated, no_transcript=excluded.no_transcript,
+             error=excluded.error, updated_at=excluded.updated_at""",
+        (
+            row.get("id", ""), row.get("kind", "deep"),
+            row.get("handle", ""), row.get("handle_norm", ""),
+            row.get("query", ""), row.get("status", "running"),
+            int(row.get("scanned", 0)), int(row.get("total", 0)),
+            row.get("cursor"), int(row.get("truncated", 0)),
+            int(row.get("no_transcript", 0)), row.get("error"),
+            row.get("started_at", datetime.now(timezone.utc).isoformat(timespec="seconds")),
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        ),
+    )
+
+
+def _deep_jobs_caption_get(handle_norm: str) -> Optional[dict]:
+    """Current caption-ingest cursor row for a channel (latest by updated_at),
+    or None — the channel has no captured cursor yet (enumerate fresh)."""
+    _ensure_deep_jobs_table()
+    rows = archive_db.query(
+        """SELECT id, handle, handle_norm, query, status, scanned, total, cursor,
+                  truncated, no_transcript, error, started_at, updated_at
+           FROM deep_jobs WHERE kind='caption' AND handle_norm=?
+           ORDER BY updated_at DESC LIMIT 1""",
+        (handle_norm,),
+    )
+    return dict(rows[0]) if rows else None
+
+
+def _deep_caption_lock(handle_norm: str) -> threading.Lock:
+    """Per-channel pump lock (settings channel-add may race the scheduler
+    pass on the same channel's cursor)."""
+    with _caption_ingest_locks_guard:
+        return _caption_ingest_locks.setdefault(handle_norm, threading.Lock())
+
+
+# --- caption ingest (channel-add / scheduler) ------------------------------
+
+def _run_channel_caption_ingest(
+    handle: str, *, budget: Optional[int] = None
+) -> dict:
+    """Pump one channel's caption ingest forward from its persistent cursor.
+
+    Scope = the FULL enumerated uploads+shorts+streams list (a fresh cursor
+    enumerates all three tabs once; an existing cursor reuses the cached
+    enumerate). Each pass processes up to *budget* videos that are not
+    covered (_youtube_covered), respecting the global pace/gate, advancing
+    the deep_jobs cursor so the next pass (or a post-restart resume)
+    continues exactly where this one stopped. Shorts are NOT skipped a
+    priori — they may carry captions worth archiving.
+
+    Runs on a worker thread (never the event loop). Returns a stats dict.
+    """
+    norm = _deep_handle_norm(handle)
+    lock = _deep_caption_lock(norm)
+    with lock:
+        now = time.monotonic()
+        cached = _deep_enumerate_cache.get(norm)
+        if cached is None or now - cached[0] >= _DEEP_ENUM_CACHE_TTL_S:
+            try:
+                videos, truncated = _deep_enumerate(handle)
+            except Exception as exc:
+                logger.debug("caption ingest enumerate failed for %s: %s", handle, exc)
+                return {"scanned": 0, "no_transcript": 0, "error": str(exc)[:200]}
+            _deep_enumerate_cache[norm] = (now, videos, bool(truncated))
+        else:
+            videos, truncated = cached[1], cached[2]
+
+        if not videos:
+            return {"scanned": 0, "no_transcript": 0, "truncated": False}
+
+        row = _deep_jobs_caption_get(norm)
+        cursor = int(row.get("cursor") or 0) if row else 0
+        cursor = max(0, min(cursor, len(videos)))
+
+        _deep_seed_video_rows(handle, videos)
+        ids = [str(v.get("id") or "") for v in videos]
+        covered, _marked = _deep_covered_ids(
+            ids[cursor:] if cursor < len(ids) else []
+        )
+
+        from services.archive_scheduler import _youtube_covered
+
+        budget = _yt_default_budget() if budget is None else int(budget)
+        spawned_budget = max(0, budget)
+        processed = 0
+        no_transcript = 0
+        idx = cursor
+        while idx < len(videos) and processed < spawned_budget:
+            v = videos[idx]
+            vid = str(v.get("id") or "")
+            if vid and vid not in covered:
+                if not _youtube_covered(vid):
+                    ok = _paced_caption_fetch(vid, handle)
+                    processed += 1
+                    if not ok:
+                        no_transcript += 1
+                else:
+                    covered.add(vid)
+            idx += 1
+            if (idx - cursor) % _DEEP_CURSOR_EVERY == 0:
+                _deep_jobs_put({
+                    "id": f"caption-{norm}", "kind": "caption",
+                    "handle": handle, "handle_norm": norm, "query": "",
+                    "status": "running", "scanned": idx,
+                    "total": len(videos), "cursor": idx,
+                    "truncated": int(bool(truncated)),
+                    "no_transcript": no_transcript, "error": None,
+                })
+        _deep_jobs_put({
+            "id": f"caption-{norm}", "kind": "caption",
+            "handle": handle, "handle_norm": norm, "query": "",
+            "status": "running", "scanned": idx, "total": len(videos),
+            "cursor": idx, "truncated": int(bool(truncated)),
+            "no_transcript": no_transcript, "error": None,
+        })
+        return {
+            "scanned": idx - cursor,
+            "processed": processed,
+            "no_transcript": no_transcript,
+            "truncated": bool(truncated),
+            "cursor": idx,
+        }
+
+
+def _yt_default_budget() -> int:
+    from services.archive_scheduler import _yt_ingest_budget
+
+    return int(_yt_ingest_budget())
+
+
+def _paced_caption_fetch(video_id: str, handle: str) -> bool:
+    """One paced caption fetch+store for the channel caption ingest.
+
+    Returns True when a transcript (>=1 segment) was stored, False on a
+    no-captions verdict or failure (the failure stamps the negative marker
+    so it is not re-fetched for a day). Bot-gate classification mirrors the
+    deep-search worker: transport errors are stamped; IP-gate errors park
+    and are NOT stamped as video verdicts."""
+    from services import yt_gate
+
+    with _deep_pace_lock:
+        now = time.monotonic()
+        start_at = max(now, _deep_pace["last"] + _DEEP_MIN_GAP_S)
+        _deep_pace["last"] = start_at
+    while time.monotonic() < start_at:
+        time.sleep(0.1)
+    try:
+        payload = _deep_fetch_transcript(video_id)
+    except Exception as exc:
+        if yt_gate.classify_youtube_gate_error(exc):
+            yt_gate.note_youtube_gate(str(exc)[:200])
+            return False
+        try:
+            archive_db.mark_captions_unavailable("youtube", video_id)
+        except Exception:
+            pass
+        return False
+    segments = _deep_store_transcript(video_id, payload)
+    if segments:
+        try:
+            archive_db.clear_captions_unavailable("youtube", video_id)
+        except Exception:
+            pass
+        return True
+    try:
+        archive_db.mark_captions_unavailable("youtube", video_id)
+    except Exception:
+        pass
+    return False
+
+
+def _start_caption_ingest_channel(handle: str) -> None:
+    """Fire-and-forget a channel's caption-ingest pump (channel-add path)."""
+    if not handle or not str(handle).strip():
+        return
+    threading.Thread(
+        target=_run_channel_caption_ingest, args=(str(handle).strip(),),
+        daemon=True, name=f"caption-ingest-{_deep_handle_norm(str(handle))[:12]}",
+    ).start()
 
 
 def _deep_set(job: dict, **fields: Any) -> None:
