@@ -6,11 +6,13 @@ spawning real yt-dlp workers (no network).
 
 import pytest
 import time
+import threading
 from datetime import datetime, timezone
 
 from models.schemas import DownloadState
+from services import ytdlp_service
 from services.download_manager import DownloadManager
-from download_test_utils import purge_download_manager
+from download_test_utils import install_daemon_pool, purge_download_manager
 
 _VALID_KICK_VOD = "https://kick.com/realchannel/videos/100000"
 _VALID_TWITCH_VOD = "https://twitch.tv/videos/1000001"
@@ -206,3 +208,129 @@ def test_kill_pp_state_procs_terminates_child():
     time.sleep(0.1)
     assert proc.poll() is not None
     assert not pp_state.get("active_procs")
+
+
+def test_has_active_runtime_false_when_event_present_but_runtime_purged():
+    """_has_active_runtime must test live ownership, not cancel-event presence.
+
+    A stale key in ``_cancel_events`` (an Event object) is NOT proof a runtime
+    is active: ``bool(threading.Event())`` is True even when the Event is never
+    set, so the old `if self._cancel_events.get(download_id)` returned True for
+    every key present — indistinguishable from membership. After a
+    purge/cancel that pops ``_worker_params`` but leaves a mid-race Event
+    behind, that stale branch would report "active" and resurrect the queue row
+    the purge just removed. Live ownership is ``_worker_params[download_id]``.
+    """
+    mgr = DownloadManager(max_workers=2)
+    dl_id = "dl_runtime_gone"
+    state = DownloadState(
+        download_id=dl_id,
+        url=_VALID_KICK_VOD,
+        status="Failed",  # in _DONE_STATUSES — must not count via state path
+        started_at=datetime.now(timezone.utc).isoformat(),
+    )
+    with mgr._lock:
+        mgr._downloads[dl_id] = state
+        # The crux: a FRESH (never-set) Event is present, but the ownership
+        # token is absent — the exact post-purge race shape.
+        mgr._cancel_events[dl_id] = threading.Event()
+        mgr._worker_params.pop(dl_id, None)
+
+    assert mgr._has_active_runtime(dl_id) is False
+
+    # Positive control: with the ownership token present, it IS active.
+    with mgr._lock:
+        mgr._worker_params[dl_id] = {"url": _VALID_KICK_VOD}
+    assert mgr._has_active_runtime(dl_id) is True
+
+
+def test_remove_history_returns_true_when_it_purged_own_worker(monkeypatch):
+    """remove_history returns True when the live branch purged the worker's own
+    terminal work.
+
+    The live branch is reached deterministically (no real worker, no network):
+    seed a runtime that `_has_active_runtime` reports as live (ownership token
+    in `_worker_params` + a persisted queue row), and neutralize the
+    `_force_stop_download` spin so the call resolves in milliseconds instead of
+    racing the ~2.5s force-stop.
+
+    Pre-fix the branch set `removed = True` but an unconditional `removed =
+    False` re-init below it executed on every path, so the live branch returned
+    False for work it had just purged and deleted — discarding own work looked
+    like a no-op.
+    """
+    mgr = DownloadManager(max_workers=2)
+    dl_id = "dl_remove_own_work"
+    state = DownloadState(
+        download_id=dl_id,
+        url=_VALID_KICK_VOD,
+        status="Downloading...",  # not in _DONE_STATUSES -> live via state
+        started_at=datetime.now(timezone.utc).isoformat(),
+        output_file="",
+    )
+    with mgr._lock:
+        mgr._downloads[dl_id] = state
+        mgr._worker_params[dl_id] = {"url": _VALID_KICK_VOD}
+        mgr._cancel_events[dl_id] = threading.Event()
+        mgr._pause_events[dl_id] = threading.Event()
+        mgr._cleanup_info[dl_id] = {
+            "output_file": "", "output_existed": False, "temp_dirs": [],
+            "expected_duration": None,
+        }
+    mgr._db.upsert_queue_entry(state, mgr._worker_params[dl_id])
+
+    # Neutralize the force-stop spin so the branch is entered deterministically
+    # and quickly; the branch's own cleanup (purge + queue delete) still runs.
+    monkeypatch.setattr(mgr, "_force_stop_download", lambda did: None)
+
+    assert mgr._has_active_runtime(dl_id) is True, "precondition: runtime is live"
+    assert mgr.remove_history(dl_id) is True, (
+        "remove_history returned False after purging and deleting the queue "
+        "row of the very work it removed"
+    )
+    assert dl_id not in {
+        e.get("download_id") for e in mgr._db.queue
+    }, "the removed download's queue row must be gone"
+    assert dl_id not in mgr._worker_params, "the ownership token must be revoked"
+
+
+def test_baseexception_escape_persists_failed_history_row(tmp_path, monkeypatch):
+    """A BaseException escape (SystemExit) is still caught by the finally-block
+    zombie guard after the dead second `except Exception:` arm was removed.
+
+    The old worker had two `except Exception:` arms; the second (after the
+    surviving `except Exception as e:`) was unreachable — every non-BaseException
+    failure already exited the try via the first. Only BaseException escape
+    reached the handler, and the surviving first arm never sees BaseException
+    anyway, so the second arm was dead weight. Its removal is proven structurally
+    by the lint N4 rule going green plus py_compile; this test pins the behavior
+    the dead arm was once (wrongly) thought to own: a SystemExit from the worker
+    must NOT leave the persisted queue row at "Finalising... 99%" — the finally
+    zombie-guard marks it Failed and lands it in history.
+    """
+    install_daemon_pool(monkeypatch)
+
+    def _suicide(url, output_path, cancel_event=None, **kwargs):
+        raise SystemExit("worker died of BaseException")
+
+    mgr = DownloadManager(max_workers=1)
+    download_id = mgr.start_download(
+        url=_VALID_KICK_VOD,
+        output_file=str(tmp_path / "clip.mp4"),
+        download_id="dl_baseexception_escape",
+        download_func=_suicide,
+    )
+
+    # Give the worker time to unwind through finally.
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if mgr.get(download_id) is None and download_id not in mgr._worker_params:
+            break
+        time.sleep(0.05)
+
+    assert download_id in {
+        e.get("download_id") for e in mgr._db.history
+    }, "the SystemExit worker should still land a Failed history row"
+    assert download_id not in {
+        e.get("download_id") for e in mgr._db.queue
+    }, "the SystemExit worker must not leave a queue entry behind"

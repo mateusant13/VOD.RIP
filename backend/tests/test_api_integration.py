@@ -5,6 +5,7 @@ Tests real HTTP requests against the running app (no mocks).
 import json
 import os
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -243,6 +244,49 @@ class TestDownloadAPI:
         assert resp.status_code == 200
         data = resp.json()
         assert data["cancelled"] is False
+
+    @pytest.mark.asyncio
+    async def test_cancel_live_download_via_endpoint(self, client, monkeypatch):
+        """POST /api/download/{id}/cancel returns 200 and cancels a live worker.
+
+        The endpoint force-stops the worker via ``asyncio.to_thread`` so the
+        ~2.5s _force_stop_download spin no longer blocks the event loop. This
+        pins the behaviour (200 + cancelled:True + row gone), not the offload
+        mechanism — the request still takes ~2.5s because the thread is awaited,
+        but that is the whole point: it is off the loop, not faster.
+        """
+        from services import ytdlp_service
+
+        in_worker = threading.Event()
+
+        def _blocking_dl(url, output_path, cancel_event=None, **kwargs):
+            in_worker.set()
+            assert cancel_event.wait(20), "cancel never signalled the worker"
+            raise ytdlp_service.CancelledError("cancelled via endpoint")
+
+        # Bind the router's module-global download_mgr to the deps singleton the
+        # rest of this test talks to, so the endpoint acts on our downloads.
+        import routers.downloads as downloads_router
+        monkeypatch.setattr(downloads_router, "download_mgr", download_mgr)
+
+        dl_id = download_mgr.start_download(
+            url="https://twitch.tv/videos/2000001",
+            output_file=r"C:\tmp\cancel_endpoint.mp4",
+            download_id="dl_cancel_endpoint",
+            download_func=_blocking_dl,
+        )
+        assert in_worker.wait(10), "worker never reached the download func"
+
+        resp = await client.post(f"/api/download/{dl_id}/cancel")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cancelled"] is True
+
+        # Row must actually be gone (not just reported cancelled).
+        assert download_mgr.get(dl_id) is None
+        assert dl_id not in {
+            e.get("download_id") for e in download_mgr._db.queue
+        }
 
     @pytest.mark.asyncio
     async def test_get_nonexistent(self, client):

@@ -39,6 +39,10 @@ jobs:
         run: |
           pip install ruff
           ruff check backend/
+      - name: Lint Python (lock contract)
+        run: |
+          cd backend
+          python scripts/lock_lint.py services/download_manager.py
       - name: Python syntax check
         run: python -m compileall -q backend
       - name: Run backend tests

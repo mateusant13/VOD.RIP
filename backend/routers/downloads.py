@@ -392,7 +392,12 @@ async def get_download(download_id: str):
 
 @router.post("/api/download/{download_id}/cancel")
 async def cancel_download(download_id: str):
-    success = download_mgr.cancel(download_id)
+    # `download_mgr.cancel` force-stops the worker with a ~2.5s synchronous
+    # loop (set cancel event, run abort hooks, kill ffmpeg, poll deadline). Run
+    # it off the event loop so the process loop + other connections are not
+    # blocked for that window; the request still takes ~2.5s to answer because
+    # the thread is awaited, but nothing else in the loop stalls.
+    success = await asyncio.to_thread(download_mgr.cancel, download_id)
     return {"cancelled": success}
 
 
