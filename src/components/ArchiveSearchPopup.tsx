@@ -1227,8 +1227,9 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                           : [...cur, s];
                         // Never empty out — an empty source set would
                         // silently mean "all" on the backend (param
-                        // omitted), which now includes the title pass. Reset
-                        // to the opening default instead (titles stay off).
+                        // omitted), which includes the title pass. Reset
+                        // to the opening default instead (the full triple —
+                        // titles stay part of the default surface, F7).
                         return next.length > 0 ? next : [...ARCHIVE_SOURCE_DEFAULTS];
                       })
                     }

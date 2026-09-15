@@ -727,7 +727,8 @@ async def archive_search(
     # hint=False (UI dismissed the chip) disables the whole implicit-scope
     # pass — pass no out-param so search() never applies it.
     hint_box: list[str] = []
-    hits = archive_db.search(
+    hits = await asyncio.to_thread(
+        archive_db.search,
         q,
         platform=platform or None,
         channel=channel or None,

@@ -431,6 +431,16 @@ def _init_schema() -> None:
             pass
     if not _schema_ready:
         _conn.executescript(SCHEMA)
+        # F6: drop the orphaned broken view from the live DB. A one-time bad
+        # call to _load_vocab_uncached("messages_fts") built
+        #   CREATE VIRTUAL TABLE messages_fts_vocab USING fts5vocab(messages_fts_fts,'row')
+        # (reference to a NON-EXISTENT messages_fts_fts), so querying it
+        # raised "no such fts5 table". IF NOT EXISTS on the next good run
+        # could never repair it; DROP here reclaims the name. Idempotent.
+        try:
+            _conn.execute("DROP TABLE IF EXISTS messages_fts_vocab")
+        except sqlite3.Error:
+            pass
         _ensure_kind_column(_conn)
         _ensure_kind_check_includes_stream(_conn)
         _ensure_channel_columns(_conn)
@@ -1203,6 +1213,7 @@ def upsert_video(video: dict) -> None:
              updated_at=excluded.updated_at""",
         {**row, "created_at": now},
     )
+    _bump_content_ref("videos")
 
 
 def upsert_channel_video(video: dict) -> None:
@@ -1250,6 +1261,7 @@ def upsert_channel_video(video: dict) -> None:
              updated_at=excluded.updated_at""",
         {**row, "created_at": now},
     )
+    _bump_content_ref("videos")
 
 
 def touch_channel_snapshot(platform: str, channel_key: str) -> None:
@@ -1694,6 +1706,11 @@ def insert_messages(platform: str, video_id: str, rows: Iterable[dict]) -> int:
                 # FTS index entry is written by the messages_ai trigger.
                 if i % _MESSAGES_COMMIT_CHUNK == 0:
                     conn.commit()
+    if runs:
+        # F5.3: a content write invalidates the row-count cache so the next
+        # vocab/bigram warm probe sees the new count, not a stale one.
+        _bump_content_ref("messages")
+        _bump_content_ref("messages_fts")
     return accepted
 
 
@@ -1941,14 +1958,16 @@ TRANSCRIPT_DUPE_MIN_GAP_SEC = 1.0
 def _collapse_transcript_dupes(hits: list[dict]) -> list[dict]:
     """Drop transcript hits that repeat the same moment of the same video:
     identical (offset, text) rows (duplicate caption rows in the archive —
-    re-fetched VTTs re-inserted instead of upserting), one caption that is
-    a substring of another at the same offset (whisper split artifacts —
-    the longer caption survives), or identical text < 1s later (YouTube
-    caption overlap, same rule as _dedupe_transcript_rows).
+    re-fetched VTTs re-inserted instead of upserting) or identical text
+    < 1s later (YouTube caption overlap, same rule as _dedupe_transcript_rows).
 
     The search merge only dedupes by per-video cap, so duplicate caption
     rows used to eat cap slots and show the same sentence twice in a row.
-    Preserves the input order of the survivors."""
+    Distinct rows whose text merely OVERLAPS (one a truncated whisper
+    fragment of the other, e.g. auto-caption full + partial cues a few ms
+    apart) are legitimate mentions and are kept even when the shorter text
+    is a substring of the longer — each is a separate real row at a
+    different offset. Preserves the input order of the survivors."""
     by_video: dict[tuple[str, str], list[dict]] = {}
     for h in hits:
         if h.get("hit_kind") == "transcript" or h.get("kind") == "transcript":
@@ -1970,24 +1989,6 @@ def _collapse_transcript_dupes(hits: list[dict]) -> list[dict]:
                 < TRANSCRIPT_DUPE_MIN_GAP_SEC
             ):
                 dropped.add(id(h))
-                continue
-            # Same-moment (≤50ms) caption pair where one text is a
-            # substring of the other: whisper emitted the same sentence
-            # twice, once truncated. Keep the longer caption, whichever
-            # row arrives first.
-            replaced_idx: Optional[int] = None
-            for k_idx, k in enumerate(kept):
-                if abs(float(k.get("offset_sec") or 0.0) - off) < 0.05:
-                    kt = str(k.get("text") or "")
-                    if text == kt or (text and kt and (text in kt or kt in text)):
-                        replaced_idx = -1 if len(text) <= len(kt) else k_idx
-                        break
-            if replaced_idx == -1:
-                dropped.add(id(h))
-                continue
-            if replaced_idx is not None:
-                dropped.add(id(kept[replaced_idx]))
-                kept[replaced_idx] = h  # in-place: keeps the time order
                 continue
             kept.append(h)
     if not dropped:
@@ -2164,6 +2165,9 @@ def insert_transcript(
                 )
                 # FTS index entry is written by the transcripts_ai trigger.
                 count += 1
+    if count:
+        _bump_content_ref("transcripts")
+        _bump_content_ref("transcripts_fts")
     return count
 
 
@@ -2173,6 +2177,9 @@ def delete_transcripts(platform: str, video_id: str) -> int:
     Used when a full re-transcribe replaces stale rows instead of appending
     a duplicate copy beside them."""
     cur = execute("DELETE FROM transcripts WHERE platform = ? AND video_id = ?", (platform, video_id))
+    if cur.rowcount:
+        _bump_content_ref("transcripts")
+        _bump_content_ref("transcripts_fts")
     return cur.rowcount
 
 
@@ -3292,13 +3299,25 @@ def search(
     # estranheza' on a corpus lacking 'estranheza' used to keep 'VALE VALE'
     # rows and drop every genuine 'estranha' match — inverted floor).
     # Single-token queries skip the floor.
+    exact_mode = mode == "exact"
+    # q_freq feeds, in BROAD mode: the q_keep relevance floor, the tiered
+    # _fuzzy_pattern tiers and the transcript span signal gate; in BOTH
+    # modes it feeds the _titles_search substring gate (_PREFIX_GATE_FREQ)
+    # and the transcript span signal gate. In EXACT mode the OR pattern is
+    # empty (no q_keep floor, no fuzzy tiers), so the only q_freq consumers
+    # are the title pass (video in scope) and the transcript span gate —
+    # for exact + chat-only there is NO consumer at all, and the _load_vocab
+    # walk is dominated by COUNT(*) probes on 3M/8.4M-row tables, so skip it
+    # entirely (F5.2). q_freq stays populated for every path that gates on a
+    # token's corpus frequency.
     q_freq: dict[str, int] = {}
-    for vocab in (_load_vocab(t[2]) for t in loops):
-        if not vocab:
-            continue
-        for bucket in vocab.values():
-            for term, n in bucket:
-                q_freq[term] = q_freq.get(term, 0) + n
+    if not exact_mode or "video" in wanted or "transcript" in wanted:
+        for vocab in (_load_vocab(t[2]) for t in loops):
+            if not vocab:
+                continue
+            for bucket in vocab.values():
+                for term, n in bucket:
+                    q_freq[term] = q_freq.get(term, 0) + n
     q_keep_tokens: set[str] = set()
     if len(q_tokens) >= 2:
         q_absent = [t for t in q_tokens if q_freq.get(t, 0) == 0]
@@ -3316,13 +3335,19 @@ def search(
             }
         elif q_present:
             q_keep_tokens = {t for t, n in q_present.items() if n == min(q_present.values())}
-    # Tiered OR pattern (exact/fuzzy expansions + native prefix reach for
-    # partial words) — see _fuzzy_pattern. The fallback quotes every raw
-    # token (embedded quotes escaped) so a query like 'a"b' can never build
-    # a malformed MATCH string.
-    pattern = _fuzzy_pattern(q, [t[2] for t in loops], q_freq=q_freq)
-    if pattern is None:
-        pattern = {0: " OR ".join(_fts_phrase(w) for w in q.split() if w) or _fts_phrase(q)}
+    pattern = None
+    if not exact_mode:
+        # Tiered OR pattern (exact/fuzzy expansions + native prefix reach for
+        # partial words) — see _fuzzy_pattern. Skipped wholesale in EXACT mode:
+        # the result is unconditionally discarded below (pattern = {}), so the
+        # _expand_query walk (2 COUNT(*) re-checks per table via _load_bigrams /
+        # _load_vocab) would be pure waste on the fast path (F5.2). The
+        # fallback quotes every raw token (embedded quotes escaped) so a query
+        # like 'a"b' can never build a malformed MATCH string — harmless here,
+        # since exact mode never uses the OR pattern.
+        pattern = _fuzzy_pattern(q, [t[2] for t in loops], q_freq=q_freq)
+        if pattern is None:
+            pattern = {0: " OR ".join(_fts_phrase(w) for w in q.split() if w) or _fts_phrase(q)}
     phrase_pattern = _fts_phrase(raw_q) if raw_q else None
     and_pattern = " AND ".join(_fts_phrase(t) for t in q_tokens) if len(q_tokens) >= 2 else None
     # Cross-segment phrase matching: multi-word queries whose tokens are
@@ -3345,49 +3370,63 @@ def search(
         # per-token _expand_query calls re-paid the bigram row-count
         # re-checks (2 COUNT(*) on million-row tables) for every token —
         # an N-token query cost N × ~1s on the real archive.
-        span_tables = [t2[2] for t2 in loops]
-        span_vocabs = [v for v in (_load_vocab(t) for t in span_tables) if v is not None]
-        span_bigrams = _load_bigrams(span_tables)
-        span_variants = {
-            t: [t] + [
-                term for term, _ in _token_expansions(t, span_vocabs, span_bigrams, q_freq)
-                if term != t
-            ]
-            for t in span_tokens
-            if len(t) >= 4
-        }
+        #
+        # F5.2: the span pass only ever runs over TRANSCRIPT rows (the gate
+        # below requires hit_kind=="transcript"), so when transcript is out
+        # of scope the variant/bigram expansion is dead — skip it. It is
+        # also skipped in EXACT mode: span_variants is zeroed anyway
+        # (:3390 below), and _phrase_span_rows ignores variants under
+        # exact (tok_match is a literal ==), so the whole _token_expansions
+        # walk (2 COUNT(*) re-checks per table) would be pure waste. Only
+        # the span_exact_tokens probe survives in exact — it is what keeps
+        # split-phrase recall for vocab-absent tokens.
+        if "transcript" in wanted and mode != "exact":
+            span_tables = [t2[2] for t2 in loops]
+            span_vocabs = [v for v in (_load_vocab(t) for t in span_tables) if v is not None]
+            span_bigrams = _load_bigrams(span_tables)
+            span_variants = {
+                t: [t] + [
+                    term for term, _ in _token_expansions(t, span_vocabs, span_bigrams, q_freq)
+                    if term != t
+                ]
+                for t in span_tokens
+                if len(t) >= 4
+            }
+            # Floor coverage for vocab-absent tokens: their rows only surface
+            # through fuzzy expansions ('estranheza' → 'estranha'), so the
+            # keep set must admit those variants — otherwise the floor drops
+            # exactly the typo/ASR matches the tiers were built to find.
+            if q_keep_tokens:
+                missing = [t for t in q_keep_tokens if q_freq.get(t, 0) == 0]
+                for t in missing:
+                    for term, _ in _token_expansions(t, span_vocabs, span_bigrams, q_freq):
+                        q_keep_tokens.add(term)
         # The vocabulary may intentionally be stale while a rebuild runs.
         # Probe all unresolved exact terms in one fts5vocab query so newly
         # ingested rows still keep split-phrase recall without token-by-token
-        # FTS work or a full scan for isolated typos.
-        span_exact_tokens: set[str] = set()
-        unresolved = [
-            token
-            for token in span_tokens
-            if q_freq.get(token, 0) == 0
-            and not any(term != token for term in span_variants.get(token, ()))
-        ]
-        if unresolved:
-            try:
-                placeholders = ", ".join("?" for _ in unresolved)
-                span_exact_tokens = {
-                    str(row["term"])
-                    for row in query(
-                        f"SELECT term FROM transcripts_vocab WHERE term IN ({placeholders})",
-                        tuple(unresolved),
-                    )
-                }
-            except sqlite3.Error:
-                pass
-        # Floor coverage for vocab-absent tokens: their rows only surface
-        # through fuzzy expansions ('estranheza' → 'estranha'), so the
-        # keep set must admit those variants — otherwise the floor drops
-        # exactly the typo/ASR matches the tiers were built to find.
-        if q_keep_tokens:
-            missing = [t for t in q_keep_tokens if q_freq.get(t, 0) == 0]
-            for t in missing:
-                for term, _ in _token_expansions(t, span_vocabs, span_bigrams, q_freq):
-                    q_keep_tokens.add(term)
+        # FTS work or a full scan for isolated typos. Needed for the
+        # transcript span gate in BOTH modes; in exact mode span_variants is
+        # empty so every freq-0 token is probed — correct for the
+        # split-phrase gate.
+        if "transcript" in wanted:
+            unresolved = [
+                token
+                for token in span_tokens
+                if q_freq.get(token, 0) == 0
+                and not any(term != token for term in span_variants.get(token, ()))
+            ]
+            if unresolved:
+                try:
+                    placeholders = ", ".join("?" for _ in unresolved)
+                    span_exact_tokens = {
+                        str(row["term"])
+                        for row in query(
+                            f"SELECT term FROM transcripts_vocab WHERE term IN ({placeholders})",
+                            tuple(unresolved),
+                        )
+                    }
+                except sqlite3.Error:
+                    pass
     # The floor compares TOKENS, so both sides must live in the same spelling
     # space. The FTS5 index folds diacritics ('cesar' matches 'César', and
     # 'transcricao' matches 'transcrição' — unicode61 strips marks into the
@@ -3597,14 +3636,43 @@ def search(
     # eat the page or the per-video slots.
     merged = _collapse_transcript_dupes(merged)
     if mode == "exact":
-        phrase = " ".join(raw_q.casefold().split())
-        if phrase:
-            def _contiguous_phrase(h):
-                blob = " ".join(f"{h.get('text') or ''} {h.get('title') or ''}".casefold().split())
-                return phrase in blob
-            merged = [h for h in merged if _contiguous_phrase(h)]
-            for h in merged:
-                h["partial"] = False
+        # EXACT post-filter: every typed token must be covered somewhere in
+        # the hit's folded text+title, not as a single contiguous phrase.
+        # Research doc F2: the old filter required `phrase in blob` over a
+        # contiguous, token-joined casefold of text+title, so cross-segment
+        # phrases and repeated lines ("vale da estranheza" appearing across
+        # several captions at different timestamps) were cut — 23 hits vs
+        # 25 real lines. Contiguity is a ranking bonus, never an acceptance
+        # gate. Keeps `partial=False` on survivors; a query with an extra
+        # word still fails because every q_token must be covered.
+        # The query tokens are FOLDED here (not search-scope raw casefold):
+        # search's q_tokens keeps accents, but the hit text is folded — an
+        # un-folded 'flexões'/'póstuma'/'gráficos' would never equal the
+        # folded 'flexoes'/'postuma'/'graficos' token (research doc F1).
+        # EVERY folded token is required (no len>=3 cut), matching
+        # _titles_search's exact branch: the literal-phrase invariant — a
+        # query with an extra short/stopword word must not match.
+        exact_q = _fold_tokens(q)[:_TITLES_MAX_TOKENS]
+        def _exact_covers(h) -> bool:
+            toks = _fold_tokens(f"{h.get('text') or ''} {h.get('title') or ''}")
+            if not toks:
+                return False
+            return all(
+                any(
+                    tt == qt
+                    or (
+                        len(qt) >= 4
+                        and q_freq.get(qt, 0) <= _PREFIX_GATE_FREQ
+                        and qt in tt
+                    )
+                    or _tok_eq(tt, qt)
+                    for tt in toks
+                )
+                for qt in exact_q
+            )
+        merged = [h for h in merged if _exact_covers(h)]
+        for h in merged:
+            h["partial"] = False
     # The per-video cap exists so a common fuzzy word never lets one video
     # flood the default result page. A caller asking for a big batch (the
     # FE's "infinite literal results" mode sends ~2000) wants every match
@@ -3708,11 +3776,18 @@ def _titles_search(
     ponytail: when videos grows past ~10k rows, move to an FTS5
     external-content titles table with a unicode61 tokenizer and reuse the
     tier/merge machinery of the content tables."""
-    q_tokens = _fold_tokens(q)
+    q_folded = _fold_tokens(q)
     # 1-2 char tokens are substring noise in titles ("da" ⊂ "day", "mudam").
     # The content passes keep them for phrase adjacency; here they only
-    # match half the catalog. An all-short query simply skips the pass.
-    q_tokens = [t for t in q_tokens if len(t) >= 3][:_TITLES_MAX_TOKENS]
+    # match half the catalog except in EXACT literal-phrase mode, where a
+    # title must carry EVERY word the user typed — 'vale o da estranheza'
+    # must NOT match "vale da estranheza", so the 1-2 char tokens ('o',
+    # 'da') stay in the acceptance set. Fuzzy/scored coverage uses the
+    # len>=3 set below.
+    if exact:
+        q_tokens = q_folded[:_TITLES_MAX_TOKENS]
+    else:
+        q_tokens = [t for t in q_folded if len(t) >= 3][:_TITLES_MAX_TOKENS]
     if not q_tokens:
         return []
     # Title COVERAGE is scored on the content words only. Stopwords are in
@@ -3750,12 +3825,15 @@ def _titles_search(
     if date_to:
         where.append("date(started_at) <= date(?)")
         params.append(date_to)
-    if exact:
-        # Exact title queries only need rows containing every token; this
-        # avoids walking the whole catalog for a guaranteed no-match.
-        for token in q_tokens:
-            where.append("(lower(title) LIKE ? OR lower(original_title) LIKE ?)")
-            params.extend((f"%{token}%", f"%{token}%"))
+    # NOTE: no pre-filter for `exact` here. A per-token `lower(title) LIKE ?`
+    # probe receives an already accent-folded query token against a raw --
+    # only lowercased, not diacritic-folded -- column, so accented titles
+    # (kick 'derrota flexões', twitch 'investigação póstuma', youtube
+    # 'gráficos ruins…', 'Edição de vídeo nos GAMES') never reach the Python
+    # fold below and yield 0 hits (research doc F1). The videos table is
+    # small; the full walk + Python fold costs ~12 ms (doc §3.1), so we drop
+    # the LIKE prefilter for exact and let _fold_tokens do the folding on
+    # BOTH sides in the loop.
     if where:
         sql += " WHERE " + " AND ".join(where)
     out: list[dict] = []
@@ -3769,9 +3847,28 @@ def _titles_search(
         if not toks:
             continue
         if exact:
-            hay = f"{title} {original}".casefold()
-            needle = " ".join(q_tokens)
-            if needle not in " ".join(toks) and q.strip().casefold() not in hay:
+            # EXACT coverage: every typed token must be covered -- equality,
+            # _tok_eq, or (absent/low-freq token) a >=4-char SUBSTRING of a
+            # title token -- across the folded title+original. Research doc
+            # F2: the old test was a CONTIGUOUS needle ("needle in
+            # ' '.join(toks)"), so 'games vida' never matched "TOP 10 GAMES
+            # da vida!" (tokens scattered) and 'estranheza games'/'graficos
+            # ruins vale' never matched rq7SIAPbgX4. Contiguity is a SCORE
+            # bonus, not an acceptance gate. Using every q_tokens (not just
+            # q_scored) keeps the literal-phrase invariant: a query with an
+            # extra word MUST NOT match a phrase title.
+            def covers_all(qt: str) -> bool:
+                return any(
+                    tt == qt
+                    or (
+                        len(qt) >= 4
+                        and freq.get(qt, 0) <= _PREFIX_GATE_FREQ
+                        and qt in tt
+                    )
+                    or _tok_eq(tt, qt)
+                    for tt in toks
+                )
+            if not all(covers_all(qt) for qt in q_tokens):
                 continue
             # A literal phrase hit carries every typed word, stopwords
             # included; both counters follow so score stays 1.0 and the
@@ -5053,7 +5150,7 @@ def _load_vocab(table: str) -> Optional[dict[int, list[tuple[str, int]]]]:
     with _vocab_lock:
         hit = _vocab_cache.get(table)
         if hit and now - hit[1] < _VOCAB_TTL_S and hit[0] == str(_db_path()):
-            cur = query(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
+            cur = _table_row_count(table)
             if cur == hit[3]:
                 return hit[2]
             stale = hit[2]
@@ -5076,7 +5173,7 @@ def _load_vocab(table: str) -> Optional[dict[int, list[tuple[str, int]]]]:
     disk = _load_vocab_disk(table)
     if disk is not None:
         saved_rows, by_len = disk
-        row_count = query(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
+        row_count = _table_row_count(table)
         if saved_rows == row_count:
             with _vocab_lock:
                 dbp = str(_db_path())
@@ -5126,7 +5223,20 @@ def _load_vocab_uncached(
     table: str, now: float
 ) -> Optional[dict[int, list[tuple[str, int]]]]:
     """The rebuild body: recreate the fts5vocab view if needed, read the
-    top-N tokens bucketed by length, and store the snapshot."""
+    top-N tokens bucketed by length, and store the snapshot.
+    F6 guard: `table` must be a CONTENT table ("messages"/"transcripts"),
+    never its FTS index ({"messages_fts", ...}) — feeding "#{table}_fts" of
+    an _fts table would build "{name}_fts_fts" and create an orphaned
+    broken view (the live-DB messages_fts_vocab bug). Refusing the suffix
+    returns the "vocab unavailable" fallback instead of poisoning the DB.
+    """
+    if table.endswith("_fts"):
+        logger.warning(
+            "_load_vocab_uncached called with FTS table %r — refusing "
+            "(vocab views are built from CONTENT tables, not their index)",
+            table,
+        )
+        return None
     get_conn().execute(
         f"CREATE VIRTUAL TABLE IF NOT EXISTS {table}_vocab "
         f"USING fts5vocab({table}_fts, 'row')"
@@ -5326,6 +5436,43 @@ _BIGRAM_MAX_ROWS = 300_000
 _bigram_cache: dict[str, tuple[float, dict[str, list[tuple[str, int]]], list[int]]] = {}
 # cache keys with a background bigram rebuild in flight (search-latency guard)
 _bigram_rebuild_pending: set[str] = set()
+
+# F5.3: row-count cache. The vocab/bigram warm paths re-probe
+# `SELECT COUNT(*) FROM {table}` on EVERY search (3M-8.4M-row tables on the
+# real archive — an indexed scan, but the doc clocks ~1s/table of Python
+# around it). We cache per table for a short TTL and flush on any content
+# write, so steady searches cost one dict lookup instead of a COUNT(*) per
+# table, while live ingests still refresh within the TTL — and promptly via
+# the write hooks (which pop the entry so the next probe re-counts).
+_ROWCOUNT_TTL_S = 2.0
+_rowcount_cache: dict[str, tuple[float, int]] = {}
+# Dedicated lock: _table_row_count is called from _load_vocab/_load_bigrams
+# while they already hold _vocab_lock, so it must never re-acquire it
+# (threading.Lock is not reentrant). Only _table_row_count takes this lock,
+# so there is no second lock-order edge to deadlock against.
+_rowcount_lock = threading.Lock()
+
+
+def _bump_content_ref(table: str) -> None:
+    """Invalidate the row-count cache for a content table after a write, so
+    the next vocab/bigram warm probe sees the new COUNT(*)."""
+    with _rowcount_lock:
+        _rowcount_cache.pop(table, None)
+
+
+def _table_row_count(table: str) -> int:
+    with _rowcount_lock:
+        now = time.monotonic()
+        hit = _rowcount_cache.get(table)
+        if hit and now - hit[0] < _ROWCOUNT_TTL_S:
+            return hit[1]
+    # TTL guarantees <=1 COUNT(*) per table per _ROWCOUNT_TTL_S, so even a
+    # cache miss here re-probes at most once within the window.
+    n = int(query(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"])
+    with _rowcount_lock:
+        now = time.monotonic()
+        _rowcount_cache[table] = (now, n)
+    return n
 _TOKEN_RE = re.compile(r"[^\w]+")
 _DEDUP_RE = re.compile(r"(.)\1+")  # fold's doubled-letter collapse — compiled once
 
@@ -5356,9 +5503,7 @@ def _load_bigrams(tables: list[str]) -> Optional[dict[str, list[tuple[str, int]]
     with _vocab_lock:
         hit = _bigram_cache.get(key)
         if hit and now - hit[0] < _BIGRAM_TTL_S:
-            counts_now = [
-                query(f"SELECT COUNT(*) AS n FROM {t}")[0]["n"] for t in tables
-            ]
+            counts_now = [_table_row_count(t) for t in tables]
             # Steady chat growth must NOT rebuild the index on every search:
             # a live stream ingests rows continuously. Reuse the cache while
             # each table drifted by <10% (or <5000 rows for small tables).
@@ -5389,7 +5534,7 @@ def _build_bigrams(tables: list[str]) -> Optional[dict[str, list[tuple[str, int]
     pair index, or None when every table is empty or over the row cap."""
     counts: dict[tuple[str, str], int] = {}
     for table in tables:
-        row_count = query(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
+        row_count = _table_row_count(table)
         if row_count == 0 or row_count > _BIGRAM_MAX_ROWS:
             continue
         # Fold each UNIQUE token once: re-folding every adjacent pair
@@ -5429,9 +5574,7 @@ def _rebuild_bigrams(key: str, tables: list[str], loaded_at: float) -> None:
     the full-corpus scan. One in-flight rebuild per cache key."""
     try:
         merged = _build_bigrams(tables)
-        row_counts = [
-            query(f"SELECT COUNT(*) AS n FROM {t}")[0]["n"] for t in tables
-        ]
+        row_counts = [_table_row_count(t) for t in tables]
         with _vocab_lock:
             _bigram_cache[key] = (loaded_at, merged, row_counts)
     except Exception:
