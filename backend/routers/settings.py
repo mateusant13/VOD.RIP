@@ -287,10 +287,11 @@ def _apply_settings_update(update: SettingsUpdate) -> AppSettings:
         try:
             from routers.live import trigger_live_detection
 
-            old_ids = {str(c.get("id") or "") for c in (current.saved_channels or []) if c.get("id")}
             for ch in (update.saved_channels or []):
                 cid = str(ch.get("id") or "")
-                if cid and cid not in old_ids:
+                # prior_cids (pre-overwrite) = channels that existed before
+                # this save; only genuinely-new ids trigger a live refresh.
+                if cid and cid not in prior_cids:
                     trigger_live_detection(cid)
         except Exception:
             logger.debug("live detection trigger skipped", exc_info=True)
@@ -302,7 +303,7 @@ def _apply_settings_update(update: SettingsUpdate) -> AppSettings:
             from services.preview.warm import warm_youtube_recent_channels
 
             warm_youtube_recent_channels(
-                [c for c in (update.saved_channels or []) if str(c.get("id") or "") not in old_ids],
+                [c for c in (update.saved_channels or []) if str(c.get("id") or "") not in prior_cids],
                 per_channel=5,
             )
         except Exception:
@@ -311,8 +312,11 @@ def _apply_settings_update(update: SettingsUpdate) -> AppSettings:
         # scope (uploads+shorts+streams, NOT just the vod/clip URL lists the
         # old path used) is captured without waiting for the next periodic
         # pass. Runs on its own daemon thread — the save (already off the
-        # event loop via asyncio.to_thread) returns before the first fetch,
-        # and the sweep dedupes via the per-channel pump lock.
+        # event loop via asyncio.to_thread) returns before the first fetch —
+        # and the pump skips itself when the YouTube bot gate is frozen
+        # (the scheduler reclaims the channel once it clears) or when the
+        # cross-channel pump cap is already met (later scheduler passes drain
+        # the backlog).
         try:
             from routers.archive import _start_caption_ingest_channel
 

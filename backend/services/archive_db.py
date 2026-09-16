@@ -1743,6 +1743,12 @@ def dedupe_messages() -> int:
         # Bulk delete leaves the FTS index fragmented — merge it like the
         # post-backfill path does so searches stay fast.
         optimize_fts()
+        # Counting invalidation too (gate F-rowcount): the DELETE moved rows
+        # in both tables; mirror insert_messages' hooks so the next warm
+        # probe re-COUNTs instead of serving the stale total for up to
+        # _ROWCOUNT_TTL_S.
+        _bump_content_ref("messages")
+        _bump_content_ref("messages_fts")
     return deleted
 
 
@@ -3304,12 +3310,13 @@ def search(
     # _fuzzy_pattern tiers and the transcript span signal gate; in BOTH
     # modes it feeds the _titles_search substring gate (_PREFIX_GATE_FREQ)
     # and the transcript span signal gate. In EXACT mode the OR pattern is
-    # empty (no q_keep floor, no fuzzy tiers), so the only q_freq consumers
-    # are the title pass (video in scope) and the transcript span gate —
-    # for exact + chat-only there is NO consumer at all, and the _load_vocab
-    # walk is dominated by COUNT(*) probes on 3M/8.4M-row tables, so skip it
-    # entirely (F5.2). q_freq stays populated for every path that gates on a
-    # token's corpus frequency.
+    # empty (no q_keep floor, no fuzzy tiers), so the q_freq consumers are
+    # the title pass (video in scope), the transcript span gate, and the
+    # exact POST-filter below — which disables its own substring branch
+    # wholesale when q_freq is empty (unknown frequency must never read as
+    # absent/rare; gate F-qfreq). exact + chat-only therefore has NO
+    # consumer needing the walk, and _load_vocab is dominated by COUNT(*)
+    # probes on 3M/8.4M-row tables, so skip it there (F5.2).
     q_freq: dict[str, int] = {}
     if not exact_mode or "video" in wanted or "transcript" in wanted:
         for vocab in (_load_vocab(t[2]) for t in loops):
@@ -3652,7 +3659,18 @@ def search(
         # EVERY folded token is required (no len>=3 cut), matching
         # _titles_search's exact branch: the literal-phrase invariant — a
         # query with an extra short/stopword word must not match.
-        exact_q = _fold_tokens(q)[:_TITLES_MAX_TOKENS]
+        # NO _TITLES_MAX_TOKENS cut here (gate F-exact-token-truncation):
+        # the post-filter runs per merged candidate only, so an uncapped
+        # literal phrase stays cheap, and a >16-token query must not
+        # silently drop its acceptance criteria past token 16.
+        exact_q = _fold_tokens(q)
+        # The F5.2 skip leaves q_freq = {} on the exact + chat-only path.
+        # Empty dict must NOT read as "every token is absent/rare" — that
+        # would open the >=4-char substring branch to common tokens and
+        # diverge acceptance from the video/transcript paths (gate
+        # F-qfreq). With no vocab loaded, exact acceptance is token
+        # equality / _tok_eq only (stricter, consistent).
+        q_freq_known = bool(q_freq)
         def _exact_covers(h) -> bool:
             toks = _fold_tokens(f"{h.get('text') or ''} {h.get('title') or ''}")
             if not toks:
@@ -3662,6 +3680,7 @@ def search(
                     tt == qt
                     or (
                         len(qt) >= 4
+                        and q_freq_known
                         and q_freq.get(qt, 0) <= _PREFIX_GATE_FREQ
                         and qt in tt
                     )
@@ -3785,7 +3804,11 @@ def _titles_search(
     # 'da') stay in the acceptance set. Fuzzy/scored coverage uses the
     # len>=3 set below.
     if exact:
-        q_tokens = q_folded[:_TITLES_MAX_TOKENS]
+        # Literal-phrase acceptance iterates EVERY typed token — the fuzzy
+        # _TITLES_MAX_TOKENS scoring cap must not silently drop criteria
+        # past 16 (gate F-exact-token-truncation; the walk is per video row
+        # and the cost is O(tokens x title-tokens) on a small table).
+        q_tokens = q_folded
     else:
         q_tokens = [t for t in q_folded if len(t) >= 3][:_TITLES_MAX_TOKENS]
     if not q_tokens:
@@ -4794,10 +4817,23 @@ def _semantic_search(
 
     from services import archive_embed  # lazy: onnxruntime stays out of boot
 
+    # Fail fast when the embedder is absent (this box has no ONNX model):
+    # one memoized-load probe, then straight back to the caller's lexical
+    # pass — before the vocab walk in _semantic_query_text, the fingerprint
+    # stat chain, or any response-cache churn. model_available() re-attempts
+    # per call (a model installed mid-process is picked up on the next
+    # search), and after _cache_dir() got memoized the failed attempt is a
+    # sub-millisecond FileNotFoundError, so the gate is cheaper than
+    # negative-caching a degraded verdict would be.
+    if not archive_embed.model_available():
+        return None
+
     # Time budget: the pass must never wedge the request path on a slow
     # box. Checked between phases only (numpy ops cannot be cancelled); an
     # expired deadline degrades to pure lexical instead of returning a
-    # half-ranked result. NOT cached — the next attempt may succeed warm.
+    # half-ranked result. Budget expiry is NOT cached — the next attempt may
+    # succeed warm. (An absent model never reaches this line: the gate above
+    # already short-circuits it at zero cost.)
     deadline = time.monotonic() + _SEMANTIC_TIME_BUDGET_S
 
     def _over_budget() -> bool:
@@ -5440,11 +5476,14 @@ _bigram_rebuild_pending: set[str] = set()
 # F5.3: row-count cache. The vocab/bigram warm paths re-probe
 # `SELECT COUNT(*) FROM {table}` on EVERY search (3M-8.4M-row tables on the
 # real archive — an indexed scan, but the doc clocks ~1s/table of Python
-# around it). We cache per table for a short TTL and flush on any content
-# write, so steady searches cost one dict lookup instead of a COUNT(*) per
-# table, while live ingests still refresh within the TTL — and promptly via
-# the write hooks (which pop the entry so the next probe re-counts).
-_ROWCOUNT_TTL_S = 2.0
+# around it). Content writes already pop the entry via _bump_content_ref
+# (the write-hook invalidation added in 804bba4), so steady searches cost
+# one dict lookup instead of a COUNT(*) per table; the TTL is only a
+# backstop for out-of-band writers (manual SQL, another process touching
+# the DB), which no app hook will ever flush. 60s bounds that stale window
+# while keeping the probe off the request path — at 2s the backstop fired
+# roughly once per search and paid the full COUNT(*) tax anyway.
+_ROWCOUNT_TTL_S = 60.0
 _rowcount_cache: dict[str, tuple[float, int]] = {}
 # Dedicated lock: _table_row_count is called from _load_vocab/_load_bigrams
 # while they already hold _vocab_lock, so it must never re-acquire it

@@ -1083,11 +1083,21 @@ _DEEP_TAB_LIMIT = 1000  # per-tab enumeration ask (== playlist ceiling)
 # channel with >1000 uploads searchable deep is walked exhaustively up to
 # this bound; truncation is reported honestly when the merge exceeds it.
 _DEEP_ENUM_MAX = 5000
+# Aggregate result bounds: _deep_match_chat/_deep_match_titles each stop at
+# their per-source cap (chat / titles independently), and the job's combined
+# `results` list stops adding beyond the total cap. Without these a sweep
+# could emit one hit per matching message over up to _DEEP_ENUM_MAX videos
+# with NO bound — a hot chat-heavy channel would accumulate an unbounded
+# results list that the ~2s status poll then copies + JSON-serves every poll.
+_DEEP_SOURCE_RESULT_CAP = 2000
+_DEEP_TOTAL_RESULT_CAP = 10000
 _DEEP_SNIPPET_PAD = 120
 _DEEP_FETCH_CONCURRENCY = 2
 _DEEP_MIN_GAP_S = 1.5  # mirrors archive_ytdlp._ORIGINAL_MIN_GAP_S
 _DEEP_SQL_CHUNK = 500
 _DEEP_RUNNING_CAP = 2  # concurrent sweeps across ALL channels (bot-gate discipline)
+# Max concurrent channel caption-ingest pumps (channel-add + scheduler).
+_DEEP_CAPTION_PUMP_CAP = 2
 # Caption-ingest persistent cursor: keep the per-channel cursor fresh every
 # N videos so a crash/restart loses at most that many caption fetches.
 _DEEP_CURSOR_EVERY = 20
@@ -1112,6 +1122,12 @@ _caption_ingest_locks_guard = threading.Lock()
 # would let each job blast YouTube independently.
 _deep_pace = {"last": 0.0}
 _deep_pace_lock = threading.Lock()
+# Global count of concurrently-RUNNING channel caption-ingest pumps
+# (channel-add + scheduler). Bounded so a burst of channel-adds can't blast
+# the bot gate; the per-channel pump lock already prevents same-channel
+# races, this caps cross-channel parallelism on top.
+_caption_pump_active = 0
+_caption_pump_active_lock = threading.Lock()
 
 def _deaccent(text: str) -> str:
     """casefold + strip combining marks (á→a, ç→c) for accent-insensitive match."""
@@ -1183,18 +1199,22 @@ def _deep_match_segments(raw_query: str, segments: list[tuple[float, str]]) -> l
     return out
 
 
-def _deep_match_chat(raw_query: str, video_ids: list[str]) -> list[dict]:
+def _deep_match_chat(raw_query: str, video_ids: list[str]) -> tuple[list[dict], bool]:
     """Query matches against archived CHAT messages of the swept videos.
 
     Plain chunked SELECT over the messages table (owned/compatible with the
     archive_db API — we call the public query() only, never its internals).
-    Returns one hit {"video_id", "ts", "snippet", "source": "chat"} per
-    message whose text contains the query as a deaccented substring. A
-    message counts as a single hit (its whole text is the snippet).
+    Returns (hits, capped): one hit {"video_id", "ts", "snippet",
+    "source": "chat"} per message whose text contains the query as a
+    deaccented substring (a message counts as a single hit; its whole text
+    is the snippet). Matching STOPS at _DEEP_SOURCE_RESULT_CAP, with
+    `capped` True when the bound was reached — the caller surfaces it as
+    truncated_results so a hot chat-heavy channel can't accumulate an
+    unbounded hit list.
     """
     q = _deaccent(raw_query.strip())
     if not q or not video_ids:
-        return []
+        return [], False
     hits: list[dict] = []
     for i in range(0, len(video_ids), _DEEP_SQL_CHUNK):
         chunk = video_ids[i : i + _DEEP_SQL_CHUNK]
@@ -1204,6 +1224,8 @@ def _deep_match_chat(raw_query: str, video_ids: list[str]) -> list[dict]:
             f"WHERE platform='youtube' AND video_id IN ({ph})",
             chunk,
         ):
+            if len(hits) >= _DEEP_SOURCE_RESULT_CAP:
+                return hits, True
             text = str(r["text"] or "")
             if q in _deaccent(text):
                 hits.append({
@@ -1212,21 +1234,23 @@ def _deep_match_chat(raw_query: str, video_ids: list[str]) -> list[dict]:
                     "snippet": _deep_snippet(text, 0, len(text)),
                     "source": "chat",
                 })
-    return hits
+    return hits, len(hits) >= _DEEP_SOURCE_RESULT_CAP
 
 
-def _deep_match_titles(raw_query: str, video_ids: list[str]) -> list[dict]:
+def _deep_match_titles(raw_query: str, video_ids: list[str]) -> tuple[list[dict], bool]:
     """Query matches against video TITLES of the swept videos.
 
     Matches the deaccented concatenation of `title` and `original_title`
     (covers non-YT-dlp ingest that stored the raw uploader title separately).
-    Returns one hit {"video_id", "ts": 0, "snippet", "source": "title"} per
-    matching video. First-placed because it neither needs a fetch nor a
-    transcript — it always answers from the videos table.
+    Returns (hits, capped): one hit {"video_id", "ts": 0, "snippet",
+    "source": "title"} per matching video. First-placed because it neither
+    needs a fetch nor a transcript — it always answers from the videos
+    table. Matching STOPS at _DEEP_SOURCE_RESULT_CAP (a huge channel whose
+    every title matches must not grow an unbounded list).
     """
     q = _deaccent(raw_query.strip())
     if not q or not video_ids:
-        return []
+        return [], False
     hits: list[dict] = []
     for i in range(0, len(video_ids), _DEEP_SQL_CHUNK):
         chunk = video_ids[i : i + _DEEP_SQL_CHUNK]
@@ -1236,6 +1260,8 @@ def _deep_match_titles(raw_query: str, video_ids: list[str]) -> list[dict]:
             f"WHERE platform='youtube' AND video_id IN ({ph})",
             chunk,
         ):
+            if len(hits) >= _DEEP_SOURCE_RESULT_CAP:
+                return hits, True
             title = f"{str(r['title'] or '')} {str(r['original_title'] or '')}".strip()
             if title and q in _deaccent(title):
                 hits.append({
@@ -1244,7 +1270,7 @@ def _deep_match_titles(raw_query: str, video_ids: list[str]) -> list[dict]:
                     "snippet": _deep_snippet(title, 0, len(title)),
                     "source": "title",
                 })
-    return hits
+    return hits, len(hits) >= _DEEP_SOURCE_RESULT_CAP
 
 
 def _deep_enumerate(handle: str) -> tuple[list[dict], bool, int]:
@@ -1553,6 +1579,16 @@ def _deep_caption_lock(handle_norm: str) -> threading.Lock:
 
 # --- caption ingest (channel-add / scheduler) ------------------------------
 
+def _deep_caption_created_key(v: dict) -> tuple[int, str]:
+    """Sort key for the caption pump's OLDEST-FIRST walk: the ISO created_at
+    (lexicographically comparable when present), missing mapped to the
+    smallest sentinel so an unknown-date video is treated as OLDEST and
+    processed first. Stable sorting keeps the enumerate's within-tab order
+    for equal dates."""
+    created = str(v.get("created_at") or "")
+    return (0 if not created else 1, created)
+
+
 def _run_channel_caption_ingest(
     handle: str, *, budget: Optional[int] = None
 ) -> dict:
@@ -1571,17 +1607,38 @@ def _run_channel_caption_ingest(
     norm = _deep_handle_norm(handle)
     lock = _deep_caption_lock(norm)
     with lock:
+        from services import yt_gate
+
         now = time.monotonic()
         cached = _deep_enumerate_cache.get(norm)
         if cached is None or now - cached[0] >= _DEEP_ENUM_CACHE_TTL_S:
             try:
-                videos, truncated, _enumerated_total = _deep_enumerate(handle)
+                raw_videos, truncated, _enumerated_total = _deep_enumerate(handle)
             except Exception as exc:
                 logger.debug("caption ingest enumerate failed for %s: %s", handle, exc)
                 return {"scanned": 0, "no_transcript": 0, "error": str(exc)[:200]}
+            # OLDEST-FIRST for the pump (the raw _deep_enumerate is
+            # newest-first, suited to the deep-search sweep that pre-receives
+            # its whole id set — but this pump's persistent cursor is a
+            # monotonic resume index that REQUIRES append-only ordering: a
+            # newest-first sequence PREPENDS new uploads, which would land
+            # them BELOW a stale cursor forever (they'd never be captioned),
+            # and a cursor==len would no-op the pump permanently. Sorting
+            # oldest-first (append-only) means every new upload lands at the
+            # TAIL, so a resume with cursor < len always reaches it. Stable;
+            # a missing created_at is treated as OLDEST (processed first).
+            videos = sorted(raw_videos, key=_deep_caption_created_key)
             _deep_enumerate_cache[norm] = (now, videos, bool(truncated))
         else:
             videos, truncated = cached[1], cached[2]
+
+        # One-time migration note: cursors persisted before the oldest-first
+        # flip were indexes INTO the raw newest-first sequence, so after the
+        # flip their positions shift once. That re-scan is cheap because the
+        # covered-set probe (_deep_covered_ids) and the no-captions marker
+        # short-circuit videos that already have transcripts/markers — no
+        # remote fetch happens for already-processed videos, only the local
+        # existence probe.
 
         if not videos:
             return {"scanned": 0, "no_transcript": 0, "truncated": False}
@@ -1604,11 +1661,25 @@ def _run_channel_caption_ingest(
         no_transcript = 0
         idx = cursor
         while idx < len(videos) and processed < spawned_budget:
+            # Bot-gate freeze: park (do NOT burn budget, do NOT advance the
+            # cursor) until the freeze lifts — a gated pump would otherwise
+            # fail every fetch fast behind the wall and either pile markers
+            # or walk the cursor past videos it never actually captioned.
+            # The scheduler picks the channel up again once the gate clears.
+            if yt_gate.youtube_gate_active():
+                break
             v = videos[idx]
             vid = str(v.get("id") or "")
             if vid and vid not in covered:
                 if not _youtube_covered(vid):
                     ok = _paced_caption_fetch(vid, handle)
+                    if not ok and yt_gate.youtube_gate_active():
+                        # A gate-classified fetch failure parks the pump and,
+                        # crucially, does NOT advance idx/processed — the
+                        # cursor stays on this unprocessed video so a later
+                        # pass (or the scheduler, once the gate clears)
+                        # retries it instead of permanently skipping it.
+                        break
                     processed += 1
                     if not ok:
                         no_transcript += 1
@@ -1689,10 +1760,36 @@ def _paced_caption_fetch(video_id: str, handle: str) -> bool:
 
 def _start_caption_ingest_channel(handle: str) -> None:
     """Fire-and-forget a channel's caption-ingest pump (channel-add path)."""
+    global _caption_pump_active
     if not handle or not str(handle).strip():
         return
+    # Bot-gate freeze: skip — the scheduler picks this channel up again once
+    # the gate clears (mirror archive_scheduler._ingest_youtube). Starting a
+    # pump now would fail every fetch fast behind the wall.
+    from services.yt_gate import youtube_gate_active
+
+    if youtube_gate_active():
+        return
+    # Cross-channel pump cap: skip when _DEEP_CAPTION_PUMP_CAP pumps are
+    # already running (the per-channel pump lock still prevents races on the
+    # SAME channel; this bounds parallel channels so a burst of channel-adds
+    # can't blast the gate). The saved-caption sweep is drained in later
+    # passes by the scheduler.
+    with _caption_pump_active_lock:
+        if _caption_pump_active >= _DEEP_CAPTION_PUMP_CAP:
+            return
+        _caption_pump_active += 1
+
+    def _pump() -> None:
+        try:
+            _run_channel_caption_ingest(str(handle).strip())
+        finally:
+            with _caption_pump_active_lock:
+                global _caption_pump_active
+                _caption_pump_active = max(0, _caption_pump_active - 1)
+
     threading.Thread(
-        target=_run_channel_caption_ingest, args=(str(handle).strip(),),
+        target=_pump,
         daemon=True, name=f"caption-ingest-{_deep_handle_norm(str(handle))[:12]}",
     ).start()
 
@@ -1764,6 +1861,7 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
         with counters_lock, _deep_jobs_lock:
             job["scanned"] = counters["scanned"]
             job["no_transcript"] = counters["no_transcript"]
+            job["truncated_results"] = _truncated_results
             job["results"] = list(results)
         # Throttle the persisted cursor to _DEEP_CURSOR_EVERY scanned rows;
         # terminal transitions call _persist() directly (unthrottled) right
@@ -1818,16 +1916,33 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
             # Same vocabulary as the videos.kind rows the unified search
             # ships (vod, not video) — the FE kind chips compose over it.
             hit["video_kind"] = {"video": "vod"}.get(kind, kind)
+        if len(results) >= _DEEP_TOTAL_RESULT_CAP:
+            _set_truncated_results(True)
+            return
         results.append(hit)
 
-    def _add_source_hits(videos_by_id: dict[str, dict], source_matches: list[dict]) -> None:
+    def _add_source_hits(videos_by_id: dict[str, dict], source: tuple[list[dict], bool]) -> None:
         """Chat/title hits carry only video_id; resolve them to the swept
         video dict (fallback: an empty video stub) so _add_result can ship
-        a uniform hit shape."""
-        for m in source_matches:
+        a uniform hit shape. `source` is the matcher's (hits, capped) pair;
+        a capped source flags the job's results as truncated."""
+        hits, capped = source
+        if capped:
+            _set_truncated_results(True)
+        for m in hits:
+            if len(results) >= _DEEP_TOTAL_RESULT_CAP:
+                _set_truncated_results(True)
+                return
             vid = m.get("video_id") or ""
             v = videos_by_id.get(vid) or {"id": vid, "title": None, "url": None, "created_at": None}
             _add_result(v, m)
+
+    _truncated_results = False
+
+    def _set_truncated_results(flag: bool) -> None:
+        nonlocal _truncated_results
+        if flag:
+            _truncated_results = True
 
     try:
         videos, truncated, enumerated_total = _deep_enumerate(handle)
@@ -2001,6 +2116,72 @@ def _deep_running_count_locked() -> int:
     return sum(1 for j in _deep_jobs.values() if j["status"] == "running")
 
 
+def _deep_join_running_locked(norm: str) -> Optional[str]:
+    """job_id of a RUNNING in-process sweep for this normalized channel, or
+    None when none is live. Caller holds _deep_jobs_lock."""
+    for jid, existing in _deep_jobs.items():
+        if existing["status"] == "running" and existing.get("handle_norm") == norm:
+            return jid
+    return None
+
+
+def _deep_start_db(norm: str, query: str) -> tuple[int, int, int, int]:
+    """DB work for a deep-sweep start, run OFF the event loop (to_thread):
+    ensure the table, find a stale 'running' row to resume, and finalize
+    stale siblings. Returns (resume_cursor, resume_scanned,
+    resume_no_transcript, resume_total) — all 0 when nothing to resume.
+
+    Finalize rule: a crashed sweep must not leave a permanently-'running'
+    row that a later start would resurrect forever. When resuming from row
+    R, siblings (same handle_norm+query, still 'running', id<>R) become
+    'interrupted'; when starting WITHOUT a resume row, every still-'running'
+    row for that handle+query becomes 'interrupted' (the fresh job writes its
+    own row)."""
+    _ensure_deep_jobs_table()
+    prev = archive_db.query(
+        """SELECT id, scanned, total, cursor, no_transcript
+           FROM deep_jobs WHERE kind='deep' AND handle_norm=? AND query=?
+             AND status='running' ORDER BY updated_at DESC LIMIT 1""",
+        (norm, query),
+    )
+    prev_id = str(prev[0]["id"]) if prev else ""
+    if prev_id:
+        archive_db.execute(
+            """UPDATE deep_jobs SET status='interrupted'
+               WHERE kind='deep' AND handle_norm=? AND query=?
+                 AND status='running' AND id<>?""",
+            (norm, query, prev_id),
+        )
+    else:
+        archive_db.execute(
+            """UPDATE deep_jobs SET status='interrupted'
+               WHERE kind='deep' AND handle_norm=? AND query=?
+                 AND status='running'""",
+            (norm, query),
+        )
+    if not prev:
+        return 0, 0, 0, 0
+    return (
+        int(prev[0]["cursor"] or 0),
+        int(prev[0]["scanned"] or 0),
+        int(prev[0]["no_transcript"] or 0),
+        int(prev[0]["total"] or 0),
+    )
+
+
+def _deep_status_from_db(job_id: str) -> list:
+    """Status-endpoint DB fallback (run off the event loop via to_thread):
+    ensure the table + read the row. Kept OUT of _deep_jobs_lock so a poll
+    never serializes behind a busy DB."""
+    _ensure_deep_jobs_table()
+    return archive_db.query(
+        """SELECT id, status, scanned, total, cursor, truncated,
+                  no_transcript, error
+           FROM deep_jobs WHERE id=? LIMIT 1""",
+        (job_id,),
+    )
+
+
 @router.post("/api/archive/search/deep")
 async def archive_search_deep_start(body: DeepSearchRequest):
     """Start a deep transcript sweep for one channel; returns {job_id}."""
@@ -2033,31 +2214,38 @@ async def archive_search_deep_start(body: DeepSearchRequest):
 
     norm = _deep_handle_norm(handle)
     job_id = uuid.uuid4().hex
+    # One sweep per channel: a second POST for a handle that already has a
+    # RUNNING in-process sweep joins it instead of piling a duplicate
+    # download (the sweep matches every cached transcript anyway, so the
+    # running job will serve this query too). This in-memory check runs
+    # BEFORE the DB resume lookup so an already-running sweep never re-reads
+    # (and then finalizes) its own persisted row.
+    with _deep_jobs_lock:
+        joined = _deep_join_running_locked(norm)
+        if joined is not None:
+            return {"job_id": joined, "joined": True}
+        # Global cap: concurrent sweeps across DIFFERENT channels are
+        # still bounded (bot-gate discipline; pace is shared anyway).
+        if _deep_running_count_locked() >= _DEEP_RUNNING_CAP:
+            raise HTTPException(
+                status_code=409,
+                detail="deep search capacity reached — cancel a running sweep first",
+            )
     # Restart-resume: a prior sweep that died mid-run persisted its cursor
     # (kind='deep', same channel+query, still 'running'). Re-hydrate it so
     # the status poll recovers the position and the fresh sweep skips the
     # already-scanned prefix instead of re-fetching/re-scanning it. The
     # transcripts themselves survive restart already; cursor resume avoids
-    # even re-reading their cached segments for the covered prefix.
-    resume_cursor = 0
-    resume_scanned = 0
-    resume_no_transcript = 0
-    resume_total = 0
+    # even re-reading their cached segments for the covered prefix. DB work
+    # runs OFF the event loop (to_thread) — sync sqlite must never run on
+    # the loop (the same rule F5 fixed for the _deep_seed path).
     try:
-        _ensure_deep_jobs_table()
-        prev = archive_db.query(
-            """SELECT id, scanned, total, cursor, no_transcript
-               FROM deep_jobs WHERE kind='deep' AND handle_norm=? AND query=?
-                 AND status='running' ORDER BY updated_at DESC LIMIT 1""",
-            (norm, query),
+        resume_cursor, resume_scanned, resume_no_transcript, resume_total = (
+            await asyncio.to_thread(_deep_start_db, norm, query)
         )
-        if prev:
-            resume_cursor = int(prev[0]["cursor"] or 0)
-            resume_scanned = int(prev[0]["scanned"] or 0)
-            resume_no_transcript = int(prev[0]["no_transcript"] or 0)
-            resume_total = int(prev[0]["total"] or 0)
     except Exception as exc:
         logger.debug("deep resume lookup failed: %s", exc)
+        resume_cursor = resume_scanned = resume_no_transcript = resume_total = 0
 
     job = {
         "status": "running",
@@ -2066,6 +2254,7 @@ async def archive_search_deep_start(body: DeepSearchRequest):
         "total": resume_total,
         "no_transcript": resume_no_transcript,
         "truncated": False,
+        "truncated_results": False,
         "results": [],
         "resume_cursor": resume_cursor,
         "paused": threading.Event(),
@@ -2074,20 +2263,6 @@ async def archive_search_deep_start(body: DeepSearchRequest):
         "handle_norm": norm,
     }
     with _deep_jobs_lock:
-        # One sweep per channel: a second POST for a handle that already
-        # has a RUNNING sweep joins it instead of piling a duplicate
-        # download (the sweep matches every cached transcript anyway, so
-        # the running job will serve this query too).
-        for jid, existing in _deep_jobs.items():
-            if existing["status"] == "running" and existing.get("handle_norm") == norm:
-                return {"job_id": jid, "joined": True}
-        # Global cap: concurrent sweeps across DIFFERENT channels are
-        # still bounded (bot-gate discipline; pace is shared anyway).
-        if _deep_running_count_locked() >= _DEEP_RUNNING_CAP:
-            raise HTTPException(
-                status_code=409,
-                detail="deep search capacity reached — cancel a running sweep first",
-            )
         _deep_jobs[job_id] = job
         _deep_prune_locked()
     threading.Thread(
@@ -2103,49 +2278,50 @@ async def archive_search_deep_status(job_id: str):
     with _deep_jobs_lock:
         job = _deep_jobs.get(job_id)
         if job is None:
-            # Restart-resume: no in-memory job (backend came back up, or the
-            # job was pruned) but the sweep persisted its row — serve the
-            # recovered position instead of a 404 so the FE can keep polling.
-            try:
-                _ensure_deep_jobs_table()
-                rows = archive_db.query(
-                    """SELECT id, status, scanned, total, cursor, truncated,
-                              no_transcript, error
-                       FROM deep_jobs WHERE id=? LIMIT 1""",
-                    (job_id,),
-                )
-            except Exception:
-                rows = []
-            if not rows:
-                raise HTTPException(status_code=404, detail="unknown deep search job")
-            r = rows[0]
-            # Hit results are ephemeral match output (not independently
-            # persisted); a DB-recovered job reports its position + status
-            # truthfully with an empty results list — the client re-runs the
-            # query (transcripts persist) if it wants the hits again.
-            return {
-                "status": r["status"],
-                "paused": False,
-                "scanned": int(r["scanned"] or 0),
-                "total": int(r["total"] or 0),
-                "no_transcript": int(r["no_transcript"] or 0),
-                "truncated": bool(int(r["truncated"] or 0)),
-                "results": [],
-                "error": r["error"],
-                "resumed": True,
+            job = None  # fall through to the DB recovery below
+        else:
+            snapshot = {
+                "status": job["status"],
+                "paused": job["status"] == "running" and job["paused"].is_set(),
+                "scanned": job["scanned"],
+                "total": job["total"],
+                "no_transcript": job["no_transcript"],
+                "truncated": job["truncated"],
+                "truncated_results": bool(job.get("truncated_results")),
+                "results": list(job["results"]),
+                "error": job["error"],
+                "resumed": bool(job.get("resume_cursor")),
             }
-        snapshot = {
-            "status": job["status"],
-            "paused": job["status"] == "running" and job["paused"].is_set(),
-            "scanned": job["scanned"],
-            "total": job["total"],
-            "no_transcript": job["no_transcript"],
-            "truncated": job["truncated"],
-            "results": list(job["results"]),
-            "error": job["error"],
-            "resumed": bool(job.get("resume_cursor")),
-        }
-    return snapshot
+    if job is not None:
+        return snapshot
+    # No in-memory job: the DB fallback (restart/prune recovery). The read
+    # runs OFF the event loop via to_thread (sync sqlite must not run on the
+    # loop) AND is taken OUT of _deep_jobs_lock so a poll never serializes
+    # behind a busy-DB 10s spin — the in-memory lookup above already
+    # released the lock before any sqlite work.
+    try:
+        rows = await asyncio.to_thread(_deep_status_from_db, job_id)
+    except Exception:
+        rows = []
+    if not rows:
+        raise HTTPException(status_code=404, detail="unknown deep search job")
+    r = rows[0]
+    # Hit results are ephemeral match output (not independently
+    # persisted); a DB-recovered job reports its position + status
+    # truthfully with an empty results list — the client re-runs the
+    # query (transcripts persist) if it wants the hits again.
+    return {
+        "status": r["status"],
+        "paused": False,
+        "scanned": int(r["scanned"] or 0),
+        "total": int(r["total"] or 0),
+        "no_transcript": int(r["no_transcript"] or 0),
+        "truncated": bool(int(r["truncated"] or 0)),
+        "truncated_results": False,
+        "results": [],
+        "error": r["error"],
+        "resumed": True,
+    }
 
 
 @router.post("/api/archive/search/deep/{job_id}/cancel")

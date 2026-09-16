@@ -31,6 +31,7 @@ it may replace cosine order — both previous attempts lost to it.
 """
 from __future__ import annotations
 
+import functools
 import os
 import threading
 from pathlib import Path
@@ -46,21 +47,68 @@ _BATCH = 128
 _MAX_TOKENS = 512
 
 
+def _cache_inputs() -> tuple[str, str, str, str]:
+    """Cheap observable inputs to the model-root resolution: the two env
+    overrides and the two settings fields that whisper_cache_dir()/
+    cache_root() consult. All in-memory (os.environ + settings_mgr.get());
+    they form the memo key in _resolve_model_roots, so the expensive half
+    — the Settings > Disk inventory ladder — only runs when one of them
+    actually changes."""
+    from deps import settings_mgr  # lazy: deps binds the import-time singletons
+
+    s = settings_mgr.get()
+    return (
+        os.environ.get("VODRIP_WHISPER_CACHE", "").strip(),
+        os.environ.get("VODRIP_CACHE_DIR", "").strip(),
+        (getattr(s, "whisper_model_cache", "") or "").strip(),
+        (getattr(s, "cache_dir", "") or "").strip(),
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _resolve_model_roots(
+    whisper_env: str, cache_env: str, whisper_setting: str, cache_setting: str
+) -> tuple[Path, Path]:
+    """Expensive half of _cache_dir: (AI-models root, legacy embed home).
+    whisper_cache_dir() falls through to best_model_cache_drive ->
+    disk_inventory -> PowerShell Get-PhysicalDisk when nothing is configured
+    — 1.1-1.8s on every 60s layout-TTL expiry, and _cache_dir() used to run
+    on EVERY semantic request through this chain. Keyed (not blind) on the
+    env/settings inputs, so a Settings > Disk save re-arms naturally;
+    mirrors caption_translate._resolve_translate_dir (P2-7)."""
+    from services.disk_hygiene import whisper_cache_dir
+    from services.settings import _get_appdata_dir, cache_root
+
+    legacy_root = cache_root()
+    legacy = (legacy_root or _get_appdata_dir()) / "embed-models"
+    return whisper_cache_dir(), legacy
+
+
 def _cache_dir() -> Path:
     # Precedence: VODRIP_EMBED_CACHE env -> AI-models folder (whisper cache
     # root) /embed-models -> legacy homes <cache root>/embed-models or
     # %APPDATA%/VOD.RIP/embed-models (migration: reuse already-downloaded
     # ONNX weights — no re-download, see disk_hygiene._migrated_model_dir).
     # Model weights never resolve under the cache disk.
+    # The drive-probe half is memoized per env/settings key (see
+    # _resolve_model_roots); the presence-based legacy-migration flip below
+    # stays LIVE (cheap stats), so models moved onto disk are picked up
+    # without a restart.
     env = os.environ.get("VODRIP_EMBED_CACHE", "").strip()
     if env:
         return Path(env)
-    from services.disk_hygiene import _migrated_model_dir, whisper_cache_dir
-    from services.settings import _get_appdata_dir, cache_root
+    from services.disk_hygiene import _migrated_model_dir
 
-    legacy_root = cache_root()
-    legacy = (legacy_root or _get_appdata_dir()) / "embed-models"
-    return _migrated_model_dir(whisper_cache_dir() / "embed-models", legacy, "embed")
+    primary_root, legacy = _resolve_model_roots(*_cache_inputs())
+    return _migrated_model_dir(primary_root / "embed-models", legacy, "embed")
+
+
+def cache_dir_changed() -> None:
+    """Drop the memoized model-root resolution. Env/settings edits
+    invalidate naturally through the key; this is for out-of-band inputs
+    the key cannot see (e.g. free-space shifts flipping the auto drive
+    pick) and for tests that re-arm the probe."""
+    _resolve_model_roots.cache_clear()
 
 
 _lock = threading.Lock()
@@ -89,6 +137,18 @@ def _load():
         except Exception:  # missing model, corrupt file — semantic is optional
             _loaded = None
         return _loaded
+
+
+def model_available() -> bool:
+    """Can the embedder produce vectors? O(1) once the session is loaded
+    (_load() short-circuits on the memoized tuple). A failed load is NOT
+    pinned: _load() stays None and re-attempts on the next call, so a model
+    installed mid-process is picked up without a restart — the same late-
+    install behavior the embed_query degradation path already had. On a
+    model-less box the re-attempt is just a fast FileNotFoundError (the
+    disk-inventory chain under _cache_dir is memoized), so this is cheap
+    enough for _semantic_search to gate every request on it."""
+    return _load() is not None
 
 
 def embed_texts(texts: list[str], prefix: str) -> Optional[object]:
