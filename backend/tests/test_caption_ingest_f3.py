@@ -100,7 +100,11 @@ def test_caption_pump_fetches_shorts_and_full_scope(monkeypatch, fast_pace):
 
     stats = archive._run_channel_caption_ingest("deepchan", budget=10)
     assert "vid-short" in calls, "a short in the scope must be captioned, not skipped"
-    assert sorted(calls) == ["vid-short", "vid-stream", "vid-upload"]
+    # OLDEST-FIRST walk (FIX-2): the pump's persistent cursor is a monotonic
+    # resume index, so it requires APPEND-ONLY ordering — new uploads (greater
+    # created_at) must land at the TAIL or a stale cursor would skip them
+    # forever. 2024-01-03 stream is oldest -> processed first.
+    assert calls == ["vid-stream", "vid-short", "vid-upload"]
     assert stats["processed"] == 3
 
     # Cursor persisted -> a second pump resumes at the cursor (no re-fetch).
@@ -174,3 +178,45 @@ def test_channel_add_spawns_caption_ingest_only_for_new_slugged(monkeypatch):
     update.saved_channels = _Fake.saved_channels
     settings_router._apply_settings_update(update)
     assert spawned == ["newchan"], f"expected only the new slugged channel, got {spawned}"
+
+
+def test_caption_pump_new_video_at_tail_is_reached(fast_pace, monkeypatch):
+    """FIX-2 regression: the pump walks OLDEST-FIRST, so a NEW upload (greater
+    created_at) always lands at the TAIL of the sorted list. A resume at a
+    mid-list cursor therefore still reaches it (cursor < len) instead of
+    parking permanently the way a newest-first prepend would."""
+    # Initial pass: c=2024-01-01 (oldest, index 0), b=2024-01-02, a=2024-01-03.
+    initial = [
+        _video("c", "2024-01-01T00:00:00+00:00", content_kind="video"),
+        _video("b", "2024-01-02T00:00:00+00:00", content_kind="video"),
+        _video("a", "2024-01-03T00:00:00+00:00", content_kind="video"),
+    ]
+    calls: list[str] = []
+
+    def fetcher(vid: str) -> dict:
+        calls.append(vid)
+        return _payload(vid, [(0.0, "césar aqui")])
+
+    monkeypatch.setattr(archive, "_deep_fetch_transcript", fetcher)
+    # Pass 1: budget=1 -> only the OLDEST (c) is fetched; cursor advances to 1.
+    monkeypatch.setattr(archive, "_deep_enumerate",
+                        lambda handle: (initial, False, len(initial)))
+    stats1 = archive._run_channel_caption_ingest("deepchan", budget=1)
+    assert calls == ["c"], "pass 1 fetches only the oldest video (index 0)"
+    assert stats1["processed"] == 1
+
+    # A NEW upload (x, newer than everything) appears in the enumerate list.
+    # OLDEST-FIRST sort appends it at the TAIL: [c, b, a, x].
+    grown = initial + [_video("x", "2024-01-04T00:00:00+00:00", content_kind="video")]
+    # Force the enumerate cache to refresh so the pump sees the GROWN list.
+    archive._deep_enumerate_cache.clear()
+    monkeypatch.setattr(archive, "_deep_enumerate",
+                        lambda handle: (grown, False, len(grown)))
+    calls.clear()
+    stats2 = archive._run_channel_caption_ingest("deepchan", budget=10)
+    # cursor (1) < new len (4) -> the uncovered videos AND the new tail one
+    # are all reached. The new upload x is NOT parked forever.
+    assert "x" in calls, "a newer upload must be reached on resume (tail, not prepended)"
+    # b, a, and x are all still uncovered -> fetches exactly those three.
+    assert calls == ["b", "a", "x"]
+    assert stats2["processed"] == 3

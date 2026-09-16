@@ -184,6 +184,41 @@ def test_embed_env_beats_cache_dir(monkeypatch):
         assert archive_embed._cache_dir() == Path("X:/embed")
 
 
+def test_embed_cache_dir_memoized_per_env(monkeypatch, tmp_path):
+    """Latency fix: the drive-probe half of archive_embed._cache_dir() is
+    memoized per env/settings key — whisper_cache_dir (and the PowerShell
+    disk inventory under it) runs ONCE, never on every semantic request;
+    the env override still bypasses it entirely, and cache_dir_changed()
+    re-arms the probe explicitly."""
+    monkeypatch.delenv("VODRIP_EMBED_CACHE", raising=False)
+    monkeypatch.delenv("VODRIP_WHISPER_CACHE", raising=False)
+    monkeypatch.setenv("VODRIP_CACHE_DIR", str(tmp_path / "cache"))
+    archive_embed.cache_dir_changed()
+    calls = {"n": 0}
+    real = disk_hygiene.whisper_cache_dir
+
+    def counting_cache_dir():
+        calls["n"] += 1
+        return real()
+
+    monkeypatch.setattr(disk_hygiene, "whisper_cache_dir", counting_cache_dir)
+    with patch("deps.settings_mgr") as mgr:
+        mgr.get.return_value = SimpleNamespace(
+            cache_dir=str(tmp_path / "cache"), whisper_model_cache=""
+        )
+        first = archive_embed._cache_dir()
+        assert archive_embed._cache_dir() == first
+        assert calls["n"] == 1, "repeated _cache_dir() must hit the memo"
+        # explicit invalidator re-arms the probe
+        archive_embed.cache_dir_changed()
+        assert archive_embed._cache_dir() == first
+        assert calls["n"] == 2, "cache_dir_changed() must force a re-probe"
+    monkeypatch.setenv("VODRIP_EMBED_CACHE", "X:/embed")
+    assert archive_embed._cache_dir() == Path("X:/embed")
+    assert calls["n"] == 2, "the env override must not touch the ladder"
+    archive_embed.cache_dir_changed()  # leave the memo clean for later tests
+
+
 # --- probe-file acceptance ---------------------------------------------------
 
 @pytest.mark.asyncio

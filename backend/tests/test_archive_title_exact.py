@@ -396,3 +396,160 @@ def test_orphan_messages_fts_vocab_dropped_on_schema_ensure():
         archive_db.query("SELECT count(*) AS n FROM messages_fts_vocab")
     assert "no such table" in str(exc.value).lower()
     assert "messages_fts_vocab" in str(exc.value)
+
+
+# ---------------------------------------------------------------- F-qfreq
+def test_exact_chat_only_substring_branch_disabled():
+    """Gate F-qfreq: the F5.2 skip leaves `q_freq = {}` when EXACT mode has no
+    content loop to walk (chat-only, and video-only — `loops` is empty there,
+    so the walk iterates nothing). An empty dict must NOT read as "every token
+    is absent/rare" (freq 0 <= _PREFIX_GATE_FREQ), or the >=4-char substring
+    branch of the exact post-filter would open to any token: exact acceptance
+    with unknown frequencies is token EQUALITY / _tok_eq only.
+
+    Pin (1) FAILS PRE-FIX: `source="video"` exact reaches the post-filter with
+    q_freq={}, while `_titles_search` (which gets the same q_freq) accepts the
+    title "valeuzaoextra" for query "valeuzao" through its own ungated
+    substring branch. Pre-fix `_exact_covers` had no q_freq_known term, so the
+    substring hit survived and the video was returned. Post-fix the
+    post-filter is the rejecting component: the row must not come back.
+
+    Pin (2) is a reachability INVARIANT (honest caveat): the chat row holding
+    only "valeuzaoextra" never reaches `merged` at all — EXACT chat/transcript
+    candidates come from the quoted full-phrase FTS MATCH (span pass is
+    capped at _SPAN_MAX_TOKENS=8), which requires every typed token as an
+    exact contiguous token, so a substring-only row is unreachable both pre-
+    and post-fix. It is asserted because it is the contract the gate protects
+    (and it fails if the FTS phrase or the post-filter ever loosens), with the
+    equality positive control guarding the over-strict direction.
+
+    Pin (3) DOCUMENTS WHICH WAY IT LANDS with frequencies known and pins it:
+    transcript+video scope walks the vocab, 'valeuzao' is present at freq 1
+    (<= _PREFIX_GATE_FREQ), so the gated substring branch is ALIVE and the
+    "valeuzaoextra" title IS accepted. This leg is pre/post-neutral (freq 1
+    passed the same gate before the fix); it exists to prove pin (1) is the
+    q_freq_known term and not a wholesale removal of substring reach.
+    """
+    import time as _t
+
+    q = "valeuzao"  # 8 chars >= 4, substring of the planted longer word
+    assert archive_db._tok_eq("valeuzao", "valeuzaoextra") is False
+
+    def _v(vid: str, title: str) -> None:
+        archive_db.upsert_video({
+            "platform": "twitch", "video_id": vid, "channel": "pinexact",
+            "title": title, "started_at": "2026-08-01T12:00:00Z", "kind": "vod",
+        })
+
+    _v("px-equality", "valeuzao obrigado")      # literal token -> must match
+    _v("px-substring", "valeuzaoextra obrigado")  # substring-only -> gate pin
+    # Chat-only leg: the long word lives on a video whose title carries no
+    # token containing 'valeuzao' (the post-filter folds text + title).
+    _v("px-chat-neutral", "titulo sem qualquer coincidencia")
+    archive_db.insert_messages(
+        "twitch", "px-chat-neutral",
+        [{"offset_sec": 1.0, "username": "pa1", "text": "valeuzaoextra obrigado"}],
+    )
+    archive_db.insert_messages(
+        "twitch", "px-equality",
+        [{"offset_sec": 2.0, "username": "pa2", "text": "valeuzao obrigado"}],
+    )
+    archive_db.insert_transcript(
+        "twitch", "px-substring",
+        [{"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0,
+          "text": "valeuzaoextra obrigado"}],
+        lang="pt",
+    )
+    # Prime the vocabularies so the content scopes have KNOWN frequencies
+    # (cold _load_vocab serves None + a background rebuild).
+    archive_db._load_vocab_uncached("transcripts", _t.monotonic())
+    archive_db._load_vocab_uncached("messages", _t.monotonic())
+
+    # (1) video-only: q_freq = {} -> substring title must NOT be accepted.
+    vids = {h["video_id"] for h in _exact(q, source="video", channel="pinexact", limit=100)}
+    assert "px-equality" in vids
+    assert "px-substring" not in vids, (
+        "F-qfreq: empty q_freq read as freq-0 and opened the substring branch"
+    )
+
+    # (2) chat-only: equality only.
+    chat = _exact(q, source="chat", channel="pinexact", limit=100)
+    assert "px-equality" in {h["video_id"] for h in chat}
+    assert "px-chat-neutral" not in {h["video_id"] for h in chat}
+
+    # (3) transcript in scope -> frequencies known -> gated branch alive.
+    both = {h["video_id"] for h in _exact(q, source="both", channel="pinexact", limit=100)}
+    assert "px-substring" in both, (
+        "substring reach must survive for a low-freq token when q_freq is known"
+    )
+    assert "px-equality" in both
+
+
+# ------------------------------------------------- F-exact-token-truncation
+_NATO20 = [
+    "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+    "india", "juliett", "kilo", "lima", "mike", "november", "oscar", "papa",
+    "quebec", "romeo", "sierra", "tango",
+]
+
+
+def test_exact_long_query_no_truncation():
+    """Gate F-exact-token-truncation: EXACT literal-phrase acceptance is no
+    longer capped at _TITLES_MAX_TOKENS (16) — neither in `_titles_search`'s
+    exact branch (`q_tokens = q_folded`) nor in the global post-filter
+    (`exact_q = _fold_tokens(q)`). A 20-token query must impose all 20
+    requirements; pre-fix tokens 17-20 were dropped by the [:16] slice, so a
+    title carrying only the first 16 (or 17) tokens was accepted as a full
+    match.
+
+    The token set is pairwise non-overlapping: no query token is a substring
+    of another, none is within edit distance 1 of another, so neither the
+    substring branch nor _tok_eq can rescue a missing token — the only way to
+    cover token 17 is to carry it (asserted below).
+
+    FAILS PRE-FIX on the two partial-title rows. Honest scope note: video
+    titles are the ONLY surface where a candidate can be missing tokens 17+
+    (chat/transcript rows arrive through the quoted full-phrase FTS MATCH,
+    which already requires every token contiguously — the span pass is capped
+    at _SPAN_MAX_TOKENS=8), so this pins the uncapping of the title pass; the
+    post-filter's own uncapping is not independently observable for a
+    >16-token query and is asserted here indirectly.
+    """
+    q = " ".join(_NATO20)
+    assert len(_NATO20) == 20
+    for i, a in enumerate(_NATO20):
+        for j, b in enumerate(_NATO20):
+            if i != j:
+                assert a not in b, (a, b)
+                assert archive_db._tok_eq(a, b) is False, (a, b)
+
+    def _v(vid: str, title: str) -> None:
+        archive_db.upsert_video({
+            "platform": "youtube", "video_id": vid, "channel": "pinlong",
+            "title": title, "started_at": "2026-08-01T12:00:00Z", "kind": "vod",
+        })
+
+    _v("pl-full", q)                                    # all 20 -> must match
+    _v("pl-first16", " ".join(_NATO20[:16]))            # pre-fix full match
+    _v("pl-first17", " ".join(_NATO20[:17]))            # pre-fix full match
+    archive_db.insert_transcript(
+        "youtube", "pl-full",
+        [{"seg_idx": 0, "start_sec": 0.0, "end_sec": 4.0, "text": q}],
+        lang="en",
+    )
+
+    for source in ("video", "both"):
+        vids = {h["video_id"] for h in _exact(q, source=source, channel="pinlong", limit=100)}
+        assert "pl-full" in vids, source
+        assert "pl-first16" not in vids, (
+            f"F-exact-token-truncation ({source}): tokens past 16 imposed no requirement"
+        )
+        assert "pl-first17" not in vids, (
+            f"F-exact-token-truncation ({source}): token 17 was inside the [:16] cap"
+        )
+
+    # Positive control on the content side: a row carrying all 20 tokens is
+    # still accepted (the uncapped requirement set must not over-reject).
+    tr = _exact(q, source="transcript", channel="pinlong", limit=100)
+    assert [h["video_id"] for h in tr if h["kind"] == "transcript"] == ["pl-full"], tr
+    assert all(h["partial"] is False for h in tr), tr

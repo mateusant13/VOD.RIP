@@ -337,12 +337,25 @@ def test_same_channel_start_joins_running_job_and_cap_409(monkeypatch):
     import asyncio
 
     started: list[str] = []
+    _real_thread = threading.Thread
 
     def fake_thread(*args, **kwargs):
-        class _T:
-            def start(self_inner):
-                started.append(str(args[1] if len(args) > 1 else ""))
-        return _T()
+        name = str(kwargs.get("name", ""))
+        if name.startswith("deep-search-"):
+            # Sweep threads must NOT actually run (their enumeration would
+            # hit the real, unmocked network) — count them as spawned but
+            # make them no-ops, exactly as before.
+            started.append(name)
+            class _Noop:
+                def start(self_inner):
+                    pass
+
+            return _Noop()
+        # Every OTHER thread (notably the ThreadPoolExecutor workers that
+        # asyncio.to_thread uses inside the start handler for the DB resume
+        # lookup/finalize) must be REAL — a no-op here would starve the
+        # to_thread future and hang the awaited handler.
+        return _real_thread(*args, **kwargs)
 
     monkeypatch.setattr(archive.threading, "Thread", fake_thread)
     post = lambda ch: asyncio.run(
@@ -357,3 +370,60 @@ def test_same_channel_start_joins_running_job_and_cap_409(monkeypatch):
         post("thirdchan")  # at cap -> 409, no new thread
     assert exc.value.status_code == 409
     assert len(started) == 2, "only the two accepted jobs spawn threads"
+
+
+def test_chat_matcher_stops_at_source_cap(monkeypatch):
+    """FIX-1 regression: _deep_match_chat must NOT emit one hit per matching
+    message over an unbounded video set — it stops at _DEEP_SOURCE_RESULT_CAP
+    and reports capped=True so the job surfaces truncated_results."""
+    # Seed >cap matching chat messages across video_ids (assert itself the
+    # DB write landed so the query genuinely sees _DEEP_SOURCE_RESULT_CAP
+    # matches). _deep_match_titles runs first in the pipeline but is a no-op
+    # here (titles don't contain the query), isolating the chat cap.
+    cap = archive._DEEP_SOURCE_RESULT_CAP
+    n = cap + 50
+    ids = [f"cv{i:05d}" for i in range(n)]
+    for i, vid in enumerate(ids):
+        archive_db.execute(
+            "INSERT INTO messages (platform, video_id, offset_sec, username, text) "
+            "VALUES ('youtube', ?, ?, 'viewer', ?)",
+            (vid, float(i), f"mensagem com CESAR numero {i}"),
+        )
+    hits, capped = archive._deep_match_chat("cesar", ids)
+    assert capped is True, "chat matcher must set capped when it hits the bound"
+    assert len(hits) == cap, "chat matcher must stop exactly at the source cap"
+    assert all(h["source"] == "chat" for h in hits)
+    assert {h["video_id"] for h in hits} == set(ids[:cap]), (
+        "first cap videos matched, nothing beyond the stop point"
+    )
+
+
+def test_job_surfaces_truncated_results_in_status_snapshot(monkeypatch, fast_pace):
+    """FIX-1 regression: a sweep that crosses the per-source result cap must
+    surface `truncated_results: True` in the status snapshot, keeping the FE
+    informed that the hit list is bounded (not silent breakage)."""
+    cap = archive._DEEP_SOURCE_RESULT_CAP
+    videos = [_video(f"tv{i:05d}", f"2024-01-{i % 28 + 1:02d}T00:00:00+00:00",
+                     "vlog neutral") for i in range(cap + 5)]
+    for i, v in enumerate(videos):
+        archive_db.execute(
+            "INSERT INTO messages (platform, video_id, offset_sec, username, text) "
+            "VALUES ('youtube', ?, ?, 'viewer', ?)",
+            (v["id"], float(i), f"caixa do CESAR numero {i}"),
+        )
+
+    def fetcher(vid: str) -> dict:
+        return _payload(vid, [(0.0, "nada relacionado")])
+
+    job_id, job = _run(monkeypatch, videos, fetcher)
+    assert job["status"] == "done"
+    assert job["truncated_results"] is True, (
+        "job crossing the chat source cap must flag truncated_results"
+    )
+    assert job["truncated"] is False, "enumerate itself was NOT truncated"
+    assert len(job["results"]) == cap, "results list bounded at the source cap"
+    # The status endpoint snapshot carries the same flag (FE sees it on poll).
+    import asyncio
+    snap = asyncio.run(archive.archive_search_deep_status(job_id))
+    assert snap["truncated_results"] is True
+    assert snap["truncated"] is False

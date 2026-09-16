@@ -11,6 +11,7 @@ Run from backend/: python -m pytest tests/test_archive_semantic.py
 """
 from __future__ import annotations
 
+import collections
 import hashlib
 import os
 import re
@@ -97,6 +98,10 @@ def _patch_embedder(monkeypatch):
         services.archive_embed, "embed_query",
         lambda q: _fake_vec([q], "query: "),
     )
+    # The fake embedder replaces the real model, so the _semantic_search
+    # availability gate must see it as loadable (the request-path fail-fast
+    # is covered by test_semantic_fail_fast_without_model below).
+    monkeypatch.setattr(services.archive_embed, "model_available", lambda: True)
     yield calls
 
 
@@ -336,3 +341,57 @@ def test_semantic_noise_predicate_unit_contract(_patch_embedder):
     assert archive_db._semantic_noise("Ã,") is True
     assert archive_db._semantic_noise("[risadas]") is False
     assert archive_db._semantic_noise("o gato corre") is False
+
+
+def test_semantic_fail_fast_without_model(_patch_embedder, monkeypatch):
+    """Latency regression: on a box with no embed model, _semantic_search
+    must bail before ANY of the per-request degradation tax — no vocab walk
+    (_semantic_query_text), no fingerprint stat chain, no response-cache
+    churn — while search() still serves the lexical hits."""
+    import services.archive_embed
+
+    _add_video("sem-off", "gaveta")
+    _add_seg("sem-off", 0, "zebra correndo na savana")
+
+    monkeypatch.setattr(services.archive_embed, "model_available", lambda: False)
+    walked: list[str] = []
+    monkeypatch.setattr(
+        archive_db, "_semantic_query_text",
+        lambda q: (walked.append(q), q)[1],
+    )
+    monkeypatch.setattr(archive_db, "_semantic_resp_cache", collections.OrderedDict())
+    assert archive_db._semantic_search(
+        "zebra", 10, platforms=[], video_id=None, channel=None, kinds=[],
+        date_from=None, date_to=None, lang=None,
+    ) is None
+    assert walked == [], "absent model must short-circuit before the vocab walk"
+    assert archive_db._semantic_resp_cache == {}, "no degraded verdict is cached"
+
+    hits = archive_db.search("zebra", semantic=True)
+    assert hits and hits[0]["video_id"] == "sem-off"
+    assert all(not h.get("semantic") for h in hits)
+    assert walked == [], "search() must not pay the walk either"
+
+
+def test_semantic_gate_open_runs_full_pass_unchanged(_patch_embedder):
+    """The gate is transparent when the model IS available: the pass still
+    corrects the query spelling against the vocab and produces semantic
+    hits (the fixture's fake embedder reports model_available True)."""
+    _add_video("sem-on", "gaveta")
+    _add_seg("sem-on", 0, "o gato felino corre")
+    walked: list[str] = []
+    orig = archive_db._semantic_query_text
+
+    def spy(q):
+        walked.append(q)
+        return orig(q)
+
+    import services.archive_db as adb
+
+    adb._semantic_query_text = spy
+    try:
+        hits = archive_db.search("criatura peluda", semantic=True)
+    finally:
+        adb._semantic_query_text = orig
+    assert walked, "available model must still run the vocab-corrected pass"
+    assert any(h.get("semantic") and h["video_id"] == "sem-on" for h in hits)

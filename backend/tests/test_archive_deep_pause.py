@@ -228,3 +228,78 @@ def test_result_dict_carries_video_kind_when_known_and_omits_when_unknown(
     assert calls == ["vkf", "vku"], "cached video must not be fetched"
     assert by_id["vkf"]["video_kind"] == "short", "Pass 2 hit carries the tab kind"
     assert "video_kind" not in by_id["vku"], "unknown kind must omit the key"
+
+
+def test_stale_running_rows_finalized_and_live_job_joins_before_db(monkeypatch, fast_pace):
+    """FIX-5: a crashed sweep leaves a permanent status='running' deep_jobs
+    row that would otherwise be resurrected forever. When a fresh sweep
+    starts (resuming from the newest such row R), every OTHER stale running
+    row for the same channel+query MUST be finalized to 'interrupted' (its
+    scan prefix is duplicated, not independently resumed). A second POST for
+    a LIVE in-process sweep joins BEFORE the DB resume lookup, so the join
+    path never re-reads (let alone re-finalizes) the persisted rows."""
+    from services import archive_db
+
+    videos = [_video("f1", "2024-01-02T00:00:00+00:00", content_kind="short"),
+              _video("f2", "2024-01-01T00:00:00+00:00", content_kind="short")]
+    calls: list[str] = []
+
+    def fetcher(vid: str) -> dict:
+        calls.append(vid)
+        return _payload(vid, [(0.0, f"dar a cesar o que é de {vid}")])
+
+    ts_resume = "2026-01-02T00:00:00+00:00"  # newest -> the resume source
+    ts_older = "2026-01-01T00:00:00+00:00"
+    norm = archive._deep_handle_norm("deepchan")
+    archive._ensure_deep_jobs_table()
+    # Two stale crashed-sweep rows for deepchan/cesar: xstale2 is the NEWEST
+    # ('running', cursor=2) and becomes the resume source; xbrother is an
+    # older sibling crash that a correct sweep must finalize as interrupted.
+    archive_db.execute(
+        "INSERT INTO deep_jobs (id, kind, handle, handle_norm, query, status, "
+        "scanned, total, cursor, truncated, no_transcript, error, started_at, updated_at) "
+        "VALUES ('xstale2', 'deep', 'deepchan', ?, 'cesar', 'running', 2, 4, 2, 0, 0, NULL, ?, ?)",
+        (norm, ts_resume, ts_resume),
+    )
+    archive_db.execute(
+        "INSERT INTO deep_jobs (id, kind, handle, handle_norm, query, status, "
+        "scanned, total, cursor, truncated, no_transcript, error, started_at, updated_at) "
+        "VALUES ('xbrother', 'deep', 'deepchan', ?, 'cesar', 'running', 1, 4, 1, 0, 0, NULL, ?, ?)",
+        (norm, ts_older, ts_older),
+    )
+
+    monkeypatch.setattr(archive, "_deep_enumerate", lambda handle: (videos, False, len(videos)))
+    monkeypatch.setattr(archive, "_deep_fetch_transcript", fetcher)
+    job_id = _start(monkeypatch, videos, fetcher)
+
+    # Start happening: the sibling must already have been finalized by the
+    # resume-finalize in _deep_start_db (xstale is the resume source, so it
+    # stays 'running' until the live sweep re-persists/replaces it).
+    def row_status(row_id: str) -> str:
+        rows = archive_db.query("SELECT status FROM deep_jobs WHERE id=?", (row_id,))
+        return rows[0]["status"] if rows else None
+
+    assert row_status("xbrother") == "interrupted", (
+        "a non-resume sibling 'running' row must be finalized to interrupted"
+    )
+    assert row_status("xstale2") in ("running", None), (
+        "resume-source row is the anchor until the live sweep writes its own"
+    )
+
+    # Join-before-lookup: while the sweep is LIVE in-process, a duplicate
+    # POST for the same handle must JOIN and NOT re-finalize/restart. The
+    # join path never even reads the DB (in-memory only).
+    def boom(norm2, query2):
+        raise AssertionError("join path must NOT hit _deep_start_db (DB lookup)")
+    monkeypatch.setattr(archive, "_deep_start_db", boom)
+    joined_id = asyncio.run(
+        archive.archive_search_deep_start(
+            archive.DeepSearchRequest(channel="deepchan", query="cesar")
+        )
+    )
+    assert joined_id["job_id"] == job_id, "live in-process sweep must join"
+    assert joined_id.get("joined") is True
+
+    final = _wait_terminal(job_id)
+    assert final["status"] == "done"
+    assert sorted(calls) == ["f1", "f2"]
