@@ -3,6 +3,7 @@ import { fileURLToPath } from "url";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 /// <reference types="vitest" />
+import type { ProxyOptions } from "vite";
 import { defineConfig } from "vitest/config";
 import { viteSingleFile } from "vite-plugin-singlefile";
 
@@ -33,8 +34,8 @@ export default defineConfig({
     // ~10s/file under AV scan → 10-15min for this graph), blocking first
     // requests the whole time. dev-all.mjs prewarms source files with
     // parallel first-touch reads instead — transforms then cost 1-24ms.
-    proxy: {
-      "/api": {
+    proxy: (() => {
+      const base: ProxyOptions = {
         target: `http://127.0.0.1:${API_PORT}`,
         changeOrigin: true,
         configure(proxy) {
@@ -67,7 +68,26 @@ export default defineConfig({
             );
           });
         },
-      },
-    },
+      };
+      return {
+        // Fail-fast lane — the endpoints first paint and idle pollers await.
+        // A wedged backend (accepts but never answers — 2026-09-13 incident:
+        // ~70 CLOSE_WAIT pile-up on :7897) left these proxied fetches pending
+        // FOREVER, and the UI never painted. proxyTimeout bounds it: http-proxy
+        // destroys the silent upstream req, vite's proxy "error" handler then
+        // sends 500 (vite never writes headers before the response event).
+        // 8s is ~160x the measured direct latency (~50ms) and far above any
+        // legitimate settings/info poll. Matched BEFORE "/api" (insertion
+        // order) so it wins for these URLs.
+        "^/api/(?:settings(?:/(?:features|recommended|youtube-auth))?|features|info|health|presence|app/version|errors/latest)([?].*)?$": {
+          ...base,
+          proxyTimeout: 8_000,
+        },
+        // Everything else (SSE streams with 15s backend keepalives, HLS/MP4
+        // proxies, yt-dlp extraction, folder pickers, scans) keeps the old
+        // no-timeout behavior — a fixed cap would sever legitimate long calls.
+        "/api": base,
+      };
+    })(),
   },
 });

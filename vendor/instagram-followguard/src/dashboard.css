@@ -108,7 +108,6 @@ header .title small { display: block; font-weight: 400; color: var(--muted); fon
 
 /* --- list --- */
 .list { overflow-y: auto; padding: 6px 12px 8px; flex: 1 1 auto; min-height: 0; }
-body.panel .list { flex: 1 1 480px; min-height: 480px; }
 .item {
   display: flex; align-items: center; gap: 10px;
   padding: 7px 8px; border-radius: 8px;
@@ -138,7 +137,7 @@ body.panel .list { flex: 1 1 480px; min-height: 480px; }
 .sentinel { height: 1px; width: 100%; pointer-events: none; }
 
 /* --- footer --- */
-footer { flex: none; max-height: 38vh; overflow-y: auto;
+footer { flex: 0 1 auto; min-height: 0; max-height: 38vh; overflow-y: auto;
   border-top: 1px solid var(--line);
   padding: 8px 12px;
   background: var(--bg2);

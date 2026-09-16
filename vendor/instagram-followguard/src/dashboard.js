@@ -232,16 +232,24 @@ function getLists() {
 
 
 function manualSyncCooldownMsLocal() {
+  // Mirror of background.js manualSyncCooldownMs — keep both in lockstep.
   const total = (Number(state.followersCount) || 0) + (Number(state.followingCount) || 0);
-  const minutes = Math.min(45, Math.max(5, 5 + Math.floor(total / 500)));
+  const minutes = Math.min(120, Math.max(10, 10 + Math.floor(total / 300)));
   return minutes * 60 * 1000;
 }
 
 function manualCooldownRemaining() {
-  if (state.status !== 'ok' || !state.lastSyncAt) return 0;
-  if (state.freeManualRefresh) return 0;
-  const elapsed = Date.now() - new Date(state.lastSyncAt).getTime();
-  return Math.max(0, manualSyncCooldownMsLocal() - elapsed);
+  // Mirror of background.js sync()'s manual gate (hunt V2 r2): error status
+  // is gated on lastAttemptAt with the 5-min floor (no free-refresh escape);
+  // success keeps the list-scaled cooldown + one free refresh.
+  const failed = state.status === 'error';
+  if (!failed && state.status !== 'ok') return 0;
+  const anchor = failed ? state.lastAttemptAt : state.lastSyncAt;
+  if (!anchor) return 0;
+  if (!failed && state.freeManualRefresh) return 0;
+  const elapsed = Date.now() - new Date(anchor).getTime();
+  const cdMs = failed ? 5 * 60 * 1000 : manualSyncCooldownMsLocal();
+  return Math.max(0, cdMs - elapsed);
 }
 
 function formatCooldownWait(ms) {
@@ -283,7 +291,14 @@ function renderHeader() {
       pill.classList.add('err');
       t.textContent = state.incomplete ? 'incompleto' : 'erro';
       break;
-    case 'idle': t.textContent = 'aguardando'; break;
+    case 'idle':
+      t.textContent = 'aguardando';
+      // Hunt V4 (O-5): the post-0.6.4 default is DORMANT — explain it, so
+      // "nothing happens" is never mistaken for a broken extension.
+      t.title = settings.consentAt
+        ? 'Sincroniza sozinha apenas com uma aba do Instagram aberta'
+        : 'O FollowGuard só sincroniza quando você clica em ↻ (primeiro clique = consentimento)';
+      break;
     default: t.textContent = state.status;
   }
   el.lastSync().textContent = `última: ${relTime(state.lastSyncAt)}`;
@@ -324,6 +339,14 @@ function renderSyncHint() {
         '<strong>Não feche a aba do Instagram</strong> enquanto sincroniza. ' +
         'A aba pode ficar em segundo plano — não precisa estar em foco.';
     }
+  } else if (state.followingReused) {
+    // v0.6.5 bounded reuse: the "Seguindo" list came straight from storage
+    // (gate in background.js shouldReuseFollowingList). One line, on the
+    // existing hint node — never a new DOM element.
+    hint.style.display = 'block';
+    hint.innerHTML =
+      '<strong>Lista "Seguindo" reaproveitada</strong> — como as suas ações são registradas na hora, ' +
+      'ela não foi buscada de novo (mais rápido e com menos requisições); a busca completa volta em até 7 dias.';
   } else {
     hint.style.display = 'none';
   }
@@ -557,7 +580,7 @@ function renderList() {
 }
 
 function renderSettings() {
-  el.interval().value = String(settings.refreshMinutes || 60);
+  el.interval().value = String(settings.refreshMinutes || 180);
   el.notif().checked = settings.notificationsEnabled !== false;
 }
 
@@ -687,13 +710,7 @@ async function load() {
   events = enrichEvents(o['igf.unfollowEvents'] || []);
   newFollowers = enrichEvents(o['igf.newFollowerEvents'] || []);
   render();
-  // Popup + panel: kick sync when idle and data is missing or stale.
-  if (state.status !== 'syncing') {
-    const staleMs = (settings.refreshMinutes || 60) * 60 * 1000;
-    const empty = !Object.keys(followers).length && !Object.keys(following).length;
-    const stale = settings.consentAt && (!state.lastSyncAt || Date.now() - new Date(state.lastSyncAt).getTime() > staleMs);
-    if (empty || stale) sendSync(); // manual trigger grants consent on first open
-  }
+  // No auto-sync on open: sync runs only on the ↻ button or background alarms.
   // Announce the dashboard is live (the injected panel listens; harmless
   // when this page runs as the toolbar popup — posting to self, no receiver).
   try {

@@ -31,9 +31,14 @@ export const RESUME_TTL_MS = 60 * 60 * 1000; // discard checkpoints older than 1
 let retryBaseMs = 5000;
 let fetchTimeoutMs = FETCH_TIMEOUT_MS;
 let pageDelayMs = PAGE_DELAY_MS;
+// MAX_PAGES is loop-bound + cap message (see fetchAllUsers); the 500-iteration
+// walk is a ~5s timer storm on Windows (setTimeout(0) clamps to >1ms each), so
+// the cap-exhaustion test drives a small cap through this seam instead.
+let maxPagesForTests = null;
 export function __setRetryBaseMsForTests(v) { retryBaseMs = v; }
 export function __setFetchTimeoutMsForTests(v) { fetchTimeoutMs = v; }
 export function __setPageDelayMsForTests(v) { pageDelayMs = v; }
+export function __setMaxPagesForTests(v) { maxPagesForTests = v; }
 
 // Transport indirection. Production (background.js) swaps in a page-context
 // transport: the fetch is executed by content_proxy.js on an instagram.com
@@ -355,6 +360,7 @@ export async function fetchAllUsers(kind, uid, session, { signal, onProgress, re
     is_verified: !!u.is_verified,
     profile_pic_url: u.profile_pic_url || '',
   });
+  const maxPages = maxPagesForTests ?? MAX_PAGES;
   if (resume && resume.maxId && Array.isArray(resume.users)) {
     seq = typeof resume.nextSeq === 'number' ? resume.nextSeq : 0;
     for (const u of resume.users) {
@@ -364,7 +370,7 @@ export async function fetchAllUsers(kind, uid, session, { signal, onProgress, re
     maxId = resume.maxId;
     seenCursors.add(String(maxId));
   }
-  while (page < MAX_PAGES) {
+  while (page < maxPages) {
     try {
       const { users, nextMaxId, usersPresent } = await fetchPage(kind, uid, maxId, session, signal);
       // Malformed response (no users array at all) would silently TRUNCATE
@@ -433,7 +439,7 @@ export async function fetchAllUsers(kind, uid, session, { signal, onProgress, re
     // >100k users or a looping cursor — completing short would diff against
     // the previous full snapshot and fire mass fake unfollows. Fail with
     // checkpoints intact; the next attempt resumes instead of re-fetching.
-    throw new IgApiError('limit', `A lista passou de ${MAX_PAGES * PAGE_SIZE} contas — a sincronização não terminou (o progresso foi guardado; tente de novo).`);
+    throw new IgApiError('limit', `A lista passou de ${maxPages * PAGE_SIZE} contas — a sincronização não terminou (o progresso foi guardado; tente de novo).`);
   }
   // Completeness oracle: IG said the walk is done, but the account's own
   // declared count says otherwise → the list was truncated and accepted

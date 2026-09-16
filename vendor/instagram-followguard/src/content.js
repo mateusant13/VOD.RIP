@@ -258,10 +258,13 @@
     own = await resolveOwn();
     tick();
     setInterval(tick, 750); // SPA navigation watcher (no reloads on IG)
-    // Retry own-resolution with CAPPED exponential backoff (5s → 60s max),
-    // never a fixed 5s loop — a fixed-cadence request stream while the user
-    // is unresolved is itself a fingerprint, and hammering a gate deepens it.
+    // Identity resolution retry: capped backoff (5s → 60s) AND a hard retry
+    // cap. After the V3 fix get-own answers from storage only, so an
+    // unresolved identity means the user has not synced yet — asking forever
+    // on every IG tab is pointless message spam. storage.onChanged re-arms
+    // resolution.
     let ownRetryMs = 5000;
+    let ownRetries = 0;
     const scheduleOwnRetry = () => {
       if (own) return;
       setTimeout(async () => {
@@ -273,6 +276,8 @@
           adoptOwn(r);
           return;
         }
+        ownRetries += 1;
+        if (ownRetries > 8) return;
         ownRetryMs = Math.min(ownRetryMs * 2, 60000);
         scheduleOwnRetry();
       }, ownRetryMs);
