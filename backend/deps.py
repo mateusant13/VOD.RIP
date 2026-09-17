@@ -35,6 +35,10 @@ CHANNEL_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="channe
 # Preview operations (session create/seek/quality/stream) run on their own
 # pool so the user's click is never queued behind batch warm tasks.
 PREVIEW_EXECUTOR = ThreadPoolExecutor(max_workers=12, thread_name_prefix="preview")
+# Preview panel reads may wait on SQLite's 10s busy timeout while archive
+# backfill writes are active. Keep that wait isolated from metadata and
+# user-facing preview pools; the FastAPI event loop must never run panel DB IO.
+PANEL_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="panel")
 # Live preview sessions (POST /api/preview/live + rotate) run on their own
 # small pool: the live POST must never queue behind slow/stuck VOD
 # create_session extracts on PREVIEW_EXECUTOR — the popup's stall budget is

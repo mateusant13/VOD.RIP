@@ -294,6 +294,65 @@ async def test_preview_panel_kicks_backfill_for_chatless_twitch_vod(
         _cleanup_backfill_videos()
 
 
+
+
+async def test_preview_panel_offloads_kick_and_archive_reads(
+    _no_network_backfill, monkeypatch
+) -> None:
+    """The panel's synchronous kick guards and payload reads must not run on
+    the request loop, while the spawned backfill coroutine still starts there.
+    """
+    import routers.archive as ar
+    from routers.preview import _PANEL_LIMIT_DEFAULT, preview_panel
+
+    video_id = "1234567890"
+    archive_db.upsert_video({
+        "platform": "twitch",
+        "video_id": video_id,
+        "channel": "somechannel",
+        "title": "offload regression",
+    })
+    _reset_backfill_clocks()
+    loop_thread = threading.current_thread().name
+    query_threads: list[str] = []
+    scheduled_threads: list[str] = []
+    original_query = archive_db.query
+
+    def recording_query(*args, **kwargs):
+        query_threads.append(threading.current_thread().name)
+        return original_query(*args, **kwargs)
+
+    async def fake_run(*args, **kwargs):
+        scheduled_threads.append(threading.current_thread().name)
+
+    monkeypatch.setattr(archive_db, "query", recording_query)
+    monkeypatch.setattr(ar, "_run_backfill", fake_run)
+    try:
+        payload = await preview_panel(
+            "twitch", video_id, limit=_PANEL_LIMIT_DEFAULT, offset_sec=None
+        )
+        await asyncio.sleep(0)
+        assert payload["backfill"] == "running"
+        assert query_threads, "kick and panel must perform archive reads"
+        assert all(name.startswith("panel_") for name in query_threads), (
+            f"archive reads escaped PANEL_EXECUTOR: {query_threads}"
+        )
+        assert all(name != loop_thread for name in query_threads)
+        assert scheduled_threads == [loop_thread], (
+            "backfill coroutine must still be scheduled on the event loop"
+        )
+    finally:
+        _reset_backfill_clocks()
+        archive_db.execute(
+            "DELETE FROM messages WHERE platform=? AND video_id=?",
+            ("twitch", video_id),
+        )
+        archive_db.execute(
+            "DELETE FROM videos WHERE platform=? AND video_id=?",
+            ("twitch", video_id),
+        )
+
+
 async def test_preview_panel_skips_synthetic_and_chatty_videos(
     _no_network_backfill,
 ) -> None:

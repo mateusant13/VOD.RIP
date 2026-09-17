@@ -16,7 +16,7 @@ from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 from models.schemas import LivePreviewRequest, LiveRotateRequest, PreviewQualityUpdateRequest, PreviewSeekRequest, PreviewSessionCreateRequest, PreviewSessionResponse, PreviewSessionStatusResponse, PreviewTimingRequest, PreviewWarmRequest, PreviewBatchWarmRequest
 
-from deps import INFO_EXECUTOR, LIVE_EXECUTOR, PREVIEW_EXECUTOR
+from deps import INFO_EXECUTOR, LIVE_EXECUTOR, PANEL_EXECUTOR, PREVIEW_EXECUTOR
 from services.preview_service import (
     PreviewMuxPending,
     REPLAY_HLS_MARKER,
@@ -69,6 +69,13 @@ router = APIRouter(tags=["preview"])
 _PREVIEW_CREATE_HARD_TIMEOUT_SEC = max(
     5.0,
     float(os.environ.get("VODRIP_PREVIEW_CREATE_TIMEOUT_SEC", "45") or "45"),
+)
+# Panel reads may wait on SQLite's busy timeout and can queue behind another
+# panel request. A bounded wait prevents a wedged read from holding a request
+# forever; the underlying SQLite call remains bounded by its own busy timeout.
+_PANEL_HARD_TIMEOUT_SEC = max(
+    5.0,
+    float(os.environ.get("VODRIP_PANEL_TIMEOUT_SEC", "15") or "15"),
 )
 
 
@@ -176,11 +183,59 @@ def _parse_prefer_height_query(request: Request) -> Optional[int]:
     return height if height > 0 else None
 
 
-# WS-2 preview chat panel payload. Reuses the archive_db transcript/message
-# queries — no duplicated SQL — and is deliberately thin so the panel can
-# fetch the whole timeline once and sync locally while seeking.
-_PANEL_LIMIT_DEFAULT = 200_000
-_PANEL_LIMIT_MAX = 500_000
+_PANEL_LIMIT_DEFAULT = 20_000
+_PANEL_LIMIT_MAX = 20_000
+_PANEL_AUDIO_EVENTS_MAX = 20_000
+_PANEL_VIDEO_ID_MAX = 256
+
+
+def _preview_panel_sync(
+    platform: str,
+    video_id: str,
+    limit: int,
+    offset_sec: Optional[float],
+) -> dict:
+    """Build the panel payload off the FastAPI event loop.
+
+    Synchronous status and archive reads stay together to preserve the
+    existing ordering and error seams while preventing a busy archive write
+    from starving health probes. Payload rows are explicitly capped so a
+    single request cannot materialize an unbounded timeline or event list.
+    """
+    backfill, backfill_progress = "idle", 0.0
+    if platform == "twitch":
+        try:
+            from routers.archive import preview_backfill_status
+
+            backfill, backfill_progress = preview_backfill_status(platform, video_id)
+        except Exception:
+            logger.debug("preview backfill status failed", exc_info=True)
+    if backfill == "running":
+        chat, total_rows = archive_db.chat_slice_for(platform, video_id, offset_sec)
+    else:
+        chat = archive_db.chat_for(platform, video_id, limit)
+        total_rows = archive_db.count_messages(platform, video_id)
+    return {
+        "transcript": archive_db.transcript_offsets(platform, video_id, limit),
+        "chat": chat,
+        "events": [
+            {
+                "offset_sec": r["start_sec"],
+                "end_sec": r["end_sec"],
+                "event": r["event"],
+                "score": r["score"],
+            }
+            for r in archive_db.audio_events_for(
+                platform, video_id, limit=_PANEL_AUDIO_EVENTS_MAX
+            )
+        ],
+        "has_transcript": archive_db.transcript_available(platform, video_id),
+        "has_chat": archive_db.has_chat(platform, video_id),
+        "backfill": backfill,
+        "backfill_progress": backfill_progress,
+        "total_rows": total_rows,
+        "chat_truncated": len(chat) < total_rows,
+    }
 
 
 @router.get("/api/preview/panel/{platform}/{video_id}")
@@ -193,72 +248,61 @@ async def preview_panel(
     """Time-ordered transcript + chat + acoustic-event rows for one archived
     video, plus a Twitch-chat backfill status envelope.
 
-    Strict response shape:
-      {transcript: [{offset_sec, text}], chat: [{offset_sec, text, username,
-       spam_count}], events: [{offset_sec, end_sec, event, score}],
-       has_transcript: bool, has_chat: bool, backfill: 'idle'|'running'|
-       'done', backfill_progress: 0..1, total_rows: int, chat_truncated: bool}
-    events are PANNs acoustic detections (LAUGH, CLAP, ...) with real
-    boundaries; the UI merges them into the transcript timeline by
-    offset_sec. The flags mirror the preview-session capability flags so the
-    UI can show empty states without loading the full payload first.
-
-    backfill/backfill_progress/total_rows describe the Twitch chat backfill
-    for this video (see routers.archive.preview_backfill_status): while it
-    is 'running' the chat slice is BOUNDED to a playhead-centered window
-    (offset_sec) so the panel's ~2.5 s polls never re-serialize the whole
-    growing archive; when 'done'/'idle' the full timeline (limit-capped) is
-    returned and chat_truncated reports a cut (window or limit). offset_sec
-    also seeds the background backfill at the playhead (Chatterino-style:
-    near-playhead messages arrive in the first pages)."""
+    The response is bounded by ``_PANEL_LIMIT_MAX`` rows per timeline and
+    ``_PANEL_AUDIO_EVENTS_MAX`` acoustic events. Twitch backfill guards and
+    panel archive reads both run in PANEL_EXECUTOR; only coroutine submission
+    returns to the request loop.
+    """
     p = (platform or "").strip().lower()
     if p not in archive_db.PLATFORMS:
         raise HTTPException(status_code=400, detail="Unknown platform")
+    if not video_id or len(video_id) > _PANEL_VIDEO_ID_MAX:
+        raise HTTPException(status_code=400, detail="Invalid video ID")
+    # FastAPI enforces this through Query(), while direct coroutine callers
+    # (tests and internal code) need the same hard payload ceiling.
+    limit = max(1, min(limit, _PANEL_LIMIT_MAX))
+    loop = asyncio.get_running_loop()
     if p == "twitch":
-        # Backfill-on-open: an archived Twitch VOD with no chat yet gets the
-        # same throttled background backfill as archive search, seeded at
-        # the client's playhead, so opening the chat tab on a preview fills
-        # history without a prior search. Fire-and-forget — the kick is a
-        # no-op when throttled / cooldown / synthetic-id / unknown-video
-        # gates fail (kick_preview_backfill).
+        # kick_preview_backfill performs synchronous DB guards before it can
+        # schedule its coroutine. Keep those reads off the event loop, then
+        # submit the coroutine safely back to this loop from the worker.
         try:
             from routers.archive import kick_preview_backfill
 
-            kick_preview_backfill(p, video_id, offset_sec=offset_sec)
+            kick_future = loop.run_in_executor(
+                PANEL_EXECUTOR,
+                lambda: kick_preview_backfill(
+                    p, video_id, offset_sec=offset_sec, loop=loop
+                ),
+            )
+            await asyncio.wait_for(kick_future, timeout=_PANEL_HARD_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "preview chat backfill kick timed out for twitch/%s after %.1fs",
+                video_id,
+                _PANEL_HARD_TIMEOUT_SEC,
+            )
         except Exception:
             logger.debug("preview chat backfill kick failed", exc_info=True)
-    backfill, backfill_progress = "idle", 0.0
-    if p == "twitch":
-        try:
-            from routers.archive import preview_backfill_status
-
-            backfill, backfill_progress = preview_backfill_status(p, video_id)
-        except Exception:
-            logger.debug("preview backfill status failed", exc_info=True)
-    if backfill == "running":
-        chat, total_rows = archive_db.chat_slice_for(p, video_id, offset_sec)
-    else:
-        chat = archive_db.chat_for(p, video_id, limit)
-        total_rows = archive_db.count_messages(p, video_id)
-    return {
-        "transcript": archive_db.transcript_offsets(p, video_id, limit),
-        "chat": chat,
-        "events": [
-            {
-                "offset_sec": r["start_sec"],
-                "end_sec": r["end_sec"],
-                "event": r["event"],
-                "score": r["score"],
-            }
-            for r in archive_db.audio_events_for(p, video_id)
-        ],
-        "has_transcript": archive_db.transcript_available(p, video_id),
-        "has_chat": archive_db.has_chat(p, video_id),
-        "backfill": backfill,
-        "backfill_progress": backfill_progress,
-        "total_rows": total_rows,
-        "chat_truncated": len(chat) < total_rows,
-    }
+    panel_future = loop.run_in_executor(
+        PANEL_EXECUTOR,
+        lambda: _preview_panel_sync(p, video_id, limit, offset_sec),
+    )
+    try:
+        return await asyncio.wait_for(
+            panel_future, timeout=_PANEL_HARD_TIMEOUT_SEC
+        )
+    except asyncio.TimeoutError as exc:
+        logger.warning(
+            "preview panel timed out for %s/%s after %.1fs",
+            p,
+            video_id,
+            _PANEL_HARD_TIMEOUT_SEC,
+        )
+        raise HTTPException(
+            status_code=504,
+            detail="Preview panel timed out — try again.",
+        ) from exc
 
 
 @router.post("/api/preview/warm")

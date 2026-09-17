@@ -164,9 +164,17 @@ async def _run_backfill(
 
 
 def _kick_backfill(
-    video_id: str, channel: str, seed_offset_sec: Optional[float] = None
+    video_id: str,
+    channel: str,
+    seed_offset_sec: Optional[float] = None,
+    *,
+    loop: Optional[asyncio.AbstractEventLoop] = None,
 ) -> str:
     """Start a background Twitch chat backfill; returns the status word.
+
+    ``loop`` is supplied by the preview panel when this synchronous function
+    runs in PANEL_EXECUTOR. The DB guards stay in that worker while the
+    coroutine is submitted safely back to the request loop.
 
     'queued' — task started now; 'running' — already in flight;
     'already' — chat rows exist or a chat job (queued/running/done marker)
@@ -185,21 +193,38 @@ def _kick_backfill(
     try:
         with _backfill_lock:
             _backfill_inflight.add(video_id)
-        asyncio.get_running_loop().create_task(
-            _run_backfill(video_id, channel, seed_offset_sec=seed_offset_sec)
+        coroutine = _run_backfill(
+            video_id, channel, seed_offset_sec=seed_offset_sec
         )
+        if loop is None:
+            asyncio.get_running_loop().create_task(coroutine)
+        else:
+            asyncio.run_coroutine_threadsafe(coroutine, loop)
         return "queued"
     except Exception:
         logger.exception("could not start chat backfill for twitch/%s", video_id)
         with _backfill_lock:
             _backfill_inflight.discard(video_id)
+        # If task submission failed before ownership transferred to a loop,
+        # close the coroutine so the failed request does not leak it.
+        try:
+            coroutine.close()
+        except (NameError, UnboundLocalError):
+            pass
         return "failed"
 
-
 def kick_preview_backfill(
-    platform: str, video_id: str, offset_sec: Optional[float] = None
+    platform: str,
+    video_id: str,
+    offset_sec: Optional[float] = None,
+    *,
+    loop: Optional[asyncio.AbstractEventLoop] = None,
 ) -> str:
     """Throttled single-video Twitch chat backfill on preview open.
+
+    All validation, status, and archive reads are synchronous so callers can
+    place this function in PANEL_EXECUTOR. When ``loop`` is provided, only
+    coroutine submission crosses back to that event loop.
 
     Mirrors _maybe_auto_backfill's gates on ONE video: numeric (non-watchdog)
     id, an archived row with a channel, and the same shared auto-kick
@@ -234,7 +259,12 @@ def kick_preview_backfill(
             return ""
         if _backfill_failed_resumes.get(video_id, 0) >= _BACKFILL_FAILED_RESUME_LIMIT:
             return ""  # P2-6: N failed resumes — no more auto-kicks
-    status = _kick_backfill(video_id, row[0]["channel"], seed_offset_sec=offset_sec)
+    status = _kick_backfill(
+        video_id,
+        row[0]["channel"],
+        seed_offset_sec=offset_sec,
+        loop=loop,
+    )
     if status == "queued":
         with _backfill_lock:
             _last_auto_kick = now

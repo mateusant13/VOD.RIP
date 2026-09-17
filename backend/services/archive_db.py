@@ -2296,11 +2296,20 @@ def delete_audio_events(platform: str, video_id: str) -> int:
     return cur.rowcount
 
 
-def audio_events_for(platform: str, video_id: str) -> list[dict]:
-    rows = query(
-        "SELECT * FROM audio_events WHERE platform = ? AND video_id = ? ORDER BY start_sec, event",
-        (platform, video_id),
+def audio_events_for(
+    platform: str,
+    video_id: str,
+    limit: Optional[int] = None,
+) -> list[dict]:
+    sql = (
+        "SELECT * FROM audio_events WHERE platform = ? AND video_id = ? "
+        "ORDER BY start_sec, event"
     )
+    params: tuple[object, ...] = (platform, video_id)
+    if limit is not None:
+        sql += " LIMIT ?"
+        params += (max(1, int(limit)),)
+    rows = query(sql, params)
     return [dict(r) for r in rows]
 
 

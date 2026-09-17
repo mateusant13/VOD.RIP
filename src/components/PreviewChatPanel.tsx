@@ -114,8 +114,8 @@ const PANEL_DEFAULT_W = 320;
 const PANEL_W_KEY = 'vodrip.preview.chatPanelWidth';
 /** Width the collapsed strip occupies (matches the w-7 button). */
 const PANEL_STRIP_W = 28;
-/** Matches the backend default; 12h+ of dense chat stays under this cap. */
-const PANEL_LIMIT = 200_000;
+/** Matches the backend cap; dense archives are reported as chat_truncated. */
+const PANEL_LIMIT = 20_000;
 /** While a Twitch backfill is 'running' the panel refreshes at this rate
  *  (the backend bounds each response to a playhead window, so polling stays
  *  cheap and chat appears progressively instead of after the whole run). */
