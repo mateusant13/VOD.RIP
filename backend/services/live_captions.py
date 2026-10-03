@@ -583,6 +583,42 @@ _CAPTIONERS: dict[tuple[str, str], "LiveCaptioner"] = {}
 _REGISTRY_LOCK = threading.Lock()
 _MAX_CONCURRENT_CAPTIONERS = 10  # ponytail: env knob if needed; prevents anon resource exhaustion
 
+# Live-caption session count across ALL captioners. While >= 1 the archive
+# worker's GPU lane is paused (services.archive_transcribe holds the flag;
+# the counter makes set/unset correct when several channels are captioned
+# concurrently — the last release clears the reservation).
+_session_count = 0
+_session_lock = threading.Lock()
+
+
+def _session_begin() -> None:
+    """Declare a live-caption session (first subscriber across all captioners)."""
+    global _session_count
+    with _session_lock:
+        _session_count += 1
+        if _session_count == 1:
+            try:
+                from services import archive_transcribe as at
+
+                at.set_caption_session_active(True)
+            except Exception:
+                pass  # best-effort reservation — never break the SSE path
+
+
+def _session_end() -> None:
+    """Clear the live-caption session when the last subscriber leaves."""
+    global _session_count
+    with _session_lock:
+        _session_count = max(0, _session_count - 1)
+        if _session_count == 0:
+            try:
+                from services import archive_transcribe as at
+
+                at.set_caption_session_active(False)
+                at.keep_parakeet_resident(False)
+            except Exception:
+                pass
+
 
 
 def get_captioner(
@@ -716,11 +752,15 @@ class LiveCaptioner:
 
         ``lang`` (pt | en | es) overrides the caption translate-target for
         the session; None on a fresh session resets to the app-language
-        The worker starts on the first subscriber and stops when the last
-        subscriber releases it."""
+        default and None on an active session keeps the current target.
+        The worker's session-active toggle stays keyed on the 0->1 refcount
+        transition regardless of the lang arg."""
         with self._life_lock:
             self._refcount += 1
             if self._refcount == 1:
+                # First subscriber anywhere: the archive worker must yield the
+                # GPU/CPU to the real-time captioner for the session's life.
+                _session_begin()
                 th = self._thread
                 if th is not None and th.is_alive():
                     # The last release set _stop; wait for the old thread so a
@@ -764,7 +804,8 @@ class LiveCaptioner:
     def release(self) -> None:
         """Refcount-- — stops the worker thread when the last subscriber
         leaves. Idempotent-safe: a second release on an already-released
-        captioner is a no-op."""
+        captioner is a no-op (refcount never goes negative, the archive
+        session reservation is only cleared on the real 1->0 transition)."""
         with self._life_lock:
             if self._refcount == 0:
                 return  # already released — nothing to stop or un-reserve
@@ -775,6 +816,7 @@ class LiveCaptioner:
                 self._asr_window_ready.set()  # unblock ASR thread so it sees stop
                 self._translate_stop.set()
                 self._translate_window_ready.set()  # unblock translate worker
+                _session_end()
 
     # --- ASR thread --------------------------------------------------------
 
