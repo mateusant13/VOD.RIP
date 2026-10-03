@@ -15,6 +15,38 @@
   --color-twitch: #9146FF;
   --font-street: "Syne", sans-serif;
   --font-mono: "Space Grotesk", monospace;
+
+  /* ── UI type ramp ──────────────────────────────────────────────────────
+     Named steps instead of ad-hoc `text-[13px]` ramps. `ui-xs` is the
+     smallest legible chrome (11px — labels, timestamps, counters);
+     `ui-sm` (13px) is the BODY step: transcript cues and chat text must
+     never fall below it (Parakeet fragments are 2-6 words, so 10px +
+     truncate rendered them as a wall of ellipses); `ui-md` (14px) is
+     emphasis (active tab, marker chips). The 8/9/10px arbitrary classes
+     still exist for the legacy dense surfaces still being migrated — they
+     are patched by the `--ui-scale` block at the bottom of this file, and
+     these three steps are patched the same way. */
+  --text-ui-xs: 0.6875rem;  /* 11px */
+  --text-ui-sm: 0.8125rem;  /* 13px */
+  --text-ui-md: 0.875rem;   /* 14px */
+
+  /* ── Semantic surfaces ─────────────────────────────────────────────────
+     The preview panel (chat / transcript / subtitles) reads these instead
+     of raw zinc utilities, so its hierarchy is one edit away from being
+     restyled. `surface` is the app background, `surface-raised` the input /
+     hover layer, `line` the border step. ponytail: the rest of the app
+     still uses the zinc ramp — migrating a second surface is fine, but
+     half-converting every call site is not. */
+  --color-surface: #09090b;        /* zinc-950 */
+  --color-surface-raised: #18181b; /* zinc-900 */
+  --color-line: #27272a;           /* zinc-800 */
+
+  /* ── Semantic accents ──────────────────────────────────────────────────
+     `mark-start` / `mark-end` are the chat range markers (Kick brand green /
+     red pair); `danger` is the hard red used for destructive chrome. */
+  --color-mark-start: #53fc18;
+  --color-mark-end: #ef4444;
+  --color-danger: #F03030;
 }
 
 html {
@@ -416,6 +448,19 @@ html .text-xs {
 }
 
 html .text-sm {
+  font-size: calc(0.875rem * var(--ui-scale)) !important;
+}
+
+/* The ui-* ramp steps honour the same viewport scale (uiScale.ts). */
+html .text-ui-xs {
+  font-size: calc(0.6875rem * var(--ui-scale)) !important;
+}
+
+html .text-ui-sm {
+  font-size: calc(0.8125rem * var(--ui-scale)) !important;
+}
+
+html .text-ui-md {
   font-size: calc(0.875rem * var(--ui-scale)) !important;
 }
 

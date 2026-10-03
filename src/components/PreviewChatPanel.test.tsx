@@ -81,8 +81,8 @@ function mockPanelFetch(
  * while the product default remains the transcription tab. */
 function render(...args: Parameters<typeof rtlRender>) {
   const result = rtlRender(...args);
-  const chat = screen.queryByRole('button', { name: 'Chat' });
-  if (chat?.getAttribute('aria-pressed') === 'false') fireEvent.click(chat);
+  const chat = screen.queryByRole('tab', { name: 'Chat' });
+  if (chat?.getAttribute('aria-selected') === 'false') fireEvent.click(chat);
   return result;
 }
 
@@ -133,9 +133,9 @@ describe('PreviewChatPanel', () => {
     mockPanelFetch(PAYLOAD);
     rtlRender(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
     await waitFor(() => expect(screen.getByText('hello world')).toBeTruthy());
-    expect(screen.getByRole('button', { name: 'Transcript' })).toHaveAttribute('aria-pressed', 'true');
-    fireEvent.click(screen.getByRole('button', { name: 'Chat' }));
-    expect(screen.getByRole('button', { name: 'Chat' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('tab', { name: 'Transcript' })).toHaveAttribute('aria-selected', 'true');
+    fireEvent.click(screen.getByRole('tab', { name: 'Chat' }));
+    expect(screen.getByRole('tab', { name: 'Chat' })).toHaveAttribute('aria-selected', 'true');
   });
   it('fetches the panel payload at session-create, before the video starts', async () => {
     const fetchMock = mockPanelFetch(PAYLOAD);
@@ -220,10 +220,10 @@ describe('PreviewChatPanel', () => {
     render(<PreviewChatPanel platform="youtube" videoId="v1" currentTime={0} />);
     await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
 
-    fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Transcript' }));
     await waitFor(() => expect(screen.getByText('hello world')).toBeTruthy());
 
-    fireEvent.click(screen.getByRole('button', { name: 'Subtitles' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Subtitles' }));
     // currentTime=0 → first transcript segment (offset 0) is the caption.
     await waitFor(() => {
       expect(document.querySelector('[data-subtitle-line]')?.textContent).toContain('hello world');
@@ -235,8 +235,8 @@ describe('PreviewChatPanel', () => {
     render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
     await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
     // The archived transcript stays available — under its Transcript tab.
-    expect(screen.getByRole('button', { name: 'Transcript' })).toBeTruthy();
-    expect(screen.queryByRole('button', { name: 'Subtitles' })).toBeNull();
+    expect(screen.getByRole('tab', { name: 'Transcript' })).toBeTruthy();
+    expect(screen.queryByRole('tab', { name: 'Subtitles' })).toBeNull();
   });
 
   it('interleaves acoustic events into the transcript timeline in offset order', async () => {
@@ -244,7 +244,7 @@ describe('PreviewChatPanel', () => {
     render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
     await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
 
-    fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Transcript' }));
     await waitFor(() => {
       // Events must sit between the transcript segments at their offsets:
       // Laughter@3 between hello world@0 and second line@5; Clapping@12.5
@@ -274,12 +274,12 @@ describe('PreviewChatPanel', () => {
     await waitFor(() => {
       expect(screen.getByText('No archived chat for this video.')).toBeTruthy();
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Transcript' }));
     await waitFor(() => {
       expect(screen.getByText('No transcript for this video.')).toBeTruthy();
     });
     // Subtitles are YouTube-only — a Twitch/Kick VOD has no Subtitles tab.
-    expect(screen.queryByRole('button', { name: 'Subtitles' })).toBeNull();
+    expect(screen.queryByRole('tab', { name: 'Subtitles' })).toBeNull();
   });
 
   it('null platform/videoId (clip/live/channel previews) shows an explanatory message instead of a blank panel', async () => {
@@ -291,12 +291,12 @@ describe('PreviewChatPanel', () => {
     });
     expect(fetchMock).not.toHaveBeenCalled(); // nothing to fetch without a key
     // The message is per-panel, not per-tab — switching tabs must not blank it.
-    fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Transcript' }));
     await waitFor(() => expect(screen.getByText(MSG)).toBeTruthy());
     // Once a key resolves (e.g. an archived VOD URL pasted in), the panel
     // fetches and renders normally instead of showing the message.
     rerender(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Chat' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Chat' }));
     await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
     expect(screen.queryByText(MSG)).toBeNull();
   });
@@ -305,7 +305,7 @@ describe('PreviewChatPanel', () => {
     mockPanelFetch({ ...PAYLOAD, chat: [], has_chat: false });
     rtlRender(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
     await waitFor(() => expect(screen.getByText('hello world')).toBeTruthy());
-    expect(screen.getByRole('button', { name: 'Transcript' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('tab', { name: 'Transcript' })).toHaveAttribute('aria-selected', 'true');
     expect(screen.queryByText('No archived chat for this video.')).toBeNull();
   });
 
@@ -319,19 +319,19 @@ describe('PreviewChatPanel', () => {
     expect(activeRowText()).toContain('LETS GO');
 
     // transcript offsets [0,5,10,15]: t=6 → index 1 (second line).
-    fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Transcript' }));
     await waitFor(() => expect(activeRowText()).toContain('second line'));
 
-    fireEvent.click(screen.getByRole('button', { name: 'Subtitles' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Subtitles' }));
     await waitFor(() => {
       expect(document.querySelector('[data-subtitle-line]')?.textContent).toContain('second line');
     });
 
     // Seek to t=12: transcript active row moves to index 2, caption to third line.
     rerender(<PreviewChatPanel platform="youtube" videoId="v1" currentTime={12} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Transcript' }));
     await waitFor(() => expect(activeRowText()).toContain('third line'));
-    fireEvent.click(screen.getByRole('button', { name: 'Subtitles' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Subtitles' }));
     await waitFor(() => {
       expect(document.querySelector('[data-subtitle-line]')?.textContent).toContain('third line');
     });
@@ -359,7 +359,7 @@ describe('PreviewChatPanel', () => {
     expect(document.querySelector('[data-preview-chat-panel-collapsed]')).toBeNull();
     // Host flips the prop → panel renders without internal state.
     rerender(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} open onOpenChange={onOpenChange} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Chat' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Chat' }));
     await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
     // Collapse button reports the close intent to the host instead of
     // closing itself.
@@ -408,7 +408,7 @@ describe('PreviewChatPanel', () => {
     const rendersAfterMount = playerRenders;
 
     // Tab switch (panel-internal state) → parent/player untouched.
-    fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Transcript' }));
     await waitFor(() => expect(screen.getByText('hello world')).toBeTruthy());
     expect(playerRenders).toBe(rendersAfterMount);
 
@@ -455,9 +455,9 @@ describe('PreviewChatPanel', () => {
     render(<PreviewChatPanel platform="youtube" videoId="yt1" currentTime={1.5} />);
     await waitFor(() => expect(screen.getByText('primeira legenda')).toBeTruthy());
     // Subtitles-only: no chat or transcript tabs are offered.
-    expect(screen.queryByRole('button', { name: 'Chat' })).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Transcript' })).toBeNull();
-    expect(screen.getByRole('button', { name: 'Subtitles' })).toBeTruthy();
+    expect(screen.queryByRole('tab', { name: 'Chat' })).toBeNull();
+    expect(screen.queryByRole('tab', { name: 'Transcript' })).toBeNull();
+    expect(screen.getByRole('tab', { name: 'Subtitles' })).toBeTruthy();
     const subsUrl = String(
       fetchMock.mock.calls.map((c) => String(c[0])).find((u) => u.includes('/api/subtitles')) ?? '',
     );
@@ -490,7 +490,7 @@ describe('PreviewChatPanel', () => {
     const fetchMock = mockPanelFetch(PAYLOAD);
     render(<PreviewChatPanel platform="youtube" videoId="yt1" currentTime={11} />);
     await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
-    fireEvent.click(screen.getByRole('button', { name: 'Subtitles' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Subtitles' }));
     await waitFor(() => expect(screen.getByText('third line')).toBeTruthy());
     // Archived videos never call the live-subtitles endpoint.
     const calls = fetchMock.mock.calls.map((c) => String(c[0]));
@@ -548,9 +548,11 @@ describe('PreviewChatPanel', () => {
     fireEvent.change(screen.getByRole('textbox', { name: 'Search chat history' }), {
       target: { value: 'carol' },
     });
-    await waitFor(() => expect(screen.getByText('hi')).toBeTruthy());
+    // The filter is debounced (200ms), so wait for the SETTLED match set — the
+    // pre-debounce DOM still shows every row, including carol's own message.
+    await waitFor(() => expect(screen.getByText('1/1')).toBeTruthy());
     expect(screen.queryByText('LETS GO')).toBeNull();
-    expect(screen.getByText('1/1')).toBeTruthy();
+    expect(screen.getByText('hi')).toBeTruthy();
   });
 
   it('polls while the Twitch backfill runs and refreshes once after done', async () => {
@@ -638,7 +640,7 @@ describe('PreviewChatPanel', () => {
     const onSeek = vi.fn();
     render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} onSeek={onSeek} />);
     await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
-    fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Transcript' }));
     await waitFor(() => expect(screen.getByText('second line')).toBeTruthy());
     fireEvent.click(screen.getByText('second line'));
     expect(onSeek).toHaveBeenCalledWith(5);
@@ -651,7 +653,7 @@ describe('PreviewChatPanel', () => {
     const onSeek = vi.fn();
     render(<PreviewChatPanel platform="youtube" videoId="v1" currentTime={6} onSeek={onSeek} />);
     await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
-    fireEvent.click(screen.getByRole('button', { name: 'Subtitles' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Subtitles' }));
     await waitFor(() => {
       expect(document.querySelector('[data-subtitle-line]')?.textContent).toContain('second line');
     });
@@ -747,8 +749,10 @@ describe('PreviewChatPanel', () => {
     expect(
       (document.querySelector('[data-marker-chip="start"]') as HTMLElement).textContent,
     ).toContain('0:03');
+    // The filled marker carries the semantic start token (--color-mark-start),
+    // not a hard-coded brand hex.
     expect((row3.querySelector('[data-marker-set="start"]') as HTMLElement).className).toContain(
-      'bg-[#53fc18]',
+      'bg-mark-start',
     );
 
     // Red END on the row at offset 8 (hi): range is now [3, 8].
@@ -802,5 +806,202 @@ describe('PreviewChatPanel', () => {
     expect(
       (document.querySelector('[data-marker-chip="start"]') as HTMLElement).textContent,
     ).not.toContain('0:03');
+  });
+
+  // ── Transcript UX (the panel's DEFAULT view) ───────────────────────────────
+  it('renders cue text at full size, wrapped, with no ellipsis-clipped fragment', async () => {
+    mockPanelFetch(PAYLOAD);
+    rtlRender(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByText('hello world')).toBeTruthy());
+
+    const cue = document.querySelector('[data-panel-cue-row="0"]') as HTMLElement;
+    expect(cue).toBeTruthy();
+    const text = cue.querySelector('span + span') as HTMLElement;
+    // 13px body step (--text-ui-sm), never the 10px + truncate one-liner.
+    expect(text.className).toContain('text-ui-sm');
+    expect(cue.className).toContain('overflow-hidden');
+    // Wrapping, not truncation: a short cue fits one line, and the clamp is a
+    // LINE clamp driven by the measured height (the "truncate" one-liner that
+    // cut every ASR fragment to an ellipsis is gone).
+    expect(text.className).not.toContain('truncate');
+    expect(Number(text.style.webkitLineClamp)).toBeGreaterThanOrEqual(1);
+    // The full text is in the DOM verbatim.
+    expect(text.textContent).toBe('hello world');
+  });
+
+  it('grows a long cue instead of clipping it, and collapses it again', async () => {
+    // ~230 chars → ~7 lines at 13px in a 320px panel, well past the 4-line
+    // collapsed clamp.
+    const long = `${'this is a very long transcript cue that will certainly need more than a couple of lines to render properly in the panel '.repeat(2)}end`;
+    mockPanelFetch({
+      ...PAYLOAD,
+      transcript: [{ offset_sec: 0, text: long }],
+      events: [],
+    });
+    rtlRender(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByText(long)).toBeTruthy());
+
+    const row = () => document.querySelector('[data-panel-cue-row="0"]') as HTMLElement;
+    const rowH = () => parseFloat(row().style.height);
+    const collapsedH = rowH();
+    // The old fixed 22px row cut this to an ellipsis; the clamp is 4 lines.
+    expect(collapsedH).toBe(4 * 19 + 12);
+    const clamped = Number(
+      (row().querySelector('span + span') as HTMLElement).style.webkitLineClamp,
+    );
+    expect(clamped).toBe(4);
+
+    const toggle = document.querySelector('[data-panel-cue-expand="0"]') as HTMLElement;
+    expect(toggle).toBeTruthy();
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    fireEvent.click(toggle);
+    await waitFor(() => expect(rowH()).toBeGreaterThan(collapsedH));
+    expect(
+      (document.querySelector('[data-panel-cue-expand="0"]') as HTMLElement).getAttribute(
+        'aria-expanded',
+      ),
+    ).toBe('true');
+
+    // Collapsing returns the row to its modelled height.
+    fireEvent.click(document.querySelector('[data-panel-cue-expand="0"]') as HTMLElement);
+    await waitFor(() => expect(rowH()).toBe(collapsedH));
+  });
+
+  it('gives a short cue no expand toggle (nothing to reveal)', async () => {
+    mockPanelFetch(PAYLOAD);
+    rtlRender(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByText('hello world')).toBeTruthy());
+    expect(document.querySelector('[data-panel-cue-expand="0"]')).toBeNull();
+  });
+
+  it('cue rows are real buttons: Enter seeks, and the seek is the row action', async () => {
+    mockPanelFetch(PAYLOAD);
+    const onSeek = vi.fn();
+    rtlRender(
+      <PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} onSeek={onSeek} />,
+    );
+    await waitFor(() => expect(screen.getByText('hello world')).toBeTruthy());
+    const cue = screen.getByRole('button', { name: /hello world/ });
+    fireEvent.keyDown(cue, { key: 'Enter' });
+    // jsdom does not translate keydown into a click on a button; the contract
+    // under test is that the cue IS a button (role + native activation), not a
+    // mouse-only div.
+    expect(cue.tagName).toBe('BUTTON');
+    expect(cue.getAttribute('type')).toBe('button');
+    fireEvent.click(cue);
+    expect(onSeek).toHaveBeenCalledWith(0);
+  });
+
+  it('keeps the transcript virtualised: a long transcript mounts a bounded window', async () => {
+    const big = Array.from({ length: 4000 }, (_, i) => ({
+      offset_sec: i,
+      text: `cue number ${i}`,
+    }));
+    mockPanelFetch({ ...PAYLOAD, transcript: big, events: [] });
+    rtlRender(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByText('cue number 0')).toBeTruthy());
+    const mounted = document.querySelectorAll('[data-panel-row]').length;
+    expect(mounted).toBeGreaterThan(0);
+    expect(mounted).toBeLessThanOrEqual(2 * 20 + 1 + 4); // TIMELINE_WINDOW
+  });
+
+  it('searches the TRANSCRIPT tab: filters cues, counts matches, steps with Enter', async () => {
+    mockPanelFetch(PAYLOAD);
+    rtlRender(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByText('hello world')).toBeTruthy());
+
+    // The search box exists on the transcript tab — it used to render only
+    // under `tab === 'chat'`, i.e. never on the panel's default view.
+    const input = screen.getByRole('textbox', { name: 'Search transcript' });
+    expect((document.querySelector('[data-chat-search]') as HTMLElement).getAttribute('data-search-tab')).toBe(
+      'transcript',
+    );
+    fireEvent.change(input, { target: { value: 'line' } });
+    // 'second line', 'third line', 'fourth line' → 3 matches.
+    await waitFor(() => expect(screen.getByText('1/3')).toBeTruthy());
+    expect(screen.queryByText('hello world')).toBeNull();
+
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(screen.getByText('2/3')).toBeTruthy());
+    fireEvent.keyDown(input, { key: 'Enter', shiftKey: true });
+    await waitFor(() => expect(screen.getByText('1/3')).toBeTruthy());
+
+    fireEvent.keyDown(input, { key: 'Escape' });
+    await waitFor(() => expect(screen.getByText('hello world')).toBeTruthy());
+  });
+
+  it('searches the SUBTITLES tab and lists the matching captions', async () => {
+    mockPanelFetch(PAYLOAD);
+    rtlRender(<PreviewChatPanel platform="youtube" videoId="v1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByText('hello world')).toBeTruthy());
+    fireEvent.click(screen.getByRole('tab', { name: 'Subtitles' }));
+    const input = await screen.findByRole('textbox', { name: 'Search subtitles' });
+    fireEvent.change(input, { target: { value: 'line' } });
+    // Cursor starts on the match nearest the playhead (1/3), Enter steps on.
+    await waitFor(() => expect(screen.getByText('1/3')).toBeTruthy());
+    const matches = document.querySelectorAll('[data-subtitle-matches] [data-panel-row]');
+    expect(matches.length).toBe(3);
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(screen.getByText('2/3')).toBeTruthy());
+    fireEvent.keyDown(input, { key: 'Enter' });
+    await waitFor(() => expect(screen.getByText('3/3')).toBeTruthy());
+  });
+
+  it('tells the user the transcript filter only covers the loaded slice', async () => {
+    const big = Array.from({ length: 20_000 }, (_, i) => ({
+      offset_sec: i,
+      text: `cue ${i}`,
+    }));
+    mockPanelFetch({ ...PAYLOAD, transcript: big, events: [] });
+    rtlRender(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByText('cue 0')).toBeTruthy());
+    fireEvent.change(screen.getByRole('textbox', { name: 'Search transcript' }), {
+      target: { value: 'zzz' },
+    });
+    await waitFor(() =>
+      expect(document.querySelector('[data-chat-search-partial]')).toBeTruthy(),
+    );
+    // And the empty state says WHY it is empty instead of implying the word
+    // was never said.
+    await waitFor(() =>
+      expect(screen.getByText(/No match in the 20000 loaded segments/)).toBeTruthy(),
+    );
+  });
+
+  it('tabs are a real tablist: roving tabindex + arrow-key navigation', async () => {
+    mockPanelFetch(PAYLOAD);
+    rtlRender(<PreviewChatPanel platform="youtube" videoId="v1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByText('hello world')).toBeTruthy());
+    const list = screen.getByRole('tablist', { name: 'Preview panel sources' });
+    expect(list).toBeTruthy();
+    const transcript = screen.getByRole('tab', { name: 'Transcript' });
+    expect(transcript.getAttribute('aria-selected')).toBe('true');
+    expect(transcript.getAttribute('tabindex')).toBe('0');
+    expect(screen.getByRole('tab', { name: 'Chat' }).getAttribute('tabindex')).toBe('-1');
+
+    fireEvent.keyDown(list, { key: 'ArrowRight' });
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: 'Subtitles' }).getAttribute('aria-selected')).toBe(
+        'true',
+      ),
+    );
+    expect(document.activeElement).toBe(screen.getByRole('tab', { name: 'Subtitles' }));
+    fireEvent.keyDown(list, { key: 'Home' });
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: 'Chat' }).getAttribute('aria-selected')).toBe('true'),
+    );
+  });
+
+  it('debounces the filter: typing does not filter per keystroke', async () => {
+    mockPanelFetch(PAYLOAD);
+    rtlRender(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByText('hello world')).toBeTruthy());
+    const input = screen.getByRole('textbox', { name: 'Search transcript' });
+    fireEvent.change(input, { target: { value: 'second' } });
+    // The input echoes immediately, the list does not: nothing is filtered
+    // until the debounce elapses.
+    expect((input as HTMLInputElement).value).toBe('second');
+    expect(screen.queryByText('1/1')).toBeNull();
+    await waitFor(() => expect(screen.getByText('1/1')).toBeTruthy());
   });
 });

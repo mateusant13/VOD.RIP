@@ -158,9 +158,9 @@ describe('main preview chat overlay host', () => {
 
     // Internal state (tab selection) is preserved across the hidden flip:
     // switch off the default transcript tab, then un-hide and check it stuck.
-    fireEvent.click(screen.getByRole('button', { name: 'Chat' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Chat' }));
     rerender(<ChatOverlayHost open hidden={false} />);
-    expect(screen.getByRole('button', { name: 'Chat' }).getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByRole('tab', { name: 'Chat' }).getAttribute('aria-selected')).toBe('true');
     await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
   });
 

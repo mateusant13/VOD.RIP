@@ -131,7 +131,7 @@ export function ChatMarkerChips({
         onClick={() => {
           if (markers.start != null) onClear('start');
         }}
-        className={`flex items-center gap-1 border px-1 py-0.5 text-[8px] font-mono font-bold uppercase tracking-wider ${
+        className={`flex items-center gap-1 border px-1 py-0.5 text-ui-xs font-mono font-bold uppercase tracking-wider ${
           markers.start != null
             ? 'border-mark-start bg-mark-start/10 text-mark-start'
             : 'border-zinc-700 text-zinc-600 hover:text-zinc-400'
@@ -151,7 +151,7 @@ export function ChatMarkerChips({
         onClick={() => {
           if (markers.end != null) onClear('end');
         }}
-        className={`flex items-center gap-1 border px-1 py-0.5 text-[8px] font-mono font-bold uppercase tracking-wider ${
+        className={`flex items-center gap-1 border px-1 py-0.5 text-ui-xs font-mono font-bold uppercase tracking-wider ${
           markers.end != null
             ? 'border-mark-end bg-mark-end/10 text-mark-end'
             : 'border-zinc-700 text-zinc-600 hover:text-zinc-400'
@@ -164,7 +164,7 @@ export function ChatMarkerChips({
         {markers.end != null && <X size={8} className="shrink-0" />}
       </button>
       <InfoHint text={t('What are chat markers?')} />
-      {hint && <span className="text-[8px] font-mono text-zinc-600 truncate">{hint}</span>}
+      {hint && <span className="text-ui-xs font-mono text-zinc-500 truncate">{hint}</span>}
     </div>
   );
 }

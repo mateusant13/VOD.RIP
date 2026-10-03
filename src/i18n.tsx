@@ -665,6 +665,32 @@ const ptBR: Record<string, string> = {
   'Asking…': 'Perguntando…',
   'Days (blank = entire history)': 'Dias (vazio = histórico inteiro)',
   'Sources': 'Fontes',
+  // ── Painel de pré-visualização (transcrição / legendas / busca) ──────────
+  // (the panel/error strings above already exist further up in this dict)
+  'Chat history is incomplete — {loaded} of {total} messages shown.':
+    'O histórico de chat está incompleto — {loaded} de {total} mensagens exibidas.',
+  'Chat history continues — scroll to load more ({loaded} messages loaded).':
+    'O histórico de chat continua — role para carregar mais ({loaded} mensagens carregadas).',
+  'Search transcript': 'Buscar na transcrição',
+  'Search transcript…': 'Buscar na transcrição…',
+  'Search subtitles': 'Buscar nas legendas',
+  'Search subtitles…': 'Buscar nas legendas…',
+  'Clear search': 'Limpar busca',
+  'Preview panel sources': 'Fontes do painel de pré-visualização',
+  'Expand cue': 'Expandir trecho',
+  'Collapse cue': 'Recolher trecho',
+  'searching {loaded} of {total}': 'buscando {loaded} de {total}',
+  'No match in the {loaded} loaded messages of {total} — older messages are not loaded.':
+    'Nenhuma correspondência nas {loaded} mensagens carregadas de {total} — as mensagens antigas não foram carregadas.',
+  'No transcript segments match “{query}”.': 'Nenhum trecho da transcrição corresponde a “{query}”.',
+  'No captions match “{query}”.': 'Nenhuma legenda corresponde a “{query}”.',
+  'No match in the {loaded} loaded segments — the rest of the transcript is not loaded.':
+    'Nenhuma correspondência nos {loaded} trechos carregados — o restante da transcrição não foi carregado.',
+  'showing first {shown} of {total} matches':
+    'mostrando as primeiras {shown} de {total} correspondências',
+  'The archive returned only part of this timeline — matches outside the loaded rows are not searchable here.':
+    'O arquivo retornou apenas parte desta linha do tempo — correspondências fora das linhas carregadas não podem ser buscadas aqui.',
+  '—': '—',
 }
 
 // botGate.* and progress.* keys are namespaced (not English sentences), so
@@ -1239,6 +1265,7 @@ const es: Record<string, string> = {
   'cookieAuto.retry': 'Reintentar',
   'cookieAuto.close': 'Cerrar',
   'cookieAuto.toggle': 'Instalación automática de la extensión',
+  'cookieAuto.toggleInfo': 'Ofrece la instalación con un clic cuando las cookies aún no están vinculadas. Desactívalo para instalar solo manualmente.',
   'cookieBridge.silentHint': 'Instalación automática en segundo plano — sin abrir chrome://extensions ni ventanas de carpetas delante de ti. Fallback manual: abre extensiones, modo desarrollador ON, arrastra VOD.RIP-cookies.',
   'cookieBridge.manualOpen': 'Instalar manualmente (abrir extensiones)',
   // ── Tutorial reset (tutorial.*) ───────────────────────────
@@ -1309,6 +1336,32 @@ const es: Record<string, string> = {
   'Asking…': 'Preguntando…',
   'Days (blank = entire history)': 'Días (vacío = historial completo)',
   'Sources': 'Fuentes',
+  // ── Panel de vista previa (transcripción / subtítulos / búsqueda) ─────────
+  // (the panel/error strings above already exist further up in this dict)
+  'Chat history is incomplete — {loaded} of {total} messages shown.':
+    'El historial de chat está incompleto: se muestran {loaded} de {total} mensajes.',
+  'Chat history continues — scroll to load more ({loaded} messages loaded).':
+    'El historial de chat continúa: desplázate para cargar más ({loaded} mensajes cargados).',
+  'Search transcript': 'Buscar en la transcripción',
+  'Search transcript…': 'Buscar en la transcripción…',
+  'Search subtitles': 'Buscar en los subtítulos',
+  'Search subtitles…': 'Buscar en los subtítulos…',
+  'Clear search': 'Limpiar búsqueda',
+  'Preview panel sources': 'Fuentes del panel de vista previa',
+  'Expand cue': 'Expandir fragmento',
+  'Collapse cue': 'Contraer fragmento',
+  'searching {loaded} of {total}': 'buscando {loaded} de {total}',
+  'No match in the {loaded} loaded messages of {total} — older messages are not loaded.':
+    'Sin coincidencias en los {loaded} mensajes cargados de {total}: los mensajes antiguos no están cargados.',
+  'No transcript segments match “{query}”.': 'Ningún fragmento de la transcripción coincide con “{query}”.',
+  'No captions match “{query}”.': 'Ningún subtítulo coincide con “{query}”.',
+  'No match in the {loaded} loaded segments — the rest of the transcript is not loaded.':
+    'Sin coincidencias en los {loaded} fragmentos cargados: el resto de la transcripción no está cargado.',
+  'showing first {shown} of {total} matches':
+    'mostrando las primeras {shown} de {total} coincidencias',
+  'The archive returned only part of this timeline — matches outside the loaded rows are not searchable here.':
+    'El archivo devolvió solo parte de esta línea de tiempo: las coincidencias fuera de las filas cargadas no se pueden buscar aquí.',
+  '—': '—',
 }
 // botGate.* and progress.* keys are namespaced (not English sentences), so
 // they need explicit English entries — every other key falls back to the key itself.

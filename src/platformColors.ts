@@ -4,6 +4,9 @@ import type { CSSProperties } from 'react';
 export const KICK_COLOR = '#53fc18';
 export const TWITCH_COLOR = '#9146FF';
 export const YOUTUBE_COLOR = '#F03030';
+/** Unknown/unmapped platform — the zinc-400 neutral, as a CSS variable so the
+ *  value comes from the Tailwind theme instead of a hex duplicated here. */
+export const NEUTRAL_COLOR = 'var(--color-zinc-400)';
 
 export type PlatformStyleKey = 'kick' | 'twitch' | 'youtube' | null;
 

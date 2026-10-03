@@ -93,6 +93,26 @@ describe('splitChatEmotes', () => {
     const segs = splitChatEmotes('fooKEKW', emoteMap([['KEKW', 'https://cdn.example/KEKW.png']]));
     expect(segs).toEqual([{ text: 'fooKEKW' }]);
   });
+
+  it('memoises the split per (text, emote set) instead of re-tokenising per render', () => {
+    const m = emoteMap([['KEKW', 'https://cdn.example/KEKW.png']]);
+    const first = splitChatEmotes('pog KEKW gg', m);
+    // The panel re-renders its visible window on every playhead tick; the same
+    // message must not be re-split each time.
+    expect(splitChatEmotes('pog KEKW gg', m)).toBe(first);
+    expect(splitChatEmotes('other', m)).not.toBe(first);
+    // A different emote set is a different cache entry (WeakMap by map identity).
+    const other = emoteMap([['KEKW', 'https://cdn.example/OTHER.png']]);
+    const otherSegs = splitChatEmotes('pog KEKW gg', other);
+    expect(otherSegs).not.toBe(first);
+    expect(otherSegs).toEqual([
+      { text: 'pog' },
+      { text: ' ' },
+      { emote: 'KEKW', url: 'https://cdn.example/OTHER.png' },
+      { text: ' ' },
+      { text: 'gg' },
+    ]);
+  });
 });
 
 describe('ChatEmoteText', () => {

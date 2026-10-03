@@ -219,7 +219,12 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
   const [langFilter, setLangFilter] = useState<'' | ArchiveLang>('');
   /** Chat author filter ('' = all authors); '@' tolerated, case-insensitive. */
   const [userFilter, setUserFilter] = useState('');
-  const [searchMode, setSearchMode] = useState<'exact' | 'broad' | 'semantic'>('exact');
+  /** Search mode. Default 'broad' — the backend's own default (archive.py
+   *  `mode: str = Query("broad")`) is broad/fuzzy, and the old 'exact' default
+   *  here only looked harmless because the request always sends the value
+   *  explicitly. Aligning the two means a pasted/hand-built request and the UI
+   *  agree on what "search" means. */
+  const [searchMode, setSearchMode] = useState<'exact' | 'broad' | 'semantic'>('broad');
   const [status, setStatus] = useState<SearchStatus>('idle');
   const [error, setError] = useState<string | null>(null);
   const [hits, setHits] = useState<ArchiveSearchHit[]>([]);
@@ -1540,10 +1545,10 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                     <span className="text-[8px] font-mono uppercase tracking-widest border border-zinc-700 px-1 py-px text-zinc-300 shrink-0">
                       youtube
                     </span>
-                    <span className="text-[9px] font-mono uppercase tracking-widest text-[#F03030] shrink-0">
+                    <span className="text-ui-xs font-mono uppercase tracking-wide text-danger shrink-0">
                       YouTube
                     </span>
-                    <span className="text-[9px] font-bold uppercase truncate text-zinc-200 min-w-0 flex-1">
+                    <span className="text-ui-xs font-bold uppercase truncate text-zinc-200 min-w-0 flex-1">
                       {displayTitle({ title: hit.title, originalTitle: hit.originalTitle })}
                     </span>
                     {hit.duration_string && (
@@ -1633,7 +1638,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                 className={
                   'shrink-0 text-[9px] font-mono uppercase tracking-widest border-2 px-2 py-1 transition-colors ' +
                   (deepConfirmed && !deepStarting
-                    ? 'border-zinc-700 bg-zinc-900/60 hover:border-[#F03030] text-zinc-200'
+                    ? 'border-zinc-700 bg-zinc-900/60 hover:border-danger text-zinc-200'
                     : 'border-zinc-800 bg-zinc-900/30 text-zinc-600 cursor-not-allowed')
                 }
               >
@@ -1691,7 +1696,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                       {r.title}
                     </span>
                     {r.ts != null && (
-                      <span className="text-[9px] font-mono text-[#F03030] shrink-0">
+                      <span className="text-ui-xs font-mono text-danger shrink-0">
                         {formatArchiveOffset(r.ts)}
                       </span>
                     )}

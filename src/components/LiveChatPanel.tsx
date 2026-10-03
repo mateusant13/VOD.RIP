@@ -23,7 +23,7 @@ import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { X } from 'lucide-react';
 import { useI18n } from '../i18n';
 import { resolveChatColor } from '../chatColors';
-import { KICK_COLOR, TWITCH_COLOR, YOUTUBE_COLOR } from '../platformColors';
+import { KICK_COLOR, NEUTRAL_COLOR, TWITCH_COLOR, YOUTUBE_COLOR } from '../platformColors';
 import { ChatEmoteText, useChatEmotes, type EmoteMap } from '../chatEmotes';
 import { TWITCH_GLYPH_PATH } from './TwitchLogoIcon';
 
@@ -55,7 +55,7 @@ function platformColor(platform: string): string {
   if (platform === 'kick') return KICK_COLOR;
   if (platform === 'twitch') return TWITCH_COLOR;
   if (platform === 'youtube') return YOUTUBE_COLOR;
-  return '#a1a1aa';
+  return NEUTRAL_COLOR;
 }
 
 function platformLabel(platform: string): string {

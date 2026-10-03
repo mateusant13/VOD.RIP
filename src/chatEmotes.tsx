@@ -16,7 +16,7 @@
  * Twitch global). slug is REQUIRED (missing → HTTP 400; there is no
  * global-only mode), so the hook skips the call entirely without a login.
  */
-import { useEffect, useState } from 'react';
+import { memo, useEffect, useState } from 'react';
 
 /** Emote name (verbatim token) → emote image URL. */
 export type EmoteMap = Map<string, string>;
@@ -30,13 +30,23 @@ const EMPTY_EMOTES: EmoteMap = new Map();
 const emoteCache = new Map<string, EmoteMap>();
 const emoteInflight = new Map<string, Promise<EmoteMap>>();
 
-/**
- * Tokenize a chat message for emote rendering: split on whitespace (keeping
- * separators), exact case-sensitive whole-word match against `emotes`.
- * Non-matching tokens (and all whitespace) stay verbatim; concatenating the
- * segments reproduces the original text exactly.
- */
-export function splitChatEmotes(text: string, emotes: EmoteMap): EmoteSegment[] {
+/** Tokenisation is pure per (message text, emote set), but the panel
+ *  re-renders its visible window on every playhead tick — without this the
+ *  same ~300 visible messages were re-split ~4×/s. Keyed by the emote-map
+ *  identity (a WeakMap, so a swapped/freed channel map drops its own
+ *  entries) then by message text; each map is pruned once it passes
+ *  SEGMENT_CACHE_MAX so a long session cannot grow it without bound. */
+const SEGMENT_CACHE_MAX = 512;
+const segmentCache = new WeakMap<EmoteMap, Map<string, EmoteSegment[]>>();
+
+function segmentsFor(text: string, emotes: EmoteMap): EmoteSegment[] {
+  let byText = segmentCache.get(emotes);
+  if (!byText) {
+    byText = new Map();
+    segmentCache.set(emotes, byText);
+  }
+  const hit = byText.get(text);
+  if (hit) return hit;
   const out: EmoteSegment[] = [];
   for (const part of text.split(/(\s+)/)) {
     if (part === '') continue; // split's leading/trailing empties — nothing to render
@@ -44,7 +54,22 @@ export function splitChatEmotes(text: string, emotes: EmoteMap): EmoteSegment[] 
     if (url) out.push({ emote: part, url });
     else out.push({ text: part });
   }
+  if (byText.size >= SEGMENT_CACHE_MAX) byText.clear();
+  byText.set(text, out);
   return out;
+}
+
+/**
+ * Tokenize a chat message for emote rendering: split on whitespace (keeping
+ * separators), exact case-sensitive whole-word match against `emotes`.
+ * Non-matching tokens (and all whitespace) stay verbatim; concatenating the
+ * segments reproduces the original text exactly.
+ *
+ * Memoised per (text, emote set) — the returned array is the cached instance
+ * and MUST be treated as read-only by callers.
+ */
+export function splitChatEmotes(text: string, emotes: EmoteMap): EmoteSegment[] {
+  return segmentsFor(text, emotes);
 }
 
 interface EmotesResponse {
@@ -121,8 +146,16 @@ export function useChatEmotes(
 }
 
 /** Renders a chat message with emotes: matched tokens become inline <img>s,
- *  everything else stays verbatim text. The message text is never mutated. */
-export function ChatEmoteText({ text, emotes }: { text: string; emotes: EmoteMap }) {
+ *  everything else stays verbatim text. The message text is never mutated.
+ *  Memoised: inside the panel's memoised row set this is the one component
+ *  that re-ran its split on every playhead tick. */
+export const ChatEmoteText = memo(function ChatEmoteText({
+  text,
+  emotes,
+}: {
+  text: string;
+  emotes: EmoteMap;
+}) {
   if (emotes.size === 0) {
     // ponytail: single span when there are no emotes — keeps rows cheap and
     // the DOM text contiguous (tests/copy see the whole message).
@@ -130,7 +163,7 @@ export function ChatEmoteText({ text, emotes }: { text: string; emotes: EmoteMap
   }
   return (
     <>
-      {splitChatEmotes(text, emotes).map((seg, i) =>
+      {segmentsFor(text, emotes).map((seg, i) =>
         'emote' in seg ? (
           <img
             key={i}
@@ -146,4 +179,4 @@ export function ChatEmoteText({ text, emotes }: { text: string; emotes: EmoteMap
       )}
     </>
   );
-}
+});
