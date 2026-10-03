@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from services.download_sidecars import (
     format_chat_txt,
     format_transcript_txt,
     resolve_remote_thumbnail,
+    transcript_sidecar,
     write_chat_sidecar,
     write_download_sidecars,
     write_thumbnail_sidecar,
@@ -16,11 +18,79 @@ from services.download_sidecars import (
 
 
 def test_format_transcript_srt_like():
+    """SRT shape AND its timestamps: cue index from 1, the comma-decimal
+    arrow, blank-line separation, and — the contract that used to be
+    untested — the REBASE that puts a trimmed download's first cue at 0:00."""
     body = format_transcript_txt([
         {"start_sec": 1.0, "end_sec": 3.5, "text": "hello"},
     ])
     assert "00:00:01,000 --> 00:00:03,500" in body
     assert "hello" in body
+    # Cue index restarts at 1 and a single cue carries no trailing gap.
+    assert body == "1\n00:00:01,000 --> 00:00:03,500\nhello\n"
+
+
+def test_format_transcript_rebase_shifts_cues():
+    """rebase_sec subtracts from BOTH ends, so a clip cut at 410s opens on
+    00:00:00,000 instead of 00:06:50,000 — the defect the membership-only
+    assertions could not see."""
+    body = format_transcript_txt([
+        {"start_sec": 410.0, "end_sec": 414.0, "text": "first"},
+        {"start_sec": 420.0, "end_sec": 423.0, "text": "second"},
+    ], rebase_sec=410.0)
+    assert "1\n00:00:00,000 --> 00:00:04,000\nfirst" in body
+    assert "2\n00:00:10,000 --> 00:00:13,000\nsecond" in body
+    assert "00:06:50" not in body
+    # Blocks are separated by a blank line (SRT cue delimiter).
+    assert "\n\n2\n" in body
+
+
+def test_format_transcript_rebase_clamps_at_zero():
+    """A cue straddling the trim point must clamp to 0:00 — an SRT reader
+    rejects a negative timestamp, and the audio IS present from 0:00."""
+    body = format_transcript_txt([
+        {"start_sec": 408.0, "end_sec": 412.0, "text": "straddles"},
+    ], rebase_sec=410.0)
+    assert "00:00:00,000 --> 00:00:02,000" in body
+    # The start of a cue can never be negative (the arrow's own '-' aside).
+    assert body.split("\n")[1].startswith("00:00:00,000 --> ")
+
+
+def test_format_transcript_endless_caption_rows_get_bounds():
+    """A YouTube timedtext cue carries a start and NO end — the writer borrows
+    the next cue's start (clamped) instead of inventing a 2s tail, and the
+    trailing cue gets the readable 2s default."""
+    body = format_transcript_txt([
+        {"offset_sec": 10.0, "text": "a"},
+        {"offset_sec": 12.0, "text": "b"},
+        {"offset_sec": 40.0, "text": "far away"},
+    ])
+    assert "00:00:10,000 --> 00:00:12,000" in body
+    # A 28s gap is clamped to _CUE_MAX_S, not shipped as one huge cue.
+    assert "00:00:12,000 --> 00:00:18,000" in body
+    # Last cue has no successor: 2s, so the viewer can actually read it.
+    assert "00:00:40,000 --> 00:00:42,000" in body
+
+
+def test_format_transcript_keeps_a_long_asr_cue_verbatim():
+    """A row that already has a real end is NOT clamped — a 30s ASR segment
+    is the transcriber's verdict, not a caption gap to be tidied up."""
+    body = format_transcript_txt([
+        {"start_sec": 5.0, "end_sec": 35.0, "text": "long thought"},
+    ])
+    assert "00:00:05,000 --> 00:00:35,000" in body
+
+
+def test_format_transcript_skips_empty_text_without_gaps_in_index():
+    """A blank row must not burn a cue number (players number cues
+    sequentially)."""
+    body = format_transcript_txt([
+        {"start_sec": 1.0, "end_sec": 2.0, "text": "one"},
+        {"start_sec": 2.0, "end_sec": 3.0, "text": "   "},
+        {"start_sec": 3.0, "end_sec": 4.0, "text": "two"},
+    ])
+    assert "\n2\n" in body
+    assert "\n3\n" not in body
 
 
 def test_format_chat_lines():
@@ -216,5 +286,128 @@ def test_download_sidecars_transcript_and_chat_share_trim(_scratch_db, tmp_path:
     tbody = Path(res["transcript"]).read_text("utf-8")
     assert "in trim" in tbody and "still in trim" in tbody
     assert "before trim" not in tbody and "after trim" not in tbody
+    # The full pipeline must also REPORT that it wrote one.
+    assert res["transcript_status"] == "written"
     cbody = Path(res["chat"]).read_text("utf-8")
     assert cbody.strip() == "bob: in trim\nalice: still in"
+
+
+# ── clip-slug fallback + non-silent failure (the "same for clips" contract) ──
+
+_CLIP_SLUG = "FunnySlug1"
+_CLIP_URL = f"https://clips.twitch.tv/{_CLIP_SLUG}"
+
+
+@pytest.fixture()
+def _isolated_data_dir(tmp_path, monkeypatch):
+    """Point the clip-history lookup at a scratch data dir."""
+    monkeypatch.setenv("VODRIP_DATA_DIR", str(tmp_path))
+    return tmp_path
+
+
+def test_clip_slug_resolves_source_vod_transcript(_scratch_db, _isolated_data_dir, tmp_path: Path):
+    """A clip download carries the CLIP SLUG as its video id, which has no
+    videos row — so transcript_source() returned None and clip transcripts
+    almost never fired. The writer resolves the slug to its source VOD
+    through the recorded clip history, exactly like the chat writer."""
+    _seed_transcript()
+    (_isolated_data_dir / "twitch_clips.json").write_text(
+        json.dumps([{"id": _CLIP_SLUG, "url": _CLIP_URL, "vod_id": _VOD}]),
+        encoding="utf-8",
+    )
+    out = tmp_path / "clip.mp4"
+    out.write_bytes(b"video")
+    res = write_download_sidecars(
+        str(out), _CLIP_URL,
+        include_transcript=True, include_chat=False,
+        crop_start=None, crop_end=None,
+        chat_start_sec=None, chat_end_sec=None,
+    )
+    assert res["transcript"] == str(tmp_path / "clip.srt")
+    assert res["transcript_status"] == "written"
+    assert res["transcript_source"] == "archive-clip-vod"
+    body = (tmp_path / "clip.srt").read_text("utf-8")
+    assert "in trim" in body and "before trim" in body
+
+
+def test_clip_slug_without_history_is_reported_not_silent(_scratch_db, _isolated_data_dir, tmp_path: Path):
+    """No transcript and no clip history: the writer must REPORT it, not
+    return None into a logger.debug and leave the user with a video and no
+    explanation (defect 1)."""
+    out = tmp_path / "clip.mp4"
+    out.write_bytes(b"video")
+    res = transcript_sidecar(str(out), "twitch", _CLIP_SLUG)
+    assert res["status"] == "unavailable"
+    assert res["path"] is None
+    assert "no transcript" in res["detail"]
+    # Twitch/Kick have no caption track — the detail says what would fix it.
+    assert "ASR" in res["detail"]
+    assert not (tmp_path / "clip.srt").exists()
+
+
+def test_transcript_rows_present_but_trimmed_away_is_reported(_scratch_db, tmp_path: Path):
+    """A transcript that exists but has no cue inside the trim window is a
+    distinct, reported case (not 'no transcript')."""
+    _seed_transcript()
+    out = tmp_path / "vod.mp4"
+    out.write_bytes(b"video")
+    res = transcript_sidecar(str(out), "twitch", _VOD, crop_start=0.0, crop_end=5.0)
+    assert res["status"] == "unavailable"
+    assert "trimmed window" in res["detail"]
+
+
+# ── output format, atomic write, and never touching a user's .txt ──
+
+def test_formats_txt_opt_in_writes_both(_scratch_db, tmp_path: Path):
+    """'srt+txt' keeps plain text available as a second file; the .srt stays
+    the primary path (that is the editor-importable one)."""
+    _seed_transcript()
+    out = tmp_path / "vod.mp4"
+    out.write_bytes(b"video")
+    res = transcript_sidecar(str(out), "twitch", _VOD, formats=("srt", "txt"))
+    assert res["paths"] == {
+        "srt": str(tmp_path / "vod.srt"),
+        "txt": str(tmp_path / "vod.txt"),
+    }
+    assert res["path"] == str(tmp_path / "vod.srt")
+    assert (tmp_path / "vod.srt").read_text("utf-8") == (tmp_path / "vod.txt").read_text("utf-8")
+
+
+def test_default_never_touches_a_preexisting_txt(_scratch_db, tmp_path: Path):
+    """The default writes the .srt and leaves a .txt the user already has on
+    disk byte-for-byte alone — no silent rename, move, overwrite or delete."""
+    _seed_transcript()
+    out = tmp_path / "vod.mp4"
+    out.write_bytes(b"video")
+    mine = tmp_path / "vod.txt"
+    mine.write_text("my own notes, do not touch", encoding="utf-8")
+    res = transcript_sidecar(str(out), "twitch", _VOD)
+    assert res["path"] == str(tmp_path / "vod.srt")
+    assert mine.read_text("utf-8") == "my own notes, do not touch"
+
+
+def test_atomic_write_creates_parent_dirs(_scratch_db, tmp_path: Path):
+    """Parent directories are created (the old writer only did this for the
+    chat sidecar) and no temp file is left behind."""
+    _seed_transcript()
+    out = tmp_path / "nested" / "deeper" / "vod.mp4"
+    out.parent.mkdir(parents=True)
+    out.write_bytes(b"video")
+    res = transcript_sidecar(str(out), "twitch", _VOD)
+    assert res["path"] == str(tmp_path / "nested" / "deeper" / "vod.srt")
+    assert (tmp_path / "nested" / "deeper" / "vod.srt").is_file()
+    assert list(out.parent.glob("*.tmp")) == []
+
+
+def test_atomic_write_replaces_existing_srt_without_truncating_first(_scratch_db, tmp_path: Path):
+    """Re-running a download replaces the .srt atomically: the old content is
+    never a half-written file on disk."""
+    _seed_transcript()
+    out = tmp_path / "vod.mp4"
+    out.write_bytes(b"video")
+    target = tmp_path / "vod.srt"
+    target.write_text("stale", encoding="utf-8")
+    assert transcript_sidecar(str(out), "twitch", _VOD)["status"] == "written"
+    assert "in trim" in target.read_text("utf-8")
+    assert "stale" not in target.read_text("utf-8")
+

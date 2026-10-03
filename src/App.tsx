@@ -415,6 +415,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   start_with_windows: true,
   download_layout: 'typed',
   download_transcript_sidecar: true,
+  download_transcript_sidecar_format: 'srt',
   experimental_ai_enabled: false,
   ai_api_key_set: false,
 };
@@ -8067,7 +8068,7 @@ export default function App() {
           <div className="flex flex-col gap-2 border-2 border-zinc-800 p-2">
             <label className="flex items-center gap-2 text-[10px] font-mono text-zinc-300 cursor-pointer">
               <input type="checkbox" checked={dlIncludeTranscript} onChange={(e) => setDlIncludeTranscript(e.target.checked)} />
-              {t('Download transcript (.txt)')}
+              {t('Download subtitles (.srt)')}
             </label>
             <label className="flex items-center gap-2 text-[10px] font-mono text-zinc-300 cursor-pointer">
               <input type="checkbox" checked={dlIncludeChat} onChange={(e) => setDlIncludeChat(e.target.checked)} />

@@ -40,10 +40,13 @@ _SIDECAR_EXT = {"srt": ".srt", "txt": ".txt"}
 _TRANSCRIPT_ROW_LIMIT = 50_000
 
 # YouTube caption cue bounds: the timedtext payloads carry a start per cue and
-# no end, so the end is the next cue's start — clamped to keep a long gap (or a
-# single-cue track) from producing a cue that swallows half the video.
+# no end, so the end is the next cue's start — clamped so a long gap cannot
+# produce a cue that swallows half the video. The trailing cue has no
+# successor, so it gets _CUE_TRAIL_S (the pre-existing default) rather than
+# flashing past before the viewer can read it.
 _CUE_MIN_S = 0.1
 _CUE_MAX_S = 6.0
+_CUE_TRAIL_S = 2.0
 
 
 def resolve_transcript_formats(value: Optional[str]) -> tuple[str, ...]:
@@ -95,17 +98,26 @@ def _cue_bounds(row: dict) -> tuple[float, float]:
 
 
 def fill_cue_ends(rows: list[dict]) -> list[dict]:
-    """Give every row a real ``end_sec``: an endless row (YouTube timedtext
-    cues carry a start only) borrows the NEXT cue's start, clamped to
-    [_CUE_MIN_S, _CUE_MAX_S] so a long silence or a single-cue track cannot
-    produce a cue that swallows half the video."""
+    """Give every row a real ``end_sec``. A row that already carries one keeps
+    it verbatim (a long ASR segment is not our business to shorten); an
+    ENDLESS row — a YouTube timedtext cue has a start and no end — borrows
+    the NEXT cue's start, clamped to [_CUE_MIN_S, _CUE_MAX_S] so a long
+    silence or a single-cue track cannot produce a cue that swallows half
+    the video."""
     out: list[dict] = []
     for i, row in enumerate(rows):
         start, end = _cue_bounds(row)
+        if end > start:
+            new = dict(row)
+            new["start_sec"] = start
+            new["end_sec"] = end
+            out.append(new)
+            continue
         nxt = rows[i + 1] if i + 1 < len(rows) else None
-        if end <= start:
-            end = _cue_bounds(nxt)[0] if nxt is not None else start
-        end = min(max(end, start + _CUE_MIN_S), start + _CUE_MAX_S)
+        if nxt is not None:
+            end = min(max(_cue_bounds(nxt)[0], start + _CUE_MIN_S), start + _CUE_MAX_S)
+        else:
+            end = start + _CUE_TRAIL_S
         new = dict(row)
         new["start_sec"] = start
         new["end_sec"] = end
@@ -125,7 +137,7 @@ def format_transcript_txt(rows: list[dict], rebase_sec: float = 0.0) -> str:
     base = max(0.0, float(rebase_sec or 0.0))
     blocks: list[str] = []
     index = 0
-    for row in rows:
+    for row in fill_cue_ends(rows):
         text = (row.get("text") or "").strip()
         if not text:
             continue
