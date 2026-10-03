@@ -1059,6 +1059,42 @@ async def archive_aliases(platform: str, video_id: str, canonical_key: str, note
     return {"ok": True}
 
 
+# --- rate-limit history (read-only) ----------------------------------------
+# The gates (yt_gate / kick_gate) freeze per-process and forget on restart.
+# These two endpoints expose the DURABLE record so a later policy lane — or
+# a human — can see when each platform limits us and whether the work that
+# tripped it was background ('auto') or user-initiated ('user'). Read-only
+# by design: this lane adds no way to arm or clear a gate from the API.
+
+
+@router.get("/api/archive/rate-limits/recent")
+async def archive_rate_limits_recent(
+    platform: Optional[str] = None,
+    since_hours: int = Query(24, ge=1, le=24 * 30),
+    limit: int = Query(200, ge=1, le=2000),
+):
+    """Recent rate-limit / bot-gate events, newest first."""
+    if platform is not None:
+        _require_platform(platform)
+    events = archive_db.recent_rate_limits(
+        platform=platform, since_hours=since_hours, limit=limit,
+    )
+    return {"events": events, "count": len(events), "since_hours": since_hours}
+
+
+@router.get("/api/archive/rate-limits/summary")
+async def archive_rate_limits_summary(
+    since_hours: int = Query(24, ge=1, le=24 * 30),
+    platform: Optional[str] = None,
+):
+    """How often we get limited, per platform, split auto vs user work."""
+    if platform is not None:
+        _require_platform(platform)
+    return archive_db.rate_limit_summary(
+        since_hours=since_hours, platform=platform,
+    )
+
+
 @router.post("/api/archive/jobs/clear")
 async def archive_jobs_clear():
     n = archive_db.clear_finished_jobs()
@@ -1932,7 +1968,9 @@ def _paced_caption_fetch(video_id: str, handle: str) -> bool:
         payload = _deep_fetch_transcript(video_id)
     except Exception as exc:
         if yt_gate.classify_youtube_gate_error(exc):
-            yt_gate.note_youtube_gate(str(exc)[:200])
+            yt_gate.note_youtube_gate(
+                str(exc)[:200], surface="captions", origin="auto",
+            )
             return False
         try:
             archive_db.mark_captions_unavailable("youtube", video_id)
@@ -2218,7 +2256,9 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
                 payload = _deep_fetch_transcript(vid)
             except Exception as exc:
                 if yt_gate.classify_youtube_gate_error(exc):
-                    yt_gate.note_youtube_gate(str(exc)[:200])
+                    yt_gate.note_youtube_gate(
+                        str(exc)[:200], surface="captions", origin="auto",
+                    )
                     # The IP is gated — not this video. Do NOT stamp the
                     # marker; park until the freeze lifts, then retry once.
                     # A paused sweep must not burn a pace slot here either.
@@ -2232,7 +2272,9 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
                                 # verdict about the video. Do not poison it
                                 # with a 24h marker; leave it for a later
                                 # sweep (the freeze is recorded instead).
-                                yt_gate.note_youtube_gate(str(exc2)[:200])
+                                yt_gate.note_youtube_gate(
+                                    str(exc2)[:200], surface="captions", origin="auto",
+                                )
                                 _bump(1, 0)
                                 _flush()
                                 return

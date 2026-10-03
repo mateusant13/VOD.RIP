@@ -73,7 +73,9 @@ def _note_gate_if_youtube(exc: BaseException) -> None:
     from services.yt_gate import classify_youtube_gate_error, note_youtube_gate
 
     if classify_youtube_gate_error(exc):
-        note_youtube_gate(str(exc)[:200])
+        # surface/origin: this is the on-demand preview the user is
+        # watching — a user-initiated metadata request, not worker traffic.
+        note_youtube_gate(str(exc)[:200], surface="metadata", origin="user")
 
 
 # ---------------------------------------------------------------------------

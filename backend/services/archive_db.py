@@ -21,6 +21,7 @@ from __future__ import annotations
 import collections
 import functools
 import html
+import itertools
 import json
 import logging
 import os
@@ -267,6 +268,43 @@ CREATE TABLE IF NOT EXISTS user_focus (
   PRIMARY KEY (platform, video_id)
 );
 CREATE INDEX IF NOT EXISTS idx_user_focus_at ON user_focus(focused_at);
+
+-- Rate-limit / bot-gate HISTORY. The gates (services.yt_gate,
+-- services.kick_gate) hold a per-process monotonic deadline that dies with
+-- the process, so nothing could be learned from them: every restart reset
+-- the knowledge to zero. This table is the durable record of WHEN each
+-- platform limits us, on WHICH surface, and — the field that makes adaptive
+-- throttling possible at all — whether the request that tripped it was
+-- background work ('auto') or something a user is waiting on ('user').
+-- Read-only consumers: /api/archive/rate-limits/{recent,summary}.
+-- Row volume is tiny (one row per real limit event, pruned at
+-- RATE_LIMIT_RETENTION_DAYS), so this stays cheap next to a 485MB archive.
+CREATE TABLE IF NOT EXISTS rate_limit_events (
+  id              INTEGER PRIMARY KEY,   -- append-only log; rowid is the order
+  ts              TEXT NOT NULL,          -- ISO-8601 UTC (_now_iso), lexicographically comparable
+  platform        TEXT NOT NULL
+                  CHECK (platform IN ('youtube','twitch','kick','other')),
+  surface         TEXT NOT NULL DEFAULT 'other'
+                  CHECK (surface IN ('metadata','chat','captions','download',
+                                     'live-status','other')),
+  kind            TEXT NOT NULL
+                  CHECK (kind IN ('http_429','http_403','bot_gate','captcha',
+                                  'soft_neg','proactive_low','other')),
+  origin          TEXT NOT NULL DEFAULT 'auto'
+                  CHECK (origin IN ('auto','user')),
+  -- Load context at the moment of the event. NULL means "not measured" and
+  -- is never coerced to 0: a gate that cannot see request counts must not
+  -- fabricate a clean-window of zero requests.
+  recent_requests INTEGER,   -- requests this process had issued in the window
+  in_flight       INTEGER,   -- concurrent requests at signal time
+  context         TEXT,       -- free text: URL template, job id, error marker
+  backoff_s       REAL        -- cooldown actually applied, if any
+);
+-- Every read is a time-window scan (recent/summary) plus a per-platform
+-- grouping; the (platform, ts) index serves both and the ts-only index
+-- serves the retention prune.
+CREATE INDEX IF NOT EXISTS idx_rl_events_ts ON rate_limit_events(ts);
+CREATE INDEX IF NOT EXISTS idx_rl_events_platform_ts ON rate_limit_events(platform, ts);
 """
 
 
@@ -489,6 +527,7 @@ def _init_schema() -> None:
         _ensure_jobs_heartbeat_column(_conn)
         _ensure_jobs_retry_columns(_conn)
         _ensure_jobs_status_paused(_conn)
+        _ensure_rate_limit_events(_conn)
         rebuilt = _migrate_fts_contentless(_conn)
         # One-time data migrations on transcripts (entity + lang backfill).
         # Runs after the FTS rebuild so the current trigger set re-indexes.
@@ -1171,6 +1210,47 @@ def _ensure_jobs_retry_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE archive_jobs ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3")
     if "next_retry_at" not in cols:
         conn.execute("ALTER TABLE archive_jobs ADD COLUMN next_retry_at TEXT")
+
+
+# Columns of rate_limit_events declared in SCHEMA, in order. A later lane
+# that adds a field appends here and _ensure_rate_limit_events backfills it
+# with ALTER TABLE (additive, instant) instead of rebuilding the table.
+_RL_EVENT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("id", "INTEGER PRIMARY KEY"),
+    ("ts", "TEXT NOT NULL"),
+    ("platform", "TEXT NOT NULL"),
+    ("surface", "TEXT NOT NULL DEFAULT 'other'"),
+    ("kind", "TEXT NOT NULL"),
+    ("origin", "TEXT NOT NULL DEFAULT 'auto'"),
+    ("recent_requests", "INTEGER"),
+    ("in_flight", "INTEGER"),
+    ("context", "TEXT"),
+    ("backoff_s", "REAL"),
+)
+
+
+def _ensure_rate_limit_events(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: the rate-limit history table + its columns.
+
+    SCHEMA's `CREATE TABLE IF NOT EXISTS` already covers the normal old-DB
+    path (an archive written before this lane has no such table, so the
+    statement simply creates it — it never touches transcripts/messages,
+    which is what a 485MB archive cannot afford). What is left here is the
+    column backfill for the rarer case: a DB whose rate_limit_events was
+    created by an EARLIER build of this table, or one where a later lane
+    appended a field to _RL_EVENT_COLUMNS. The PRAGMA table_info guard
+    makes repeated calls no-ops, and ALTER TABLE ADD COLUMN is additive and
+    instant (no table rewrite).
+    """
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(rate_limit_events)")}
+    except sqlite3.Error:
+        return
+    if not cols:
+        return  # table absent — SCHEMA creates it whole on this same open
+    for name, decl in _RL_EVENT_COLUMNS:
+        if name not in cols:
+            conn.execute(f"ALTER TABLE rate_limit_events ADD COLUMN {name} {decl}")
 
 
 # (fts_table, content_table) pairs kept in sync by FTS triggers.
@@ -2911,6 +2991,279 @@ def clear_user_focus(platform: Optional[str] = None, video_id: Optional[str] = N
         )
     else:
         execute("DELETE FROM user_focus")
+
+
+# --- rate-limit history ----------------------------------------------------
+
+# The event classes the gates (and, later, a Twitch budget reader) emit.
+#   http_429 / http_403 — a hard HTTP status we actually saw
+#   bot_gate            — "Sign in to confirm you're not a bot" and the
+#                         localized playability walls yt_gate already detects
+#   captcha             — a challenge page
+#   soft_neg            — a ytdlp soft-negative (a video that is simply
+#                         unavailable, not an IP-level limit)
+#   proactive_low       — NOT a limit: a budget signal that the platform is
+#                         running out (e.g. Twitch `Ratelimit-Remaining`
+#                         near zero). Supported now so the later policy lane
+#                         can emit it without another migration.
+RATE_LIMIT_KINDS = (
+    "http_429", "http_403", "bot_gate", "captcha", "soft_neg",
+    "proactive_low", "other",
+)
+# What we were doing when the platform said no. 'live-status' is the
+# livestream-up check (spelled with a hyphen so the wire value matches the
+# task vocabulary; 'live_status' is accepted as an input alias).
+RATE_LIMIT_SURFACES = (
+    "metadata", "chat", "captions", "download", "live-status", "other",
+)
+# auto = background worker / scheduled sweep; user = someone is waiting on it
+# in the UI right now. This is the split that lets a later lane throttle the
+# former to protect the latter.
+RATE_LIMIT_ORIGINS = ("auto", "user")
+# Retention for a 24/7 app. Volume is one row per real limit event (a heavy
+# day is tens), so 30 days is generous for a policy window and keeps the
+# table in the kilobytes next to a 485MB archive.
+RATE_LIMIT_RETENTION_DAYS = 30
+# Retention runs at most once per this many recorded events, so the DELETE
+# never sits on the hot path (it would take the global _lock for a full scan).
+_RL_PRUNE_EVERY = 64
+# Hard row ceiling for the table (retention is normally the binding bound).
+_RL_MAX_ROWS = 20_000
+# Starts at 1, not 0: the very first event of a fresh process must not spend
+# a DELETE, only every _RL_PRUNE_EVERY-th one.
+_rl_prune_counter = itertools.count(1)
+
+
+def _norm_rl_platform(value: Any) -> str:
+    p = str(value or "").strip().lower()
+    return p if p in PLATFORMS else "other"
+
+
+def _norm_rl_kind(value: Any) -> str:
+    k = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return k if k in RATE_LIMIT_KINDS else "other"
+
+
+def _norm_rl_surface(value: Any) -> str:
+    s = str(value or "").strip().lower().replace("_", "-")
+    return s if s in RATE_LIMIT_SURFACES else "other"
+
+
+def _norm_rl_origin(value: Any) -> str:
+    o = str(value or "").strip().lower()
+    return o if o in RATE_LIMIT_ORIGINS else "auto"
+
+
+def record_rate_limit(
+    platform: str,
+    kind: str,
+    *,
+    surface: str = "other",
+    origin: str = "auto",
+    context: str = "",
+    backoff_s: Optional[float] = None,
+    recent_requests: Optional[int] = None,
+    in_flight: Optional[int] = None,
+) -> bool:
+    """Append one rate-limit event. Returns True when the row landed.
+
+    NEVER raises. This is called from the middle of a network request (a
+    429 handler, a bot-gate arm), and a DB hiccup — locked file, full disk,
+    a half-migrated schema — must not turn a rate limit into a crash or a
+    failed job. Everything is swallowed and logged at debug; the caller
+    keeps its own behaviour either way.
+
+    origin='auto' is the DEFAULT on purpose: an unlabelled egress is
+    background work, and mislabelling user work as automatic is the safe
+    direction (a later policy lane throttles 'auto' first, so a wrong
+    default costs latency, never a user's request).
+    """
+    try:
+        execute(
+            "INSERT INTO rate_limit_events "
+            "(ts, platform, surface, kind, origin, recent_requests, in_flight, context, backoff_s) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                _now_iso(),
+                _norm_rl_platform(platform),
+                _norm_rl_surface(surface),
+                _norm_rl_kind(kind),
+                _norm_rl_origin(origin),
+                None if recent_requests is None else int(recent_requests),
+                None if in_flight is None else int(in_flight),
+                str(context or "")[:500] or None,
+                None if backoff_s is None else float(backoff_s),
+            ),
+        )
+    except Exception:
+        logger.debug("rate-limit event not recorded", exc_info=True)
+        return False
+    # Amortized retention: 1 DELETE per 64 events, never on the hot path.
+    try:
+        if next(_rl_prune_counter) % _RL_PRUNE_EVERY == 0:
+            prune_rate_limit_events()
+    except Exception:
+        logger.debug("rate-limit prune skipped", exc_info=True)
+    return True
+
+
+def prune_rate_limit_events(max_age_days: int = RATE_LIMIT_RETENTION_DAYS) -> int:
+    """Drop events older than *max_age_days*. Returns rows removed.
+
+    A lexicographic ts compare is a valid time compare here: every ts is
+    _now_iso() output (UTC, fixed width), the same invariant worker_live()
+    relies on. Also caps the table by row count, so a pathological event
+    storm (a 429 retry loop) cannot outgrow the day-based bound.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    days = max(1, int(max_age_days))
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(
+        timespec="seconds"
+    )
+    cur = execute("DELETE FROM rate_limit_events WHERE ts < ?", (cutoff,))
+    removed = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+    # Row-count backstop: a 429 retry storm inside one day can outrun the
+    # day-based bound, and the aggregate reads the whole window.
+    cur = execute(
+        "DELETE FROM rate_limit_events WHERE id NOT IN ("
+        "  SELECT id FROM rate_limit_events ORDER BY id DESC LIMIT ?)",
+        (_RL_MAX_ROWS,),
+    )
+    if cur.rowcount and cur.rowcount > 0:
+        removed += cur.rowcount
+    if removed:
+        logger.debug("pruned %d rate-limit events (cutoff %s)", removed, cutoff)
+    return removed
+
+
+def recent_rate_limits(
+    platform: Optional[str] = None,
+    since_hours: int = 24,
+    limit: int = 200,
+) -> list[dict]:
+    """Rate-limit events from the trailing window, newest first.
+
+    Read-only and lock-free (query()'s per-thread connection). since_hours
+    and limit are clamped so a fat-fingered query cannot pull the whole
+    30-day retention into memory.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    hours = max(1, min(int(since_hours or 24), 24 * RATE_LIMIT_RETENTION_DAYS))
+    cap = max(1, min(int(limit or 200), 2000))
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(
+        timespec="seconds"
+    )
+    sql = "SELECT * FROM rate_limit_events WHERE ts >= ?"
+    params: list[Any] = [cutoff]
+    if platform:
+        sql += " AND platform = ?"
+        params.append(_norm_rl_platform(platform))
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(cap)
+    return [dict(r) for r in query(sql, params)]
+
+
+def _pctl(values: list[float], q: float) -> Optional[float]:
+    """Nearest-rank percentile over a sorted-ish sample (q in 0..1)."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, int(round(q * (len(ordered) - 1)))))
+    return round(ordered[idx], 2)
+
+
+def rate_limit_summary(
+    since_hours: int = 24,
+    platform: Optional[str] = None,
+) -> dict:
+    """'How often, how hard, and was it us or the worker?' — per platform/origin.
+
+    The aggregate the user actually asked for, computed from the event rows
+    ALONE (no second table, no request counter), so it is honest about what
+    is measured and what is not:
+
+      count / first_seen / last_seen   — frequency and window
+      events_per_hour                  — how often we get limited
+      kinds                            — the event-class breakdown
+      requests_at_limit_mean / _p95    — the load we were running when the
+                                         limit landed (rows that measured it;
+                                         gates alone cannot, so this is often
+                                         null until a later lane threads a
+                                         request counter through)
+      observed_rate_per_min            — requests-per-minute of the *last
+                                         measured* clean window per group,
+                                         i.e. the rate at which we were
+                                         still getting limited. It is an
+                                         UPPER bound on a safe rate, never a
+                                         claim that the rate was safe.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    hours = max(1, min(int(since_hours or 24), 24 * RATE_LIMIT_RETENTION_DAYS))
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(hours=hours)).isoformat(timespec="seconds")
+    sql = "SELECT * FROM rate_limit_events WHERE ts >= ?"
+    params: list[Any] = [cutoff]
+    if platform:
+        sql += " AND platform = ?"
+        params.append(_norm_rl_platform(platform))
+    sql += " ORDER BY ts ASC, id ASC"
+    rows = [dict(r) for r in query(sql, params)]
+
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for r in rows:
+        groups.setdefault((r["platform"], r["origin"]), []).append(r)
+
+    out: list[dict] = []
+    for (plat, orig), evs in sorted(groups.items()):
+        loads = [float(e["recent_requests"]) for e in evs if e["recent_requests"] is not None]
+        kinds: dict[str, int] = {}
+        for e in evs:
+            kinds[e["kind"]] = kinds.get(e["kind"], 0) + 1
+        # Observed rate: for each pair of consecutive events, how many
+        # requests were in flight over the clean window between them.
+        rates: list[float] = []
+        for prev, cur in zip(evs, evs[1:]):
+            if cur["recent_requests"] is None:
+                continue
+            try:
+                gap_s = (
+                    datetime.fromisoformat(cur["ts"]) - datetime.fromisoformat(prev["ts"])
+                ).total_seconds()
+            except (TypeError, ValueError):
+                continue
+            if gap_s > 0:
+                rates.append(float(cur["recent_requests"]) / (gap_s / 60.0))
+        mean_load = round(sum(loads) / len(loads), 2) if loads else None
+        out.append({
+            "platform": plat,
+            "origin": orig,
+            "count": len(evs),
+            "first_seen": evs[0]["ts"],
+            "last_seen": evs[-1]["ts"],
+            "events_per_hour": round(len(evs) / hours, 3),
+            "kinds": kinds,
+            "requests_at_limit_mean": mean_load,
+            "requests_at_limit_p95": _pctl(loads, 0.95),
+            "observed_rate_per_min": round(sum(rates) / len(rates), 2) if rates else None,
+            "surfaces": sorted({e["surface"] for e in evs}),
+        })
+    return {
+        "since_hours": hours,
+        "generated_at": _now_iso(),
+        "totals": {
+            "events": len(rows),
+            "auto": sum(1 for r in rows if r["origin"] == "auto"),
+            "user": sum(1 for r in rows if r["origin"] == "user"),
+            "by_platform": {
+                p: sum(1 for r in rows if r["platform"] == p)
+                for p in sorted({r["platform"] for r in rows})
+            },
+        },
+        "groups": out,
+    }
 
 
 def list_jobs(limit: int = 50) -> list[dict]:
@@ -6345,7 +6698,21 @@ def _run_module_selfcheck() -> None:
     assert _damerau_levenshtein("aaa", "a", 2) == 2, "j<2 wrap must not fake a cheaper path"
     assert _damerau_levenshtein("bbb", "b", 2) == 2, "j<2 wrap must not fake a cheaper path"
     assert _damerau_levenshtein("abbba", "bab", 2) is None, "wrap must not fake an in-budget path"
+    # Rate-limit history must exist on EVERY archive (old or new) with the
+    # full column set — the gates write to it from a network error handler,
+    # so a missing column would surface as a swallowed exception and a table
+    # nobody trusts. Read-only assert (no rows), so the check stays
+    # idempotent across re-imports.
     _conn_selfcheck = get_conn()
+    _sc_rl_cols = {
+        r[1] for r in _conn_selfcheck.execute("PRAGMA table_info(rate_limit_events)")
+    }
+    assert {c for c, _ in _RL_EVENT_COLUMNS} <= _sc_rl_cols, (
+        f"rate_limit_events missing columns: "
+        f"{sorted({c for c, _ in _RL_EVENT_COLUMNS} - _sc_rl_cols)}"
+    )
+    assert _norm_rl_origin("USER") == "user" and _norm_rl_origin("nonsense") == "auto"
+    assert _norm_rl_surface("live_status") == "live-status"
     _selfcheck_platform = "twitch"
     _selfcheck_video = "__archive_selfcheck__"
     with _lock:

@@ -14,6 +14,12 @@ ponytail: state is per-process. The app + one detached worker can each see
 the gate independently (correct for single-IP boxes — each process's own
 requests trip it). Cross-process coordination would need a shared lock
 file; not worth it while at most one worker runs.
+
+The DEADLINE is per-process, but the HISTORY is not: every arm/extend
+appends a row to ``archive_db.rate_limit_events`` so the app can learn
+*when* YouTube limits us and whether the request that tripped it was
+background work or something a user is waiting on. That is what makes an
+adaptive throttle possible later; today this module only records.
 """
 from __future__ import annotations
 
@@ -45,6 +51,49 @@ _GATE_MARKERS = (
 _until = 0.0  # monotonic deadline of the freeze; 0 = not gated
 _lock = threading.Lock()
 
+# Marker -> event class for the history table. The gate's default is
+# 'bot_gate' (this module is only ever called for gate-classified errors);
+# these refine it so a plain 429 and a ytdlp soft-negative don't pollute the
+# "how often does YouTube bot-wall us" answer.
+_KIND_MARKERS = (
+    ("429", "http_429"),
+    ("too many requests", "http_429"),
+    ("rate-limited by youtube", "http_429"),
+    ("403", "http_403"),
+    ("captcha", "captcha"),
+    ("preview unavailable for this video", "soft_neg"),
+)
+
+
+def _classify_gate_kind(reason: str) -> str:
+    """Map an error string onto a rate_limit_events.kind class."""
+    msg = (reason or "").lower()
+    for marker, kind in _KIND_MARKERS:
+        if marker in msg:
+            return kind
+    return "bot_gate"
+
+
+def _record_history(
+    reason: str, *, kind: str, surface: str, origin: str, backoff_s: float
+) -> None:
+    """Append the event to the durable history. Never raises.
+
+    Lazy import: archive_db is a heavy module and this is a cold path, but
+    the import itself can still fail in a half-initialized process — a
+    network error handler must not become a crash.
+    """
+    try:
+        from services import archive_db
+
+        archive_db.record_rate_limit(
+            "youtube", kind,
+            surface=surface, origin=origin,
+            context=reason, backoff_s=backoff_s,
+        )
+    except Exception:  # noqa: BLE001 — instrumentation must never break a fetch
+        logger.debug("YouTube rate-limit history not recorded", exc_info=True)
+
 
 def youtube_gate_active() -> bool:
     """True while the cooldown freeze is in effect."""
@@ -56,8 +105,23 @@ def gate_remaining_sec() -> float:
     return max(0.0, _until - time.monotonic())
 
 
-def note_youtube_gate(reason: str, *, freeze_sec: Optional[float] = None) -> None:
-    """Arm/extend the freeze (longest-wins). Logs the first arm of each run."""
+def note_youtube_gate(
+    reason: str,
+    *,
+    freeze_sec: Optional[float] = None,
+    surface: str = "other",
+    origin: str = "auto",
+) -> None:
+    """Arm/extend the freeze (longest-wins). Logs the first arm of each run.
+
+    *surface* (metadata/chat/captions/download/live-status/other) and
+    *origin* ('auto' = background worker, 'user' = someone is waiting on
+    it in the UI) are recorded, not acted on. Both are keyword-only with
+    conservative defaults so every existing call site keeps its exact
+    behaviour; the longest-wins early return is untouched, and the history
+    write happens OUTSIDE _lock (it is a SQLite commit under archive_db's
+    own global lock — never hold the gate's critical section across it).
+    """
     global _until
     with _lock:
         now = time.monotonic()
@@ -69,6 +133,13 @@ def note_youtube_gate(reason: str, *, freeze_sec: Optional[float] = None) -> Non
             "YouTube bot-gate cooldown until +%ds (%s)",
             int(new_until - now), reason,
         )
+    _record_history(
+        reason,
+        kind=_classify_gate_kind(reason),
+        surface=surface,
+        origin=origin,
+        backoff_s=new_until - now,
+    )
 
 
 def clear_youtube_gate() -> None:

@@ -114,11 +114,15 @@ def _get_json(path: str, referer: str, *, timeout: float = 15.0) -> Any:
             # Cloudflare classification (bot block): record the event and
             # arm the gate cooldown; consecutive events escalate to a long
             # freeze (kick_gate).
-            kick_gate.note_kick_gate_event(f"403 on {path}")
+            kick_gate.note_kick_gate_event(
+                f"403 on {path}", kind="http_403", surface="metadata",
+            )
             raise KickGateError(f"Kick request blocked (Cloudflare/403): {path}")
         if resp.status_code == 429:
             if attempt >= _BACKOFF_MAX_ATTEMPTS:
-                kick_gate.note_kick_gate_event(f"429 rate-limited on {path}")
+                kick_gate.note_kick_gate_event(
+                    f"429 rate-limited on {path}", kind="http_429", surface="metadata",
+                )
                 raise KickRateLimitError(
                     f"Kick rate-limited (429) after {_BACKOFF_MAX_ATTEMPTS} attempts: {path}"
                 )

@@ -497,7 +497,7 @@ def _guarded_youtube_dl(outdir: Path, *, video_id: Optional[str] = None):
         from services.yt_gate import classify_youtube_gate_error, note_youtube_gate
 
         if classify_youtube_gate_error(exc):
-            note_youtube_gate(str(exc)[:200])
+            note_youtube_gate(str(exc)[:200], surface="download", origin="auto")
         raise
 
 
@@ -885,7 +885,7 @@ def ingest_video(id_or_url: str, *, temp_dir: Optional[Path] = None) -> dict:
             if _is_gate_error(exc):
                 from services.yt_gate import note_youtube_gate
 
-                note_youtube_gate(str(exc)[:200])
+                note_youtube_gate(str(exc)[:200], surface="download", origin="auto")
                 error = "extract error: YouTube bot-gate active — retrying after it clears"
             else:
                 error = f"extract error: {exc}"
@@ -977,7 +977,7 @@ def download_bestaudio(
         from services.yt_gate import classify_youtube_gate_error, note_youtube_gate
 
         if classify_youtube_gate_error(exc) or _is_gate_error(exc):
-            note_youtube_gate(str(exc)[:200])
+            note_youtube_gate(str(exc)[:200], surface="download", origin="auto")
         raise
     files = [f for f in outdir.iterdir() if f.is_file()]
     if not files:
