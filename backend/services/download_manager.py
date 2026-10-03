@@ -152,6 +152,7 @@ class DownloadManager:
         include_chat: bool = False,
         chat_start_sec: Optional[float] = None,
         chat_end_sec: Optional[float] = None,
+        transcript_formats: str = "srt",
     ) -> str:
         download_id = download_id or f"dl_{uuid.uuid4().hex[:12]}"
         resolved_platform = platform or ytdlp_service.detect_platform(url)
@@ -199,6 +200,7 @@ class DownloadManager:
             "include_chat": include_chat,
             "chat_start_sec": chat_start_sec,
             "chat_end_sec": chat_end_sec,
+            "transcript_formats": transcript_formats,
         }
 
         with self._lock:
@@ -583,7 +585,7 @@ class DownloadManager:
                     )
                     try:
                         from services.download_sidecars import write_download_sidecars
-                        write_download_sidecars(
+                        sidecars = write_download_sidecars(
                             output_file_result,
                             params.get("url") or "",
                             include_transcript=bool(params.get("include_transcript")),
@@ -593,9 +595,28 @@ class DownloadManager:
                             chat_start_sec=params.get("chat_start_sec"),
                             chat_end_sec=params.get("chat_end_sec"),
                             platform=state.platform,
+                            transcript_formats=params.get("transcript_formats"),
                         )
+                        # A sidecar that could not be written is a WARNING,
+                        # not a debug line: the setting is on by default, so
+                        # silence here is what made "the transcript came with
+                        # the download" a lie. The queue item carries the
+                        # reason so the user can see it happened.
+                        if params.get("include_transcript"):
+                            _t_status = sidecars.get("transcript_status")
+                            if _t_status and _t_status != "written":
+                                _t_note = sidecars.get("transcript_detail") or _t_status
+                                logger.warning(
+                                    "download %s: transcript sidecar %s — %s",
+                                    download_id, _t_status, _t_note,
+                                )
+                                with self._lock:
+                                    state.extra = {
+                                        **(state.extra or {}),
+                                        "transcript_note": _t_note,
+                                    }
                     except Exception:
-                        logger.debug("download sidecars skipped", exc_info=True)
+                        logger.warning("download sidecars failed", exc_info=True)
                     try:
                         # TASK1: persist a local thumbnail next to the file —
                         # yt-dlp's writethumbnail sidecar when present, else a

@@ -158,9 +158,14 @@ class AppSettings(BaseModel):
     # Download folder layout: 'flat' (everything in download_folder) or
     # 'typed' (VODs / Cuts / Clips / Twitch clips / Live / Audio / Chat).
     download_layout: str = "typed"
-    # Write a .txt transcript sidecar next to finished downloads when the
-    # archive already has a transcript (on by default).
+    # Write a subtitle sidecar next to finished downloads (on by default).
+    # '.srt' is the default because it is the only form video editors accept
+    # as a subtitle track; 'srt+txt' adds a plain-text copy, 'txt' is the
+    # legacy text-only output. YouTube fetches its captions at completion
+    # when the archive has no transcript yet; Twitch/Kick reuse the archived
+    # (or the clip's source VOD) transcript.
     download_transcript_sidecar: bool = True
+    download_transcript_sidecar_format: str = "srt"
     # Experimental AI ask-about-channel: single-turn RAG over the local
     # archive (chat + transcripts). The API key is WRITE-ONLY — GET never
     # returns it (ai_api_key_set reports presence instead); only the update
@@ -237,6 +242,7 @@ class SettingsUpdate(BaseModel):
     ui_language: Optional[str] = None
     download_layout: Optional[str] = None
     download_transcript_sidecar: Optional[bool] = None
+    download_transcript_sidecar_format: Optional[str] = None
     experimental_ai_enabled: Optional[bool] = None
     ai_api_key: Optional[str] = None
     caption_low_latency: Optional[bool] = None

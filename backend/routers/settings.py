@@ -389,6 +389,15 @@ def _apply_settings_update(update: SettingsUpdate) -> AppSettings:
         current.download_layout = layout if layout in ('flat', 'typed') else 'typed'
     if update.download_transcript_sidecar is not None:
         current.download_transcript_sidecar = bool(update.download_transcript_sidecar)
+    if update.download_transcript_sidecar_format is not None:
+        # 'srt' (default) | 'srt+txt' | 'txt' — anything else falls back to
+        # the editor-importable subtitle default rather than writing nothing.
+        from services.download_sidecars import SIDECAR_FORMAT_CHOICES
+
+        fmt = (update.download_transcript_sidecar_format or "srt").strip().lower()
+        current.download_transcript_sidecar_format = (
+            fmt if fmt in SIDECAR_FORMAT_CHOICES else "srt"
+        )
     # Write-only AI key: handled BEFORE the toggle so a single save that sets
     # both key and toggle-on validates against the fresh key.
     if update.ai_api_key is not None:

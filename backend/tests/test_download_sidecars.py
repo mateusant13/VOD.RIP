@@ -118,19 +118,26 @@ def _seed_chat() -> None:
 
 def test_write_transcript_sidecar_trim_scoped(_scratch_db, tmp_path: Path):
     """Transcript sidecar covers exactly the trim window: rows outside the
-    crop range are excluded, rows inside (or straddling it) are kept."""
+    crop range are excluded, rows inside (or straddling it) are kept, and
+    every cue is REBASED by crop_start so the timestamps line up with the
+    trimmed media file (which starts at 0:00)."""
     _seed_transcript()
     out = tmp_path / "vod.mp4"
     out.write_bytes(b"video")
     got = write_transcript_sidecar(
         str(out), "twitch", _VOD, crop_start=410.0, crop_end=423.0
     )
-    assert got == str(tmp_path / "vod.txt")
+    # SRT by default: it is the only subtitle extension Premiere / Resolve /
+    # Vegas / Final Cut / Shotcut / Kdenlive accept.
+    assert got == str(tmp_path / "vod.srt")
     body = Path(got).read_text("utf-8")
     assert "in trim" in body
     assert "still in trim" in body
     assert "before trim" not in body
     assert "after trim" not in body
+    # Rebase contract: the 410s cue must read ~0:00, NOT 00:06:50.
+    assert "00:00:00,000" in body
+    assert "00:06:50" not in body
 
 
 def test_write_transcript_sidecar_no_trim_writes_whole(_scratch_db, tmp_path: Path):

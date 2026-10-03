@@ -80,6 +80,8 @@ def _sidecar_kwargs(req: DownloadRequest, opts) -> dict:
         "include_chat": bool(req.include_chat),
         "chat_start_sec": req.chat_start_sec,
         "chat_end_sec": req.chat_end_sec,
+        # 'srt' (default, editor-importable subtitles) | 'srt+txt' | 'txt'
+        "transcript_formats": getattr(opts, "download_transcript_sidecar_format", "srt"),
     }
 
 

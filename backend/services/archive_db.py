@@ -2258,18 +2258,23 @@ def delete_transcripts(platform: str, video_id: str) -> int:
     return cur.rowcount
 
 
-def transcript_for(platform: str, video_id: str, *, raw: bool = False) -> list[dict]:
-    """All transcript rows for a video, seg_idx-ordered.
+def transcript_for(platform: str, video_id: str, *, raw: bool = False, limit: int = 200_000) -> list[dict]:
+    """Transcript rows for a video, seg_idx-ordered, capped at ``limit``.
 
     Default is the display shape: overlapping YouTube auto-caption
     duplicates are dropped (see _dedupe_transcript_rows). raw=True returns
     every stored row — the whisper resume path needs the full seg_idx set
-    so a deduped read can never make it re-insert an existing segment."""
+    so a deduped read can never make it re-insert an existing segment.
+
+    The cap mirrors chat_for's: a 10h ASR VOD is tens of thousands of rows
+    and a download worker thread has no reason to materialize more (a
+    sidecar writer that wants a tighter bound passes a smaller limit)."""
     rows = [
         dict(r)
         for r in query(
-            "SELECT * FROM transcripts WHERE platform = ? AND video_id = ? ORDER BY seg_idx",
-            (platform, video_id),
+            "SELECT * FROM transcripts WHERE platform = ? AND video_id = ? "
+            "ORDER BY seg_idx LIMIT ?",
+            (platform, video_id, limit),
         )
     ]
     return rows if raw else _dedupe_transcript_rows(rows)
