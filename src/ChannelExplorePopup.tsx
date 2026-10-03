@@ -12,6 +12,7 @@ import { useI18n } from './i18n';
 import TwitchLogoIcon from './components/TwitchLogoIcon';
 import ArchiveSearchPopup from './components/ArchiveSearchPopup';
 import PreviewChatPanel, { readPreviewChatPanelWidth } from './components/PreviewChatPanel';
+import PreviewMiniEditor from './components/PreviewMiniEditor';
 import type { ChatMarkers } from './components/ChatRangeMarkers';
 import PreviewQualityMenu from './PreviewQualityMenu';
 import { usePreviewPlayer } from './hooks/usePreviewPlayer';
@@ -152,6 +153,11 @@ function shouldIgnorePlayerKeyEvent(e: KeyboardEvent): boolean {
   if (e.ctrlKey || e.metaKey || e.altKey) return true;
   const el = e.target as HTMLElement;
   if (el.isContentEditable) return true;
+  // The in-preview mini editor owns its arrow keys (they nudge the cut's
+  // needles, whose role="slider" ARIA promises that to screen readers). Without
+  // this the same keypress would also skip the video, so a focused needle would
+  // move the cut AND the playhead.
+  if (el.closest?.('[data-preview-mini-editor]')) return true;
   const tag = el.tagName;
   if (tag === 'TEXTAREA' || tag === 'SELECT') return true;
   if (tag === 'INPUT') {
@@ -1317,6 +1323,10 @@ export default function ChannelExplorePopup({
     return () => window.removeEventListener('resize', fit);
   }, [fullscreen, stackIndex, frameSnapRect]);
 
+  // The mini editor is inside the chrome (below videoWrapRef), so expanding it
+  // changes the popup's chrome height. This feeds the measurement effect below
+  // so the frame-mode snap pin re-centres instead of drifting.
+  const [editorOpen, setEditorOpen] = useState(false);
   useEffect(() => {
     if (fullscreen || !containerRef.current || !videoWrapRef.current) return;
     const chromeH = containerRef.current.offsetHeight - videoWrapRef.current.offsetHeight;
@@ -1324,7 +1334,7 @@ export default function ChannelExplorePopup({
       chromeHRef.current = chromeH;
       setChromeHVersion((v) => v + 1);
     }
-  }, [fullscreen, panelWidth, videoAspect, ready, error]);
+  }, [fullscreen, panelWidth, videoAspect, ready, error, editorOpen]);
 
   useEffect(() => {
     if (!playback?.url) return;
@@ -1657,6 +1667,15 @@ export default function ChannelExplorePopup({
     return () => window.clearTimeout(t);
   }, [ready, focusPlayer, seekVideo]);
 
+  // Declared BEFORE timelineUi because the in-preview mini editor (rendered
+  // inside it) reports through the same notice row — reusing the popup's
+  // existing notice instead of growing a second one.
+  const showClipNotice = useCallback((kind: 'error' | 'ok', text: string) => {
+    if (clipNoticeTimerRef.current) window.clearTimeout(clipNoticeTimerRef.current);
+    setClipNotice({ kind, text });
+    clipNoticeTimerRef.current = window.setTimeout(() => setClipNotice(null), 4000);
+  }, []);
+
   const ctrlBtn = (fs: boolean) => platformPreviewCtrlBtn(platform, fs);
 
   const fsCtrlBtn = platformPreviewCtrlBtn(platform, true);
@@ -1681,6 +1700,26 @@ export default function ChannelExplorePopup({
         {formatHmsFull(effectiveDurationSec)}
       </span>
     </div>
+    {/* The in-preview MINI EDITOR: pick a range, then clip it to Twitch or cut
+        and download it without leaving this window. Rendered inside timelineUi
+        so it appears in BOTH the normal and the fullscreen preview. */}
+    <PreviewMiniEditor
+      url={vod.url}
+      title={vod.title}
+      platform={platform}
+      channel={vod.channel}
+      videoId={vod.videoId ?? archiveVideoIdFromUrl(vod.url) ?? null}
+      durationSec={effectiveDurationSec}
+      playheadSec={currentTime}
+      chatMarkers={
+        chatMarkersRef.current.start != null || chatMarkersRef.current.end != null
+          ? chatMarkersRef.current
+          : null
+      }
+      onNotice={showClipNotice}
+      onOpenChange={setEditorOpen}
+      fullscreen={fullscreen}
+    />
     </>
   );
 
@@ -1750,12 +1789,6 @@ export default function ChannelExplorePopup({
       popoverPlacement="up"
     />
   );
-
-  const showClipNotice = useCallback((kind: 'error' | 'ok', text: string) => {
-    if (clipNoticeTimerRef.current) window.clearTimeout(clipNoticeTimerRef.current);
-    setClipNotice({ kind, text });
-    clipNoticeTimerRef.current = window.setTimeout(() => setClipNotice(null), 4000);
-  }, []);
 
   /**
    * Open the Twitch clip mini-preview at the current playhead (120s window,
