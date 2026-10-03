@@ -282,8 +282,12 @@ def check_live_status(
 # server startup we pre-warm the cache for every saved channel so the very
 # first user request hits the warm cache.
 #
-# Concurrency: refreshes run on a dedicated 4-worker thread pool. We bound
-# concurrency so a 20-channel saved list does not slam YouTube at boot.
+# Concurrency: refreshes run on a dedicated 16-worker thread pool (separate
+# from the shared anyio threadpool sync routes use). We bound concurrency so
+# a 20-channel saved list does not slam YouTube at boot, while still letting
+# a full list refresh in one wave. The TTL-trip wait is capped at
+# `_LIVE_REFRESH_WAIT_SEC` (4s) precisely because the waiting handler is a
+# sync `def` — it must not hold a threadpool slot for tens of seconds.
 
 _LIVE_STATUS_CACHE: dict[str, tuple[float, dict]] = {}
 _LIVE_STATUS_TTL_SEC = 60.0
@@ -293,9 +297,14 @@ _LIVE_STATUS_TTL_SEC = 60.0
 # to the TTL so a failed refresh at most one cycle behind (see endpoint).
 _LIVE_STATUS_MAX_STALE_SEC = 60.0
 # How long a TTL-trip read waits for its kicked refresh before falling back
-# to the stale serve. Platform extracts run 3-15s (parallel per channel), so
-# a 20s bound covers one refresh plus warm-pool queueing headroom.
-_LIVE_REFRESH_WAIT_SEC = 20.0
+# to the stale serve. This is a *threadpool-slot* bound, not a correctness
+# bound: `channel_live_status` is a sync `def` handler, so every second spent
+# here is a second held out of the shared anyio threadpool that all other
+# sync routes (disk/entities/subtitles/clips) need. At 20s with a 4-worker
+# warm pool, ~19 saved channels all burned the full 20s and starved every
+# other sync route. 4s covers the common 1-3s extract; the slow tail falls
+# through to the max-stale path below, which the badge already handles.
+_LIVE_REFRESH_WAIT_SEC = 4.0
 # channel_id -> in-flight refresh Future. TTL-trip reads WAIT on the shared
 # future and return the FRESH payload — without this, the poll that crosses
 # the TTL serves the stale one and the frontend only sees the refresh on its
@@ -311,7 +320,13 @@ _LIVE_STATUS_LOCK = threading.Lock()
 # gets a live fetch instead of waiting up to 60s for the next poll cycle.
 _LIVE_RECENTLY_ADDED: dict[str, float] = {}
 _LIVE_RECENTLY_ADDED_WINDOW_SEC = 60.0
-_LIVE_WARM_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="live-warm")
+# Refreshes run on a dedicated pool, sized so a full saved-channel list
+# refreshes in ONE wave instead of queueing 4-at-a-time. 16 covers the common
+# 8-16 saved-channel list; beyond that the extra workers just queue, and the
+# 4s TTL-trip wait (above) has already given up by then. This pool is NOT the
+# shared anyio threadpool, so widening it does not steal slots from sync
+# routes — that is exactly the starvation the old 20s/4-worker setting caused.
+_LIVE_WARM_POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="live-warm")
 # Platform fetches inside one channel run concurrently across this pool (the
 # warm pool + this pool bound total concurrency: 4 channels x 3 platforms
 # queue onto 6 workers). Kick/Twitch/YouTube are independent CDNs/APIs, so

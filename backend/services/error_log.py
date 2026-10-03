@@ -97,8 +97,58 @@ def _sanitize_message(message: str) -> str:
     return text[:500]
 
 
+# In-memory count of lines currently in the JSONL file, or None when unknown
+# (fresh process). record_error is the only writer (it holds
+# _ERROR_RING_LOCK for every append), so this stays accurate; it is
+# initialized once per process by counting the file, then maintained in O(1).
+# This lets rotation keep the latest _ERROR_RING_MAX records by LINE COUNT
+# (independent of line length) without re-reading the file per error.
+_ERROR_FILE_LINES: Optional[int] = None
+# How many lines may accumulate past the retention bound before we compact.
+# A small buffer amortizes the rewrite (once per ~64 errors) while keeping the
+# on-disk file at ~500-564 lines. get_error_ring always returns the last 500.
+_ERROR_ROTATE_SLACK = 64
+
+
+def _count_error_file_lines(pp: Path) -> int:
+    try:
+        if not pp.exists():
+            return 0
+        with pp.open("r", encoding="utf-8", errors="replace") as fh:
+            return sum(1 for _ in fh)
+    except OSError:
+        return 0
+
+
+def _rotate_error_file() -> None:
+    """Compact the JSONL to the latest ``_ERROR_RING_MAX`` lines, atomically.
+
+    Caller must hold ``_ERROR_RING_LOCK``. Uses temp + replace so a crash
+    never leaves a truncated JSONL.
+    """
+    pp = _error_log_path()
+    lines: list[str] = []
+    try:
+        if pp.exists():
+            lines = pp.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        lines = []
+    lines = lines[-_ERROR_RING_MAX:]
+    tmp = pp.with_suffix(".jsonl.tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tmp.replace(pp)
+
+
 def record_error(kind: str, message: str) -> None:
-    """Append an error record (thread-safe) to the ring and the JSONL file."""
+    """Append an error record (thread-safe) to the ring and the JSONL file.
+
+    Append-only: a single error costs one ``write`` of one line, not a
+    read-modify-rewrite of the whole file. Retention of the latest
+    ``_ERROR_RING_MAX`` records is preserved by an amortized tail rewrite that
+    fires only once the file outgrows the bound by _ERROR_ROTATE_SLACK lines,
+    so the steady state never pays a rewrite on the request path.
+    """
+    global _ERROR_FILE_LINES
     entry = {
         "ts": time.time(),
         "kind": kind,
@@ -109,23 +159,22 @@ def record_error(kind: str, message: str) -> None:
     try:
         pp = _error_log_path()
         pp.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.fromtimestamp(entry["ts"], tz=timezone.utc).isoformat()
+        line = json.dumps({"ts": ts, "kind": kind, "message": entry["message"]}, ensure_ascii=False)
         with _ERROR_RING_LOCK:
-            ts = datetime.fromtimestamp(entry["ts"], tz=timezone.utc).isoformat()
-            line = json.dumps({"ts": ts, "kind": kind, "message": entry["message"]}, ensure_ascii=False)
-            # Retain exactly the latest _ERROR_RING_MAX records: read existing
-            # lines, keep the tail, append the new one, rewrite atomically via
-            # temp + replace so a crash never leaves a truncated JSONL.
-            lines: list[str] = []
-            try:
-                if pp.exists():
-                    lines = pp.read_text(encoding="utf-8", errors="replace").splitlines()
-            except OSError:
-                lines = []
-            lines.append(line)
-            lines = lines[-_ERROR_RING_MAX:]
-            tmp = pp.with_suffix(".jsonl.tmp")
-            tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            tmp.replace(pp)
+            if _ERROR_FILE_LINES is None:
+                # One-time-per-process hydration of the line count (replaces
+                # the per-error full read the old rewrite path paid).
+                _ERROR_FILE_LINES = _count_error_file_lines(pp)
+            with pp.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+            _ERROR_FILE_LINES += 1
+            if _ERROR_FILE_LINES > _ERROR_RING_MAX + _ERROR_ROTATE_SLACK:
+                try:
+                    _rotate_error_file()
+                    _ERROR_FILE_LINES = _ERROR_RING_MAX
+                except OSError:
+                    pass
     except Exception:
         # The logging path must never itself raise into the request.
         pass
@@ -154,8 +203,12 @@ def get_error_ring(limit: int = 50) -> list[dict]:
         return list(_ERROR_RING)[-cap:]
 
 def clear_error_ring_for_tests() -> None:
+    global _ERROR_FILE_LINES
     with _ERROR_RING_LOCK:
         _ERROR_RING.clear()
+    # Force the next record_error to re-hydrate the on-disk line count (tests
+    # seed/overwrite the JSONL directly between cases).
+    _ERROR_FILE_LINES = None
 
 
 class _ErrorFileHandler(logging.Handler):

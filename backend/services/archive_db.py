@@ -397,6 +397,12 @@ def _init_schema() -> None:
     the old connection is dropped and migrations re-run against the new DB."""
     global _conn, _conn_path, _schema_ready
     path = _db_path()
+    # Tracks whether the fresh-open branch below already ran the CREATE
+    # script, so the guarded block at the bottom does not run it a 2nd time.
+    # _schema_ready is only cleared at the path-rebind (which also nils _conn
+    # and therefore re-enters the fresh-open branch) and set True at the very
+    # end, so the bottom executescript is redundant on every path.
+    schema_applied = False
     if _conn is not None and _conn_path != str(path):
         try:
             _conn.close()
@@ -410,6 +416,7 @@ def _init_schema() -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         _conn = _open_conn(path)
         _conn.executescript(SCHEMA)
+        schema_applied = True
         _conn.commit()
         # Disk hygiene (fresh open only): checkpoint a stale -wal left by a
         # killed process, then VACUUM when the freelist outgrows 10% of the
@@ -430,7 +437,11 @@ def _init_schema() -> None:
         except sqlite3.Error:
             pass
     if not _schema_ready:
-        _conn.executescript(SCHEMA)
+        if not schema_applied:
+            # Only reachable if _conn was already open but the schema was not
+            # marked ready (a defensive path; the fresh-open branch above
+            # already applied SCHEMA on the normal boot). Keep it for safety.
+            _conn.executescript(SCHEMA)
         # F6: drop the orphaned broken view from the live DB. A one-time bad
         # call to _load_vocab_uncached("messages_fts") built
         #   CREATE VIRTUAL TABLE messages_fts_vocab USING fts5vocab(messages_fts_fts,'row')

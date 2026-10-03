@@ -377,10 +377,14 @@ def _server_supervisor(port: int):
 def _server_health_watchdog(port: int) -> None:
     """Force-restart a HUNG API (alive but unresponsive).
 
-    Waits for the first healthy response (the boot can take 35-90s+ on a
-    warm archive / frozen cold import), then polls /api/info every 15s.
-    After 3 consecutive misses the API is treated as hung — stop uvicorn
-    via server_lifecycle so the supervisor's restart path takes over.
+    Waits for the first healthy response, then polls /api/info every 15s.
+    Boot is NOT minutes: across 37 real boots the lifespan (startup ->
+    "Application startup complete") measured p50 56ms / p90 461ms / max
+    1713ms; the dominant boot cost is module import before uvicorn binds
+    (~2-4s). Heavy boot work (retention, dedupe, warm-ups) runs on daemon
+    threads and never gates readiness. After 3 consecutive misses the API is
+    treated as hung — stop uvicorn via server_lifecycle so the supervisor's
+    restart path takes over.
     """
     from services.server_lifecycle import should_stop_supervisor, stop_api_server
 
@@ -421,16 +425,16 @@ def _server_health_watchdog(port: int) -> None:
             misses = 0
 
 
-def _wait_for_server(port: int, timeout_sec: int = 90) -> bool:
+def _wait_for_server(port: int, timeout_sec: int = 45) -> bool:
     """Poll the API health endpoint. Returns ``True`` when ready.
 
-    The timeout must clear the full boot cost, not just the import: the
-    lifespan runs startup hygiene + archive retention + chat dedupe before
-    the API answers, and that work grows with the archive (35s+ observed on
-    a warm archive; frozen bundles pay the PyInstaller cold import on top).
-    The window only opens after this returns, so failing fast just means
-    the app never opens — wait long enough for a genuinely slow boot, and
-    let the daemon warm-ups (which never block readiness) finish after.
+    Boot is fast: heavy work (archive retention, chat dedupe, warm-ups) runs
+    on daemon threads and does NOT gate readiness. The lifespan measured
+    p50 56ms / p90 461ms / max 1713ms across 37 real boots; the dominant
+    cost is module import before uvicorn binds (~2-4s dev, more on a frozen
+    cold import). 45s is a generous ceiling for the slowest frozen cold start
+    while still failing fast enough that a genuinely dead port surfaces
+    quickly instead of stalling the UI for a minute and a half.
     """
     import requests as http_requests
 

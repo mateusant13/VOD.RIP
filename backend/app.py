@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -743,6 +744,13 @@ async def _app_lifespan(_app: FastAPI):
     else:
         import logging as _lg3; _lg3.getLogger(__name__).info("YouTube warm skipped (live-preview disabled)")
 
+    # Anonymous YouTube session pre-warm. MOVED from module scope: firing it at
+    # import ran it on EVERY import of `app` — including the frozen
+    # supervisor's crash-restart path and every pytest collection — even
+    # though the warm only matters once a server is actually serving. In the
+    # lifespan it runs exactly once per real server start.
+    threading.Thread(target=_warm_youtube_session, daemon=True, name="youtube-warm").start()
+
     # Periodic preview pre-warm: the startup wave runs once per boot and the
     # session snapshots it lands expire after 1h (and any bot-gate pause or
     # dead-video grind can leave warm dead for hours). Re-run the recent-
@@ -1175,27 +1183,55 @@ def _stamp_app_activity() -> None:
         logger.debug("app-activity stamp failed", exc_info=True)
 
 
-@app.middleware("http")
-async def _app_activity_middleware(request: Request, call_next):
-    # Off the event loop: the SQLite write happens on a worker thread so a
-    # transient DB lock can never stall the interactive lane.
-    if _activity_stamp_due():
-        threading.Thread(target=_stamp_app_activity, daemon=True).start()
-    return await call_next(request)
+# Reused single-worker pool for the throttled app-activity stamp. The stamp is
+# claimed at most once per _ACTIVITY_STAMP_EVERY_S and the write is a tiny
+# idempotent upsert, so ONE worker is plenty — and reusing it means the hot
+# request path no longer spawns a fresh thread per claim (which also
+# contended the global archive write lock every 20s). Never shut down: module
+# global like every other deps.py pool; interpreter exit reclaims the thread.
+_ACTIVITY_STAMP_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="app-activity")
 
 
-@app.middleware("http")
-async def _ask_rate_limit_middleware(request: Request, call_next):
-    """Rate-limit POST /api/ai/ask to prevent abuse of the AI backend."""
-    if request.method == "POST" and request.url.path.rstrip("/") == "/api/ai/ask":
-        client_ip = request.client.host if request.client else "unknown"
-        if not _ask_rate_ok(client_ip):
-            from fastapi.responses import JSONResponse as _JR
-            return _JR(
-                {"detail": "Rate limit exceeded. Try again in a minute."},
-                status_code=429,
-            )
-    return await call_next(request)
+class _ActivityRateLimitASGI:
+    """Single pure-ASGI layer: rate-limit /api/ai/ask + throttled activity stamp.
+
+    Replaces two stacked ``BaseHTTPMiddleware`` layers. Each BaseHTTPMiddleware
+    wraps the request in an anyio task group and a stream hop and breaks
+    streaming passthrough; both of these are no-ops for >99% of requests, so
+    the tax was pure overhead on every call. As pure ASGI this is one
+    transparent passthrough that only does work on the two rare branches, and
+    it passes the receive/send callables straight through (no stream hop).
+    Response shapes and status codes are unchanged.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        method = scope.get("method", "")
+        path = scope.get("path", "")
+        if method == "POST" and path.rstrip("/") == "/api/ai/ask":
+            client = scope.get("client")
+            client_ip = client[0] if client else "unknown"
+            if not _ask_rate_ok(client_ip):
+                from fastapi.responses import JSONResponse as _JR
+
+                response = _JR(
+                    {"detail": "Rate limit exceeded. Try again in a minute."},
+                    status_code=429,
+                )
+                await response(scope, receive, send)
+                return
+        # Throttled activity stamp: never on the event loop, never blocking.
+        if _activity_stamp_due():
+            _ACTIVITY_STAMP_POOL.submit(_stamp_app_activity)
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(_ActivityRateLimitASGI)
 
 # Mount static files
 # Memoized root-UI bundle: (mtime_ns, size) key -> content + SHA1 ETag, so a
@@ -1240,11 +1276,8 @@ def _warm_youtube_session() -> None:
         logger.debug("YouTube session pre-warm failed", exc_info=True)
 
 
-threading.Thread(
-    target=_warm_youtube_session,
-    daemon=True,
-    name="youtube-warm",
-).start()
+# NOTE: _warm_youtube_session is now launched from the lifespan (see the
+# "Anonymous YouTube session pre-warm" block there), NOT at module scope.
 
 
 @app.get("/", response_class=HTMLResponse)

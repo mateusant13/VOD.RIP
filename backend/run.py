@@ -61,6 +61,16 @@ def main():
     _install_fatal_hooks()
     _install_logging()
     _install_shutdown_hook()
+    # Truthful log ordering: when stdout is a PIPE (dev supervisor, Tee-Object,
+    # `| tee`) Python block-buffers it, so the banner and uvicorn's own lines
+    # land in the log out of order — the banner once appeared 3.1s AFTER
+    # "Uvicorn running". Line-buffering stdout makes the piped log match real
+    # event order. No-op-safe for a TTY and for a redirected file handle.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(line_buffering=True)
+        except Exception:
+            pass
     # Debug mode removed — the `--debug` flag pointed to a missing `debug_cli.py`.
     # ponytail: Restore when a real debug CLI is built. For now, ignore --debug.
     if "--debug" in sys.argv:
