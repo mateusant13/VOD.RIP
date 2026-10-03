@@ -7,15 +7,54 @@ from __future__ import annotations
 
 import os
 
+import sqlite3
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from services import archive_transcribe as at  # noqa: E402
+# Own scratch DB, pinned at import AND re-bound for the module. The gate test
+# below drives _claim_next_job, whose cap gate counts 'running' transcribe
+# rows; a row another module left running in the shared scratch archive makes
+# the claim loop exit early and this file fail by run order alone.
+_TMP = Path(tempfile.mkdtemp(prefix="gpu-batching-"))
+_DB = _TMP / "archive.db"
+sqlite3.connect(str(_DB)).close()
+os.environ["VODRIP_ARCHIVE_DB"] = str(_DB)
+
+import pytest  # noqa: E402
+
+from services import archive_db, archive_transcribe as at  # noqa: E402
 
 GIB = 1024 ** 3
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _module_scratch_db():
+    """Re-bind archive_db's global connection to THIS module's DB.
+
+    Setting the env at import is not enough — conftest.py runs first and
+    archive_db._conn may already point at the shared scratch DB. Rebinding
+    the connection is what actually retargets it; restored afterwards so
+    whatever runs next keeps the shared DB."""
+    prev_env = os.environ.get("VODRIP_ARCHIVE_DB")
+    os.environ["VODRIP_ARCHIVE_DB"] = str(_DB)
+    with archive_db._lock:
+        prev_conn = archive_db._conn
+        prev_ready = archive_db._schema_ready
+        archive_db._conn = None
+        archive_db._schema_ready = False
+    archive_db.get_conn()
+    yield
+    with archive_db._lock:
+        archive_db._conn = prev_conn
+        archive_db._schema_ready = prev_ready
+    if prev_env is None:
+        os.environ.pop("VODRIP_ARCHIVE_DB", None)
+    else:
+        os.environ["VODRIP_ARCHIVE_DB"] = prev_env
 
 
 class _FakeResult:
