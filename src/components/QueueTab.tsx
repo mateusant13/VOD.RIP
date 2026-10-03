@@ -25,32 +25,6 @@ function isPlayableLocalFile(path: string): boolean {
   return /\.(mp4|mkv|webm|mov|m4v)$/i.test(path);
 }
 
-/** One row of GET /api/archive/jobs (Notifications tab). `title` is enriched
- *  by the backend router (LEFT JOIN videos) and may be '' when the video row
- *  is absent. */
-export interface ArchiveJobRow {
-  id: string;
-  kind: 'ingest' | 'chat' | 'transcribe' | 'events' | string;
-  platform: string;
-  video_id: string;
-  status: 'queued' | 'running' | 'done' | 'failed' | string;
-  progress: number; // 0..1
-  error: string | null;
-  created_at: string;
-  updated_at: string;
-  heartbeat: string | null;
-  title?: string;
-  /** TASK10 retry bookkeeping — absent on older backends; all optional. */
-  attempts?: number;
-  max_attempts?: number;
-  next_retry_at?: string | null;
-}
-
-/** TASK10: a queued job with attempts > 0 was auto-requeued after a failure —
- *  an informational retry, NOT a final failure (only status 'failed' is final). */
-export const isRetryJob = (j: Pick<ArchiveJobRow, 'status' | 'attempts'>): boolean =>
-  j.status === 'queued' && (j.attempts ?? 0) > 0;
-
 type Props = {
   queueDownloads: DownloadState[];
   recentDownloads?: DownloadState[];

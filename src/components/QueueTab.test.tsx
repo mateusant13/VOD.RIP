@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import QueueTab, { type ArchiveJobRow } from './QueueTab';
-import type { DownloadState } from '../types';
+import QueueTab from './QueueTab';
+import type { DownloadState, ArchiveJobRow } from '../types';
 
 const DL = (over: Partial<DownloadState> = {}): DownloadState => ({
   download_id: 'dl-1',
@@ -52,6 +52,7 @@ const JOB = (over: Partial<ArchiveJobRow> = {}): ArchiveJobRow => ({
   updated_at: '2026-08-08T00:00:01Z',
   heartbeat: '2026-08-08T00:00:01Z',
   title: 'My VOD',
+  priority: 0,
   ...over,
 });
 

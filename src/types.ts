@@ -130,6 +130,19 @@ export interface AppSettings {
   /** Captions-first: skip ASR for YouTube videos that already have
    * auto-caption rows at ingest (absent on older backends -> default true). */
   yt_subtitles_first?: boolean;
+  /** Queue management (absent on older backends -> the defaults below).
+   *  auto: add a channel and its newest videos get transcribed without
+   *  waiting for the user to open one. latest_per_channel: how many of a
+   *  channel's most recent videos are candidates. concurrency: VODs
+   *  transcribed at once (1 = one VOD at a time, all lanes on it; 0 = one
+   *  VOD per lane). focus_pauses_queue: the item the user is interacting
+   *  with gets the transcribe queue. force_transcribe: run ASR even while
+   *  the caption question is open. */
+  archive_auto_transcribe?: boolean;
+  archive_transcribe_latest_per_channel?: number;
+  archive_transcribe_concurrency?: number;
+  archive_focus_pauses_queue?: boolean;
+  archive_force_transcribe?: boolean;
   /** Default ASR language for parakeet jobs: 'auto' or a family code ('pt','en','es'). */
   asr_language?: string;
   /** Per-channel ASR override: channel slug -> 'auto' or family code. */
@@ -144,6 +157,45 @@ export interface AppSettings {
   ai_api_key_set?: boolean;
   features?: Record<string, boolean> | null;
 }
+
+/** One row of GET /api/archive/jobs (rendered by NotificationsPanel).
+ *  `title` is enriched by the backend router and may be '' when the video
+ *  row is absent. Lives here, not in QueueTab: the job table is rendered by
+ *  the notifications panel, and a job type exported from the queue tab
+ *  read as if the queue tab owned the queue. */
+export interface ArchiveJobRow {
+  id: string;
+  kind: 'ingest' | 'chat' | 'transcribe' | 'events' | string;
+  platform: string;
+  video_id: string;
+  /** 'paused' is a user-held row: it is never claimed by the worker. */
+  status: 'queued' | 'running' | 'paused' | 'done' | 'failed' | string;
+  progress: number; // 0..1
+  error: string | null;
+  priority: number;
+  created_at: string;
+  updated_at: string;
+  heartbeat: string | null;
+  title?: string;
+  /** TASK10 retry bookkeeping — absent on older backends; all optional. */
+  attempts?: number;
+  max_attempts?: number;
+  next_retry_at?: string | null;
+}
+
+/** TASK10: a queued job with attempts > 0 was auto-requeued after a failure —
+ *  an informational retry, NOT a final failure (only status 'failed' is final). */
+export const isRetryJob = (j: Pick<ArchiveJobRow, 'status' | 'attempts'>): boolean =>
+  j.status === 'queued' && (j.attempts ?? 0) > 0;
+
+/** Priority tiers, mirroring services/queue_policy.py. Sent by NAME so the
+ *  UI states intent instead of hardcoding a magic number. */
+export type JobPriorityTier = 'background' | 'search' | 'preview' | 'focus';
+
+/** A running job is never preempted (the executor is mid-decode), so the
+ *  control surface only offers actions on queued/paused rows. */
+export const canControlJob = (j: Pick<ArchiveJobRow, 'status'>): boolean =>
+  j.status === 'queued' || j.status === 'paused';
 
 export interface AiAskSource {
   video_title: string;

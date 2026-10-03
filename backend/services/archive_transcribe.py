@@ -27,6 +27,16 @@ Design decisions:
     exclusive-GPU worker). Each pool thread is pinned to its slot's device
     at thread start, so CPU threads never compete for VRAM. CPU-only hosts
     are unchanged (WORKERS, same dynamic default).
+  * ONE VOD AT A TIME (VODRIP_TRANSCRIBE_JOB_CONCURRENCY, default 1): the
+    pool's lanes are NOT one-VOD-per-lane. The refill claims at most N
+    transcribe jobs, and the lanes become chunk workers INSIDE the single
+    running VOD (_transcribe_chunks_hybrid), so GPU and CPU decode that
+    same VOD in parallel. N=0 restores the legacy pool (each lane claims
+    its own VOD). chat/events jobs are never capped by this.
+  * Queue control: jobs can be paused/resumed/re-prioritised/cancelled via
+    /api/archive/jobs/* ('paused' is never claimed), and while the user is
+    interacting with an item, queue_policy.active_focus() gives that VOD
+    the transcribe queue. See services/queue_policy.py for every knob.
   * Engine: parakeet (sherpa-onnx, nemo_transducer TDT v3 int8) is the ONLY
     ASR engine — faster-whisper was removed. It covers 26 European language
     families (PARAKEET_LANG_CANDIDATES) plus unknown/auto-detect. A known
@@ -81,6 +91,7 @@ from services.archive_events import detect_events_video, events_enabled
 from services.autostart import background_mode
 from services.disk_hygiene import whisper_cache_dir
 from services.os_services import _NO_WINDOW
+from services import queue_policy
 from services.yt_gate import gate_remaining_sec, youtube_gate_active
 from services.ytdlp_ffmpeg import _resolve_ffmpeg_exe, _resolve_ffprobe_exe
 
@@ -4437,6 +4448,14 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+# Max VODs transcribing at once. A one-element list so run_worker can set it
+# without a global statement; 0 = unlimited = the legacy behaviour where each
+# pool lane claims a DIFFERENT VOD. Default 1 ("one VOD at a time") is applied
+# by run_worker from queue_policy.transcribe_job_concurrency() — a module-level
+# 1 here would silently cap the tests that drive the worker with a pinned plan.
+_transcribe_cap: list[int] = [0]
+
+
 def _claim_next_job() -> Optional[dict]:
     """Atomically claim the newest queued transcribe/events/chat job (crash-stale too).
 
@@ -4449,16 +4468,59 @@ def _claim_next_job() -> Optional[dict]:
     stored page, so a running one whose heartbeat went stale past
     _CHAT_HEARTBEAT_STALE (20 min) is a dead or wedged executor —
     reclaimed long before the flat 2h window; NULL heartbeats
-    (pre-heartbeat rows, YouTube) fall back to updated_at."""
+    (pre-heartbeat rows, YouTube) fall back to updated_at.
+
+    Three claim-time gates, in this order:
+
+    * 'paused' rows are NEVER claimed. The status predicate below only
+      selects 'queued' (or a stale 'running'), so a paused row cannot
+      match — a user pause is honored by construction, not by a filter
+      that a future edit could drop.
+    * The transcribe CONCURRENCY cap (_transcribe_cap, default 1): with
+      "one VOD at a time" the pool's lanes stop being job slots and become
+      chunk lanes INSIDE the one running VOD (see _transcribe_chunks_hybrid),
+      so claiming a second VOD would defeat the setting. Chat/events are
+      NOT capped — they are short network jobs, not VOD transcription, and
+      capping them would let one 13-hour VOD starve every chat backfill.
+    * USER FOCUS (queue_policy.active_focus): while the user is on item X,
+      only X's transcribe job is claimable. chat/events keep draining, and
+      the focus record expires on its own (FOCUS_TTL_S) so a closed app can
+      never wedge the queue."""
     now = datetime.now(timezone.utc)
     transcribe_cutoff = (now - _STALE_JOB_TIMEDELTA).isoformat(timespec="seconds")
     twitch_chat_cutoff = (now - _CHAT_HEARTBEAT_STALE).isoformat(timespec="seconds")
     yt_chat_cutoff = (now - _CHAT_STALE_TIMEDELTA).isoformat(timespec="seconds")
     now_iso = now.isoformat(timespec="seconds")
+    # --- claim-time gates (see docstring) ---------------------------------
+    focus = queue_policy.active_focus()
+    cap = _transcribe_cap[0]
+    if cap > 0:
+        try:
+            running = archive_db.query(
+                "SELECT COUNT(*) AS n FROM archive_jobs "
+                "WHERE kind='transcribe' AND status='running'"
+            )
+            at_cap = int(running[0]["n"] or 0) >= cap
+        except Exception:
+            at_cap = False
+    else:
+        at_cap = False
+    if at_cap:
+        # Cap reached: the only claimable kinds are the uncapped ones.
+        kinds_sql = "'events','chat'"
+        focus_sql, focus_params = "", []
+    elif focus is not None:
+        # Focus held: the focused VOD's transcribe job wins, everything
+        # else's transcribe work waits.
+        kinds_sql = "'transcribe','events','chat'"
+        focus_sql = " AND (kind <> 'transcribe' OR (platform = ? AND video_id = ?))"
+        focus_params = [focus[0], focus[1]]
+    else:
+        kinds_sql, focus_sql, focus_params = "'transcribe','events','chat'", "", []
     # String comparison is valid: both sides come from _now_iso (UTC, same width).
     rows = archive_db.query(
-        """SELECT * FROM archive_jobs
-           WHERE kind IN ('transcribe','events','chat')
+        f"""SELECT * FROM archive_jobs
+           WHERE kind IN ({kinds_sql}){focus_sql}
              AND ((status = 'queued' AND (next_retry_at IS NULL OR next_retry_at <= ?))
                   OR (status = 'running' AND
                   COALESCE(heartbeat, updated_at) <
@@ -4469,7 +4531,7 @@ def _claim_next_job() -> Optional[dict]:
             (SELECT duration_sec FROM videos WHERE videos.platform = archive_jobs.platform AND videos.video_id = archive_jobs.video_id),
             99999) ASC, created_at ASC
            LIMIT 8""",
-        (now_iso, twitch_chat_cutoff, yt_chat_cutoff, transcribe_cutoff),
+        (focus_params + [now_iso, twitch_chat_cutoff, yt_chat_cutoff, transcribe_cutoff]),
     )
     for row in rows:
         # Bot-gate freeze: never claim YouTube jobs while the gate is up.
@@ -4604,52 +4666,32 @@ class _YoutubeGateRequeue(Exception):
 
 
 def _youtube_transcribe_verdict(
-    platform: str, video_id: str, *, subtitles_first: Optional[bool] = None
+    platform: str, video_id: str, *, subtitles_first: Optional[bool] = None,
+    force_transcribe: Optional[bool] = None,
 ) -> str:
-    """ASR decision for one YouTube transcribe job (non-YouTube -> 'run-asr').
+    """ASR decision for one transcribe job — THIN WRAPPER.
 
-    Decision matrix (captions-first, settings.yt_subtitles_first, default
-    True):
-      'skip-captions' — captions-first ON and transcript rows exist: the
-          captions ARE the transcript — resolve the job done, never ASR.
-      'music'         — terminal VAD verdict (speech fraction below
-          VODRIP_MUSIC_SPEECH_FRAC): the video is instrumental — done,
-          never ASR, never re-enqueued.
-      'blocked'       — terminal download verdict (DRM/age-gated/deleted/
-          private): the audio can never be fetched — done, never ASR,
-          never re-enqueued.
-      'wait-caption'  — no captions AND no captions_unavailable_at marker:
-          the ingest leg is still extracting/retrying, so the caption
-          question is undetermined — requeue, never run ASR, never resolve
-          done. (The audio download would fail identically while the
-          extract fails.)
-      'run-asr'       — captions_unavailable_at marker set (permanent
-          caption unavailability -> ASR candidate) OR the subtitles_first
-          override is OFF (explicit user override: always ASR, captions
-          included).
-    ponytail: there is no force-transcribe path (archive_jobs has no force
-    flag) — add one there if a job ever needs to bypass this.
+    The decision itself now lives in queue_policy.transcript_route_verdict,
+    which the scheduler consults BEFORE it creates the job. That is the
+    whole point of the move: the two used to be separate implementations of
+    the same matrix, free to drift (the scheduler skipped only
+    'wait-caption', the worker also had to honour 'skip-captions'), and a
+    drift between them shows up as a job the scheduler was happy to create
+    and the worker immediately throws away.
+
+    force_transcribe (setting archive_force_transcribe) bypasses the
+    caption question — the old docstring's "there is no force-transcribe
+    path" note is now closed. Terminal 'music'/'blocked' verdicts still
+    win: they are facts about the media, not about caption availability.
     """
-    if platform != "youtube":
-        return "run-asr"
-    if subtitles_first is None:
-        try:
-            from deps import settings_mgr  # lazy: archive_transcribe is opt-in by design
-
-            subtitles_first = bool(getattr(settings_mgr.get(), "yt_subtitles_first", True))
-        except Exception:
-            subtitles_first = True
-    kind = archive_db.video_transcript_kind(platform, video_id) or ""
-    if kind == "music":
-        return "music"
-    if kind == "blocked":
-        return "blocked"
-    has_rows = bool(archive_db.transcript_for(platform, video_id))
-    if has_rows and subtitles_first:
-        return "skip-captions"
-    if not has_rows and archive_db.captions_unavailable_at(platform, video_id) is None:
-        return "wait-caption"
-    return "run-asr"
+    if force_transcribe is None:
+        force_transcribe = queue_policy.force_transcribe_enabled()
+    return queue_policy.transcript_route_verdict(
+        platform,
+        video_id,
+        subtitles_first=subtitles_first,
+        force_transcribe=bool(force_transcribe),
+    )
 
 
 def _resolve_job_language(platform: str, video_id: str) -> Optional[str]:
@@ -5276,8 +5318,11 @@ def _run_worker(
     ALWAYS parakeet (the only ASR engine): GPU slots run it with
     provider='cuda' when a CUDA sherpa-onnx is installed and VRAM allows,
     CPU slots run it int8. The shared queue stays FIFO (_claim_next_job)
-    with no duration routing: the GPU thread claims the next job when it
-    finishes one, CPU threads pick up queued VODs in the meantime.
+    ordered by priority then shortest-first, with two claim-time gates that
+    narrow it further: the JOB cap (_transcribe_cap, "one VOD at a time")
+    and user focus. Under the default cap of 1 the GPU thread claims the
+    only running VOD and the CPU lanes pick up CHUNKS of that same VOD
+    (_transcribe_chunks_hybrid) instead of other queued VODs.
 
     A plan of exactly one CUDA slot (VODRIP_TRANSCRIBE_WORKERS=0) is the
     single-global-model path: budget 1, one recognizer. max_workers
@@ -5297,8 +5342,17 @@ def _run_worker(
     plan = _pool_plan(max_workers)
     budget = len(plan)
     multi = budget > 1
-    logger.info("archive transcribe worker: plan=[%s] workers=%d",
-                ", ".join(f"{d}/{ct}" for d, ct in plan), budget)
+    # "One VOD at a time, GPU and CPU together on that VOD" — the JOB cap
+    # (queue_policy.transcribe_job_concurrency, default 1) is deliberately
+    # NOT the lane count: the pool keeps its GPU+CPU lanes, but the refill
+    # may only claim that many transcribe JOBS, and the lanes then become
+    # chunk lanes INSIDE the one running VOD (_transcribe_chunks_hybrid).
+    # That is what makes GPU and CPU cooperate on a single VOD instead of
+    # each lane grabbing a different one. 0 = legacy pool (one VOD per lane).
+    _prev_transcribe_cap = _transcribe_cap[0]
+    _transcribe_cap[0] = queue_policy.transcribe_job_concurrency()
+    logger.info("archive transcribe worker: plan=[%s] workers=%d transcribe_job_cap=%d",
+                ", ".join(f"{d}/{ct}" for d, ct in plan), budget, _transcribe_cap[0])
     # Dynamic plan re-evaluation: a GPU that frees up (or gets grabbed) is
     # noticed within ~_PLAN_RECHECK_S.  A proposed replacement waits for the
     # current executor to drain before creation, so old/new inference never
@@ -5445,6 +5499,7 @@ def _run_worker(
             if once and not pending:
                 break
     finally:
+        _transcribe_cap[0] = _prev_transcribe_cap
         if max_workers is None:
             watch_stop.set()
             watch.join(timeout=2.0)

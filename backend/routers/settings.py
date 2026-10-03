@@ -367,6 +367,25 @@ def _apply_settings_update(update: SettingsUpdate) -> AppSettings:
         current.yt_subtitles_first = bool(update.yt_subtitles_first)
     if update.archive_smart_enrich is not None:
         current.archive_smart_enrich = bool(update.archive_smart_enrich)
+    if update.archive_auto_transcribe is not None:
+        current.archive_auto_transcribe = bool(update.archive_auto_transcribe)
+    if update.archive_transcribe_latest_per_channel is not None:
+        # 0 = never auto-select candidates (explicit enqueue only). Negative
+        # or absurd values clamp rather than 400 — this is a tuning knob, and
+        # a clamped number is friendlier than a rejected save.
+        current.archive_transcribe_latest_per_channel = max(
+            0, min(200, int(update.archive_transcribe_latest_per_channel))
+        )
+    if update.archive_transcribe_concurrency is not None:
+        # 0 = unlimited (legacy pool: one VOD per lane); 1 = one VOD at a
+        # time with all lanes cooperating on it.
+        current.archive_transcribe_concurrency = max(
+            0, min(64, int(update.archive_transcribe_concurrency))
+        )
+    if update.archive_focus_pauses_queue is not None:
+        current.archive_focus_pauses_queue = bool(update.archive_focus_pauses_queue)
+    if update.archive_force_transcribe is not None:
+        current.archive_force_transcribe = bool(update.archive_force_transcribe)
     if update.asr_language is not None:
         # 'auto' or a family code ('pt'/'en'/'es'); anything else is kept
         # verbatim (parakeet accepts raw codes) but never left blank.

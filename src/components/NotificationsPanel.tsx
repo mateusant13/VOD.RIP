@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Bell, CheckCircle2, CircleAlert, Loader2 } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { Bell, CheckCircle2, CircleAlert, Loader2, Pause, Play, Star, XCircle } from 'lucide-react';
 import PlatformVodIcon from './PlatformVodIcon';
-import { isRetryJob, type ArchiveJobRow } from './QueueTab';
+import { canControlJob, isRetryJob, type ArchiveJobRow, type JobPriorityTier } from '../types';
 import { useI18n } from '../i18n';
 
 const JOBS_POLL_MS = 3000;
@@ -21,6 +21,56 @@ async function fetchJobs(): Promise<ArchiveJobRow[]> {
   if (!res.ok) return [];
   const data = (await res.json().catch(() => null)) as { jobs?: ArchiveJobRow[] } | null;
   return Array.isArray(data?.jobs) ? data.jobs : [];
+}
+
+/** Pause / resume / cancel / prioritise one job.
+ *
+ *  A 409 is not an error to shout about: the backend refuses to preempt a
+ *  RUNNING job (the executor is mid-decode and killing it would drop the
+ *  in-flight chunk), so the poll simply re-reads the truth instead. The
+ *  returned boolean drives whether we bother refetching.
+ *
+ *  'priority' carries the target tier in the body; the other three take no
+ *  body. */
+async function controlJob(
+  id: string,
+  action: 'pause' | 'resume' | 'cancel' | 'priority',
+  tier?: JobPriorityTier,
+): Promise<boolean> {
+  const body = tier ? JSON.stringify({ tier }) : undefined;
+  const res = await fetch(`/api/archive/jobs/${encodeURIComponent(id)}/${action}`, {
+    method: 'POST',
+    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    body,
+  }).catch(() => null);
+  return Boolean(res?.ok);
+}
+
+/** One small control on a job row. Kept as a local component so the four
+ *  action buttons share the same shape instead of four near-identical
+ *  className strings drifting apart. */
+function JobButton({ icon, label, onClick, danger = false }: {
+  icon: ReactNode;
+  label: string;
+  onClick: () => void;
+  danger?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={label}
+      aria-label={label}
+      className={`px-1.5 py-0.5 border text-[9px] font-bold uppercase tracking-wider transition-colors flex items-center gap-1 ${
+        danger
+          ? 'border-zinc-800 text-zinc-500 hover:text-red-400 hover:border-red-700'
+          : 'border-zinc-800 text-zinc-400 hover:text-white hover:border-zinc-500'
+      }`}
+    >
+      {icon}
+      {label}
+    </button>
+  );
 }
 
 export default function NotificationsPanel() {
@@ -64,16 +114,27 @@ export default function NotificationsPanel() {
     switch (j.status) {
       case 'queued': return t('progress.status.queued');
       case 'running': return t('progress.status.running');
+      case 'paused': return t('progress.status.paused');
       case 'done': return t('progress.status.done');
       case 'failed': return t('progress.status.failed');
       default: return j.status;
     }
   };
 
+  /** Re-read the queue after a control action (the poll would catch up
+   *  anyway, but acting on a stale row reads as "the button did nothing"). */
+  const refresh = useCallback(() => {
+    void fetchJobs().then(setJobs).catch(() => {});
+  }, []);
+
+  const runAction = useCallback((id: string, action: 'pause' | 'resume' | 'cancel' | 'priority', tier?: JobPriorityTier) => {
+    void controlJob(id, action, tier).then(refresh);
+  }, [refresh]);
+
   const filtered = useMemo(() => {
     return jobs.filter((j) => {
       if (kindFilter !== 'all' && j.kind !== kindFilter) return false;
-      if (statusFilter === 'active') return j.status === 'queued' || j.status === 'running';
+      if (statusFilter === 'active') return j.status === 'queued' || j.status === 'running' || j.status === 'paused';
       if (statusFilter === 'done') return j.status === 'done';
       // 'failed' is FINAL failure only — retries (queued, attempts>0) are not.
       if (statusFilter === 'failed') return j.status === 'failed';
@@ -153,10 +214,16 @@ export default function NotificationsPanel() {
           {filtered.map((j) => {
             const pct = Math.min(100, Math.max(0, Math.round((j.progress || 0) * 100)));
             const running = j.status === 'running';
+            const paused = j.status === 'paused';
             const retrying = isRetryJob(j);
             const jobTs = j.updated_at || j.created_at;
+            // Only queued/paused rows are actionable — the backend refuses
+            // to preempt a running job, so offering the button would only
+            // ever produce a 409.
+            const controllable = canControlJob(j);
+            const prioritised = (j.priority ?? 0) > 0;
             return (
-              <div key={j.id} className="border-2 border-zinc-800 bg-zinc-950/80 p-2.5 flex flex-col gap-1.5">
+              <div key={j.id} className={`border-2 bg-zinc-950/80 p-2.5 flex flex-col gap-1.5 ${paused ? 'border-amber-700/60' : 'border-zinc-800'}`}>
                 <div className="flex justify-between items-center gap-2">
                   <div className="flex items-center gap-1.5 min-w-0">
                     <PlatformVodIcon platform={PLATFORM_ICON_NAME[j.platform] ?? j.platform} className="w-3.5 h-3.5 shrink-0" />
@@ -176,12 +243,14 @@ export default function NotificationsPanel() {
                     <span className={`text-[10px] font-mono shrink-0 flex items-center gap-1 ${
                       j.status === 'running' ? 'text-[#53fc18]' :
                       j.status === 'failed' ? 'text-red-400' :
+                      paused ? 'text-amber-400' :
                       retrying ? 'text-amber-400' :
                       j.status === 'done' ? 'text-zinc-400' : 'text-zinc-500'
                     }`}>
                       {j.status === 'running' ? <Loader2 size={11} className="animate-spin" /> : null}
                       {j.status === 'done' ? <CheckCircle2 size={11} /> : null}
                       {j.status === 'failed' ? <CircleAlert size={11} /> : null}
+                      {paused ? <Pause size={11} /> : null}
                       {statusLabel(j)}
                     </span>
                   </div>
@@ -199,6 +268,34 @@ export default function NotificationsPanel() {
                 )}
                 {retrying && j.error && (
                   <span className="text-[10px] text-amber-300/70 font-mono truncate" title={j.error}>{j.error}</span>
+                )}
+                {controllable && (
+                  <div className="flex items-center gap-1.5 pt-0.5">
+                    {paused ? (
+                      <JobButton
+                        icon={<Play size={11} />}
+                        label={t('progress.action.resume')}
+                        onClick={() => runAction(j.id, 'resume')}
+                      />
+                    ) : (
+                      <JobButton
+                        icon={<Pause size={11} />}
+                        label={t('progress.action.pause')}
+                        onClick={() => runAction(j.id, 'pause')}
+                      />
+                    )}
+                    <JobButton
+                      icon={<Star size={11} />}
+                      label={prioritised ? t('progress.action.demote') : t('progress.action.prioritise')}
+                      onClick={() => runAction(j.id, 'priority', prioritised ? 'background' : 'focus')}
+                    />
+                    <JobButton
+                      icon={<XCircle size={11} />}
+                      label={t('progress.action.cancel')}
+                      onClick={() => runAction(j.id, 'cancel')}
+                      danger
+                    />
+                  </div>
                 )}
               </div>
             );

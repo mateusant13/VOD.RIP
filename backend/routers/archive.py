@@ -18,7 +18,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
-from services import archive_db, archive_twitch
+from services import archive_db, archive_twitch, queue_policy
 from services.archive_scheduler import TRANSCRIBE_PRIORITY_HIGH, _chat_job_guard
 
 logger = logging.getLogger(__name__)
@@ -1100,8 +1100,15 @@ async def archive_jobs_enqueue(job: dict):
     if not (job_id and kind and video_id):
         raise HTTPException(status_code=400, detail="id, kind and video_id required")
     _require_platform(platform)
+    # Optional priority (the caller may ask for a tier explicitly); omitted
+    # or unparseable keeps the historical default of 0 rather than 400ing a
+    # client that never knew the field existed.
     try:
-        archive_db.enqueue_job(job_id, kind, platform, video_id, priority=0)
+        priority = int(job.get("priority", 0))
+    except (TypeError, ValueError):
+        priority = 0
+    try:
+        archive_db.enqueue_job(job_id, kind, platform, video_id, priority=priority)
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=409, detail=f"job {job_id} already exists") from None
     threading.Thread(
@@ -1110,6 +1117,115 @@ async def archive_jobs_enqueue(job: dict):
         name="archive-worker-kick",
     ).start()
     return {"ok": True, "id": job_id}
+
+
+# --- user control over the queue -----------------------------------------
+# The asymmetry this closes: per-DOWNLOAD pause/resume/cancel existed
+# (download_manager), while a TRANSCRIPTION had no controls at all — the
+# only job endpoints were list / enqueue / clear. A user watching a
+# 13-hour VOD had no way to say "not that one" or "do this one next".
+#
+# Every action is refused with 409 when the job is not in a state it can act
+# on (running, done, failed). A RUNNING job is deliberately NOT preemptable:
+# the executor is mid-decode and killing it would throw away the in-flight
+# chunk, so pause/cancel/prioritise only apply to queued and paused rows.
+def _job_or_409(job_id: str) -> dict:
+    job = archive_db.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"job {job_id} not found")
+    return job
+
+
+def _applied_or_409(job_id: str, applied: bool, action: str) -> dict:
+    if applied:
+        return {"ok": True, "id": job_id, "status": action}
+    job = _job_or_409(job_id)
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"cannot {action} job {job_id}: it is {job['status']} "
+            "(running jobs are never preempted)"
+        ),
+    )
+
+
+@router.post("/api/archive/jobs/{job_id}/pause")
+async def archive_job_pause(job_id: str):
+    return _applied_or_409(job_id, archive_db.pause_job(job_id), "paused")
+
+
+@router.post("/api/archive/jobs/{job_id}/resume")
+async def archive_job_resume(job_id: str):
+    return _applied_or_409(job_id, archive_db.resume_job(job_id), "resumed")
+
+
+@router.post("/api/archive/jobs/{job_id}/cancel")
+async def archive_job_cancel(job_id: str):
+    return _applied_or_409(job_id, archive_db.cancel_job(job_id), "cancelled")
+
+
+@router.post("/api/archive/jobs/{job_id}/priority")
+async def archive_job_priority(job_id: str, body: dict):
+    """Re-prioritise a queued/paused job.
+
+    Accepts a raw integer (0/100/200/300 — queue_policy's named tiers) or a
+    tier NAME, so a client can say what it MEANS ('focus', 'preview',
+    'search', 'background') instead of hardcoding a magic number. Unknown
+    names fall back to the raw value, then to 400 if neither parses."""
+    tier = str(body.get("tier") or "").strip().lower()
+    tiers = {
+        "background": queue_policy.PRIORITY_BACKGROUND,
+        "search": queue_policy.PRIORITY_SEARCH,
+        "preview": queue_policy.PRIORITY_PREVIEW,
+        "focus": queue_policy.PRIORITY_FOCUS,
+    }
+    if tier in tiers:
+        priority = tiers[tier]
+    else:
+        raw = body.get("priority", tier or None)
+        try:
+            priority = int(raw)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail="priority must be an integer or a tier name "
+                       "(background/search/preview/focus)",
+            ) from None
+    return _applied_or_409(
+        job_id, archive_db.set_job_priority(job_id, priority), "reprioritised"
+    )
+
+
+@router.post("/api/archive/focus")
+async def archive_focus_stamp(body: dict):
+    """Record that the user is interacting with an item right now.
+
+    The worker consults this BEFORE claiming a transcribe job: while a focus
+    is live, the focused VOD gets the transcribe queue and the others wait
+    (chat/events keep draining). The record expires on its own after
+    queue_policy.FOCUS_TTL_S, so a client that never sends a release — a
+    closed tab, a crashed renderer — cannot wedge the queue.
+
+    An empty body (or a missing video_id) RELEASES the focus, which is the
+    natural 'the user navigated away' signal."""
+    platform = str(body.get("platform") or "").strip().lower()
+    video_id = str(body.get("video_id") or "").strip()
+    if not video_id or platform not in archive_db.PLATFORMS:
+        archive_db.clear_user_focus()
+        return {"ok": True, "focus": None}
+    archive_db.set_user_focus(platform, video_id)
+    # Bump the focused item's job to the focus tier so it also wins the
+    # priority ordering against older queued work. Never touches a running
+    # job (set_job_priority refuses) — a running job is already past the
+    # claim decision, which is the no-preemption invariant.
+    try:
+        archive_db.set_job_priority(
+            f"transcribe-{platform}-{video_id}", queue_policy.PRIORITY_FOCUS
+        )
+    except Exception:
+        logger.debug("focus priority bump skipped", exc_info=True)
+    return {"ok": True, "focus": {"platform": platform, "video_id": video_id}}
+
 
 
 from pydantic import BaseModel

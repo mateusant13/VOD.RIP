@@ -212,7 +212,7 @@ CREATE TABLE IF NOT EXISTS archive_jobs (
   platform   TEXT NOT NULL,
   video_id   TEXT NOT NULL,
   status     TEXT NOT NULL DEFAULT 'queued'
-             CHECK (status IN ('queued','running','done','failed')),
+             CHECK (status IN ('queued','running','paused','done','failed')),
   progress   REAL NOT NULL DEFAULT 0,
   error      TEXT,
   priority   INTEGER NOT NULL DEFAULT 0,
@@ -254,6 +254,19 @@ CREATE TABLE IF NOT EXISTS worker_heartbeats (
   tag TEXT PRIMARY KEY,
   at  TEXT NOT NULL
 );
+
+-- User-interaction focus: the item the user is currently looking at. The
+-- worker consults this BEFORE claiming a transcribe job and gives the
+-- focused video the queue while the rest wait (see services.queue_policy).
+-- Rows expire on read (FOCUS_TTL_S) — a stale focus must never wedge the
+-- queue, so a crash mid-session cannot leave a permanent hold.
+CREATE TABLE IF NOT EXISTS user_focus (
+  platform   TEXT NOT NULL,
+  video_id   TEXT NOT NULL,
+  focused_at TEXT NOT NULL,
+  PRIMARY KEY (platform, video_id)
+);
+CREATE INDEX IF NOT EXISTS idx_user_focus_at ON user_focus(focused_at);
 """
 
 
@@ -475,6 +488,7 @@ def _init_schema() -> None:
         _ensure_jobs_kind_chat(_conn)
         _ensure_jobs_heartbeat_column(_conn)
         _ensure_jobs_retry_columns(_conn)
+        _ensure_jobs_status_paused(_conn)
         rebuilt = _migrate_fts_contentless(_conn)
         # One-time data migrations on transcripts (entity + lang backfill).
         # Runs after the FTS rebuild so the current trigger set re-indexes.
@@ -1053,6 +1067,74 @@ def _ensure_jobs_kind_chat(conn: sqlite3.Connection) -> None:
     conn.execute(
         "UPDATE archive_jobs SET kind = 'chat' WHERE kind = 'chat_backfill'"
     )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_jobs_status_priority ON archive_jobs(status, priority, created_at)"
+    )
+
+
+def _ensure_jobs_status_paused(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: add the 'paused' job status.
+
+    SQLite cannot ALTER a CHECK constraint, so the table is rebuilt
+    (rename -> create -> copy -> drop) exactly like
+    _ensure_jobs_kind_events / _ensure_jobs_priority / _ensure_jobs_kind_chat
+    before it. Runs LAST, after every additive column migration, so the
+    rebuild DDL is the final shape (priority + heartbeat + the retry-queue
+    columns included) and the copy is driven by PRAGMA table_info: a legacy
+    DB that predates ANY of those columns copies only the ones it has, and
+    the missing ones fall back to their column DEFAULT. That keeps a real
+    user DB (485 MB, rows mid-queue) readable across the upgrade instead of
+    failing on 'no such column'.
+
+    The copy PRESERVES heartbeat, unlike the older rebuilds which wrote
+    NULL AS heartbeat: nulling it would make every 'running' chat job look
+    stale to _claim_next_job's COALESCE fallback and get reclaimed the
+    instant the app restarted.
+
+    'paused' is a pure claim-time state: _claim_next_job only selects
+    status='queued', so a paused row is never claimed and needs no
+    predicate change — but a paused row must also never be resurrected by a
+    terminal requeue, which is why the API's resume is explicit.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='archive_jobs'"
+    ).fetchone()
+    if row and "'paused'" in (row[0] or ""):
+        return
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(archive_jobs)")}
+    conn.execute("ALTER TABLE archive_jobs RENAME TO archive_jobs_old")
+    conn.execute(
+        """CREATE TABLE archive_jobs (
+             id           TEXT PRIMARY KEY,
+             kind         TEXT NOT NULL CHECK (kind IN ('ingest','chat','transcribe','events')),
+             platform     TEXT NOT NULL,
+             video_id     TEXT NOT NULL,
+             status       TEXT NOT NULL DEFAULT 'queued'
+                          CHECK (status IN ('queued','running','paused','done','failed')),
+             progress     REAL NOT NULL DEFAULT 0,
+             error        TEXT,
+             priority     INTEGER NOT NULL DEFAULT 0,
+             created_at   TEXT NOT NULL,
+             updated_at   TEXT NOT NULL,
+             heartbeat    TEXT,
+             attempts     INTEGER NOT NULL DEFAULT 0,
+             max_attempts INTEGER NOT NULL DEFAULT 3,
+             next_retry_at TEXT
+           )"""
+    )
+    # Copy only the columns this DB actually has; anything absent takes the
+    # new table's DEFAULT (attempts 0 / max_attempts 3 / next_retry_at NULL).
+    target = [
+        "id", "kind", "platform", "video_id", "status", "progress", "error",
+        "priority", "created_at", "updated_at", "heartbeat",
+        "attempts", "max_attempts", "next_retry_at",
+    ]
+    cols = [c for c in target if c in existing]
+    conn.execute(
+        f"INSERT INTO archive_jobs ({', '.join(cols)}) "
+        f"SELECT {', '.join(cols)} FROM archive_jobs_old"
+    )
+    conn.execute("DROP TABLE archive_jobs_old")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_jobs_status_priority ON archive_jobs(status, priority, created_at)"
     )
@@ -2709,14 +2791,117 @@ def clear_finished_jobs() -> int:
     return int(cur.rowcount or 0)
 
 
+# --- user control surface over the queue ---------------------------------
+# Every helper below is a compare-and-set on the CURRENT status, so a stale
+# UI click can never clobber a transition the worker made in the meantime.
+# The shared rule: a RUNNING job is never preempted (the executor is mid
+# decode; killing it would lose the in-flight chunk). Pause/cancel/prioritise
+# therefore act on queued/paused rows only and report False otherwise, and
+# the API turns that into a 409 with the real current status.
+
+def get_job(job_id: str) -> Optional[dict]:
+    rows = query("SELECT * FROM archive_jobs WHERE id = ?", (job_id,))
+    return dict(rows[0]) if rows else None
+
+
+def pause_job(job_id: str) -> bool:
+    """Hold a queued job. True when this call flipped it to 'paused'."""
+    now = _now_iso()
+    cur = execute(
+        "UPDATE archive_jobs SET status='paused', updated_at=?, heartbeat=? "
+        "WHERE id=? AND status='queued'",
+        (now, now, job_id),
+    )
+    return bool(cur.rowcount == 1)
+
+
+def resume_job(job_id: str) -> bool:
+    """Release a paused job back to 'queued'.
+
+    Clears next_retry_at: a paused job may have been sitting under a retry
+    backoff (or a GPU-gate cooldown) from before the pause, and resuming it
+    into a future deadline would look like the resume did nothing.
+    """
+    now = _now_iso()
+    cur = execute(
+        "UPDATE archive_jobs SET status='queued', updated_at=?, heartbeat=?, "
+        "next_retry_at=NULL, progress=0 "
+        "WHERE id=? AND status='paused'",
+        (now, now, job_id),
+    )
+    return bool(cur.rowcount == 1)
+
+
+def set_job_priority(job_id: str, priority: int) -> bool:
+    """Re-prioritise a queued/paused job. Running and terminal rows are
+    refused (see the shared rule above)."""
+    now = _now_iso()
+    cur = execute(
+        "UPDATE archive_jobs SET priority=?, updated_at=? "
+        "WHERE id=? AND status IN ('queued','paused')",
+        (int(priority), now, job_id),
+    )
+    return bool(cur.rowcount == 1)
+
+
+def cancel_job(job_id: str) -> bool:
+    """Cancel a queued/paused job.
+
+    Writes status='failed' with a 'cancelled by user' error THROUGH A
+    DIRECT UPDATE, deliberately NOT update_job(): update_job's failed-path
+    requeues anything that is not a terminal error, so routing a cancel
+    through it would resurrect the job on a backoff timer seconds later —
+    the exact opposite of cancelling. The row stays visible as failed until
+    /jobs/clear drops it."""
+    now = _now_iso()
+    cur = execute(
+        "UPDATE archive_jobs SET status='failed', error=?, updated_at=?, heartbeat=?, "
+        "next_retry_at=NULL WHERE id=? AND status IN ('queued','paused')",
+        ("cancelled by user", now, now, job_id),
+    )
+    return bool(cur.rowcount == 1)
+
+
+# --- user-interaction focus ---------------------------------------------
+def set_user_focus(platform: str, video_id: str) -> None:
+    """Record that the user is interacting with this item right now.
+
+    Re-focusing a DIFFERENT item is the normal case (the user clicks
+    through videos), so older rows for the same video are upserted and
+    rows for other videos are dropped: exactly one item holds focus, and
+    the write is self-cleaning so a crashed app cannot leave a pile."""
+    now = _now_iso()
+    execute(
+        "INSERT INTO user_focus (platform, video_id, focused_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(platform, video_id) DO UPDATE SET focused_at=excluded.focused_at",
+        (platform, video_id, now),
+    )
+    execute(
+        "DELETE FROM user_focus WHERE NOT (platform = ? AND video_id = ?)",
+        (platform, video_id),
+    )
+
+
+def clear_user_focus(platform: Optional[str] = None, video_id: Optional[str] = None) -> None:
+    """Drop focus (all of it, or one item's)."""
+    if platform and video_id:
+        execute(
+            "DELETE FROM user_focus WHERE platform = ? AND video_id = ?",
+            (platform, video_id),
+        )
+    else:
+        execute("DELETE FROM user_focus")
+
+
 def list_jobs(limit: int = 50) -> list[dict]:
     rows = query(
         """SELECT * FROM archive_jobs
            ORDER BY CASE status
              WHEN 'running' THEN 0
              WHEN 'queued' THEN 1
-             WHEN 'failed' THEN 2
-             ELSE 3 END,
+             WHEN 'paused' THEN 2
+             WHEN 'failed' THEN 3
+             ELSE 4 END,
              updated_at DESC
            LIMIT ?""",
         (limit,),

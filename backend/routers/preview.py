@@ -57,7 +57,7 @@ from services.preview_service import (
 from services.youtube_diag import youtube_http_status, youtube_user_message
 from services.ytdlp_service import detect_platform
 from services.preview_timing import log_preview_timing
-from services import archive_db
+from services import archive_db, queue_policy
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["preview"])
@@ -407,10 +407,12 @@ async def preview_invalidate(req: PreviewWarmRequest):
 
 
 # WS-1 preview-queue priority: previewing an archived video with no transcript
-# yet enqueues (or bumps) its transcribe job to priority 200 so the worker
-# picks it before any normal-queue job AND before transcript-source search
-# re-enqueues (TRANSCRIBE_PRIORITY_HIGH = 100 — the focused preview wins).
-_PREVIEW_TRANSCRIBE_PRIORITY = 200
+# yet enqueues (or bumps) its transcribe job so the worker picks it before any
+# normal-queue job AND before transcript-source search re-enqueues
+# (PRIORITY_SEARCH = 100 — the focused preview wins). The value now comes
+# from queue_policy's named tiers (PRIORITY_PREVIEW = 200, unchanged) instead
+# of a bare number whose only other mention was a test file.
+_PREVIEW_TRANSCRIBE_PRIORITY = queue_policy.PRIORITY_PREVIEW
 
 
 def _preview_video_id(platform: str, url: str) -> Optional[str]:

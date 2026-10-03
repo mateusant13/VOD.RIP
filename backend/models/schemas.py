@@ -142,6 +142,30 @@ class AppSettings(BaseModel):
     # jobs for videos matching the search scope (default on). Off disables
     # the whole enrichment pass — hits-only responses.
     archive_smart_enrich: bool = True
+    # Queue management. Autonomous enqueue: when a channel is added, ingest
+    # alone never produced transcribe work (the old BOOT-02 gate only topped
+    # up a queue that already had work in it), so nothing was ever
+    # transcribed until the user opened or searched something by hand. ON by
+    # default — the per-pass budget and the one-VOD-at-a-time job cap bound
+    # the work; turn it OFF for strictly opt-in transcription.
+    archive_auto_transcribe: bool = True
+    # "The latest N per channel" — how many of a channel's most recent
+    # videos are transcription candidates (recency-ordered, per-channel
+    # capped). Replaces a global 50-shortest window that starved every
+    # recent VOD of a large channel.
+    archive_transcribe_latest_per_channel: int = 5
+    # How many VODs transcribe at once. 1 = one VOD at a time with every
+    # lane (GPU + CPU) cooperating on that single VOD; 0 = unlimited, the
+    # legacy pool where each lane claims its own VOD.
+    archive_transcribe_concurrency: int = 1
+    # While the user is interacting with an item, give it the transcribe
+    # queue and hold the rest (chat/events keep draining). Focus expires on
+    # its own, so it can never wedge the queue.
+    archive_focus_pauses_queue: bool = True
+    # Force ASR even while the caption question is open (captions never
+    # arrived and the ingest leg never stamped a verdict). Ignores terminal
+    # music/blocked verdicts, which are facts about the media.
+    archive_force_transcribe: bool = False
     # Default ASR language for parakeet jobs: 'auto' (parakeet has no
     # detection — the job language stays None and the channel-language
     # aggregation stamps the family) or a family code ('pt', 'en', 'es').
@@ -237,6 +261,11 @@ class SettingsUpdate(BaseModel):
     whisper_model_cache: Optional[str] = None
     yt_subtitles_first: Optional[bool] = None
     archive_smart_enrich: Optional[bool] = None
+    archive_auto_transcribe: Optional[bool] = None
+    archive_transcribe_latest_per_channel: Optional[int] = None
+    archive_transcribe_concurrency: Optional[int] = None
+    archive_focus_pauses_queue: Optional[bool] = None
+    archive_force_transcribe: Optional[bool] = None
     asr_language: Optional[str] = None
     channel_asr_languages: Optional[Dict[str, str]] = None
     ui_language: Optional[str] = None

@@ -48,7 +48,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from services import archive_db
+from services import archive_db, queue_policy
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +63,12 @@ BACKFILL_MAX_MESSAGES = 100_000      # chat-backfill ceiling (worker + search ki
 # so a capped run self-heals on the next resume instead of losing chat;
 # upgrade path: persist a per-video cursor (offset_sec) with the job row if
 # a single VOD ever exceeds the cap.
-TRANSCRIBE_PRIORITY_LOW = 0
-TRANSCRIBE_PRIORITY_HIGH = 100       # transcript-source search jump-the-queue
+# Priority tiers live in queue_policy (one named definition; the values are
+# unchanged — 0 background, 100 search, 200 preview, 300 live focus). They
+# used to be bare numbers here and in the preview hook, with 200 discoverable
+# only from a test file.
+TRANSCRIBE_PRIORITY_LOW = queue_policy.PRIORITY_BACKGROUND
+TRANSCRIBE_PRIORITY_HIGH = queue_policy.PRIORITY_SEARCH    # transcript-source search jump-the-queue
 YOUTUBE_RETRY_BACKOFF_S = 3600.0     # bot-wall retry delay per video
 FAILED_JOB_FRESH_S = 3600.0          # don't re-run a job failed < 1h ago
 # Re-fetch window for the per-pass Twitch GQL channel walk: a channel whose
@@ -637,46 +641,53 @@ def _enqueue_transcriptions() -> None:
     if enqueued >= budget:
         return
 
-    # BOOT-02: do not auto-create transcribe work on an idle queue. Pass 1
-    # still resurrects stale failures (attempt-capped). Fresh candidates
-    # only enqueue when the user/search already put transcribe work in
-    # flight — otherwise every 180s we'd start dozens of yt-dlp+ffmpeg jobs.
-    inflight = list(
-        archive_db.query(
-            """SELECT 1 FROM archive_jobs
-               WHERE kind='transcribe' AND status IN ('queued','running')
-               LIMIT 1"""
-        )
-    )
+    # BOOT-02: the idle gate is now a SETTING, not a hard rule. It used to
+    # return early unless transcribe work was ALREADY inflight, which meant
+    # a freshly added channel was ingested and then sat there forever: with
+    # nothing queued there was nothing to top up from, so the user had to
+    # open or search a video by hand before anything was ever transcribed.
+    # The gate's original purpose — no boot-time yt-dlp+ffmpeg storm — is a
+    # BUDGET problem, and the per-pass budget, the priority ordering and the
+    # one-VOD-at-a-time job cap already bound the storm. Default is now the
+    # behaviour the user actually asked for (add a channel -> it gets
+    # transcribed); the old behaviour stays available as a setting for
+    # anyone who wants strictly opt-in transcription.
     global _pass2_idle_logged
-    if not inflight:
-        # Gap 3b: INFO on state transition only (debug was invisible; an
-        # unconditional INFO would spam every 180s pass).
-        if _pass2_idle_logged is not True:
-            logger.info("scheduler transcribe pass-2 idle (no queued/running transcribe work)")
-            _pass2_idle_logged = True
-        return
-    if _pass2_idle_logged is True:
-        logger.info("scheduler transcribe pass-2 active again")
+    if not queue_policy.auto_transcribe_enabled():
+        inflight = list(
+            archive_db.query(
+                """SELECT 1 FROM archive_jobs
+                   WHERE kind='transcribe' AND status IN ('queued','running')
+                   LIMIT 1"""
+            )
+        )
+        if not inflight:
+            # Gap 3b: INFO on state transition only (debug was invisible; an
+            # unconditional INFO would spam every 180s pass).
+            if _pass2_idle_logged is not True:
+                logger.info(
+                    "scheduler transcribe pass-2 idle (no queued/running transcribe "
+                    "work; autonomous enqueue disabled by setting)"
+                )
+                _pass2_idle_logged = True
+            return
+        if _pass2_idle_logged is True:
+            logger.info("scheduler transcribe pass-2 active again")
+    elif _pass2_idle_logged is not True:
+        logger.info("scheduler transcribe pass-2 active (autonomous enqueue on)")
     _pass2_idle_logged = False
 
     # Pass 2 — fresh candidates. FIX A: twitch/kick rows are candidates
     # WITHOUT a local archive file (the worker downloads the audio at job
     # time), so the archive_path predicate is gone; a ready row whose file
     # was evicted/relocated is enqueued instead of skipped forever (FIX B).
-    rows = list(
-        archive_db.query(
-            """SELECT platform, video_id, channel, title, duration_sec, archive_path
-               FROM videos
-               WHERE platform IN ('youtube','twitch','kick')
-                 AND (status='ready' OR platform='youtube'
-                      OR archive_path IS NULL OR archive_path = '')
-                 AND NOT EXISTS (SELECT 1 FROM transcripts t
-                                 WHERE t.platform=videos.platform
-                                   AND t.video_id=videos.video_id)
-               ORDER BY duration_sec ASC LIMIT 50"""
-        )
-    )
+    # Candidate SHAPE moved to queue_policy.latest_per_channel_candidates:
+    # the newest N per channel, recency-ordered (N=5 by default). The old
+    # `ORDER BY duration_sec ASC LIMIT 50` took the 50 SHORTEST videos in
+    # the whole archive, so a channel with a thousand clips pushed every one
+    # of its recent VODs out of the window entirely — the exact opposite of
+    # "transcribe the latest 5".
+    rows = queue_policy.latest_per_channel_candidates()
     for r in rows:
         if enqueued >= budget:
             break
@@ -684,24 +695,25 @@ def _enqueue_transcriptions() -> None:
         plat = r["platform"]
         latest = archive_db.latest_job(plat, vid, kind="transcribe")
         job_id = f"transcribe-{plat}-{vid}"
-        # Terminal verdicts (music / blocked) are never re-run — for
-        # youtube (captionless-ASR verdicts) AND twitch/kick (the remote
-        # route marks deleted/sub-only VODs 'blocked').
-        kind = archive_db.video_transcript_kind(plat, vid) or ""
-        if kind in ("music", "blocked"):
+        # Routing is decided by the SAME verdict the worker will consult
+        # before it runs (queue_policy.transcript_route_verdict) — the two
+        # used to be separate copies of the same matrix and could drift.
+        # Terminal verdicts (music / blocked) are never re-run, for youtube
+        # (captionless-ASR verdicts) AND twitch/kick (the remote route marks
+        # deleted/sub-only VODs 'blocked').
+        verdict = queue_policy.transcript_route_verdict(plat, vid)
+        if verdict in (queue_policy.VERDICT_MUSIC, queue_policy.VERDICT_BLOCKED):
             continue
-        if plat == "youtube":
+        if plat == "youtube" and latest is None and verdict in (
+            queue_policy.VERDICT_WAIT_CAPTION,
+            queue_policy.VERDICT_SKIP_CAPTIONS,
+        ):
             # Captions-first policy: create a transcribe job ONLY when the
             # caption question is settled AND there is nothing that already
-            # serves as the transcript — captions_unavailable_at set
-            # (permanent unavailability -> ASR candidate) with no transcript
-            # rows (the SQL's NOT EXISTS above) and no terminal verdict.
-            # Never create while captions are still pending (no marker: the
-            # ingest leg is extracting/retrying — the worker requeues any
-            # kicked job with 'waiting for caption decision'). The audio is
-            # downloaded at transcribe time (no local archive_path).
-            if latest is None and archive_db.captions_unavailable_at(plat, vid) is None:
-                continue
+            # serves as the transcript. Never create while captions are still
+            # pending (no marker: the ingest leg is extracting/retrying). The
+            # audio is downloaded at transcribe time (no local archive_path).
+            continue
         if latest:
             if latest["status"] in ("queued", "running"):
                 continue
