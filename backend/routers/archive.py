@@ -23,6 +23,12 @@ from services.archive_scheduler import TRANSCRIBE_PRIORITY_HIGH, _chat_job_guard
 
 logger = logging.getLogger(__name__)
 
+# Hard ceiling on ONE local /api/archive/search call. See the wait_for at the
+# call site for the reasoning; the remote sibling uses 25s for a network
+# round-trip, the local pass only touches a local SQLite file, so it gets a
+# slightly larger budget.
+_SEARCH_TIMEOUT_S = 30.0
+
 
 def _start_frozen_archive_worker() -> None:
     """Start the optional worker after a job is queued in the frozen app."""
@@ -77,6 +83,9 @@ _transcribe_attempted_at: dict[str, float] = {}
 _TRANSCRIBE_COOLDOWN_S = 600.0
 _TRANSCRIBE_FAILED_FRESH_S = 3600.0
 _TRANSCRIBE_LIMIT = 1
+# How far down the ranked candidate list the archive_path stat() probe walks
+# before giving up (see _transcribe_candidates).
+_TRANSCRIBE_PROBE_CAP = 10
 _transcribe_lock = threading.Lock()
 
 # YouTube chat display-name resolution: lazy, throttled, fire-and-forget.
@@ -513,8 +522,6 @@ def _transcribe_candidates(
         vid = r["video_id"]
         if now - _transcribe_attempted_at.get(vid, 0.0) < _TRANSCRIBE_COOLDOWN_S:
             continue
-        if not (r["archive_path"] or "").strip() or not Path(r["archive_path"]).is_file():
-            continue  # file gone — whisper would fail immediately
         if vid in covered:
             continue
         latest = latest_by_vid.get(vid)
@@ -530,7 +537,21 @@ def _transcribe_candidates(
         out.append(r)
     out.sort(key=lambda r: r["duration_sec"] or 0.0)  # stable: duration tiebreak
     out.sort(key=lambda r: -_title_relevance(q, r["title"] or ""))  # relevance first
-    return out[:_TRANSCRIBE_LIMIT]
+    # The disk probe runs LAST and bounded. archive_path lives on a network/
+    # spinning-disk volume, so Path().is_file() is a real stat() per row —
+    # up to 50 of them in the request path to pick the ONE row this function
+    # returns. Probe down the ranked list only until _TRANSCRIBE_LIMIT
+    # candidates survive; a vanished file still falls through to the
+    # next-best one, so the outcome is unchanged and the stat count is capped
+    # by _TRANSCRIBE_PROBE_CAP instead of the SQL LIMIT.
+    picked: list[dict] = []
+    for r in out[:_TRANSCRIBE_PROBE_CAP]:
+        if not (r["archive_path"] or "").strip() or not Path(r["archive_path"]).is_file():
+            continue  # file gone — whisper would fail immediately
+        picked.append(r)
+        if len(picked) >= _TRANSCRIBE_LIMIT:
+            break
+    return picked
 
 
 def _maybe_enrich(
@@ -679,7 +700,12 @@ async def archive_search(
     video_id: str | None = None,
     lang: str | None = None,
     username: str | None = None,
-    limit: int = Query(20, ge=1, le=100000),
+    # Ceiling matches the UI's documented literal-search cap (300 rows, a
+    # full scroll of variety) with headroom for a narrower, hand-made call.
+    # It used to be 100000, which made archive_db.fetch = limit*3 = 300k rows
+    # PER TABLE per pass (a full bm25 rank + sort) and serialised the whole
+    # thing as JSON on every keystroke.
+    limit: int = Query(20, ge=1, le=1000),
     hint: bool = Query(True),
     semantic: bool = Query(False),
     # Defaults mirror archive_db.search(): an omitted mode is 'broad' (fuzzy
@@ -757,23 +783,46 @@ async def archive_search(
     # hint=False (UI dismissed the chip) disables the whole implicit-scope
     # pass — pass no out-param so search() never applies it.
     hint_box: list[str] = []
-    hits = await asyncio.to_thread(
-        archive_db.search,
-        q,
-        platform=platform or None,
-        channel=channel or None,
-        date_from=date_from,
-        date_to=date_to,
-        kind=kind or None,
-        source=source,
-        video_id=video_id or None,
-        lang=lang or None,
-        limit=limit,
-        semantic=semantic,
-        mode=mode,
-        _channel_hint_out=hint_box if hint else None,
-        username=username or None,
-    )
+    # Bounded like the remote path below (wait_for, not a bare to_thread): a
+    # pathological query — a 1-char token that expands to a huge fuzzy tier,
+    # a broad-mode chain of passes over a multi-million-row archive, a DB
+    # page thrashing under a concurrent transcribe — otherwise parks the
+    # request forever and the panel's spinner never resolves. 30s is well
+    # past any honest local search (the slowest measured hit on the real
+    # archive was ~2.2s cold) and past the deepest sweep's own budget, so it
+    # only fires when the pass is genuinely stuck. The thread is NOT
+    # cancellable, but the response is abandoned and the search cache it
+    # would have published is keyed to a generation that a later write retires.
+    try:
+        hits = await asyncio.wait_for(
+            asyncio.to_thread(
+                archive_db.search,
+                q,
+                platform=platform or None,
+                channel=channel or None,
+                date_from=date_from,
+                date_to=date_to,
+                kind=kind or None,
+                source=source,
+                video_id=video_id or None,
+                lang=lang or None,
+                limit=limit,
+                semantic=semantic,
+                mode=mode,
+                _channel_hint_out=hint_box if hint else None,
+                username=username or None,
+            ),
+            timeout=_SEARCH_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        # Graceful, same style as the remote path: the FE surfaces `error` as
+        # a retryable banner, never a 500.
+        logger.warning("archive search timed out after %ss (q=%r mode=%s)", _SEARCH_TIMEOUT_S, q[:80], mode)
+        return {
+            "hits": [],
+            "enriching": [],
+            "error": "Search took too long — narrow it with a channel, date or kind filter.",
+        }
     channel_hint = hint_box[0] if hint_box else None
     # Targeted enrichment: lazily kick chat backfill / enqueue transcribe
     # jobs for videos in scope. Runs inline but only fires background tasks;

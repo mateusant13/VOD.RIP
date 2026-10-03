@@ -138,10 +138,13 @@ function defaultPopupHeight(): number {
 }
 const SEARCH_DEBOUNCE_MS = 250;
 /** Literal-word searches page through matches; 300 rows (5 videos × 60,
- *  bounded server-side) is a full scroll of variety — the old 2000 flooded
- *  the page with one video's repeated chat and took 20s+ under load. The
+ *  bounded server-side) is a full scroll of variety — a 2000-row cap flooded
+ *  the page with one video's repeated chat and took 20s+ under load. A later
+ *  100000-row cap made every keystroke ask for up to 100k hits (3x that per
+ *  table per pass on the server); this is the cap the comment always said
+ *  and the one the endpoint enforces. The
  *  list renders incrementally, so even this stays smooth. */
-const SEARCH_LIMIT_LITERAL = 100000;
+const SEARCH_LIMIT_LITERAL = 300;
 /** Semantic (embedding) search stays tight — it is expensive per candidate. */
 const SEARCH_LIMIT_SEMANTIC = 30;
 /** How many hits render per scroll batch. */
@@ -628,6 +631,16 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
     void apiGet<ArchiveSearchResponse>(url)
       .then((res) => {
         if (!mountedRef.current || gen !== searchGenRef.current) return;
+        // A 200 carrying `error` means the backend gave up (the request-path
+        // timeout), not "nothing matched" — surface it as the retryable
+        // error banner instead of an empty result list.
+        if (res.error) {
+          setHits([]);
+          setEnriching([]);
+          setError(res.error);
+          setStatus('error');
+          return;
+        }
         setHits(res.hits ?? []);
         setVisibleCount(HITS_RENDER_CHUNK);
         if (hitsScrollRef.current) hitsScrollRef.current.scrollTop = 0;

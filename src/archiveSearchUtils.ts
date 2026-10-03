@@ -355,6 +355,11 @@ export interface ArchiveSearchResponse {
   enriching: ArchiveEnrichEntry[];
   /** Set when the first query token auto-scoped the search to a channel. */
   channel_hint?: string;
+  /** Set when the search gave up instead of failing (e.g. the request-path
+   *  timeout). Hits is then empty — this is a retryable note, NOT "no
+   *  results", and the popup renders it as an error banner. Mirrors the
+   *  sibling /api/archive/search/remote response. */
+  error?: string | null;
 }
 
 /** Seconds → mm:ss (h:mm:ss past an hour). Negative/NaN clamp to 00:00. */

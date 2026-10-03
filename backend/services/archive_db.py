@@ -412,6 +412,11 @@ def _init_schema() -> None:
         _schema_ready = False
     if _conn is None:
         _conn_path = str(path)
+        # A (re)open means the file behind this path may be a different
+        # archive entirely (test suites rebind VODRIP_ARCHIVE_DB, the data
+        # dir moves). Retire every path-keyed memo, exactly like the
+        # rowcount/vocab caches, so nothing survives across the swap.
+        _bump_search_gen()
         _migrate_db_to_data_dir(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         _conn = _open_conn(path)
@@ -1158,11 +1163,64 @@ def _bind(params: Any) -> Any:
     return params if isinstance(params, dict) else tuple(params)
 
 
+# --- search result cache ---------------------------------------------------
+# search() re-ran every FTS/span/title pass from scratch on an identical
+# query, so a re-fired (debounce echo, filter toggle, panel reopen) or retyped
+# query paid the full cold cost again — 600ms-2.1s on the real archive. This
+# memoises the FINAL hit list, keyed by the full argument tuple + the DB path +
+# a content generation counter.
+#
+# Invalidation rides the central write funnel: every statement goes through
+# execute() below, so bumping the generation there covers inserts AND the
+# write paths that never call _bump_content_ref (dedupe_messages,
+# delete_video, the transcript text/lang fixes, the spam-collapse UPDATE).
+# Over-invalidation is safe — the entry is just recomputed; under-invalidation
+# would be a correctness regression, so this is the funnel and not a
+# hand-picked list of call sites. Statements that only touch non-content
+# tables (archive_jobs heartbeats, transcripts_vocab) never match and leave
+# the cache alone.
+#
+# The generation is read BEFORE the search runs: a write landing mid-search
+# advances it, so the entry would be stored under an already-dead generation
+# and could never be served (the store re-checks before publishing).
+_SEARCH_CACHE_TTL_S = 30.0
+_SEARCH_CACHE_MAX = 32
+# A cached entry is a whole hit list; cap the list too so the cache's memory
+# ceiling is MAX x MAX_HITS regardless of what limit a caller asks for.
+_SEARCH_CACHE_MAX_HITS = 400
+# key -> (stored_at, hits, channel_hint)
+_search_cache: dict[tuple, tuple[float, list[dict], Optional[str]]] = {}
+_search_cache_lock = threading.Lock()
+_search_gen = 0
+# Matches a write aimed at a searchable content table. \b after the name
+# keeps transcripts_vocab / messages_fts (word-char '_' follows) out.
+_SEARCHABLE_WRITE_RE = re.compile(
+    r"\b(?:INSERT\s+(?:OR\s+\w+\s+)?INTO|REPLACE\s+INTO|UPDATE|DELETE\s+FROM)\s+"
+    r"(?:main\.)?(?:messages|transcripts|videos)\b",
+    re.IGNORECASE,
+)
+
+
+def _bump_search_gen() -> None:
+    """Retire every memoised search (called under _lock by execute())."""
+    global _search_gen
+    with _search_cache_lock:
+        _search_gen += 1
+        _search_cache.clear()
+
+
+def _search_gen_now() -> int:
+    with _search_cache_lock:
+        return _search_gen
+
+
 def execute(sql: str, params: Any = ()) -> sqlite3.Cursor:
     with _lock:
         conn = get_conn()
         cur = conn.execute(sql, _bind(params))
         conn.commit()
+        if _SEARCHABLE_WRITE_RE.search(sql):
+            _bump_search_gen()
         return cur
 
 
@@ -3180,6 +3238,111 @@ def search(
     _channel_hint_out: Optional[list] = None,
     username: Optional[str] = None,
 ) -> list[dict]:
+    """BM25 across transcripts + messages, memoised on the exact arguments.
+
+    The search itself is a pure function of its arguments and the archive
+    contents, so an identical call inside _SEARCH_CACHE_TTL_S returns the
+    previous hit list without re-running any pass. Correctness comes from the
+    generation counter execute() bumps on every content write (see
+    _SEARCH_CACHE_TTL_S above): any transcript/chat/title change retires the
+    entry, so a stale list is never served.
+
+    The caller gets a fresh list object every time (the cached dicts are
+    shared and treated as read-only), and the channel-hint out-param is
+    replayed from the cache on a hit so the response shape is identical
+    either way. Semantics, ordering and mode handling all live in
+    _search_uncached below.
+    Semantic (embedding) searches are NOT memoised. Their result depends on
+    the embed model's fingerprint, which changes when the model files change
+    — with no transcript/chat write for the generation counter to see — so a
+    cached semantic hit list would survive a re-embed and keep serving vectors
+    from the old vector space. They are also the cheapest case to skip: the
+    router already caps them at limit=100.
+    """
+    if semantic or mode == "semantic":
+        return _search_uncached(
+            q,
+            platform=platform,
+            channel=channel,
+            date_from=date_from,
+            date_to=date_to,
+            kind=kind,
+            source=source,
+            video_id=video_id,
+            lang=lang,
+            limit=limit,
+            semantic=semantic,
+            mode=mode,
+            _channel_hint_out=_channel_hint_out,
+            username=username,
+        )
+    gen = _search_gen_now()
+    # _channel_hint_out is part of the KEY, not just replayed: passing the box
+    # turns on the implicit channel-scope pass, which strips the slug token
+    # from q and filters by channel — a different result set, not a different
+    # report of the same one. Omitting it would let a hint=True search poison
+    # the hint=False (UI-dismissed) one.
+    key = (
+        str(_db_path()), gen, q, platform, channel, date_from, date_to, kind,
+        source, video_id, lang, limit, semantic, mode, username,
+        _channel_hint_out is not None,
+    )
+    now = time.monotonic()
+    with _search_cache_lock:
+        hit = _search_cache.get(key)
+        if hit is not None and now - hit[0] < _SEARCH_CACHE_TTL_S:
+            if _channel_hint_out is not None and hit[2] is not None:
+                _channel_hint_out.append(hit[2])
+            return list(hit[1])
+    hits = _search_uncached(
+        q,
+        platform=platform,
+        channel=channel,
+        date_from=date_from,
+        date_to=date_to,
+        kind=kind,
+        source=source,
+        video_id=video_id,
+        lang=lang,
+        limit=limit,
+        semantic=semantic,
+        mode=mode,
+        _channel_hint_out=_channel_hint_out,
+        username=username,
+    )
+    hint = _channel_hint_out[0] if _channel_hint_out else None
+    if len(hits) <= _SEARCH_CACHE_MAX_HITS:
+        with _search_cache_lock:
+            # Publish only if no content write landed while the search ran —
+            # gen is the same counter execute() bumps, so a mismatch means
+            # these hits are already stale and must not be memoised.
+            if _search_gen == gen:
+                if len(_search_cache) >= _SEARCH_CACHE_MAX:
+                    # FIFO eviction: dicts keep insertion order, and a cache
+                    # hit does not refresh it (a refresh would let a hot
+                    # entry pin the whole budget).
+                    _search_cache.pop(next(iter(_search_cache)), None)
+                _search_cache[key] = (time.monotonic(), hits, hint)
+    return list(hits)
+
+
+def _search_uncached(
+    q: str,
+    *,
+    platform: Optional[str] = None,
+    channel: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    kind: Optional[str] = None,
+    source: str = "both",
+    video_id: Optional[str] = None,
+    lang: Optional[str] = None,
+    limit: int = 20,
+    semantic: bool = False,
+    mode: str = "broad",
+    _channel_hint_out: Optional[list] = None,
+    username: Optional[str] = None,
+) -> list[dict]:
     """BM25 across transcripts + messages. Returns unified hits ordered by
     relevance: complete matches lead (exact phrase, then all-words), partial
     (subset-of-tokens) hits follow — each group by score desc, the owning
@@ -4432,6 +4595,18 @@ def _phrase_span_rows(
         # literal LIKE gate would skip a segment whose text holds only a
         # dist-1 twin ("estranhesa") before _tok_eq could match it below.
         long_toks = sorted({v for t in long_toks for v in span_variants.get(t, [t])})
+    if not long_toks:
+        # No prefilter token means the scan below matches EVERY transcript
+        # row and materialises the whole table before the Python split loop
+        # even starts — a full-corpus read for a query like "de que" whose
+        # tokens are all < 4 chars. The prefilter is what makes this pass
+        # proportional to the phrase's rarity; without it the pass is pure
+        # cost, and the FTS5 phrase/AND passes already cover the real recall
+        # for an all-short-token query. Callers gate on query shape already
+        # (search() checks the token count and _span_query_has_signal), but
+        # that signal gate admits common short words like 'de'/'que' because
+        # they DO exist in the vocab — this is the check it cannot make.
+        return []
     sql = (
         "SELECT t.rowid AS _rowid, t.platform, t.video_id, t.seg_idx, "
         "t.start_sec AS offset_sec, t.text, t.lang AS lang, "
