@@ -153,9 +153,13 @@ def test_plan_env_forced_cpu_matches_cpu_host(monkeypatch):
     # the plan length matches the auto ladder (order-independent). No pin:
     # the env itself must drive the plan (a leaked pin would override it).
     monkeypatch.delenv(at.WORKERS_ENV, raising=False)
-    monkeypatch.delenv(at.WORKERS_ENV, raising=False)
     monkeypatch.delattr(at._multi_tls, "pin", raising=False)
     monkeypatch.setenv("VODRIP_WHISPER_DEVICE", "cpu")
+    # Same isolation the _force_cpu/_force_cuda helpers use: this test
+    # hand-rolls its setup, and without the idle-governor pin the exact
+    # lane count holds only on an unloaded box.
+    isolate_worker_plan(monkeypatch)
+    monkeypatch.setattr(at, "caption_session_active", lambda: False)
     monkeypatch.setattr(at, "_free_system_ram_bytes", lambda: 64 * GIB)
     monkeypatch.setattr(at, "_cpu_load_high", lambda: False)  # deterministic under suite load
     monkeypatch.setattr("os.cpu_count", lambda: 20)  # budget 8, auto lanes 3 — any runner

@@ -248,7 +248,7 @@ async def test_endpoint_hint_false_disables_auto_scope():
         archive_db.execute("DELETE FROM videos WHERE video_id IN ('hint-vid','other-vid')")
 
 
-# --- (c) transcribe enqueue gated on worker_live ----------------------------
+# --- (c) transcribe enqueue is NOT gated on worker_live ---------------------
 
 
 def _seed_ready_youtube(video_id: str) -> Path:
@@ -259,24 +259,40 @@ def _seed_ready_youtube(video_id: str) -> Path:
     return media
 
 
-async def test_transcribe_enqueue_skipped_when_worker_not_live(monkeypatch):
+async def test_transcribe_enqueue_not_gated_on_worker_live(monkeypatch):
+    """Search enrichment enqueues a transcribe job REGARDLESS of worker liveness.
+
+    The old `if not archive_db.worker_live(): return []` gate was removed
+    deliberately (commit 52044de, "Split ASR runtime from base installer"),
+    together with the docstring rewrite in _transcribe_candidates: a frozen app
+    now starts the optional worker itself right after enqueueing
+    (_start_frozen_archive_worker, kicked from archive_search and
+    archive_jobs_enqueue), so a queued job is never orphaned on a box whose
+    worker has not started yet. This test pins that contract — re-adding the
+    gate would reintroduce "queued forever for users who never opted in".
+    """
     import routers.archive as ar
 
     vid = "transcribe-1"
     media = _seed_ready_youtube(vid)
     archive_db.execute("DELETE FROM archive_jobs WHERE platform='youtube' AND video_id=?", (vid,))
     _reset_enrichment_state()
-    monkeypatch.setattr(archive_db, "worker_live", lambda age_s=30: False)
     try:
+        # Worker NOT live -> still enqueues (deterministic job id, queued).
+        monkeypatch.setattr(archive_db, "worker_live", lambda age_s=30: False)
         enriching = _maybe_enrich(platform="youtube", channel=None, source="transcript",
                                   q="ready")
-        assert not any(e["kind"] == "transcribe" for e in enriching), (
-            "no transcribe enqueue when the worker is not live"
+        assert any(e["kind"] == "transcribe" and e["video_id"] == vid for e in enriching), (
+            "a dead worker must NOT block the enqueue — the app starts it"
         )
-        assert archive_db.latest_job("youtube", vid, kind="transcribe") is None
-        # live worker → deterministic job id + honest enriching entry
-        monkeypatch.setattr(archive_db, "worker_live", lambda age_s=30: True)
+        job = archive_db.latest_job("youtube", vid, kind="transcribe")
+        assert job is not None and job["id"] == f"transcribe-youtube-{vid}"
+        assert job["status"] == "queued"
+
+        # Worker live -> identical result: liveness is not an input to the gate.
+        archive_db.execute("DELETE FROM archive_jobs WHERE platform='youtube' AND video_id=?", (vid,))
         _reset_enrichment_state()
+        monkeypatch.setattr(archive_db, "worker_live", lambda age_s=30: True)
         enriching = _maybe_enrich(platform="youtube", channel=None, source="transcript",
                                   q="ready")
         assert any(e["kind"] == "transcribe" and e["video_id"] == vid for e in enriching)

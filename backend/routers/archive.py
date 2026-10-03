@@ -76,7 +76,9 @@ _BACKFILL_FAILED_RESUME_LIMIT = 3
 
 # Transcript enrichment (search-v2): same global-throttle + per-video
 # cooldown shape as chat backfill, on its OWN clock so the two halves never
-# starve each other. Enqueue is gated on worker_live() — see _transcribe_candidates.
+# starve each other. NOT gated on worker_live(): a frozen app starts the
+# optional worker itself after enqueueing (see _start_frozen_archive_worker
+# and _transcribe_candidates).
 _last_transcribe_kick = 0.0
 _TRANSCRIBE_MIN_GAP_S = 30.0
 _transcribe_attempted_at: dict[str, float] = {}

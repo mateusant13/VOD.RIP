@@ -768,9 +768,16 @@ async def test_captions_stream_lang_param_reaches_captioner(monkeypatch):
     (app-language default); a bad lang is rejected 400 before any stream."""
     from routers import live as live_router
     from services import live_captions
+    from services import asr_runtime
     from services.feature_registry import is_enabled as _orig_enabled
     monkeypatch.setattr("services.feature_registry.is_enabled", lambda fid: True if fid == "live-captions" else _orig_enabled(fid))
     monkeypatch.setattr(live_captions, "captions_available", lambda plat: (True, ""))
+    # The SSE path calls asr_runtime.ensure_runtime, which DOWNLOADS the ASR
+    # runtime when missing. Stub it (same seam as
+    # test_captions_stream_proceeds_when_parakeet_pending) — otherwise this unit
+    # test reaches the network and 503s on any box without the runtime.
+    from pathlib import Path
+    monkeypatch.setattr(asr_runtime, "ensure_runtime", lambda progress=None: Path("stub-runtime"))
     acquired: list = []
 
     class _StubCaptioner:

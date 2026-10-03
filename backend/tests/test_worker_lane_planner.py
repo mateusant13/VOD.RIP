@@ -15,7 +15,10 @@ Unknown allowance (probe failure) trusts the env cap like everywhere else.
 import contextlib
 import os
 
+import pytest
+
 from services import archive_transcribe as at
+from transcribe_plan_isolation import isolate_worker_plan, stub_idle_governor
 
 
 def _patched(
@@ -37,6 +40,16 @@ def _patched(
     at._multi_tls.pin = ("cuda", "int8")
     os.environ["VODRIP_TRANSCRIBE_WORKERS"] = workers
     os.environ["VODRIP_TRANSCRIBE_GPU_COPIES"] = gpu_copies
+    # The plan also consults TWO process-global verdicts that are NOT hardware
+    # probes: the resource governor (a live singleton that samples THIS box's
+    # CPU every second, clamping to 1 lane past _GOVERNOR_BACKOFF) and the
+    # live-caption reservation. Both are pinned to their idle answer so the
+    # ladder is a pure function of the inputs above. Without this the exact
+    # lane counts below only hold on an idle box — they fail on any loaded
+    # machine, which is precisely the 24/7 worker box this app runs on.
+    mp = pytest.MonkeyPatch()
+    stub_idle_governor(mp)
+    mp.setattr(at, "caption_session_active", lambda: False)
     try:
         lane = at._gpu_lane_plan()
         copies = at._gpu_copies()
@@ -48,6 +61,7 @@ def _patched(
         at._multi_tls.pin = None
         for name, fn in saved.items():
             setattr(at, name, fn)
+        mp.undo()
 
 
 def test_ladder_32gb_int8():
@@ -101,6 +115,8 @@ def test_background_cpu_default_is_three_lanes(monkeypatch):
     free target). The env override VODRIP_TRANSCRIBE_WORKERS keeps winning
     over the default."""
     at._multi_tls.pin = ("cpu", "int8")
+    isolate_worker_plan(monkeypatch)  # idle governor: no load-coupled clamp
+    monkeypatch.setattr(at, "caption_session_active", lambda: False)
     monkeypatch.setenv("VODRIP_TRANSCRIBE_WORKERS", "")
     monkeypatch.setattr(at, "background_mode", lambda: True)
     monkeypatch.setattr(at, "_cpu_load_high", lambda: False)
@@ -121,6 +137,8 @@ def test_background_three_lanes_ram_clamped(monkeypatch):
     """3-lane default is RAM-clamped on a tight box (usable free < 3x the
     per-lane estimate) — never overshoots the machine."""
     at._multi_tls.pin = ("cpu", "int8")
+    isolate_worker_plan(monkeypatch)  # RAM is the clamp under test, not load
+    monkeypatch.setattr(at, "caption_session_active", lambda: False)
     monkeypatch.setenv("VODRIP_TRANSCRIBE_WORKERS", "")
     monkeypatch.setattr(at, "background_mode", lambda: True)
     monkeypatch.setattr(at, "_cpu_load_high", lambda: False)

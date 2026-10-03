@@ -10,6 +10,7 @@ from __future__ import annotations
 import torch
 
 from services import archive_transcribe as at
+from transcribe_plan_isolation import isolate_worker_plan
 
 GIB = 1024 ** 3
 
@@ -25,11 +26,31 @@ def _force_cpu(monkeypatch) -> None:
     # Fixed thread count: the CPU cap (budget = 0.4 x threads) must be
     # deterministic on any runner — 20 threads -> budget 8, auto lanes 3.
     monkeypatch.setattr("os.cpu_count", lambda: 20)
+    # _worker_budget() == len(_worker_plan()), and the plan also consults the
+    # process-global resource governor (a live singleton sampling THIS box) and
+    # the live-caption reservation. Pin both to their idle answer: these tests
+    # are about the RAM clamp, and without the pin the exact budgets below only
+    # hold on an idle box — they fail whenever the 24/7 worker is busy.
+    isolate_worker_plan(monkeypatch)
+    monkeypatch.setattr(at, "caption_session_active", lambda: False)
+    # _cpu_load_high is the THIRD contention input (contended box -> at most one
+    # quiet lane, archive_transcribe.py:1140) and it takes a real 0.2 s sample of
+    # THIS box, not a hardware probe. isolate_worker's reset_cpu_load_cache()
+    # zeroes _cpu_load_at, which DEFEATS the 15 s TTL cache and forces a fresh
+    # live sample — so the clamp under test (RAM) is not the clamp that fires.
+    # Measured on the busy dev box: _measure_cpu_load() == 1.0 -> the plan folds
+    # to 1 lane and the RAM expectations below are unreachably strict. Same pin
+    # the sibling lane-planner / hybrid-pool suites already use.
+    monkeypatch.setattr(at, "_cpu_load_high", lambda: False)
 
 
 def _force_cuda(monkeypatch) -> None:
     monkeypatch.setattr(at._multi_tls, "pin", ("cuda", "int8"), raising=False)
     monkeypatch.setattr("os.cpu_count", lambda: 20)
+    isolate_worker_plan(monkeypatch)
+    monkeypatch.setattr(at, "caption_session_active", lambda: False)
+    # same live-load contention clamp as _force_cpu (see its note)
+    monkeypatch.setattr(at, "_cpu_load_high", lambda: False)
 
 
 # --- _ram_worker_clamp (pure clamp math) ------------------------------------

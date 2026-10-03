@@ -1178,7 +1178,14 @@ def _worker_plan() -> list[tuple[str, str]]:
 
 
 def _worker_budget() -> int:
-    """Max concurrent transcribe jobs: len(_worker_plan()).
+    """Number of transcribe pool LANES: len(_worker_plan()).
+
+    NOT the job concurrency. Under the one-VOD-at-a-time policy the pool runs
+    this many lanes but may only hold queue_policy.transcribe_job_concurrency()
+    (=1) JOBS — the extra lanes become chunk lanes inside that one VOD
+    (_transcribe_chunks_hybrid). The two counts are set independently in
+    _run_worker: budget = len(_pool_plan(...)) for the lanes,
+    _transcribe_cap[0] = queue_policy.transcribe_job_concurrency() for jobs.
 
     1 on a CUDA host with VODRIP_TRANSCRIBE_WORKERS=0 (the exact legacy
     single-model path), 1 GPU copy + the dynamic CPU lane count on a
