@@ -207,11 +207,61 @@ def test_search_pt_keeps_null_hides_en_on_pt_channel():
     _seed_rows("youtube", "sp1", [(0.0, 1.0, "zebra pt row")], lang="pt")
     _seed_rows("youtube", "sp1", [(2.0, 3.0, "zebra en row")], lang="en")
     _seed_rows("youtube", "sp1", [(4.0, 5.0, "zebra null row")], lang=None)
-    hits = archive_db.search("zebra", lang="pt")
+    # Scoped to this test's own video, the way its twin scopes to 'lg-pt'
+    # (test_transcribe_cross_platform.py:299). An UNSCOPED search is the 20
+    # best rows in the WHOLE corpus: search() sorts by score then started_at
+    # DESC (archive_db.py:4470) and truncates to limit AFTER that (:4493), and
+    # 'zebra' is a sentinel five-plus modules seed. Any unrelated row dated
+    # later than sp1 therefore outranks this test's own rows and pushes them
+    # off the page, so the result depended on rows this test does not own.
+    # The three assertions are unchanged: they are all about sp1's own rows
+    # and canalsem's pt family.
+    hits = archive_db.search("zebra", lang="pt", video_id="sp1")
     texts = {h["text"] for h in hits}
     assert "zebra pt row" in texts
     assert "zebra null row" in texts  # untagged rows flow through the pt filter
     assert "zebra en row" not in texts  # channel family pt hides the en rows
+
+
+def test_search_pt_scope_survives_foreign_zebra_rows_on_later_videos():
+    """The scoping in the test above is load-bearing, so pin it here.
+
+    'zebra' is a sentinel half a dozen modules seed, and the row this test
+    cares about is on ONE video. This seeds ordinary foreign 'zebra' rows dated
+    LATER than sp1 — more than the 20-row default page holds — and re-asserts
+    the same three outcomes through the same scoped search. If anyone widens
+    that search back to the whole corpus, the foreign rows take the page and
+    this fails; the product itself is right either way, since a 20-row page is
+    the intended API contract, not a bug to raise the limit for.
+    """
+    _seed_video("youtube", "sp2", "ck-sp2", channel="canalsem")
+    archive_db.set_channel_language("youtube", "canalsem", "pt")
+    _seed_rows("youtube", "sp2", [(0.0, 1.0, "quokka pt row")], lang="pt")
+    _seed_rows("youtube", "sp2", [(2.0, 3.0, "quokka en row")], lang="en")
+    _seed_rows("youtube", "sp2", [(4.0, 5.0, "quokka null row")], lang=None)
+    for i in range(12):
+        vid = f"qz-{i}"
+        _seed_video("youtube", vid, f"ck-qz-{i}", channel="otherchan")
+        # started_at is _seed_video's fixed 2026-08-03, same as sp1's, so
+        # stamp the foreign videos later explicitly: they must outrank sp2.
+        archive_db.execute(
+            "UPDATE videos SET started_at='2026-09-15T12:00:00Z' WHERE video_id=?",
+            (vid,),
+        )
+        _seed_rows("youtube", vid, [
+            (0.0, 1.0, f"quokka foreign {i} a"),
+            (1.0, 2.0, f"quokka foreign {i} b"),
+            (2.0, 3.0, f"quokka foreign {i} c"),
+        ])
+
+    unscoped = archive_db.search("quokka", lang="pt")
+    assert len(unscoped) == 20, f"the default page is 20 rows, got {len(unscoped)}"
+    assert not any(h["video_id"] == "sp2" for h in unscoped), (
+        "precondition: the unscoped page is exactly what crowds sp2 out"
+    )
+
+    texts = {h["text"] for h in archive_db.search("quokka", lang="pt", video_id="sp2")}
+    assert texts == {"quokka pt row", "quokka null row"}, texts
 
 
 # --- 6. done-time language correction --------------------------------------

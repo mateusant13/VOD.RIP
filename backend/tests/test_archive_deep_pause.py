@@ -15,6 +15,7 @@ python -m pytest tests/test_archive_deep_pause.py \
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 
 import pytest
@@ -64,6 +65,45 @@ def isolate_deep_jobs():
         for j in archive._deep_jobs.values():
             j["cancel"].set()
         archive._deep_jobs.clear()
+
+
+@pytest.fixture()
+def sole_resume_anchor():
+    """The deep_jobs TABLE is module-global in a way the in-memory dict above
+    is not: it lives in the conftest SESSION scratch DB (this module sets no
+    scratch DB of its own) and nothing wipes it between tests. A crashed sweep
+    another file left behind is therefore still 'running' here — and that is
+    the exact production condition this module is about.
+
+    _deep_start_db picks the NEWEST 'running' row for (handle_norm, query) as
+    the resume anchor and finalizes every OTHER one (archive.py:2394-2407).
+    That is the contract, but it makes the anchor the newest row rather than
+    this test's own, so a foreign crash with a later updated_at silently
+    demotes the row the test means to assert on. Drop the 'running' rows for
+    THIS test's own (handle_norm, query) so the row set under test is exactly
+    the rows it seeds. Scoped on purpose: other handles/queries and the
+    terminal history are none of these tests' business.
+
+    Symmetric teardown: a test that leaves its anchor 'running' would hand the
+    next deepchan/cesar sweep a resume cursor it never asked for — the exact
+    leak this fixture exists to stop, in the other direction. test_archive_
+    deep_f4.py's resume test asserts resume_cursor == 2, and pytest runs
+    explicitly-listed files in the order given, so a leaked row there reads
+    back as some other test's cursor.
+    """
+    from services import archive_db
+
+    def _drop() -> None:
+        archive._ensure_deep_jobs_table()
+        archive_db.execute(
+            "DELETE FROM deep_jobs WHERE kind='deep' AND handle_norm=? AND query=? "
+            "AND status='running'",
+            (archive._deep_handle_norm("deepchan"), "cesar"),
+        )
+
+    _drop()
+    yield archive._deep_handle_norm("deepchan")
+    _drop()
 
 
 def _start(monkeypatch, videos, fetcher) -> str:
@@ -230,7 +270,9 @@ def test_result_dict_carries_video_kind_when_known_and_omits_when_unknown(
     assert "video_kind" not in by_id["vku"], "unknown kind must omit the key"
 
 
-def test_stale_running_rows_finalized_and_live_job_joins_before_db(monkeypatch, fast_pace):
+def test_stale_running_rows_finalized_and_live_job_joins_before_db(
+    monkeypatch, fast_pace, sole_resume_anchor
+):
     """FIX-5: a crashed sweep leaves a permanent status='running' deep_jobs
     row that would otherwise be resurrected forever. When a fresh sweep
     starts (resuming from the newest such row R), every OTHER stale running
@@ -243,15 +285,26 @@ def test_stale_running_rows_finalized_and_live_job_joins_before_db(monkeypatch, 
     videos = [_video("f1", "2024-01-02T00:00:00+00:00", content_kind="short"),
               _video("f2", "2024-01-01T00:00:00+00:00", content_kind="short")]
     calls: list[str] = []
+    gate = threading.Event()      # test -> sweep: let the parked fetch finish
+    in_flight = threading.Event()  # sweep -> test: the sweep is provably live
 
     def fetcher(vid: str) -> dict:
         calls.append(vid)
+        if vid == "f1":
+            # Park the sweep here so it is provably STILL LIVE when the join
+            # POST below runs. Without this the sweep can finish in
+            # milliseconds (fast_pace sets the gap to 0 and both videos are
+            # tiny), the in-process job is already terminal, and the join
+            # correctly returns a NEW job_id — a race, not a product defect.
+            # gate.wait() is bounded so a failed assertion can never leave the
+            # sweep thread parked forever.
+            in_flight.set()
+            gate.wait(10.0)
         return _payload(vid, [(0.0, f"dar a cesar o que é de {vid}")])
 
     ts_resume = "2026-01-02T00:00:00+00:00"  # newest -> the resume source
     ts_older = "2026-01-01T00:00:00+00:00"
-    norm = archive._deep_handle_norm("deepchan")
-    archive._ensure_deep_jobs_table()
+    norm = sole_resume_anchor
     # Two stale crashed-sweep rows for deepchan/cesar: xstale2 is the NEWEST
     # ('running', cursor=2) and becomes the resume source; xbrother is an
     # older sibling crash that a correct sweep must finalize as interrupted.
@@ -271,6 +324,14 @@ def test_stale_running_rows_finalized_and_live_job_joins_before_db(monkeypatch, 
     monkeypatch.setattr(archive, "_deep_enumerate", lambda handle: (videos, False, len(videos)))
     monkeypatch.setattr(archive, "_deep_fetch_transcript", fetcher)
     job_id = _start(monkeypatch, videos, fetcher)
+
+    # The sweep must be mid-flight (parked in the fetcher) before anything
+    # below claims the job is LIVE. Bounded so a regression surfaces as this
+    # assertion, not as a 10s stall inside the join POST.
+    assert in_flight.wait(10.0), (
+        "the sweep never reached the fetcher — the join assertions below would "
+        "be testing a job that is already terminal"
+    )
 
     # Start happening: the sibling must already have been finalized by the
     # resume-finalize in _deep_start_db (xstale is the resume source, so it
@@ -300,6 +361,75 @@ def test_stale_running_rows_finalized_and_live_job_joins_before_db(monkeypatch, 
     assert joined_id["job_id"] == job_id, "live in-process sweep must join"
     assert joined_id.get("joined") is True
 
+    gate.set()  # release the parked fetch so the sweep can reach terminal
     final = _wait_terminal(job_id)
     assert final["status"] == "done"
     assert sorted(calls) == ["f1", "f2"]
+
+
+def test_stale_finalize_holds_when_a_newer_crashed_row_is_already_present(
+    monkeypatch, fast_pace, sole_resume_anchor
+):
+    """The same FIX-5 contract with the table ALREADY polluted — the shape a
+    crashed backend leaves behind, and the one that used to make the sibling
+    assertion above read someone else's crash.
+
+    deep_jobs is the conftest session scratch DB, so a stale 'running' row
+    from any earlier file is a real hazard here — the fixture clears those at
+    setup, and this test then recreates the shape deterministically: one
+    crashed row NEWER than two older siblings. The contract is about the
+    NEWEST running row, not about any particular row this file seeded: the
+    newest is the resume anchor and every OTHER running sibling for the same
+    channel+query is finalized to 'interrupted'. That is asserted here by
+    naming the rows, so this test is immune to whatever else the table holds —
+    and it fails if the finalize logic ever stops finalizing.
+
+    sole_resume_anchor is requested for its TEARDOWN, not its setup: this test
+    deliberately leaves a fresh 'running' row behind (that IS the condition
+    under test), and deep_jobs is session-global. Handing the next
+    deepchan/cesar sweep a cursor it never asked for is the same leak in the
+    other direction — the fixture's own docstring, and the reason
+    test_deep_restart_resumes_from_persisted_cursor in the sibling f4 file
+    reads a cursor of 5 instead of its seeded 2 when this file runs first.
+    """
+    from services import archive_db
+
+    videos = [_video("g1", "2024-02-02T00:00:00+00:00", content_kind="short"),
+              _video("g2", "2024-02-01T00:00:00+00:00", content_kind="short")]
+    calls: list[str] = []
+
+    def fetcher(vid: str) -> dict:
+        calls.append(vid)
+        return _payload(vid, [(0.0, f"dar a cesar o que é de {vid}")])
+
+    norm = archive._deep_handle_norm("deepchan")
+    archive._ensure_deep_jobs_table()
+    # xcrashed is the newest crash (a later wall clock than the two below) and
+    # is therefore the resume anchor; the two older siblings must be finalized.
+    for row_id, ts in (
+        ("gcrashed", "2026-10-03T18:00:00+00:00"),
+        ("gold1", "2026-01-02T00:00:00+00:00"),
+        ("gold2", "2026-01-01T00:00:00+00:00"),
+    ):
+        archive_db.execute(
+            "INSERT INTO deep_jobs (id, kind, handle, handle_norm, query, status, "
+            "scanned, total, cursor, truncated, no_transcript, error, started_at, updated_at) "
+            "VALUES (?, 'deep', 'deepchan', ?, 'cesar', 'running', 5, 20, 5, 0, 0, NULL, ?, ?)",
+            (row_id, norm, ts, ts),
+        )
+
+    monkeypatch.setattr(archive, "_deep_enumerate", lambda handle: (videos, False, len(videos)))
+    monkeypatch.setattr(archive, "_deep_fetch_transcript", fetcher)
+    job_id = _start(monkeypatch, videos, fetcher)
+
+    def row_status(row_id: str) -> str:
+        rows = archive_db.query("SELECT status FROM deep_jobs WHERE id=?", (row_id,))
+        return rows[0]["status"] if rows else None
+
+    assert row_status("gold1") == "interrupted", "older sibling must be finalized"
+    assert row_status("gold2") == "interrupted", "older sibling must be finalized"
+    assert row_status("gcrashed") in ("running", None), (
+        "the NEWEST running row is the resume anchor, whoever inserted it"
+    )
+    final = _wait_terminal(job_id)
+    assert final["status"] == "done"
