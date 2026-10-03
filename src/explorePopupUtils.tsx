@@ -651,8 +651,18 @@ export function startExplorePanelBoxResize(
 export function startFloatingPanelDrag(
   e: ReactPointerEvent<HTMLElement>,
   posRef: MutableRefObject<PanelPos | null>,
-  setPos: Dispatch<SetStateAction<PanelPos | null>>,
+  setPos: (pos: PanelPos | null) => void,
   panelEl: HTMLElement | null,
+  opts?: {
+    /**
+     * Edge lock in px. Defaults to VIEWPORT_EDGE_LOCK + resize inset. A
+     * window that can be snapped into a frame cell needs a SMALLER lock: the
+     * grid's outer padding is only FRAME_GRID_PADDING (8px), so the default
+     * ~46px lock teleports a just-unsnapped cell-0 window 38px right on the
+     * first pointermove — the "it jumped when I grabbed it" complaint.
+     */
+    margin?: number;
+  },
 ) {
   if ((e.target as HTMLElement).closest('button, input, select, textarea, a, [role="slider"]')) return;
   e.preventDefault();
@@ -679,7 +689,7 @@ export function startFloatingPanelDrag(
   const startW = panelEl?.offsetWidth ?? 0;
   const startH = panelEl?.offsetHeight ?? 0;
   const inset = panelResizeHandleInset(true);
-  const margin = VIEWPORT_EDGE_LOCK + inset;
+  const margin = opts?.margin ?? (VIEWPORT_EDGE_LOCK + inset);
 
   const clampFloatingPos = (next: PanelPos): PanelPos => {
     const minX = margin;

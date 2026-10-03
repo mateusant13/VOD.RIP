@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject, type PointerEvent as ReactPointerEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { Captions, ExternalLink, Languages, Loader2, Maximize2, Minimize2, MessageSquare, Pause, Play, Search, Type, Volume2, VolumeX, RefreshCw, X } from 'lucide-react';
 import { apiDelete, apiPost } from '../hooks/useApiClient';
@@ -10,8 +10,11 @@ import ArchiveSearchPopup from './ArchiveSearchPopup';
 import type { ArchiveSearchHit, ArchiveVideoRow } from '../archiveSearchUtils';
 import {
   PanelResizeHandles,
+  startFloatingPanelDrag,
   type ResizeEdge,
 } from '../explorePopupUtils';
+import { frameWindowKey, type FrameRect } from '../frameLayout';
+import { useFrameSnapPin } from '../frameSnap';
 import {
   LIVE_PANEL_MAX_H,
   LIVE_PANEL_MAX_W,
@@ -97,14 +100,17 @@ interface LivePlayerPopupProps {
   onBringToFront?: () => void;
   /** Pre-warmed live session from channel hover — consumed on mount to skip the POST. */
   liveSessionPrefetchRef?: MutableRefObject<{ url: string; session: PreviewSessionResponse } | null>;
+  /** Stable id of this popup window (App's livePopupIdRef counter). Namespaces
+   *  the frame-cell key so a live popup and an explore popup never collide. */
+  popupId?: string | number;
+  /** Frame tiling mode is on — the popup participates in the snap grid. */
+  frameMode?: boolean;
+  /** Cell to pin into, or null when floating. Memoized by App (never a fresh
+   *  object per render) so the pin does not re-run on unrelated re-renders. */
+  frameSnapRect?: FrameRect | null;
+  /** Release this popup from its frame cell (a drag started). */
+  onUnsnap?: () => void;
 }
-
-type DragState = {
-  startX: number;
-  startY: number;
-  offsetX: number;
-  offsetY: number;
-} | null;
 
 interface LevelInfo {
   index: number;
@@ -278,7 +284,7 @@ export function __resetLivePlayerRegistryForTests(): void {
   liveQualityCount = 0;
 }
 
-export function LivePlayerPopup({ entry, entries, channelName, onClose, channelSlug, channel, vodUrl, onOpenHit, onNotFoundChannel, savedChannels, cascadeIndex = 0, zIndex, onBringToFront, liveSessionPrefetchRef }: LivePlayerPopupProps) {
+export function LivePlayerPopup({ entry, entries, channelName, onClose, channelSlug, channel, vodUrl, onOpenHit, onNotFoundChannel, savedChannels, cascadeIndex = 0, zIndex, onBringToFront, liveSessionPrefetchRef, popupId, frameMode = false, frameSnapRect = null, onUnsnap }: LivePlayerPopupProps) {
   const { t } = useI18n();
   const videoRef = useRef<HTMLVideoElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
@@ -416,8 +422,6 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     setEntryIndex(entryIndexRef.current);
     return true;
   }, [allEntries]);
-  const [drag, setDrag] = useState<DragState>(null);
-
   // Transport state
   const [paused, setPaused] = useState(false);
   const [muted, setMuted] = useState(true);
@@ -2015,6 +2019,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
   // --- Resize: aspect-locked (video keeps the stream's aspect; chat docks
   //     right of the video, so the video area = popup − chat panel width) ---
   const handleResize = useCallback((e: React.PointerEvent<HTMLDivElement>, edge: ResizeEdge) => {
+    // Pinned into a frame cell: the pin owns this window's size, so a resize
+    // would immediately be overwritten. The dimmed gutters (frame.css) are the
+    // visible reason.
+    if (frameSnapRect) return;
     const startSize = { ...sizeRef.current };
     const startPos = { ...posRef.current };
     const viewport = { w: window.innerWidth, h: window.innerHeight };
@@ -2044,30 +2052,83 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     });
   }, []);
 
-  // --- Dragging (header bar only, so transport buttons don't fight the drag) ---
-  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+  // --- Dragging (shared floating-panel primitive) ---
+  // Was a bespoke mousedown -> setState -> window mousemove/mouseup path, which
+  // is a different mechanism from every other floating window: no pointer
+  // capture, a setState per move event, and no way for the frame grid to arm
+  // (the grid arms on pointerdown). startFloatingPanelDrag is the repo's
+  // shared primitive (pointer capture + rAF-coalesced direct DOM writes +
+  // transitions suspended for the gesture), and FrameOverlay now arms from the
+  // `data-frame-window` attribute on this root, so body AND header drags snap.
+  const dragPointerRef = useRef<{ x: number; y: number; moved: boolean } | null>(null);
+  const beginDrag = useCallback((e: ReactPointerEvent<HTMLElement>) => {
+    if (isFullscreen) return;
     const t = e.target as HTMLElement;
-    if (t.closest('.live-popup-close') || t.closest('.live-popup-link') || t.closest('.live-popup-search')) return;
-    setDrag({ startX: e.clientX, startY: e.clientY, offsetX: posRef.current.x, offsetY: posRef.current.y });
-  }, []);
+    if (t.closest('button, input, select, textarea, a, [role="slider"], .live-popup-close, .live-popup-link, .live-popup-search')) return;
+    const el = popupRef.current;
+    if (!el) return;
+    // A snapped window is released by the same gesture that moves it.
+    if (frameSnapRect) onUnsnap?.();
+    if (!posRef.current) posRef.current = { x: position.x, y: position.y };
+    // Track movement so the click that ends a real drag does not also toggle
+    // play/pause (same guard the explore popup uses for its video).
+    dragPointerRef.current = { x: e.clientX, y: e.clientY, moved: false };
+    const onMove = (ev: PointerEvent) => {
+      const p = dragPointerRef.current;
+      if (p && Math.hypot(ev.clientX - p.x, ev.clientY - p.y) > 4) p.moved = true;
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+    // margin 8 = the frame grid's own outer padding, so a window unsnapped
+    // from a cell can be placed back anywhere the grid can reach. The live
+    // position state is non-nullable, so the helper's null is dropped.
+    startFloatingPanelDrag(e, posRef, (p) => { if (p) setPosition(p); }, el, { margin: 8 });
+  }, [isFullscreen, frameSnapRect, onUnsnap, position.x, position.y]);
 
+  // Frame snap pin — same shared placement math the explore popup uses. The
+  // popup's own left/top/width/height are React-controlled, so the pinned
+  // size is written to state too; max-width/max-height land as direct DOM
+  // writes that survive re-render.
+  useFrameSnapPin({
+    el: popupRef.current,
+    rect: isFullscreen ? null : frameSnapRect,
+    posRef,
+    setPos: setPosition,
+    fit: (inner) => {
+      const aspect = videoAspectRef.current || 16 / 9;
+      let w = Math.min(inner.w, sizeRef.current.w);
+      let h = w / aspect;
+      if (h > inner.h) {
+        h = inner.h;
+        w = h * aspect;
+      }
+      return { w: Math.max(1, w), h: Math.max(1, h) };
+    },
+    onPin: (next) => setSize(next),
+    repinKey: isFullscreen ? null : headerRef.current?.offsetHeight ?? 0,
+  });
+
+  // Leaving a cell restores a free-floating size: the pin wrote the cell-fit
+  // size into state, which would otherwise leave a cell-sized window behind.
+  const wasSnappedRef = useRef(false);
   useEffect(() => {
-    if (!drag) return;
-    const handleMouseMove = (e: MouseEvent) => {
-      const s = sizeRef.current;
-      setPosition({
-        x: Math.max(0, Math.min(window.innerWidth - s.w, drag.offsetX + e.clientX - drag.startX)),
-        y: Math.max(0, Math.min(window.innerHeight - s.h, drag.offsetY + e.clientY - drag.startY)),
-      });
-    };
-    const handleMouseUp = () => setDrag(null);
-    window.addEventListener('mousemove', handleMouseMove);
-    window.addEventListener('mouseup', handleMouseUp);
-    return () => {
-      window.removeEventListener('mousemove', handleMouseMove);
-      window.removeEventListener('mouseup', handleMouseUp);
-    };
-  }, [drag]);
+    if (frameSnapRect) {
+      wasSnappedRef.current = true;
+      return;
+    }
+    if (!wasSnappedRef.current) return;
+    wasSnappedRef.current = false;
+    setSize((prev) => {
+      const w = Math.max(prev.w, Math.min(POPUP_WIDTH + (chatOpenRef.current ? LIVE_CHAT_PANEL_W : 0), window.innerWidth - RESIZE_MARGIN));
+      return { w, h: Math.max(prev.h, Math.min(POPUP_HEIGHT, window.innerHeight - RESIZE_MARGIN)) };
+    });
+  }, [frameSnapRect]);
 
   // Transport buttons match the main preview player (platform accent when
   // docked, glass when the popup is fullscreen).
@@ -2325,6 +2386,13 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       tabIndex={-1}
       className="group border-2 border-zinc-700 bg-zinc-950"
       data-live-popup
+      // Carrying this attribute IS the snap contract: FrameOverlay arms from
+      // it on pointerdown, so live players snap exactly like explore popups.
+      // Only while frame mode is on — the grid is not mounted otherwise.
+      data-frame-window={frameMode ? frameWindowKey('live', popupId ?? channelName) : undefined}
+      // Affordance for a silently-disabled resize: the gutters dim while the
+      // window is pinned (they are inert then, see handleResize).
+      data-frame-snapped={frameSnapRect ? '1' : undefined}
       onPointerDownCapture={onBringToFront}
       // Inactivity auto-hide: any interaction inside the popup (mouse move,
       // click/touch, key — the popup root holds focus, so keydown from a
@@ -2357,11 +2425,11 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       <div
         ref={headerRef}
         data-live-header
-        onMouseDown={handleMouseDown}
+        onPointerDown={beginDrag}
         className={`flex items-start justify-between gap-2 px-2 py-1.5 bg-zinc-900 border-b-2 border-zinc-800 select-none shrink-0 transition-opacity duration-300 ${
           controlsHidden ? 'opacity-0 pointer-events-none' : 'opacity-100'
         }`}
-        style={{ cursor: drag ? 'grabbing' : 'grab' }}
+        style={{ cursor: 'grab' }}
       >
         <div className="flex items-start gap-1.5 min-w-0">
           <div className="min-w-0">
@@ -2443,7 +2511,14 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       {/* Video area + docked live chat — the chat panel takes its own column
           right of the video (same side-dock pattern as the archive preview's
           chat panel), never over the video while fullscreen. */}
-      <div className="flex flex-1 min-h-0 overflow-hidden" style={{ minHeight: 0 }}>
+      <div
+        className="flex flex-1 min-h-0 overflow-hidden"
+        style={{ minHeight: 0 }}
+        // The body is the natural grab surface (and the one that reaches the
+        // video), so it drags too — controls are excluded by beginDrag's
+        // closest() guard.
+        onPointerDown={beginDrag}
+      >
       <div
         style={{
           flex: 1,
@@ -2457,6 +2532,9 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
           data-live-video-area
           className={`absolute inset-0 z-0 ${controlsHidden ? 'cursor-none' : 'cursor-pointer'}`}
           onClick={() => {
+            // A drag that ends over the video still delivers a click; without
+            // this the popup jumps AND toggles play at the same time.
+            if (dragPointerRef.current?.moved) return;
             if (!loading && !error) togglePlay();
           }}
         >
@@ -2465,6 +2543,9 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
             autoPlay
             playsInline
             muted
+            // Chromium makes media natively draggable; that payload is a URL,
+            // not a frame window key, so the drop silently did nothing.
+            draggable={false}
             onLoadedMetadata={() => {
               // Lock the resize math to the STREAM's aspect (not the panel's
               // box) — the reason the old free-form resize letterboxed.

@@ -132,7 +132,11 @@ import PanelResizer from './components/PanelResizer';
 import './styles/frame.css';
 import {
   decodeFrameDragPayload,
+  frameWindowKey,
   getFrameCellRect,
+  parseFrameWindowKey,
+  type FrameRect,
+  type FrameWindowRef,
 } from './frameLayout';
 // ─── TYPES (migrated to src/types.ts) ───────────────
 
@@ -776,8 +780,10 @@ export default function App() {
     try { const v = localStorage.getItem('vodrip.ui.frameMode'); return v === '1' || v === 'true'; } catch { return false; }
   });
   useEffect(() => { try { localStorage.setItem('vodrip.ui.frameMode', frameMode ? '1' : '0'); } catch {} }, [frameMode]);
-  // Frame cell contents: which card is in each grid cell (null = empty)
-  const [frameCellContents, setFrameCellContents] = useState<(string | null)[]>(Array(6).fill(null));
+  // Frame cell contents: which floating window occupies each grid cell.
+  // Carries the window FAMILY as well as its id — a bare id string could only
+  // ever describe an explore popup, which is why live players could not snap.
+  const [frameCellContents, setFrameCellContents] = useState<(FrameWindowRef | null)[]>(Array(6).fill(null));
   const pendingFrameDropRef = useRef<{ index: number; url: string } | null>(null);
   const [frameLayoutTick, setFrameLayoutTick] = useState(0);
   useEffect(() => {
@@ -787,14 +793,38 @@ export default function App() {
     return () => window.removeEventListener('resize', onResize);
   }, [frameMode]);
 
-  const assignPopupToFrameCell = useCallback((index: number, popupId: string) => {
+  /**
+   * Cell rects keyed by window key — MEMOIZED, one object per cell.
+   *
+   * This is the fix for "snaps, then springs back": the rect used to be a
+   * fresh object literal built inline on every App render, and it was a
+   * dependency of each window's pin effect, so every timeupdate / chat tick /
+   * quality change re-ran the pin and re-wrote the position.
+   */
+  const frameSnapRects = useMemo(() => {
+    void frameLayoutTick; // re-read window.innerWidth/innerHeight after a resize
+    const map = new Map<string, FrameRect>();
+    frameCellContents.forEach((entry, i) => {
+      if (entry) map.set(frameWindowKey(entry.kind, entry.id), getFrameCellRect(i));
+    });
+    return map;
+  }, [frameCellContents, frameLayoutTick]);
+
+  const assignWindowToFrameCell = useCallback((index: number, ref: FrameWindowRef) => {
     setFrameCellContents((prev) => {
-      const next = [...prev];
-      const prevIdx = next.indexOf(popupId);
-      if (prevIdx !== -1) next[prevIdx] = null;
-      next[index] = popupId;
+      const next = prev.map((c) => (
+        c && frameWindowKey(c.kind, c.id) === frameWindowKey(ref.kind, ref.id) ? null : c
+      ));
+      next[index] = ref;
       return next;
     });
+  }, []);
+
+  /** Release a window from whichever cell holds it (a drag started on it). */
+  const unsnapFrameWindow = useCallback((key: string) => {
+    setFrameCellContents((prev) => prev.map((c) => (
+      c && frameWindowKey(c.kind, c.id) === key ? null : c
+    )));
   }, []);
 
   const [previewPanelWidth, setPreviewPanelWidth] = useState(initialPanelLayout.previewPanelWidth);
@@ -3466,10 +3496,9 @@ export default function App() {
   const closeExplorePopup = useCallback((id: string) => {
     explorePauseMapRef.current.delete(id);
     dropPopupZ(id);
-    setFrameCellContents((prev) => prev.map((cell) => (cell === id ? null : cell)));
+    setFrameCellContents((prev) => prev.map((cell) => (cell?.kind === 'explore' && cell.id === id ? null : cell)));
     setExplorePopups((prev) => prev.filter((p) => p.id !== id));
   }, [dropPopupZ]);
-
   const openExplorePlayer = useCallback((v: ListedChannelVideo) => {
     // Synthetic watchdog ids have no real video — nothing to preview.
     // (platform arrives capitalized as 'YouTube'; compare case-insensitively.)
@@ -3527,13 +3556,15 @@ export default function App() {
 
   const handleDropCell = useCallback((index: number, raw: string) => {
     const parsed = decodeFrameDragPayload(raw);
-    let popupId: string | null = null;
+    let target: FrameWindowRef | null = null;
     if (parsed.kind === 'popup') {
-      popupId = parsed.id;
+      // "explore:<id>" / "live:<id>" from the attribute-based arm, or a bare
+      // explore popup id from the legacy HTML5 header drag — both still work.
+      target = parseFrameWindowKey(parsed.id) ?? { kind: 'explore', id: parsed.id };
     } else {
       const existing = explorePopups.find((ep) => ep.vod.url === parsed.url);
       if (existing) {
-        popupId = existing.id;
+        target = { kind: 'explore', id: existing.id };
       } else {
         const video = visibleChannelVideos.find((v) => buildVodUrl(v) === parsed.url);
         if (video) {
@@ -3543,9 +3574,21 @@ export default function App() {
         }
       }
     }
-    if (!popupId || !explorePopups.some((ep) => ep.id === popupId)) return;
-    assignPopupToFrameCell(index, popupId);
-  }, [explorePopups, visibleChannelVideos, openExplorePlayer, assignPopupToFrameCell]);
+    // Previously a bare `return` with no signal: a drop whose payload did not
+    // match an open window (a native <video>/<img> drag carrying a URL, a
+    // popup closed mid-drag) looked identical to the app ignoring you. Log it
+    // so the next failure is diagnosable instead of invisible.
+    const open = target && (
+      target.kind === 'explore'
+        ? explorePopups.some((ep) => ep.id === target!.id)
+        : livePopups.some((lp) => String(lp.id) === target!.id)
+    );
+    if (!target || !open) {
+      console.warn('[frame] drop ignored — no open window for payload', { index, raw, target });
+      return;
+    }
+    assignWindowToFrameCell(index, target);
+  }, [explorePopups, livePopups, visibleChannelVideos, openExplorePlayer, assignWindowToFrameCell]);
 
   useEffect(() => {
     const pending = pendingFrameDropRef.current;
@@ -3553,8 +3596,8 @@ export default function App() {
     const popup = explorePopups.find((ep) => ep.vod.url === pending.url);
     if (!popup) return;
     pendingFrameDropRef.current = null;
-    assignPopupToFrameCell(pending.index, popup.id);
-  }, [explorePopups, assignPopupToFrameCell]);
+    assignWindowToFrameCell(pending.index, { kind: 'explore', id: popup.id });
+  }, [explorePopups, assignWindowToFrameCell]);
 
   /**
    * Archive search → open the hit in the explore-player flow at its offset.
@@ -5773,9 +5816,12 @@ export default function App() {
 
   const closeLivePopup = useCallback((id: number) => {
     dropPopupZ(String(id));
+    // A live popup can now hold a frame cell — release it or the cell stays
+    // occupied by a window that no longer exists.
+    unsnapFrameWindow(frameWindowKey('live', String(id)));
     livePopupsRef.current = livePopupsRef.current.filter((p) => p.id !== id);
     setLivePopups(livePopupsRef.current);
-  }, [dropPopupZ]);
+  }, [dropPopupZ, unsnapFrameWindow]);
 
   const removePlatformFromChannel = useCallback((channelId: string, platform: 'Kick' | 'Twitch' | 'YouTube') => {
     setSavedChannels((prev) => {
@@ -7878,13 +7924,10 @@ export default function App() {
               zIndex={EXPLORE_POPUP_Z + (popupZOrder[entry.id] ?? 0)}
               stackIndex={entry.layoutIndex}
               frameMode={frameMode}
-              frameSnapRect={(() => {
-                void frameLayoutTick;
-                if (!frameMode) return null;
-                const cellIdx = frameCellContents.indexOf(entry.id);
-                return cellIdx >= 0 ? getFrameCellRect(cellIdx) : null;
-              })()}
-              onUnsnap={() => setFrameCellContents((prev) => prev.map((cell) => (cell === entry.id ? null : cell)))}
+              // Memoized rect (see frameSnapRects) — a fresh object here
+              // re-pinned the window on every unrelated App render.
+              frameSnapRect={frameMode ? frameSnapRects.get(frameWindowKey('explore', entry.id)) ?? null : null}
+              onUnsnap={() => unsnapFrameWindow(frameWindowKey('explore', entry.id))}
               onClose={() => closeExplorePopup(entry.id)}
               onHandoffToMain={(vod: ExplorePopupVod, timeSec: number, trim?: { start: number; end: number } | null, chat?: ChatMarkers | null) => carryExploreToUrl(vod, timeSec, trim, chat)}
               onRegisterPause={registerExplorePause}
@@ -7929,6 +7972,7 @@ export default function App() {
         return (
           <LivePlayerPopup
             key={popup.id}
+            popupId={String(popup.id)}
             entry={popup.entry}
             entries={popup.entries}
             channelName={popup.channelName}
@@ -7937,6 +7981,11 @@ export default function App() {
             vodUrl={vodUrl}
             cascadeIndex={idx}
             zIndex={EXPLORE_POPUP_Z + (popupZOrder[String(popup.id)] ?? 0)}
+            // Same frame contract the explore popup gets — this is what makes
+            // a live player snappable at all.
+            frameMode={frameMode}
+            frameSnapRect={frameMode ? frameSnapRects.get(frameWindowKey('live', String(popup.id))) ?? null : null}
+            onUnsnap={() => unsnapFrameWindow(frameWindowKey('live', String(popup.id)))}
             onBringToFront={() => bringPopupToFront(String(popup.id))}
             onClose={() => closeLivePopup(popup.id)}
             onOpenHit={openArchiveHit}

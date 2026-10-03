@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { act, fireEvent, render } from '@testing-library/react';
-import FrameOverlay, { FRAME_DRAG_DESPAWN_MS } from './FrameOverlay';
+import FrameOverlay, { FRAME_DRAG_DESPAWN_MS, FRAME_IDLE_OVERLAY_OPACITY } from './FrameOverlay';
 
 describe('FrameOverlay', () => {
   beforeEach(() => {
@@ -13,12 +13,14 @@ describe('FrameOverlay', () => {
     delete document.body.dataset.frameDragging;
   });
 
-  it('is click-through and invisible while frame mode is idle (no active drag)', () => {
+  it('is click-through but VISIBLE while frame mode is idle (no active drag)', () => {
     const { container } = render(<FrameOverlay active onDropCell={vi.fn()} />);
     const overlay = container.querySelector('[data-frame-overlay]') as HTMLElement;
     expect(overlay).not.toBeNull();
     expect(overlay.style.pointerEvents).toBe('none');
-    expect(overlay.style.opacity).toBe('0');
+    // Idle guide stays faintly visible so the user can see the snap target
+    // before any drag starts (it used to be opacity 0 and read as broken).
+    expect(overlay.style.opacity).toBe(String(FRAME_IDLE_OVERLAY_OPACITY));
     expect(document.body.dataset.frameDragging).toBeUndefined();
   });
 
@@ -43,7 +45,7 @@ describe('FrameOverlay', () => {
     fireEvent.dragEnd(document, { bubbles: true, cancelable: true });
 
     expect(overlay.style.pointerEvents).toBe('none');
-    expect(overlay.style.opacity).toBe('0');
+    expect(overlay.style.opacity).toBe(String(FRAME_IDLE_OVERLAY_OPACITY));
     expect(document.body.dataset.frameDragging).toBeUndefined();
     expect(cell.style.border).toContain('dashed');
   });
@@ -70,7 +72,7 @@ describe('FrameOverlay', () => {
     });
 
     expect(document.body.dataset.frameDragging).toBeUndefined();
-    expect(overlay.style.opacity).toBe('0');
+    expect(overlay.style.opacity).toBe(String(FRAME_IDLE_OVERLAY_OPACITY));
     expect(overlay.style.pointerEvents).toBe('none');
   });
 

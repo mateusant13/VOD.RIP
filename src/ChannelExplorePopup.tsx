@@ -75,7 +75,8 @@ import {
   type ResizeEdge,
 } from './explorePopupUtils';
 import type { FrameRect } from './frameLayout';
-import { encodeFrameDragPopupId } from './frameLayout';
+import { encodeFrameDragPopupId, frameWindowKey } from './frameLayout';
+import { useFrameSnapPin } from './frameSnap';
 import { formatHmsFull } from './utils';
 import { createFullscreenGate, FULLSCREEN_SETTLE_FALLBACK_MS, type FullscreenGate } from './utils/fullscreenGate';
 import type { PreviewSessionResponse, AiAskResponse } from './types';
@@ -1135,15 +1136,13 @@ export default function ChannelExplorePopup({
       posRef.current = layoutExplorePopupWindow(el, panelWidthRef.current + chatTotal, posRef, stackIndex);
       setPos(posRef.current);
     }
-    // The natural gesture to snap into a frame cell is grabbing the popup body/video.
-    // That is a pointer drag (below), which never fires HTML5 dragstart — so in frame
-    // mode we arm the snap grid explicitly. FrameOverlay computes the hovered cell by
-    // geometry and snaps on pointerup.
-    if (frameMode) {
-      document.dispatchEvent(new CustomEvent('explore-frame-arm', { detail: { id } }));
-    }
+    // No arm event here on purpose: FrameOverlay reads the window key off the
+    // `data-frame-window` attribute on the pointerdown target (capture phase,
+    // before this handler runs). The old bespoke 'explore-frame-arm' dispatch
+    // had to stay in lockstep with FrameOverlay's own disarm handler or the
+    // snap silently died — that ordering coupling is what made this fragile.
     startFloatingPanelDrag(e, posRef, setPos, el);
-  }, [fullscreen, stackIndex, frameSnapRect, onUnsnap, frameMode, id]);
+  }, [fullscreen, stackIndex, frameSnapRect, onUnsnap]);
 
   const fsGateRef = useRef<FullscreenGate | null>(null);
   if (fsGateRef.current === null) {
@@ -1252,6 +1251,38 @@ export default function ChannelExplorePopup({
     return () => window.clearTimeout(t);
   }, [fullscreen]);
 
+  // Frame snap pin — the shared placement math (see src/frameSnap.ts). This
+  // popup used to inline it, which is why no other window family could snap.
+  // `repinKey` carries only REAL geometry changes (measured chrome height,
+  // stream aspect, chat column width); the cell rect itself is memoized in
+  // App, so a timeupdate / chat tick / quality change no longer re-pins and
+  // springs the window back.
+  useFrameSnapPin({
+    el: containerRef.current,
+    rect: fullscreen ? null : frameSnapRect,
+    posRef,
+    setPos,
+    fit: (inner) => {
+      const chatW = chatTotal;
+      let videoW = Math.max(
+        EXPLORE_PANEL_MIN_W,
+        Math.min(inner.w - chatW, inner.w * 0.92 - chatW),
+      );
+      let videoH = videoW / videoAspectRef.current;
+      const chrome = chromeHRef.current;
+      let totalH = chrome + videoH;
+      if (totalH > inner.h) {
+        videoH = Math.max(72, inner.h - chrome);
+        videoW = Math.min(inner.w - chatW, videoH * videoAspectRef.current);
+        totalH = chrome + videoW / videoAspectRef.current;
+      }
+      panelWidthRef.current = videoW;
+      return { w: videoW + chatW, h: totalH };
+    },
+    onPin: ({ w }) => setPanelWidth(w - chatTotal),
+    repinKey: fullscreen ? null : `${chromeHVersion}|${videoAspect}|${chatTotal}`,
+  });
+
   useLayoutEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -1259,37 +1290,7 @@ export default function ChannelExplorePopup({
       applyExplorePopupFullscreenPosition(el);
       return;
     }
-    if (frameSnapRect) {
-      const innerPad = 6;
-      const maxInnerW = Math.max(0, frameSnapRect.w - innerPad * 2);
-      const maxInnerH = Math.max(0, frameSnapRect.h - innerPad * 2);
-      const chatW = chatTotal;
-      let videoW = Math.max(
-        EXPLORE_PANEL_MIN_W,
-        Math.min(maxInnerW - chatW, maxInnerW * 0.92 - chatW),
-      );
-      let videoH = videoW / videoAspectRef.current;
-      const chrome = chromeHRef.current;
-      let totalH = chrome + videoH;
-      if (totalH > maxInnerH) {
-        videoH = Math.max(72, maxInnerH - chrome);
-        videoW = Math.min(maxInnerW - chatW, videoH * videoAspectRef.current);
-        totalH = chrome + videoW / videoAspectRef.current;
-      }
-      panelWidthRef.current = videoW;
-      setPanelWidth(videoW);
-      const totalW = videoW + chatW;
-      const px = frameSnapRect.x + innerPad + Math.max(0, (maxInnerW - totalW) / 2);
-      const py = frameSnapRect.y + innerPad + Math.max(0, (maxInnerH - totalH) / 2);
-      const snapped: PanelPos = { x: px, y: py };
-      posRef.current = snapped;
-      setPos(snapped);
-      applyExplorePopupWindowPosition(el, snapped);
-      el.style.width = `${totalW}px`;
-      el.style.maxWidth = `${maxInnerW}px`;
-      el.style.maxHeight = `${maxInnerH}px`;
-      return;
-    }
+    if (frameSnapRect) return; // owned by useFrameSnapPin above
     const p = layoutExplorePopupWindow(el, containerW, posRef, stackIndex);
     setPos((prev) => (prev?.x === p.x && prev?.y === p.y ? prev : p));
   }, [fullscreen, containerW, videoAspect, stackIndex, frameSnapRect, chatTotal, chromeHVersion]);
@@ -1859,6 +1860,9 @@ export default function ChannelExplorePopup({
           ? 'explore-fs-host min-h-0 p-0 gap-0 border-0 shadow-none'
           : `p-3 gap-2 border-2 border-white ${platformCardShadow(platform)}`
       }`}
+      // Carrying this attribute IS the snap contract: FrameOverlay arms from
+      // it on pointerdown, so this window cannot "forget to arm".
+      data-frame-window={frameWindowKey('explore', id)}
       style={fullscreen ? {
         position: 'fixed',
         top: 0,
@@ -1892,7 +1896,15 @@ export default function ChannelExplorePopup({
           <div
             className="flex items-start justify-between gap-2 shrink-0"
             draggable={frameMode && !fullscreen}
-            onPointerDown={frameMode && !fullscreen ? (e) => e.stopPropagation() : undefined}
+            onPointerDown={frameMode && !fullscreen ? (e) => {
+              // The header is its own drag mechanism (HTML5 DnD), so it stops
+              // the body pointer drag from also firing — which means it must
+              // release the cell ITSELF. Without this a header drag of a
+              // snapped popup left it registered in frameCellContents while
+              // being dragged (stale registration, double-occupancy).
+              if (frameSnapRect) onUnsnap?.();
+              e.stopPropagation();
+            } : undefined}
             onDragStart={frameMode && !fullscreen ? (e) => {
               e.dataTransfer.setData('text/plain', encodeFrameDragPopupId(id));
               e.dataTransfer.effectAllowed = 'move';
@@ -2107,6 +2119,11 @@ export default function ChannelExplorePopup({
           <video
             ref={videoRef}
             className="w-full h-full object-contain pointer-events-none"
+            // Chromium makes media natively draggable: a drag started here
+            // carries a URL payload, not `vodrip-frame:<id>`, so
+            // handleDropCell found no match and returned silently — the drop
+            // looked like it did nothing. Frame dragging is ours.
+            draggable={false}
             muted={muted}
             playsInline
             poster={resolveVideoThumbnail(vod.thumbnailUrl ?? null, 640, 360) || undefined}
@@ -2164,6 +2181,7 @@ export default function ChannelExplorePopup({
             <video
               ref={instantPreview.videoRef}
               className="absolute inset-0 w-full h-full object-contain pointer-events-none z-30"
+              draggable={false}
               src={instantPreview.matched.media_url}
               autoPlay
               muted

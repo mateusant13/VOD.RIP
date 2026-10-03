@@ -1,15 +1,25 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { FRAME_GRID_CELLS, encodeFrameDragPopupId, getFrameCellRect } from '../frameLayout';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  FRAME_GRID_CELLS,
+  FRAME_WINDOW_ATTR,
+  encodeFrameDragPopupId,
+  frameCellIndexAt,
+  getFrameCellRect,
+} from '../frameLayout';
 import { EXPLORE_POPUP_Z } from '../layoutUtils';
 
 /**
- * FrameOverlay — CSS grid of snap targets (dotted outlines, tmux-like).
- * - 2x3 / 3x2 adaptive (wide screens 3 cols, narrow 2 cols) — CSS grid auto
- * - Preview cards draggable with custom ghost, onDragOver highlight nearest cell, onDrop reparent via portal
+ * FrameOverlay — the 6-cell snap grid (dotted outlines, tmux-like).
+ * - 2x3 / 3x2 adaptive (wide screens 3 cols, narrow 2 cols)
+ * - Any floating window whose root carries `data-frame-window="<key>"` snaps
+ *   into the grid: the arm is read off the DOM at pointerdown, so a window
+ *   CANNOT "forget to arm" — carrying the attribute is the whole contract.
+ * - Cells are absolutely positioned from the same getFrameCellRect() math the
+ *   hit-test uses, so the pixels and the snap math can never disagree.
  * - Only rendered when frameMode === true
- * - Grid is click-through by default; becomes interactive only during an active HTML5 drag
- *   so the underlying channel list / popups remain fully clickable in frame mode.
- * ponytail: drag uses HTML5 DnD ghost; upgrade to pointer-capture + absolute positioning for smoother cross-panel moves
+ * - The guide is visible (faint) whenever frame mode is on so the user can
+ *   see where to aim, and brightens during a drag. It stays click-through
+ *   unless a drag is in flight.
  */
 
 /**
@@ -18,6 +28,14 @@ import { EXPLORE_POPUP_Z } from '../layoutUtils';
  * live drag keeps refreshing the deadline and never gets cut off.
  */
 export const FRAME_DRAG_DESPAWN_MS = 600;
+
+/**
+ * Idle guide opacity. The grid used to be `opacity: 0` until a drag started,
+ * so a user in frame mode had no visible target to aim at and the feature
+ * read as broken. Faint-but-present fixes that without competing with the
+ * video underneath.
+ */
+export const FRAME_IDLE_OVERLAY_OPACITY = 0.3;
 
 export function FrameOverlay({
   active,
@@ -30,11 +48,12 @@ export function FrameOverlay({
 }) {
   const [hoverCell, setHoverCell] = useState<number | null>(null);
   const [dragging, setDragging] = useState(false);
+  // Bumped on resize so the absolutely-positioned cells re-read the viewport.
+  const [viewportTick, setViewportTick] = useState(0);
 
-  // Popup body/video drags are POINTER drags (startFloatingPanelDrag), which never
-  // fire an HTML5 dragstart. In frame mode the explore popup dispatches
-  // 'explore-frame-arm' so the grid arms for the primary gesture too; we track the
-  // cursor over the 6 cells by geometry and snap on pointerup.
+  // Popup body/video drags are POINTER drags (startFloatingPanelDrag), which
+  // never fire an HTML5 dragstart. The armed window key is read straight off
+  // the pointerdown target, so every window family snaps through one path.
   const pointerArmIdRef = useRef<string | null>(null);
 
   // handleDropCell (App.tsx) changes identity whenever visibleChannelVideos or
@@ -48,14 +67,38 @@ export function FrameOverlay({
     onDropCellRef.current = onDropCell;
   });
 
-  /** Which frame cell (by shared grid geometry, not hit-testing) contains (x, y). */
-  const cellIndexAt = useCallback((x: number, y: number): number | null => {
-    for (let i = 0; i < FRAME_GRID_CELLS; i++) {
-      const r = getFrameCellRect(i);
-      if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) return i;
-    }
-    return null;
-  }, []);
+  useEffect(() => {
+    if (!active) return;
+    let raf = 0;
+    const onResize = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        setViewportTick((t) => t + 1);
+      });
+    };
+    window.addEventListener('resize', onResize);
+    return () => {
+      window.removeEventListener('resize', onResize);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [active]);
+
+  /** Cell rects rendered as pixels — the same source the hit-test reads. */
+  const cellRects = useMemo(() => {
+    void viewportTick; // re-read window.innerWidth/innerHeight after a resize
+    return Array.from({ length: FRAME_GRID_CELLS }, (_, i) => getFrameCellRect(i));
+  }, [viewportTick]);
+
+  /**
+   * Which cell (x, y) snaps to: exact hit, else the NEAREST cell within the
+   * snap threshold. Reads live viewport dims, so it can never drift from the
+   * rects the user is aiming at.
+   */
+  const cellIndexAt = useCallback(
+    (x: number, y: number): number | null => frameCellIndexAt(x, y),
+    [],
+  );
 
   // Track global HTML5 drag lifecycle — grid only becomes interactive while a drag is active.
   const endDrag = useCallback(() => {
@@ -100,10 +143,31 @@ export function FrameOverlay({
       const onDragOverAnywhere = () => {
         if (deadline != null) armDespawn();
       };
-      // Pointer-drag co-op (explore popup body/video). The arm event carries the
-      // popup id; the grid stays armed until pointerup (no 600ms deadline, since a
-      // held pointer-drag has no dragover cadence). Geometry-based hover/snap, so it
-      // works even though the dragged popup paints above the cells.
+      // Pointer-drag co-op (any floating window body/video/header). The armed
+      // key comes from the `data-frame-window` attribute on the pointerdown
+      // target, so a window cannot fail to snap by forgetting to arm: this
+      // capture-phase listener runs BEFORE the popup's own React handler and
+      // before any dragstart, which is what makes the ordering deterministic.
+      // Pointer-drags have no dragover cadence, so the grid stays armed with
+      // no despawn deadline until pointerup. Hover/snap are geometric, so it
+      // works even though the dragged window paints above the cells.
+      const onPointerDownCapture = (ev: PointerEvent) => {
+        const target = ev.target as (Element & { closest?: (s: string) => Element | null }) | null;
+        const host = target?.closest?.(`[${FRAME_WINDOW_ATTR}]`) as HTMLElement | null;
+        const key = host?.getAttribute(FRAME_WINDOW_ATTR);
+        if (!key) {
+          disarm();
+          return;
+        }
+        if (deadline != null) window.clearTimeout(deadline);
+        deadline = null;
+        pointerArmIdRef.current = key;
+        setDragging(true);
+        setHoverCell(null);
+        document.body.dataset.frameDragging = '1';
+      };
+      // Backwards-compatible fallback for windows that still dispatch the
+      // bespoke event instead of (or before) carrying the attribute.
       const onPointerArm = (ev: Event) => {
         const id = (ev as CustomEvent<{ id?: string }>).detail?.id;
         if (!id) return;
@@ -128,7 +192,7 @@ export function FrameOverlay({
       document.addEventListener('dragover', onDragOverAnywhere, true);
       document.addEventListener('dragend', disarm, true);
       document.addEventListener('drop', disarm, true);
-      document.addEventListener('pointerdown', disarm, true);
+      document.addEventListener('pointerdown', onPointerDownCapture, true);
       document.addEventListener('explore-frame-arm', onPointerArm);
       document.addEventListener('pointermove', onPointerMoveAnywhere, true);
       document.addEventListener('pointerup', onPointerRelease, true);
@@ -140,7 +204,7 @@ export function FrameOverlay({
         document.removeEventListener('dragover', onDragOverAnywhere, true);
         document.removeEventListener('dragend', disarm, true);
         document.removeEventListener('drop', disarm, true);
-        document.removeEventListener('pointerdown', disarm, true);
+        document.removeEventListener('pointerdown', onPointerDownCapture, true);
         document.removeEventListener('explore-frame-arm', onPointerArm);
         document.removeEventListener('pointermove', onPointerMoveAnywhere, true);
         document.removeEventListener('pointerup', onPointerRelease, true);
@@ -173,19 +237,15 @@ export function FrameOverlay({
       style={{
         position: 'absolute',
         inset: 0,
-        display: 'grid',
-        gap: 8,
-        padding: 8,
-        // Tiling guide appears only mid-drag (mirrors tmux tiling: zones
-        // reveal at drag time, not on toggle) and is click-through until a
-        // drag starts so the base channel cards stay grabbable underneath.
-        // ponytail: upgrade to IntersectionObserver-driven visibility for smoother UX
+        // The guide is ALWAYS visible in frame mode (faint) so there is a
+        // target to aim at before any drag starts, and clicks through to the
+        // app underneath until a drag is actually in flight.
         pointerEvents: dragging ? 'auto' : 'none',
-        opacity: dragging ? 1 : 0,
+        opacity: dragging ? 1 : FRAME_IDLE_OVERLAY_OPACITY,
         zIndex: dragging ? EXPLORE_POPUP_Z + 20 : 1,
       }}
     >
-      {Array.from({ length: FRAME_GRID_CELLS }, (_, i) => (
+      {cellRects.map((r, i) => (
         <div
           key={i}
           data-frame-cell={i}
@@ -193,14 +253,23 @@ export function FrameOverlay({
           onDragLeave={onDragLeave}
           onDrop={(e) => onDrop(e, i)}
           style={{
+            // Positioned from the SAME getFrameCellRect() the hit-test uses —
+            // no CSS grid, no minHeight, so pixels == snap math by
+            // construction. boxSizing keeps the 2px border inside the rect.
+            position: 'absolute',
+            left: r.x,
+            top: r.y,
+            width: r.w,
+            height: r.h,
+            boxSizing: 'border-box',
             border: hoverCell === i ? '2px solid #fff' : '2px dashed rgba(255,255,255,0.35)',
             borderRadius: 6,
             background: hoverCell === i ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.03)',
-            minHeight: 120,
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            transition: 'border-color 120ms, background 120ms',
+            // Transitions off while dragging (no hover lag mid-gesture).
+            transition: dragging ? 'none' : 'border-color 120ms, background 120ms',
           }}
         >
           <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', fontFamily: 'monospace' }}>{i + 1}</span>
