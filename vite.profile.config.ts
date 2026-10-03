@@ -16,7 +16,13 @@ export default defineConfig({
   },
   esbuild: { jsx: "automatic" },
   server: {
-    host: true,
+    // Bind loopback only. `host: true` means 0.0.0.0, which exposes this dev
+    // server (and its /api proxy) to every host on the LAN — and that is the
+    // exact precondition the vite `server.fs.deny` bypass advisories
+    // (GHSA-356w-63v5-8wf4, GHSA-4r4m-qw57-chr8, GHSA-859w-5945-r5v3) require.
+    // This config exists for headless local profiling; nothing needs to reach
+    // it from another machine, so loopback is the whole requirement.
+    host: "127.0.0.1",
     port: 5175,
     strictPort: true,
     proxy: {
