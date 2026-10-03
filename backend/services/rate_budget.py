@@ -112,6 +112,16 @@ _UP_FACTOR = 1.05            # ~+5% per clean window
 _CLEAN_WINDOW_S = 300.0      # 5 min event-free before one up-step
 _MAX_CATCHUP_STEPS = 4       # bounded spring-back after a long idle
 
+# The history table records `requests_at_limit_*` as a COUNT of requests
+# issued before the limiter fired, not a per-minute rate. When no request
+# counter is running (observed_rate_per_min is NULL) we can only guess the
+# window that count spanned. 60 min is the conservative guess: it assumes the
+# count was accumulated over an hour, which yields the SMALLEST defensible rpm
+# from a given count. A count is a hint that may only ever lower a ceiling,
+# never raise it, so erring small is the safe direction. Set to 0 to disable
+# the count fallback entirely and trust only a measured rate.
+_HISTORY_COUNT_WINDOW_MIN = 60.0
+
 # --- pool split --------------------------------------------------------------
 AUTO_SHARE = 0.70            # AUTO may hold/regenerate this much of the ceiling
 _MIN_POOL_TOKENS = 2.0       # always allow a small burst so a page fetch is
@@ -318,19 +328,31 @@ def _persist_event(platform: str, kind: str, origin: str, ceiling_rpm: float,
 
 
 def _read_history() -> List[Dict[str, Any]]:
+    """Per-(platform, origin) summary rows from the shared history table.
+
+    The shape matters. archive_db.rate_limit_summary() returns
+    ``{generated_at, since_hours, totals, groups}`` where ``groups`` is the
+    LIST of per-(platform, origin) dicts. Iterating the dict's .values()
+    instead yields 'totals' and 'groups' — neither is a platform row, so
+    every lookup missed and cross-process priming silently never happened.
+    """
     try:
         from services import archive_db
 
         fn = getattr(archive_db, "rate_limit_summary", None)
         if fn is None:
             return []
-        rows = fn(since_hours=24)
+        payload = fn(since_hours=24)
     except Exception:  # noqa: BLE001
         logger.debug("rate_budget: rate_limit_summary failed", exc_info=True)
         return []
-    if isinstance(rows, dict):
-        rows = list(rows.values())
-    return [r for r in (rows or []) if isinstance(r, dict)]
+    if isinstance(payload, dict):
+        rows = payload.get("groups") or []
+    elif isinstance(payload, list):
+        rows = payload
+    else:
+        return []
+    return [r for r in rows if isinstance(r, dict)]
 
 
 def prime_from_history(platform: Optional[str] = None) -> Dict[str, Any]:
@@ -345,11 +367,42 @@ def prime_from_history(platform: Optional[str] = None) -> Dict[str, Any]:
         plat = str(row.get("platform") or "").strip().lower()
         if not plat or (platform and plat != platform):
             continue
-        trip = row.get("min_trip_rpm") or row.get("trip_rpm") or row.get("rate_rpm")
+        # The history lane names these differently from this module's own
+        # vocabulary. Prefer a real observed RATE when one exists (the
+        # request counter makes it non-null); otherwise fall back to the
+        # p95 of requests-at-limit, which is a COUNT over an unstated window
+        # and is only a ceiling hint, never a measured rpm. The legacy names
+        # are kept last so a caller supplying this module's own vocabulary
+        # still works.
+        trip = row.get("observed_rate_per_min")
+        source = "observed_rate_per_min"
+        if trip is None:
+            trip = row.get("requests_at_limit_p95")
+            source = "requests_at_limit_p95(count,not-a-rate)"
+        if trip is None:
+            trip = row.get("requests_at_limit_mean")
+            source = "requests_at_limit_mean(count,not-a-rate)"
+        if trip is None:
+            # This module's own vocabulary (already a rate, no rescale).
+            for legacy in ("min_trip_rpm", "trip_rpm", "rate_rpm"):
+                if row.get(legacy) is not None:
+                    trip, source = row[legacy], legacy
+                    break
         try:
             trip_rpm = float(trip)
         except (TypeError, ValueError):
-            continue
+            trip_rpm = 0.0
+        if source.endswith("(count,not-a-rate)"):
+            # A raw request count is not a per-minute rate. Treating it as one
+            # would set the ceiling absurdly high (a 24h count read as rpm)
+            # and defeat the whole point. Scale it by a conservative assumed
+            # sustained window and record the assumption.
+            window = _HISTORY_COUNT_WINDOW_MIN or 0.0
+            trip_rpm = (trip_rpm / window) if window else 0.0
+            logger.debug(
+                "rate_budget: %s priming %s from %s over an assumed %s-minute window",
+                plat, source, trip, window,
+            )
         if trip_rpm <= 0:
             continue
         target = max(_FLOOR_CEILING_RPM, trip_rpm * _SAFETY_FRACTION)

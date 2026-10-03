@@ -443,3 +443,80 @@ def test_gates_are_untouched_by_the_governor():
 
     assert kick_gate.gate_remaining_sec() == 0.0
     assert _ceiling("youtube") == before
+
+# --- cross-process learning from the shared history table -----------------
+#
+# The app and the detached worker each keep private buckets, so a limit the
+# worker took has to travel to the app through the shared history table. That
+# path is prime_from_history() -> _read_history() -> archive_db.
+# rate_limit_summary().
+
+def test_read_history_unwraps_the_summary_envelope(monkeypatch):
+    """The summary returns an ENVELOPE; only 'groups' holds platform rows.
+
+    Regression: _read_history() iterated the returned dict's .values(),
+    which yields 'totals' and 'groups' - neither is a platform row. Every
+    row.get("platform") then missed, so priming silently returned {} and
+    cross-process learning never happened at all.
+    """
+    payload = {
+        "generated_at": "2026-10-03T00:00:00+00:00",
+        "since_hours": 24,
+        "totals": {"events": 1, "auto": 1, "user": 0, "by_platform": {"twitch": 1}},
+        "groups": [{"platform": "twitch", "origin": "auto", "count": 1}],
+    }
+    monkeypatch.setattr(archive_db, "rate_limit_summary", lambda **kw: payload)
+    rows = rate_budget._read_history()
+    assert rows == payload["groups"], rows
+
+
+def test_prime_lowers_a_ceiling_from_history(monkeypatch):
+    """A limit recorded by the other process must lower this one's ceiling,
+    and must leave platforms with no history untouched."""
+    payload = {
+        "generated_at": "2026-10-03T00:00:00+00:00",
+        "since_hours": 24,
+        "totals": {"events": 3, "auto": 3, "user": 0, "by_platform": {"twitch": 3}},
+        "groups": [{
+            "platform": "twitch", "origin": "auto", "count": 3,
+            # No counter running, so the count fallback is used: 300 requests
+            # over the assumed 60-minute window = 5 rpm, x0.7 safety = 3.5,
+            # which the floor lifts to _FLOOR_CEILING_RPM.
+            "requests_at_limit_p95": 300.0, "observed_rate_per_min": None,
+        }],
+    }
+    monkeypatch.setattr(archive_db, "rate_limit_summary", lambda **kw: payload)
+    monkeypatch.setenv("VODRIP_RATE_BUDGET_PRIME", "1")
+    rate_budget.reset()
+    rate_budget._history_primed = False
+
+    before = {p["platform"]: p["ceiling_rpm"] for p in rate_budget.status()["platforms"]}
+    applied = rate_budget.prime_from_history()
+    after = {p["platform"]: p["ceiling_rpm"] for p in rate_budget.status()["platforms"]}
+
+    assert applied == {"twitch": rate_budget._FLOOR_CEILING_RPM}, applied
+    assert after["twitch"] < before["twitch"], (before, after)
+    # No history for kick/youtube -> their ceilings must not move.
+    assert after["kick"] == before["kick"], (before, after)
+    assert after["youtube"] == before["youtube"], (before, after)
+
+
+def test_prime_prefers_a_measured_rate_over_a_raw_count(monkeypatch):
+    """A measured rpm is a rate. A bare request count is NOT - reading a 24h
+    count as rpm would set the ceiling absurdly high and defeat the policy.
+    When both are present the measured rate must win."""
+    payload = {
+        "generated_at": "x", "since_hours": 24,
+        "totals": {"events": 1},
+        "groups": [{
+            "platform": "twitch", "origin": "auto", "count": 1,
+            "requests_at_limit_p95": 5000.0,   # count over an unstated window
+            "observed_rate_per_min": 8.0,     # the real measured rate
+        }],
+    }
+    monkeypatch.setattr(archive_db, "rate_limit_summary", lambda **kw: payload)
+    rate_budget.reset()
+    applied = rate_budget.prime_from_history()
+    # 8.0 rpm x 0.7 = 5.6, which is above the 4.0 floor.
+    assert applied == {"twitch": 5.6}, applied
+
