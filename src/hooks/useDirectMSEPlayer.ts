@@ -22,6 +22,12 @@
  */
 import { useCallback, useRef, useState, useEffect } from 'react';
 
+// Debug tracing for the attach/seek path. Scrubbing fires several lines per seek,
+// so these are dev-only: in a production build import.meta.env.DEV is replaced
+// with false and the branches are dead-code eliminated. Same convention as
+// useApiClient.ts / App.tsx.
+const IS_DEV_UI = import.meta.env.DEV;
+
 interface DirectMSEPlayerState {
   ready: boolean;
   error: string | null;
@@ -250,7 +256,9 @@ export function useDirectMSEPlayer(
       await prefetchSegments(sessionId, 0, 3);
 
       setReady(true);
-      console.log('[MSE] Player attached, init + first segments queued');
+      if (IS_DEV_UI) {
+        console.log('[MSE] Player attached, init + first segments queued');
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Attach failed';
       console.error('[MSE] attach failed:', e);
@@ -274,7 +282,9 @@ export function useDirectMSEPlayer(
     const targetTime = Math.max(0, time);
     const targetIndex = segmentIndexAtTime(targetTime);
 
-    console.log(`[MSE] seek to ${targetTime.toFixed(2)}s (segment ${targetIndex})`);
+    if (IS_DEV_UI) {
+      console.log(`[MSE] seek to ${targetTime.toFixed(2)}s (segment ${targetIndex})`);
+    }
 
     // If we already have this segment buffered, just let video seek natively
     segmentTimeRange(targetIndex);
@@ -284,7 +294,9 @@ export function useDirectMSEPlayer(
         const bufEnd = sb.buffered.end(i);
         if (bufStart <= targetTime && targetTime < bufEnd) {
           // Already buffered — native seek will work
-          console.log('[MSE] target already buffered, native seek');
+          if (IS_DEV_UI) {
+            console.log('[MSE] target already buffered, native seek');
+          }
           return;
         }
       }
@@ -352,7 +364,9 @@ export function useDirectMSEPlayer(
       await waitForSegment(targetIndex);
 
       pendingSeekRef.current = null;
-      console.log('[MSE] seek complete');
+      if (IS_DEV_UI) {
+        console.log('[MSE] seek complete');
+      }
     } catch (e) {
       pendingSeekRef.current = null;
       console.error('[MSE] seek failed:', e);
