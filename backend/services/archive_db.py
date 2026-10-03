@@ -1262,6 +1262,12 @@ def _bind(params: Any) -> Any:
 # tables (archive_jobs heartbeats, transcripts_vocab) never match and leave
 # the cache alone.
 #
+# CAVEAT — the funnel is not universal: the batch writers below run their own
+# transaction via conn.execute() and so never reach execute() at all. They
+# call _bump_search_gen() themselves (insert_transcript, insert_messages).
+# If you add a writer of transcripts/messages/videos that bypasses execute(),
+# it must bump the generation or a memoised search will serve pre-write hits.
+#
 # The generation is read BEFORE the search runs: a write landing mid-search
 # advances it, so the entry would be stored under an already-dead generation
 # and could never be served (the store re-checks before publishing).
@@ -1862,6 +1868,9 @@ def insert_messages(platform: str, video_id: str, rows: Iterable[dict]) -> int:
         # vocab/bigram warm probe sees the new count, not a stale one.
         _bump_content_ref("messages")
         _bump_content_ref("messages_fts")
+        # Own transaction via conn.execute() — never reaches the execute()
+        # funnel that bumps the search generation (see _SEARCH_CACHE_TTL_S).
+        _bump_search_gen()
     return accepted
 
 
@@ -1900,6 +1909,8 @@ def dedupe_messages() -> int:
         # _ROWCOUNT_TTL_S.
         _bump_content_ref("messages")
         _bump_content_ref("messages_fts")
+        # Same bypass caveat: own transaction, so retire memoised searches.
+        _bump_search_gen()
     return deleted
 
 
@@ -2056,6 +2067,10 @@ def set_message_display_name(platform: str, user_id: str, display_name: str) -> 
                 "UPDATE messages SET display_name = ? WHERE platform = ? AND user_id = ?",
                 (display_name, platform, user_id),
             )
+            if cur.rowcount:
+                # display_name is a searched field, and this UPDATE bypasses
+                # the execute() funnel (see _SEARCH_CACHE_TTL_S).
+                _bump_search_gen()
             return cur.rowcount
 
 
@@ -2325,6 +2340,11 @@ def insert_transcript(
     if count:
         _bump_content_ref("transcripts")
         _bump_content_ref("transcripts_fts")
+        # This writer uses conn.execute() directly (it is a batch insert in
+        # one transaction), so it never passes through the execute() funnel
+        # that bumps the search generation. Without this a memoised search
+        # would keep serving hits from before the insert.
+        _bump_search_gen()
     return count
 
 

@@ -153,9 +153,16 @@ def test_transcript_delete_invalidates(seed, counted):
     archive_db.insert_transcript("twitch", VID, [{
         "seg_idx": 1, "start_sec": 2.0, "end_sec": 3.0, "text": f"second {WORD}",
     }])
-    assert len(archive_db.search(WORD)) == 2
+    # Two transcript hits (seg 0 + seg 1) plus the video's TITLE hit, which
+    # also contains WORD — the title pass is on by default.
+    assert len(archive_db.search(WORD)) == 3
     archive_db.delete_transcripts("twitch", VID)
-    assert _texts(archive_db.search(WORD)) == [f"first {WORD}"]
+    after = _texts(archive_db.search(WORD))
+    # delete_transcripts removes EVERY transcript row for the video, so both
+    # segments go and only the video's title hit survives. This is the
+    # invalidation check: if the entry had not been retired, the two deleted
+    # segments would still be in `after`.
+    assert after == [f"{WORD} title"], after
 
 
 def test_chat_insert_invalidates(seed, counted):

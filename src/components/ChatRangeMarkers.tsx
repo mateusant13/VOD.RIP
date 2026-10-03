@@ -79,8 +79,8 @@ export function ChatRowMarkers({
         }}
         className={`w-3.5 h-3.5 shrink-0 rounded-full border text-[7px] font-black leading-none flex items-center justify-center ${
           isStart
-            ? 'bg-[#53fc18] border-[#53fc18] text-black'
-            : 'border-[#53fc18] text-[#53fc18] hover:bg-[#53fc18] hover:text-black'
+            ? 'bg-mark-start border-mark-start text-black'
+            : 'border-mark-start text-mark-start hover:bg-mark-start hover:text-black'
         }`}
       >
         S
@@ -96,8 +96,8 @@ export function ChatRowMarkers({
         }}
         className={`w-3.5 h-3.5 shrink-0 rounded-full border text-[7px] font-black leading-none flex items-center justify-center ${
           isEnd
-            ? 'bg-[#ef4444] border-[#ef4444] text-white'
-            : 'border-[#ef4444] text-[#ef4444] hover:bg-[#ef4444] hover:text-white'
+            ? 'bg-mark-end border-mark-end text-white'
+            : 'border-mark-end text-mark-end hover:bg-mark-end hover:text-white'
         }`}
       >
         E
@@ -133,7 +133,7 @@ export function ChatMarkerChips({
         }}
         className={`flex items-center gap-1 border px-1 py-0.5 text-[8px] font-mono font-bold uppercase tracking-wider ${
           markers.start != null
-            ? 'border-[#53fc18] bg-[#53fc18]/10 text-[#53fc18]'
+            ? 'border-mark-start bg-mark-start/10 text-mark-start'
             : 'border-zinc-700 text-zinc-600 hover:text-zinc-400'
         }`}
       >
@@ -153,7 +153,7 @@ export function ChatMarkerChips({
         }}
         className={`flex items-center gap-1 border px-1 py-0.5 text-[8px] font-mono font-bold uppercase tracking-wider ${
           markers.end != null
-            ? 'border-[#ef4444] bg-[#ef4444]/10 text-[#ef4444]'
+            ? 'border-mark-end bg-mark-end/10 text-mark-end'
             : 'border-zinc-700 text-zinc-600 hover:text-zinc-400'
         }`}
       >

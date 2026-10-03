@@ -7,11 +7,20 @@ scheduler's autonomous-enqueue un-gate.
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
 from pathlib import Path
 
-os.environ["VODRIP_ARCHIVE_DB"] = str(
-    Path(tempfile.mkdtemp(prefix="queue-claim-")) / "archive.db")
+# Pin this module to its OWN scratch DB before archive_db is imported. The
+# suite shares one process-level scratch archive, so a job row another module
+# left in 'running' (a GPU-gate scratch row, a leftover transcribe claim) makes
+# the concurrency cap in _claim_next_job read as already-saturated and these
+# tests fail depending on run order. An isolated DB removes the coupling
+# entirely - same pattern as test_yt_gate.py.
+_TMP = Path(tempfile.mkdtemp(prefix="queue-claim-"))
+_DB = _TMP / "archive.db"
+sqlite3.connect(str(_DB)).close()
+os.environ["VODRIP_ARCHIVE_DB"] = str(_DB)
 
 import pytest  # noqa: E402
 
@@ -19,9 +28,43 @@ from services import archive_db, archive_scheduler, queue_policy  # noqa: E402
 from services import archive_transcribe as at  # noqa: E402
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _module_scratch_db():
+    """Re-bind archive_db's global connection to THIS module's DB.
+
+    Setting the env at import is not enough: conftest.py runs first and may
+    already have opened the shared scratch archive, so archive_db._conn still
+    points there. Rebinding the connection is what actually retargets the
+    module - otherwise job rows other modules left behind (a 'running'
+    transcribe claim, a scratch GPU-gate row) make the concurrency cap read
+    as saturated and these tests fail by run order."""
+    prev_env = os.environ.get("VODRIP_ARCHIVE_DB")
+    os.environ["VODRIP_ARCHIVE_DB"] = str(_DB)
+    with archive_db._lock:
+        prev_conn = archive_db._conn
+        prev_ready = archive_db._schema_ready
+        archive_db._conn = None
+        archive_db._schema_ready = False
+    archive_db.get_conn()
+    yield
+    with archive_db._lock:
+        archive_db._conn = prev_conn
+        archive_db._schema_ready = prev_ready
+    if prev_env is None:
+        os.environ.pop("VODRIP_ARCHIVE_DB", None)
+    else:
+        os.environ["VODRIP_ARCHIVE_DB"] = prev_env
+
+
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
     monkeypatch.setattr(at, "_transcribe_cap", [0])
+    # _claim_next_job's behaviour depends on the lane plan, and the plan
+    # builder is lru_cache'd off device detection + env. A previous test
+    # module that monkeypatched VODRIP_WHISPER_DEVICE / a GPU probe leaves a
+    # cached verdict behind, so a claim can return None here for reasons that
+    # have nothing to do with this test. Drop the cached plan on both sides.
+    at._detect_device.cache_clear()
     # The scheduler enqueues under the derived id 'transcribe-<plat>-<vid>',
     # so the cleanup must match the vid AND the derived id — a leftover
     # queued row keeps the legacy idle gate open and would silently pass a
@@ -35,6 +78,7 @@ def _clean(monkeypatch):
     archive_db.execute("DELETE FROM archive_jobs WHERE id LIKE '%clm-%'")
     archive_db.execute("DELETE FROM videos WHERE channel LIKE 'clm-%'")
     archive_db.clear_user_focus()
+    at._detect_device.cache_clear()
 
 
 def _job(kind: str, vid: str, *, platform: str = "twitch", priority: int = 0) -> None:

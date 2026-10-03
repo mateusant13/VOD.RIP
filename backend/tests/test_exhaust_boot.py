@@ -49,13 +49,21 @@ def _vod(video_id: str, platform: str = "twitch") -> None:
 
 
 def test_enqueue_skips_pass2_when_queue_idle(scratch_db):
-    """No user/search transcribe work in flight -> scheduler must not invent it."""
+    """An idle queue now DOES get work.
+
+    This used to assert the opposite: pass-2 returned early unless transcribe
+    work was already inflight, so adding a channel never transcribed anything
+    on a quiet app. The product decision changed - a saved channel's recent
+    VODs are transcribed automatically, bounded per channel and rate-limited
+    by the scheduler's own cooldown, so the boot storm the old gate existed
+    to prevent is handled in-policy instead of by refusing to work.
+    """
     _vod("111")
     archive_scheduler._enqueue_transcriptions()
     rows = list(archive_db.query(
         "SELECT id FROM archive_jobs WHERE kind='transcribe'"
     ))
-    assert rows == [], f"idle pass-2 must not enqueue, got {rows}"
+    assert rows, "an idle queue must pick up the channel's recent VODs"
 
 
 def test_enqueue_pass2_when_transcribe_already_inflight(scratch_db):

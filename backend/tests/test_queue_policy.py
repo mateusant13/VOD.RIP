@@ -7,15 +7,49 @@ latest-N-per-channel selection, the single-sourced captions-first verdict
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
 from pathlib import Path
 
-os.environ["VODRIP_ARCHIVE_DB"] = str(
-    Path(tempfile.mkdtemp(prefix="queue-policy-")) / "archive.db")
+# Own scratch DB, pinned at import AND re-bound for the module (a later
+# conftest/module import can clobber VODRIP_ARCHIVE_DB under us — the conftest
+# itself notes this fragility). Without it these tests can see job rows another
+# module left behind and fail only depending on run order.
+_TMP = Path(tempfile.mkdtemp(prefix="queue-policy-"))
+_DB = _TMP / "archive.db"
+sqlite3.connect(str(_DB)).close()
+os.environ["VODRIP_ARCHIVE_DB"] = str(_DB)
 
 import pytest  # noqa: E402
 
 from services import archive_db, queue_policy  # noqa: E402
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _module_scratch_db():
+    """Re-bind archive_db's global connection to THIS module's DB.
+
+    conftest sets a process-level scratch archive that every module shares;
+    a job row another test left in 'running' can then make the queue look
+    saturated. Rebinding the connection (not just the env) is what actually
+    retargets archive_db, and restoring it afterwards keeps the shared DB
+    intact for whatever runs next."""
+    prev_env = os.environ.get("VODRIP_ARCHIVE_DB")
+    os.environ["VODRIP_ARCHIVE_DB"] = str(_DB)
+    with archive_db._lock:
+        prev_conn = archive_db._conn
+        prev_ready = archive_db._schema_ready
+        archive_db._conn = None
+        archive_db._schema_ready = False
+    archive_db.get_conn()
+    yield
+    with archive_db._lock:
+        archive_db._conn = prev_conn
+        archive_db._schema_ready = prev_ready
+    if prev_env is None:
+        os.environ.pop("VODRIP_ARCHIVE_DB", None)
+    else:
+        os.environ["VODRIP_ARCHIVE_DB"] = prev_env
 
 
 def _video(vid: str, channel: str, started: str, *, platform: str = "twitch",

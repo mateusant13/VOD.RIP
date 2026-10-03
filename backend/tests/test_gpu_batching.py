@@ -303,6 +303,12 @@ def test_gpu_pinned_job_requeues_when_gate_held():
     finally:
         at._multi_tls.pin = saved_pin
         at._gpu_gate_video = saved_video
+        # Drop the scratch rows: this module shares the process-level scratch
+        # archive DB, and a leftover 'gpu-gate-1' sitting in 'running' makes
+        # the transcribe-cap gate in _claim_next_job read as already-at-cap
+        # for any later module (this showed up as queue-claim tests failing
+        # only when run after this file).
+        archive_db.execute("DELETE FROM archive_jobs WHERE id LIKE 'gpu-gate-%'")
 
 
 
