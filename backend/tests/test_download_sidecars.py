@@ -140,6 +140,47 @@ def test_write_transcript_sidecar_trim_scoped(_scratch_db, tmp_path: Path):
     assert "00:06:50" not in body
 
 
+def test_preview_mini_editor_cut_srt_is_rebased_to_its_own_media(_scratch_db, tmp_path: Path):
+    """The in-preview MINI EDITOR's default selection (playhead 120, 30s cut)
+    is sent to POST /api/download/clip as crop_start=120 / crop_end=150. This
+    pins those exact values to the sidecar contract: the cut's own media file
+    starts at 0:00, so a cue spoken at 126s in the SOURCE VOD must land at
+    00:00:06 in the .srt — not 00:02:06, which is what an un-rebased sidecar
+    would emit and what silently desyncs every subtitle in the clip.
+
+    This is the end-to-end half of the alignment contract: the frontend half
+    (that the editor really sends crop_start=120/crop_end=150) is asserted in
+    src/components/PreviewMiniEditor.test.tsx.
+    """
+    archive_db.execute(
+        "DELETE FROM transcripts WHERE platform = 'twitch' AND video_id = ?", (_VOD,)
+    )
+    archive_db.insert_transcript("twitch", _VOD, [
+        {"seg_idx": 0, "start_sec": 100.0, "end_sec": 104.0, "text": "before the cut"},
+        {"seg_idx": 1, "start_sec": 126.0, "end_sec": 130.0, "text": "six seconds in"},
+        {"seg_idx": 2, "start_sec": 149.0, "end_sec": 152.0, "text": "crosses the out point"},
+        {"seg_idx": 3, "start_sec": 200.0, "end_sec": 205.0, "text": "after the cut"},
+    ])
+    out = tmp_path / "clip.mp4"
+    out.write_bytes(b"video")
+    got = write_transcript_sidecar(
+        str(out), "twitch", _VOD, crop_start=120.0, crop_end=150.0
+    )
+    body = Path(got).read_text("utf-8")
+
+    # Trim scoping: only cues overlapping [120,150] survive.
+    assert "before the cut" not in body
+    assert "after the cut" not in body
+    assert "six seconds in" in body
+
+    # THE alignment assertion: 126s in the source VOD reads as 6s into the clip.
+    assert "00:00:06,000 --> 00:00:10,000" in body
+    # And the un-rebased source time is absent, so a regression to
+    # rebase_sec=0 cannot pass this test.
+    assert "00:02:06" not in body
+    assert "00:00:00,000" not in body
+
+
 def test_write_transcript_sidecar_no_trim_writes_whole(_scratch_db, tmp_path: Path):
     """Without a trim window the transcript sidecar keeps every row."""
     _seed_transcript()
