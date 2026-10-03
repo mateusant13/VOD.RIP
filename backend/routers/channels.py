@@ -311,7 +311,7 @@ async def _gather_channel_clips(
                         f"https://kick.com/{kick_slug}/clips",
                         need,
                         sort=sort,
-                        source="user",
+                        origin="user",
                     ),
                 ),
                 timeout=CLIP_FETCH_TIMEOUT_SEC,

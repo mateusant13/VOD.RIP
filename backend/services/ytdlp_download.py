@@ -1538,6 +1538,13 @@ def download_video_sync(
             register_temp_dir=register_temp_dir,
             mp4_faststart=mp4_faststart,
             audio_only=audio_only,
+            # Instrumentation: name the counter bucket the segment fetches
+            # land in. detect_platform already ran for this call, and
+            # rl_counter normalizes the label ('YouTube' -> 'youtube').
+            # No origin here: download_video_sync is entered from the
+            # download-manager worker for both the worker and the
+            # on-demand preview, so 'auto' stays the conservative default.
+            platform=platform,
         )
     else:
         crop = _normalize_crop_range(crop_start, crop_end)

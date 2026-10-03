@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 
+from services import rl_counter
 from services.http_fingerprint import twitch_http_headers
 import random
 import re
@@ -622,8 +623,12 @@ def _gql_request(
     )
     _governor_admit(source, "gql")
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
+        # Instrumentation: one in-memory increment + in-flight gauge per
+        # GQL request (see services.rl_counter). No DB write, no
+        # archive_db import, no lock beyond that counter's own.
+        with rl_counter.request_scope("twitch"):
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")[:200]
         if e.code == 429:
@@ -660,8 +665,13 @@ def _gql_persisted(
     )
     _governor_admit(source, "gql_persisted")
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
+        # Instrumentation: same in-memory count as _gql_request. A
+        # persisted-hash miss retries through _gql_persisted_with_fallback
+        # and is therefore counted twice - which is correct, the platform
+        # saw two requests.
+        with rl_counter.request_scope("twitch"):
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")[:200]
         if e.code == 429:

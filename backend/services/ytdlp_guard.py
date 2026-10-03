@@ -10,6 +10,7 @@ import threading
 from pathlib import Path
 from typing import Any, Iterator
 
+from services import rl_counter
 from services import ytdlp_env  # noqa: F401
 
 logger = logging.getLogger(__name__)
@@ -177,13 +178,24 @@ def ytdlp_js_runtimes() -> dict[str, dict]:
 
 @contextlib.contextmanager
 def guarded_youtube_dl(opts: dict[str, Any]) -> Iterator[Any]:
-    """Only supported way to construct YoutubeDL — one instance at a time."""
+    """Only supported way to construct YoutubeDL — one instance at a time.
+
+    Instrumentation: this is the single funnel every YouTube metadata /
+    download request passes through, so it is where the YouTube request
+    count that yt_gate's rate-limit history reports comes from. One
+    in-memory increment per context entry (see services.rl_counter) — the
+    process-wide lock below already serializes construction, so this adds
+    no contention and no DB write. yt-dlp's individual HTTP requests are
+    NOT counted separately: they are invisible from here, and pretending
+    otherwise would inflate the number a throttle is calibrated on.
+    """
     import yt_dlp  # lazy: keeps yt-dlp (~0.5s) off the app import path
 
     assert_ytdlp_safe()
     safe = sanitize_ytdlp_opts(opts)
     safe.setdefault("logger", ytdlp_console_logger())
     safe.setdefault("js_runtimes", ytdlp_js_runtimes())
+    rl_counter.count_request("youtube")
     with _YTDLP_LOCK:
         with yt_dlp.YoutubeDL(safe) as ydl:
             yield ydl
@@ -191,13 +203,18 @@ def guarded_youtube_dl(opts: dict[str, Any]) -> Iterator[Any]:
 
 @contextlib.contextmanager
 def guarded_youtube_dl_channel(opts: dict[str, Any]) -> Iterator[Any]:
-    """Flat channel playlists — separate lock so preview segment yt-dlp can't starve lists."""
+    """Flat channel playlists — separate lock so preview segment yt-dlp can't starve lists.
+
+    Counted like guarded_youtube_dl: one in-memory increment per context
+    entry, no DB write.
+    """
     import yt_dlp  # lazy
 
     assert_ytdlp_safe()
     safe = sanitize_ytdlp_opts(opts)
     safe.setdefault("logger", ytdlp_console_logger())
     safe.setdefault("js_runtimes", ytdlp_js_runtimes())
+    rl_counter.count_request("youtube")
     with _YTDLP_CHANNEL_LOCK:
         with yt_dlp.YoutubeDL(safe) as ydl:
             yield ydl

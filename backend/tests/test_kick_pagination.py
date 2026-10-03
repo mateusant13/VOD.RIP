@@ -47,7 +47,12 @@ def _clip_items(n: int) -> list[dict]:
 
 
 def _fake_get_json(monkeypatch, payload) -> None:
-    monkeypatch.setattr(k, "_get_json", lambda path, referer, **kw: payload)
+    # `origin` is a keyword on the real _get_json (it labels the rate-limit
+    # row when a 403/429 lands, and picks the governor's AUTO/USER pool);
+    # the fake accepts and ignores it.
+    monkeypatch.setattr(
+        k, "_get_json", lambda path, referer, *, origin="auto", **_: payload
+    )
 
 
 def test_videos_api_returns_requested_depth(monkeypatch) -> None:

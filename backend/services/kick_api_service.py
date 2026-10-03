@@ -17,7 +17,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from services import kick_gate
+from services import kick_gate, rl_counter
 from services.rate_budget import MAX_AUTO_WAIT_S, acquire, note_limit
 from services.kick_models import (
     KickChannel,
@@ -82,7 +82,7 @@ class KickRateLimitError(RuntimeError):
     """429 retries exhausted — Kick rate-limited this IP/session."""
 
 
-def _governor_admit(source: str, path: str) -> None:
+def _governor_admit(origin: str, path: str) -> None:
     """Pace this call against the learned Kick budget. Never raises.
 
     Background work waits when the AUTO pool is dry — that is the point of
@@ -91,7 +91,7 @@ def _governor_admit(source: str, path: str) -> None:
     ingest down; it never fails a metadata call.
     """
     try:
-        decision = acquire("kick", source, kind=path)  # type: ignore[arg-type]
+        decision = acquire("kick", origin, kind=path)  # type: ignore[arg-type]
         if decision.allowed:
             return
         if decision.source == "user":
@@ -110,15 +110,22 @@ def _get_json(
     referer: str,
     *,
     timeout: float = 15.0,
-    source: str = "auto",
+    origin: str = "auto",
 ) -> Any:
-    """One Kick API GET — the chokepoint for 100% of Kick JSON egress.
+    """One Kick API GET — the chokepoint for 100% of Kick JSON egress,
+    with the retry/backoff ladder.
 
-    ``source`` tags the origin for the predictive governor ("auto" for
-    background/ingest, "user" for preview/live). It is a pacing hint only:
-    when the AUTO pool is dry we wait a bounded moment and then proceed, so
-    pacing never turns a metadata call into a failure. kick_gate remains the
-    reactive backstop and its behaviour is unchanged.
+    *origin* ('auto' background worker / 'user' on-demand) is threaded from
+    the public helpers so a rate-limit row says WHO was waiting, and tags
+    the predictive governor. It defaults to 'auto' on purpose: an
+    unlabelled egress is background work, and mislabelling user work as
+    automatic is the safe direction (a later policy lane throttles 'auto'
+    first, so a wrong default costs latency, never a user's request).
+
+    For the governor *origin* is only a pacing hint: when the AUTO pool is
+    dry we wait a bounded moment and then proceed, so pacing never turns a
+    metadata call into a failure. kick_gate remains the reactive backstop
+    and its behaviour is unchanged.
     """
     from curl_cffi import requests
 
@@ -132,15 +139,21 @@ def _get_json(
                 f"Kick requests frozen for {kick_gate.gate_remaining_sec():.0f}s "
                 "(Cloudflare/rate-limit cooldown)"
             )
-        _governor_admit(source, path)
+        _governor_admit(origin, path)
         try:
-            resp = requests.get(
-                url,
-                impersonate=_IMPERSONATE,
-                headers=_headers(referer),
-                cookies=_bridge_cookie_jar(),
-                timeout=timeout,
-            )
+            # Instrumentation (in-memory, no DB, no archive_db import):
+            # every ATTEMPT is a request the platform sees, so every
+            # attempt is counted and held in flight for its duration.
+            # This is what lets kick_gate's history rows report the load
+            # a 403/429 actually landed on.
+            with rl_counter.request_scope("kick"):
+                resp = requests.get(
+                    url,
+                    impersonate=_IMPERSONATE,
+                    headers=_headers(referer),
+                    cookies=_bridge_cookie_jar(),
+                    timeout=timeout,
+                )
         except Exception as exc:  # noqa: BLE001 — curl_cffi transport errors (timeout/DNS/conn) are transient
             if attempt >= _BACKOFF_MAX_ATTEMPTS or not kick_gate.classify_transient_kick_error(exc):
                 raise
@@ -155,13 +168,15 @@ def _get_json(
             # freeze (kick_gate).
             kick_gate.note_kick_gate_event(
                 f"403 on {path}", kind="http_403", surface="metadata",
+                origin=origin,
             )
             raise KickGateError(f"Kick request blocked (Cloudflare/403): {path}")
         if resp.status_code == 429:
-            note_limit("kick", kind=f"api {path}", status=429, source=source)
+            note_limit("kick", kind=f"api {path}", status=429, source=origin)
             if attempt >= _BACKOFF_MAX_ATTEMPTS:
                 kick_gate.note_kick_gate_event(
-                    f"429 rate-limited on {path}", kind="http_429", surface="metadata",
+                    f"429 rate-limited on {path}", kind="http_429",
+                    surface="metadata", origin=origin,
                 )
                 raise KickRateLimitError(
                     f"Kick rate-limited (429) after {_BACKOFF_MAX_ATTEMPTS} attempts: {path}"
@@ -183,12 +198,12 @@ def _get_json(
     raise RuntimeError("unreachable")  # pragma: no cover — loop always returns or raises
 
 
-def verify_channel_exists(slug: str, *, source: str = "auto") -> None:
+def verify_channel_exists(slug: str, *, origin: str = "auto") -> None:
     """Raise ValueError when the Kick channel slug does not exist."""
     slug = (slug or "").strip()
     if not slug:
         raise ValueError("Kick channel slug is required")
-    _get_json(f"/api/v2/channels/{slug}", f"{_BASE}/{slug}/clips", source=source)
+    _get_json(f"/api/v2/channels/{slug}", f"{_BASE}/{slug}/clips", origin=origin)
 
 
 def _thumb_url(value: Any) -> Optional[str]:
@@ -301,17 +316,18 @@ def _clip_from_api_item(item: dict, slug: str) -> Optional[KickVideo]:
 CLIP_MAX_DURATION_SEC = 60
 
 
-def list_channel_clips_api(slug: str, limit: int = 10, *, verify: bool = True,
-                           source: str = "auto") -> List[KickVideo]:
+def list_channel_clips_api(
+    slug: str, limit: int = 10, *, verify: bool = True, origin: str = "auto"
+) -> List[KickVideo]:
     """Last *limit* clips by date, then ranked by views (desc).
 
     Uses Kick channel clips page/API: https://kick.com/{slug}/clips
     """
     slug = (slug or "").strip().lower()
     if verify:
-        verify_channel_exists(slug, source=source)
+        verify_channel_exists(slug, origin=origin)
     referer = f"{_BASE}/{slug}/clips"
-    data = _get_json(f"/api/v2/channels/{slug}/clips", referer, source=source)
+    data = _get_json(f"/api/v2/channels/{slug}/clips", referer, origin=origin)
     raw = data.get("clips") if isinstance(data, dict) else []
     if not isinstance(raw, list):
         raise RuntimeError("Unexpected Kick clips API response")
@@ -334,12 +350,13 @@ def list_channel_clips_api(slug: str, limit: int = 10, *, verify: bool = True,
     return parsed[: max(1, min(int(limit), KICK_CLIPS_CEILING))]
 
 
-def list_channel_clips_sync(url: str, limit: int = 10, *, sort: str = "date",
-                            source: str = "user") -> list[dict]:
+def list_channel_clips_sync(
+    url: str, limit: int = 10, *, sort: str = "date", origin: str = "user"
+) -> list[dict]:
     slug = extract_slug(url)
     if not slug:
         raise ValueError(f"Not a Kick channel URL: {url}")
-    clips = list_channel_clips_api(slug, limit, verify=False, source=source)
+    clips = list_channel_clips_api(slug, limit, verify=False, origin=origin)
     if sort == "views":
         clips = sorted(clips, key=lambda c: int(getattr(c, "views", 0) or 0), reverse=True)
     return [
@@ -359,9 +376,11 @@ def list_channel_clips_sync(url: str, limit: int = 10, *, sort: str = "date",
     ]
 
 
-def list_channel_videos_api(slug: str, limit: int = 20, *, source: str = "auto") -> List[KickVideo]:
+def list_channel_videos_api(
+    slug: str, limit: int = 20, *, origin: str = "auto"
+) -> List[KickVideo]:
     referer = f"{_BASE}/{slug}/videos"
-    data = _get_json(f"/api/v2/channels/{slug}/videos", referer, source=source)
+    data = _get_json(f"/api/v2/channels/{slug}/videos", referer, origin=origin)
     if not isinstance(data, list):
         raise RuntimeError("Unexpected Kick videos API response")
     limit = max(1, min(int(limit), KICK_VIDEOS_CEILING))
@@ -379,21 +398,21 @@ def list_channel_videos_api(slug: str, limit: int = 20, *, source: str = "auto")
     return out
 
 
-def resolve_kick_stream_api(url: str) -> KickVideo:
+def resolve_kick_stream_api(url: str, *, origin: str = "auto") -> KickVideo:
     """Resolve Kick VOD or clip metadata (+ m3u8) from any supported URL shape."""
     raw = (url or "").strip()
     if is_clip_url(raw) or extract_clip_id(raw):
-        return get_clip_info_api(canonical_kick_clip_url(raw))
-    return get_video_info_api(raw)
+        return get_clip_info_api(canonical_kick_clip_url(raw), origin=origin)
+    return get_video_info_api(raw, origin=origin)
 
 
-def get_clip_info_api(url: str) -> KickVideo:
+def get_clip_info_api(url: str, *, origin: str = "auto") -> KickVideo:
     clip_id = extract_clip_id(url)
     if not clip_id:
         raise ValueError(f"Not a Kick clip URL: {url}")
     slug = extract_slug(url)
     referer = url if url.startswith("http") else f"{_BASE}/{slug}/clips/{clip_id}"
-    data = _get_json(f"/api/v2/clips/{clip_id}", referer)
+    data = _get_json(f"/api/v2/clips/{clip_id}", referer, origin=origin)
     clip = data.get("clip") if isinstance(data, dict) else None
     if not isinstance(clip, dict):
         raise RuntimeError("Unexpected Kick clip API response")
@@ -420,13 +439,13 @@ def get_clip_info_api(url: str) -> KickVideo:
     )
 
 
-def get_video_info_api(url: str) -> KickVideo:
+def get_video_info_api(url: str, *, origin: str = "auto") -> KickVideo:
     video_id = extract_vod_id(url)
     if not video_id:
         raise ValueError(f"Not a Kick VOD URL: {url}")
     slug = extract_slug(url)
     referer = url if url.startswith("http") else f"{_BASE}/{slug}/videos/{video_id}"
-    data = _get_json(f"/api/v1/video/{video_id}", referer)
+    data = _get_json(f"/api/v1/video/{video_id}", referer, origin=origin)
     if not isinstance(data, dict):
         raise RuntimeError("Unexpected Kick video API response")
     v = _video_from_v1(data, slug)
@@ -435,11 +454,11 @@ def get_video_info_api(url: str) -> KickVideo:
     return v
 
 
-def get_channel_api(url: str) -> KickChannel:
+def get_channel_api(url: str, *, origin: str = "auto") -> KickChannel:
     slug = extract_slug(url)
     if not slug:
         raise ValueError(f"Not a Kick channel URL: {url}")
-    data = _get_json(f"/api/v2/channels/{slug}", f"{_BASE}/{slug}")
+    data = _get_json(f"/api/v2/channels/{slug}", f"{_BASE}/{slug}", origin=origin)
     if not isinstance(data, dict):
         raise RuntimeError("Unexpected Kick channel API response")
     user = data.get("user") if isinstance(data.get("user"), dict) else {}
@@ -459,7 +478,7 @@ def get_channel_api(url: str) -> KickChannel:
     )
 
 
-def get_channel_language_sync(slug: str) -> Optional[str]:
+def get_channel_language_sync(slug: str, *, origin: str = "auto") -> Optional[str]:
     """Language clue for a Kick channel slug (cached ~1h, best-effort).
 
     Part of the WS-3 platform-clue path: called at channel-list refresh
@@ -474,7 +493,7 @@ def get_channel_language_sync(slug: str) -> Optional[str]:
     if cached is not None:
         return cached or None
     try:
-        data = _get_json(f"/api/v2/channels/{slug}", f"{_BASE}/{slug}")
+        data = _get_json(f"/api/v2/channels/{slug}", f"{_BASE}/{slug}", origin=origin)
         user = data.get("user") if isinstance(data.get("user"), dict) else {}
         lang = user.get("language") or data.get("language") or None
     except Exception:
@@ -485,10 +504,10 @@ def get_channel_language_sync(slug: str) -> Optional[str]:
 
 
 # Sync helpers for FastAPI routes — curl_cffi only, never Playwright.
-def get_clip_info_sync(url: str) -> dict:
+def get_clip_info_sync(url: str, *, origin: str = "auto") -> dict:
     from services.size_estimate import enrich_info_dict
 
-    v = get_clip_info_api(url)
+    v = get_clip_info_api(url, origin=origin)
     payload = {
         "id": v.id,
         "title": v.title,
@@ -514,10 +533,10 @@ def get_clip_info_sync(url: str) -> dict:
     return payload
 
 
-def get_video_info_sync(url: str) -> dict:
+def get_video_info_sync(url: str, *, origin: str = "auto") -> dict:
     from services.size_estimate import enrich_info_dict
 
-    v = get_video_info_api(url)
+    v = get_video_info_api(url, origin=origin)
     payload = {
         "id": v.id,
         "title": v.title,
@@ -543,12 +562,14 @@ def get_video_info_sync(url: str) -> dict:
     return payload
 
 
-def list_channel_videos_sync(url: str, limit: int = 20) -> list[dict]:
+def list_channel_videos_sync(url: str, limit: int = 20, *, origin: str = "user") -> list[dict]:
     slug = extract_slug(url)
     if not slug:
         raise ValueError(f"Not a Kick channel URL: {url}")
-    # Reached from the channels/preview UI, not the background ingest lane.
-    vids = list_channel_videos_api(slug, limit, source="user")
+    # Reached from the channels/preview UI, not the background ingest lane:
+    # that is why the default above is "user" rather than the "auto" an
+    # unlabelled egress would get everywhere else.
+    vids = list_channel_videos_api(slug, limit, origin=origin)
     return [
         {
             "id": v.id,
@@ -566,8 +587,8 @@ def list_channel_videos_sync(url: str, limit: int = 20) -> list[dict]:
     ]
 
 
-def get_channel_info_sync(url: str) -> dict:
-    ch = get_channel_api(url)
+def get_channel_info_sync(url: str, *, origin: str = "auto") -> dict:
+    ch = get_channel_api(url, origin=origin)
     return {
         "slug": ch.slug,
         "username": ch.username,
@@ -643,6 +664,10 @@ def download_vod_sync(
             prefer_height=_parse_prefer_height(quality),
             video_encoder=video_encoder,
             mp4_faststart=mp4_faststart,
+            # Kick CDN segment traffic belongs in the kick bucket: a Kick
+            # rate limit is a real Kick signal, and folding it into the
+            # unattributed 'hls' bucket would hide it.
+            platform="kick",
         )
         if audio_only and temp_video:
             from services.ytdlp_hls import _extract_hls_audio

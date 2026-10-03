@@ -1200,7 +1200,10 @@ class PreviewManager:
             if vod_url:
                 from services.kick_api_service import resolve_kick_stream_api
 
-                info = resolve_kick_stream_api(vod_url)
+                # origin='user': this is the on-demand preview the user
+                # is watching, so a rate-limit row for it must not be
+                # labelled background work a policy lane would throttle.
+                info = resolve_kick_stream_api(vod_url, origin="user")
                 master = info.m3u8_url
             else:
                 from services.live_capture import kick_archive_info
@@ -4069,7 +4072,9 @@ def resolve_stream_info(
     if platform == "Kick":
         from services.kick_api_service import resolve_kick_stream_api
 
-        info = resolve_kick_stream_api(url)
+        # origin='user': the preview session is an on-demand resolve the
+        # user is waiting on (see the sibling rail branch above).
+        info = resolve_kick_stream_api(url, origin="user")
         if not info.m3u8_url:
             raise RuntimeError("Kick stream has no HLS URL")
         page = info.url or url

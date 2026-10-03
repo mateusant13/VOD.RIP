@@ -5,6 +5,7 @@ HLS downloader that avoids yt-dlp for Twitch/Kick VODs.
 
 import contextlib
 import errno
+import functools
 import io
 import logging
 import os
@@ -23,6 +24,7 @@ from typing import Any, Optional
 from urllib.parse import urljoin
 
 import requests
+from services import rl_counter
 from services import ytdlp_env  # noqa: F401 ÔÇö YTDLP_NO_PLUGINS before yt-dlp import
 from services.os_services import _NO_WINDOW
 from services.ytdlp_ffmpeg import (
@@ -1795,38 +1797,56 @@ def _download_one_segment(
     temp_dir: str,
     cancel_event: Optional[threading.Event],
     pause_event: Optional[threading.Event] = None,
-    source: str = "auto",
+    *,
+    platform: Optional[str] = None,
+    origin: str = "auto",
 ) -> str:
     """Fetch one HLS segment; retry transient network/CDN errors with backoff.
 
     A single flaky segment used to kill the whole VOD job after the 90 s stall
     timeout; CDN blips (5xx/429, mid-stream timeouts) are retried instead.
 
-    This is the highest-volume egress surface in the app (12 parallel
-    fetchers; a 4h VOD is ~2,400 calls x3 retries), so it is instrumented
-    with **counter-only** governor accounting: ``note_hot_call`` bumps a
-    bucketed counter and writes no rows and takes no token. Pacing a segment
-    fetch would stall the whole download, and CDN limits are a different
-    limiter from the GQL/API budgets.
+    This is the single hottest egress in the app (~2,400 calls for one 4h
+    VOD, 12 fetchers in parallel), so it is also the single most valuable
+    place to count: a platform that rate-limits us on a media CDN limits
+    us HERE. The count is a pure in-memory increment in rl_counter, one
+    per ATTEMPT (a retry is another request the CDN sees). There is no DB
+    write on this path and none may ever be added: archive_db.execute
+    takes a process-global write lock, and 2,400 serialized commits per
+    VOD would cost far more than the download itself. *platform* picks the
+    counter bucket the fetch is counted into; *origin* records who asked
+    for it (threaded from the entry points, defaulting to 'auto').
+
+    The same fetch is ALSO accounted to the predictive governor by
+    ``_note_segment_call`` — but with **counter-only** semantics:
+    ``note_hot_call`` bumps a bucketed counter and writes no rows and takes
+    no token. Pacing a segment fetch would stall the whole download, and
+    CDN limits are a different limiter from the GQL/API budgets.
+
+    *platform* is an override, not a declaration: when the caller does not
+    name a platform we fall back to ``_segment_platform(url)``, which reads
+    the CDN host and buckets anything unrecognised as "cdn" rather than
+    guessing into a real platform's budget.
     """
     _check_pause_cancel(cancel_event, pause_event)
 
     path = os.path.join(temp_dir, f"{index:05d}.ts")
     last_exc: Optional[BaseException] = None
-    platform = _segment_platform(seg.get("url", ""))
+    platform = platform or _segment_platform(seg.get("url", ""))
     for attempt in range(_SEGMENT_RETRIES):
         _check_pause_cancel(cancel_event, pause_event)
-        _note_segment_call(platform, source)
+        _note_segment_call(platform, origin)
         try:
-            r = requests.get(
-                seg["url"],
-                headers=headers,
-                stream=True,
-                timeout=(_SEGMENT_CONNECT_TIMEOUT, _SEGMENT_READ_TIMEOUT),
-            )
+            with rl_counter.request_scope(platform):
+                r = requests.get(
+                    seg["url"],
+                    headers=headers,
+                    stream=True,
+                    timeout=(_SEGMENT_CONNECT_TIMEOUT, _SEGMENT_READ_TIMEOUT),
+                )
             try:
                 if r.status_code in (429,) or r.status_code >= 500:
-                    _note_segment_call(platform, source, limited=True)
+                    _note_segment_call(platform, origin, limited=True)
                     raise requests.HTTPError(
                         f"HTTP {r.status_code} for segment {index}"
                     )
@@ -1861,9 +1881,15 @@ def _download_segments(
     cancel_event: Optional[threading.Event] = None,
     pause_event: Optional[threading.Event] = None,
     index_offset: int = 0,
-    source: str = "auto",
+    *,
+    platform: Optional[str] = None,
+    origin: str = "auto",
 ) -> list[str]:
-    """Download HLS segment files into *temp_dir* (parallel)."""
+    """Download HLS segment files into *temp_dir* (parallel).
+
+    *platform* / *origin* only label the rl_counter bucket each segment
+    fetch is counted into; the download behaves identically either way.
+    """
     total = len(segments)
     if total == 0:
         return []
@@ -1872,17 +1898,21 @@ def _download_segments(
     completed = 0
     workers = min(SEGMENT_DOWNLOAD_WORKERS, total)
 
+    # functools.partial because pool.submit takes positional args only and
+    # the counter bucket is a keyword.
+    fetch_one = functools.partial(
+        _download_one_segment, platform=platform, origin=origin
+    )
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(
-                _download_one_segment,
+                fetch_one,
                 index_offset + i,
                 seg,
                 headers,
                 temp_dir,
                 cancel_event,
                 pause_event,
-                source,
             ): i
             for i, seg in enumerate(segments)
         }
@@ -1957,10 +1987,15 @@ def _progressive_hls_copy_to_mp4(
     first_segment_path: Optional[str] = None,
     mp4_faststart: bool = False,
     input_format: str = "mpegts",
-    source: str = "auto",
     init_path: Optional[str] = None,
+    platform: Optional[str] = None,
+    origin: str = "auto",
 ) -> None:
-    """Parallel-download HLS media and pipe TS or fragmented MP4 to ffmpeg."""
+    """Parallel-download HLS media and pipe TS or fragmented MP4 to ffmpeg.
+
+    *platform* / *origin* are counter labels only (see
+    _download_one_segment); a None *platform* falls back to the CDN host.
+    """
     total = len(segments)
     if total == 0:
         raise RuntimeError("No HLS segments to mux")
@@ -2068,7 +2103,8 @@ def _progressive_hls_copy_to_mp4(
                 temp_dir,
                 cancel_event,
                 pause_event,
-                source,
+                platform=platform,
+                origin=origin,
             )
         # ponytail: survival guarantee for per-segment download ÔÇö segment I/O may fail in many ways; skip to next segment
         except Exception as exc:
@@ -2369,14 +2405,25 @@ def download_hls_media_clip(
     prefer_height: int = 720,
     video_encoder: Optional[str] = None,
     mp4_faststart: bool = False,
-    source: str = "auto",
+    *,
+    platform: Optional[str] = None,
+    origin: str = "auto",
 ) -> None:
     """Download an HLS media playlist clip by segment (Kick m3u8 URL or Twitch variant).
 
-    ``source`` only tags the counter-only governor accounting on the segment
-    path; it defaults to "auto" because the callers above this entry point
-    (the download manager) serve both the archive lane and user-initiated
-    downloads, and that discriminator lives above us.
+    *platform* names the counter bucket the segment fetches are counted
+    into (the caller knows it: Kick clips come from kick_api_service, the
+    generic path from the yt-dlp HLS branch); *origin* says who asked.
+    Both are labels only — they pick the rl_counter bucket and the
+    counter-only governor accounting, and the download behaves
+    identically either way.
+
+    *platform* left as None falls back to ``_segment_platform(url)`` per
+    segment, so an unlabelled caller still counts - it just never inflates
+    a real platform's number and never claims a user's request was
+    background work. *origin* defaults to "auto" because the callers above
+    this entry point (the download manager) serve both the archive lane and
+    user-initiated downloads, and that discriminator lives above us.
     """
     headers = headers or {}
     segments, stream_info = _parse_m3u8(media_url, headers, prefer_height)
@@ -2452,7 +2499,8 @@ def download_hls_media_clip(
                 tmpdir,
                 cancel_event,
                 pause_event,
-                source,
+                platform=platform,
+                origin=origin,
             )
             if is_fmp4:
                 init_path = _download_one_segment(
@@ -2462,7 +2510,8 @@ def download_hls_media_clip(
                     tmpdir,
                     cancel_event,
                     pause_event,
-                    source,
+                    platform=platform,
+                    origin=origin,
                 )
             elif _is_fragmented_mp4_segment(first_path):
                 raise RuntimeError(
@@ -2508,7 +2557,8 @@ def download_hls_media_clip(
                 mp4_faststart=mp4_faststart,
                 input_format="mp4" if is_fmp4 else "mpegts",
                 init_path=init_path,
-                source=source,
+                platform=platform,
+                origin=origin,
             )
             if progress_hook:
                 progress_hook({"status": "downloading", "percent": 100})
@@ -2524,7 +2574,8 @@ def download_hls_media_clip(
                 cancel_event,
                 pause_event,
                 index_offset=1,
-                source=source,
+                platform=platform,
+                origin=origin,
             )
             if len(selected) > 1
             else []
@@ -4008,8 +4059,18 @@ def _download_hls_clip(
     video_encoder: Optional[str] = None,
     mp4_faststart: bool = False,
     audio_only: bool = False,
+    platform: str = "",
+    origin: str = "auto",
 ) -> None:
-    """Download only the HLS segments covering *start_sec*ÔÇô*end_sec*."""
+    """Download only the HLS segments covering *start_sec*ÔÇô*end_sec*.
+
+    *platform* names the counter bucket for the segment fetches; empty
+    means "derive it" (a YouTube id is YouTube, anything else stays in
+    the unattributed 'hls' bucket). *origin* is threaded from the caller
+    and defaults to 'auto', the conservative default: this path serves
+    both the worker and the on-demand preview, and mislabelling a user's
+    request as background work is the direction that costs latency only.
+    """
     from services.youtube_innertube import extract_video_id
 
     extract_opts = dict(opts)
@@ -4180,6 +4241,11 @@ def _download_hls_clip(
             prefer_height=prefer_height,
             video_encoder=video_encoder,
             mp4_faststart=mp4_faststart,
+            # Counter bucket for every segment fetch below. An explicit
+            # platform wins; otherwise a YouTube id means YouTube and
+            # anything else stays in the unattributed 'hls' bucket.
+            platform=platform or ("youtube" if extract_video_id(url) else "hls"),
+            origin=origin,
         )
         if audio_only and temp_video:
             _extract_hls_audio(temp_video, output_path, ffmpeg_exe)

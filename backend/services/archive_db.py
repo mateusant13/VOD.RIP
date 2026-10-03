@@ -3077,6 +3077,12 @@ def record_rate_limit(
     background work, and mislabelling user work as automatic is the safe
     direction (a later policy lane throttles 'auto' first, so a wrong
     default costs latency, never a user's request).
+
+    recent_requests / in_flight are the caller's to supply: pass None and
+    NULL is written, which means "not measured" and is NOT the same as 0.
+    The two gates (services.yt_gate, services.kick_gate) fill them from
+    services.rl_counter, which counts this process's egress per platform;
+    a new recorder should do the same rather than leaving them NULL.
     """
     try:
         execute(
@@ -3192,12 +3198,28 @@ def rate_limit_summary(
                                          gates alone cannot, so this is often
                                          null until a later lane threads a
                                          request counter through)
-      observed_rate_per_min            — requests-per-minute of the *last
-                                         measured* clean window per group,
-                                         i.e. the rate at which we were
-                                         still getting limited. It is an
-                                         UPPER bound on a safe rate, never a
-                                         claim that the rate was safe.
+      observed_rate_per_min            — the requests-per-minute rate we
+                                         were running at the measured limit
+                                         events, i.e. the rate at which we
+                                         were still getting limited. It is
+                                         an UPPER bound on a safe rate,
+                                         never a claim that the rate was
+                                         safe.
+
+    The load columns are fed by services.rl_counter, which counts each
+    platform's egress in `recent_requests` = "requests in the trailing
+    60 s window" (see that module for the bucket maths). That unit is
+    ALREADY requests-per-minute, which is why the observed rate is the
+    mean of the measured window counts.
+
+    ponytail: the first cut computed this as
+    `recent_requests / (gap_between_events / 60)`, i.e. it treated the
+    column as a cumulative counter and divided by the gap. That is wrong
+    the moment a real count lands: the column is a per-window total, not
+    a monotonic total, so two limits 30 s apart at 40 req/min reported
+    80 req/min and two limits 10 min apart under-reported. The gap also
+    says nothing about the rate DURING the window the count describes.
+    The field keeps its name and its null-when-unmeasured contract.
     """
     from datetime import datetime, timedelta, timezone
 
@@ -3222,20 +3244,6 @@ def rate_limit_summary(
         kinds: dict[str, int] = {}
         for e in evs:
             kinds[e["kind"]] = kinds.get(e["kind"], 0) + 1
-        # Observed rate: for each pair of consecutive events, how many
-        # requests were in flight over the clean window between them.
-        rates: list[float] = []
-        for prev, cur in zip(evs, evs[1:]):
-            if cur["recent_requests"] is None:
-                continue
-            try:
-                gap_s = (
-                    datetime.fromisoformat(cur["ts"]) - datetime.fromisoformat(prev["ts"])
-                ).total_seconds()
-            except (TypeError, ValueError):
-                continue
-            if gap_s > 0:
-                rates.append(float(cur["recent_requests"]) / (gap_s / 60.0))
         mean_load = round(sum(loads) / len(loads), 2) if loads else None
         out.append({
             "platform": plat,
@@ -3247,7 +3255,10 @@ def rate_limit_summary(
             "kinds": kinds,
             "requests_at_limit_mean": mean_load,
             "requests_at_limit_p95": _pctl(loads, 0.95),
-            "observed_rate_per_min": round(sum(rates) / len(rates), 2) if rates else None,
+            # recent_requests is a trailing-60s request COUNT, so its mean
+            # is already requests-per-minute. None (never 0) when no row in
+            # this group measured the load.
+            "observed_rate_per_min": mean_load,
             "surfaces": sorted({e["surface"] for e in evs}),
         })
     return {

@@ -35,6 +35,7 @@ import urllib.request
 from typing import Any, Callable, Dict, List, Optional
 
 from services import archive_db
+from services import rl_counter
 from services import twitch_gql_service
 from services.archive_scheduler import _enqueue_chat_job
 from services.rate_budget import MAX_AUTO_WAIT_S, acquire, note_limit
@@ -268,6 +269,18 @@ def _post_comments_page(
     (True = a user's kick off the router/preview, False = the background
     backfill lane). It is reused verbatim by the rate governor — no second,
     redundant origin argument.
+
+    Highest-volume rate-limitable call in the app (a long replay is
+    hundreds of pages), so the count is a pure in-memory increment in
+    rl_counter: no DB write, no archive_db import, no lock beyond that
+    counter's own.
+
+    ponytail: no `origin` parameter here on purpose. Nothing on this path
+    records a rate_limit_events row today, so an origin argument would
+    label nothing while every test double of this function in four test
+    modules had to grow a parameter. The lane flag that decides it
+    (`interactive`) is one line above at the _fetch_page_with_backoff
+    call site, so a future Twitch recorder can thread it in one edit.
     """
     payload = json.dumps({
         "query": VIDEO_COMMENTS_QUERY,
@@ -291,8 +304,11 @@ def _post_comments_page(
     # Bounded, and never a failure: the page fetch proceeds either way.
     _governor_admit(interactive=interactive, kind=f"comments {video_id}")
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
+        # Instrumentation: one in-memory increment + in-flight gauge per
+        # page fetch (see services.rl_counter). Never a DB write.
+        with rl_counter.request_scope("twitch"):
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")[:200]
         if e.code == 429:

@@ -110,7 +110,7 @@ def _fetch_latest_vod(channel: dict, platform: str) -> Optional[dict]:
     if platform == "kick":
         from services.kick_api_service import list_channel_videos_api
 
-        vids = list_channel_videos_api(_slug(channel, "kick").lower(), limit=1, source="user")
+        vids = list_channel_videos_api(_slug(channel, "kick").lower(), limit=1, origin="user")
         if not vids:
             return None
         v = vids[0]

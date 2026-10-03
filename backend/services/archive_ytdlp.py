@@ -483,13 +483,21 @@ def _apply_youtube_session(opts: dict, *, video_id: Optional[str] = None) -> Non
 
 
 @contextmanager
-def _guarded_youtube_dl(outdir: Path, *, video_id: Optional[str] = None):
+def _guarded_youtube_dl(outdir: Path, *, video_id: Optional[str] = None,
+                        origin: str = "auto"):
     """guarded_youtube_dl context that records the YouTube bot gate on failure.
 
     Gate/rate-limit errors arm the process-wide cooldown (services.yt_gate)
     so the worker stops hammering YouTube and requeues its jobs; the
     exception still propagates so each caller keeps its own fail/requeue
-    contract."""
+    contract.
+
+    *origin* is a parameter (not a hardcoded literal) so the row says who
+    was waiting. Every caller here is the archive worker, so the truthful
+    value is 'auto' and that is what they pass; the default is 'auto' too
+    so a future on-demand caller cannot accidentally label a user's
+    request as background work.
+    """
     try:
         with guarded_youtube_dl(_yt_opts(outdir, video_id=video_id)) as ydl:
             yield ydl
@@ -497,7 +505,9 @@ def _guarded_youtube_dl(outdir: Path, *, video_id: Optional[str] = None):
         from services.yt_gate import classify_youtube_gate_error, note_youtube_gate
 
         if classify_youtube_gate_error(exc):
-            note_youtube_gate(str(exc)[:200], surface="download", origin="auto")
+            note_youtube_gate(
+                str(exc)[:200], surface="download", origin=origin
+            )
         raise
 
 

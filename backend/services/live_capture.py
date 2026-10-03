@@ -296,7 +296,7 @@ def kick_archive_info(slug: str) -> Optional[dict]:
     try:
         from services.kick_api_service import list_channel_videos_api
 
-        vids = list_channel_videos_api(slug, limit=1, source="user")
+        vids = list_channel_videos_api(slug, limit=1, origin="user")
         if not vids:
             return None
         # ponytail: Kick could apply the same previous-broadcast guard as the

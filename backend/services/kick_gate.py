@@ -92,14 +92,23 @@ def _record_history(
     Lazy import: archive_db is a heavy module and this is a cold path, but
     the import itself can still fail in a half-initialized process — a
     Cloudflare 403 handler must not become a crash.
+
+    The load columns come from rl_counter, which counts this process's
+    Kick egress (kick_api_service._get_json is the single funnel). It
+    answers None for a process that never issued a Kick request, and None
+    is written straight through: 'not measured' must never become 0,
+    because a fabricated zero reads as a clean window and poisons the
+    summary's mean/p95.
     """
     try:
-        from services import archive_db
+        from services import archive_db, rl_counter
 
         archive_db.record_rate_limit(
             "kick", kind,
             surface=surface, origin=origin,
             context=reason, backoff_s=backoff_s,
+            recent_requests=rl_counter.recent_requests("kick"),
+            in_flight=rl_counter.in_flight("kick"),
         )
     except Exception:  # noqa: BLE001 — instrumentation must never break a request
         logger.debug("Kick rate-limit history not recorded", exc_info=True)
