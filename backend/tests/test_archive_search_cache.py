@@ -139,12 +139,12 @@ def test_hint_is_replayed_on_a_cache_hit(seed, counted):
 # --- 2. invalidation on write --------------------------------------------
 
 def test_transcript_insert_invalidates(seed, counted):
-    before = _texts(archive_db.search(WORD))
+    before = _texts(archive_db.search(WORD, source="transcript"))
     assert len(counted) == 1
     archive_db.insert_transcript("twitch", VID, [{
         "seg_idx": 1, "start_sec": 2.0, "end_sec": 3.0, "text": f"second {WORD}",
     }])
-    after = _texts(archive_db.search(WORD))
+    after = _texts(archive_db.search(WORD, source="transcript"))
     assert len(counted) == 2, "a content write must retire the entry"
     assert len(after) == len(before) + 1, "the new segment must be visible"
 
@@ -153,9 +153,12 @@ def test_transcript_delete_invalidates(seed, counted):
     archive_db.insert_transcript("twitch", VID, [{
         "seg_idx": 1, "start_sec": 2.0, "end_sec": 3.0, "text": f"second {WORD}",
     }])
-    assert len(archive_db.search(WORD)) == 2
+    assert len(archive_db.search(WORD, source="transcript")) == 2
     archive_db.delete_transcripts("twitch", VID)
-    assert _texts(archive_db.search(WORD)) == [f"first {WORD}"]
+    assert _texts(archive_db.search(WORD, source="transcript")) == [], (
+        "delete_transcripts removed every segment: a stale entry would still "
+        "return the 2 hits cached before the delete"
+    )
 
 
 def test_chat_insert_invalidates(seed, counted):
