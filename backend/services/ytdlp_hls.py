@@ -1756,6 +1756,38 @@ _SEGMENT_RETRY_BACKOFF_SEC = 1.0
 _SEGMENT_NO_RETRY = (CancelledError, PausedError)
 
 
+def _note_segment_call(platform: str, source: str, *, limited: bool = False) -> None:
+    """Counter-only governor accounting for one segment attempt.
+
+    Deliberately swallows everything: this sits inside the download hot path
+    (thousands of calls, 12 threads) and must never be able to fail a
+    download. Lazy import keeps rate_budget off this module's import graph.
+    """
+    try:
+        from services.rate_budget import note_hot_call
+
+        note_hot_call(platform, source, limited=limited, kind="hls_segment")
+    except Exception:  # noqa: BLE001 — observability must never break a download
+        pass
+
+
+def _segment_platform(url: str) -> str:
+    """Best-effort platform for a CDN segment URL (for the rate governor).
+
+    Segments are served by per-platform CDNs, so the host is the only signal
+    available here. Anything unrecognised is bucketed as "cdn" rather than
+    guessed into a platform budget.
+    """
+    u = (url or "").lower()
+    if "googlevideo" in u:
+        return "youtube"
+    if "ttvnw" in u or "twitch" in u:
+        return "twitch"
+    if "kick" in u:
+        return "kick"
+    return "cdn"
+
+
 def _download_one_segment(
     index: int,
     seg: dict,
@@ -1763,18 +1795,28 @@ def _download_one_segment(
     temp_dir: str,
     cancel_event: Optional[threading.Event],
     pause_event: Optional[threading.Event] = None,
+    source: str = "auto",
 ) -> str:
     """Fetch one HLS segment; retry transient network/CDN errors with backoff.
 
     A single flaky segment used to kill the whole VOD job after the 90 s stall
     timeout; CDN blips (5xx/429, mid-stream timeouts) are retried instead.
+
+    This is the highest-volume egress surface in the app (12 parallel
+    fetchers; a 4h VOD is ~2,400 calls x3 retries), so it is instrumented
+    with **counter-only** governor accounting: ``note_hot_call`` bumps a
+    bucketed counter and writes no rows and takes no token. Pacing a segment
+    fetch would stall the whole download, and CDN limits are a different
+    limiter from the GQL/API budgets.
     """
     _check_pause_cancel(cancel_event, pause_event)
 
     path = os.path.join(temp_dir, f"{index:05d}.ts")
     last_exc: Optional[BaseException] = None
+    platform = _segment_platform(seg.get("url", ""))
     for attempt in range(_SEGMENT_RETRIES):
         _check_pause_cancel(cancel_event, pause_event)
+        _note_segment_call(platform, source)
         try:
             r = requests.get(
                 seg["url"],
@@ -1784,6 +1826,7 @@ def _download_one_segment(
             )
             try:
                 if r.status_code in (429,) or r.status_code >= 500:
+                    _note_segment_call(platform, source, limited=True)
                     raise requests.HTTPError(
                         f"HTTP {r.status_code} for segment {index}"
                     )
@@ -1818,6 +1861,7 @@ def _download_segments(
     cancel_event: Optional[threading.Event] = None,
     pause_event: Optional[threading.Event] = None,
     index_offset: int = 0,
+    source: str = "auto",
 ) -> list[str]:
     """Download HLS segment files into *temp_dir* (parallel)."""
     total = len(segments)
@@ -1838,6 +1882,7 @@ def _download_segments(
                 temp_dir,
                 cancel_event,
                 pause_event,
+                source,
             ): i
             for i, seg in enumerate(segments)
         }
@@ -1912,6 +1957,7 @@ def _progressive_hls_copy_to_mp4(
     first_segment_path: Optional[str] = None,
     mp4_faststart: bool = False,
     input_format: str = "mpegts",
+    source: str = "auto",
     init_path: Optional[str] = None,
 ) -> None:
     """Parallel-download HLS media and pipe TS or fragmented MP4 to ffmpeg."""
@@ -2022,6 +2068,7 @@ def _progressive_hls_copy_to_mp4(
                 temp_dir,
                 cancel_event,
                 pause_event,
+                source,
             )
         # ponytail: survival guarantee for per-segment download ÔÇö segment I/O may fail in many ways; skip to next segment
         except Exception as exc:
@@ -2322,8 +2369,15 @@ def download_hls_media_clip(
     prefer_height: int = 720,
     video_encoder: Optional[str] = None,
     mp4_faststart: bool = False,
+    source: str = "auto",
 ) -> None:
-    """Download an HLS media playlist clip by segment (Kick m3u8 URL or Twitch variant)."""
+    """Download an HLS media playlist clip by segment (Kick m3u8 URL or Twitch variant).
+
+    ``source`` only tags the counter-only governor accounting on the segment
+    path; it defaults to "auto" because the callers above this entry point
+    (the download manager) serve both the archive lane and user-initiated
+    downloads, and that discriminator lives above us.
+    """
     headers = headers or {}
     segments, stream_info = _parse_m3u8(media_url, headers, prefer_height)
     # Compute actual total duration from parsed segments so we never
@@ -2398,6 +2452,7 @@ def download_hls_media_clip(
                 tmpdir,
                 cancel_event,
                 pause_event,
+                source,
             )
             if is_fmp4:
                 init_path = _download_one_segment(
@@ -2407,6 +2462,7 @@ def download_hls_media_clip(
                     tmpdir,
                     cancel_event,
                     pause_event,
+                    source,
                 )
             elif _is_fragmented_mp4_segment(first_path):
                 raise RuntimeError(
@@ -2452,6 +2508,7 @@ def download_hls_media_clip(
                 mp4_faststart=mp4_faststart,
                 input_format="mp4" if is_fmp4 else "mpegts",
                 init_path=init_path,
+                source=source,
             )
             if progress_hook:
                 progress_hook({"status": "downloading", "percent": 100})
@@ -2467,6 +2524,7 @@ def download_hls_media_clip(
                 cancel_event,
                 pause_event,
                 index_offset=1,
+                source=source,
             )
             if len(selected) > 1
             else []

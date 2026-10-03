@@ -172,7 +172,7 @@ def test_partial_done_row_requeued_in_place_for_user_resume(scratch_db, monkeypa
     archive_db.update_job("tw-backfill-6301", status="done")
     calls = {"n": 0}
 
-    def fake_page(vid, offset, size):
+    def fake_page(vid, offset, size, **kw):
         calls["n"] += 1
         if calls["n"] > 3:
             return []  # tail ends after 3 advancing pages
@@ -276,7 +276,7 @@ def test_forward_sweep_exhausts_pages_and_dedupes(scratch_db, monkeypatch):
     _seed_video("6601", duration=3600.0)
     requested: list[float] = []
 
-    def fake_page(vid, offset, size):
+    def fake_page(vid, offset, size, **kw):
         requested.append(float(offset))
         page = len(requested)
         if page > 5:  # after 5 data pages the API answers empty -> end
@@ -306,7 +306,7 @@ def test_forward_sweep_stops_at_max_messages_ceiling(scratch_db, monkeypatch):
     sweep stops mid-tail and reports it, so the caller can resume later."""
     _seed_video("6602", duration=3600.0)
 
-    def fake_page(vid, offset, size):
+    def fake_page(vid, offset, size, **kw):
         base = float(offset)
         return [_node(base + 30.0), _node(base + 60.0), _node(base + 90.0)]
 

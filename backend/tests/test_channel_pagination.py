@@ -106,7 +106,7 @@ def _paged_services(monkeypatch):
     }
     calls: list[str] = []
 
-    def fake_twitch_videos(login, limit, return_has_more=False):
+    def fake_twitch_videos(login, limit, return_has_more=False, **kw):
         calls.append("twitch_vods")
         pool = pools["twitch_vods"]
         out = pool[-limit:]
@@ -118,7 +118,7 @@ def _paged_services(monkeypatch):
         calls.append("twitch_clips")
         return pools["twitch_clips"][-limit:]
 
-    def fake_kick_videos(url, limit):
+    def fake_kick_videos(url, limit, **kw):
         calls.append("kick_vods")
         return list(pools["kick_vods"])[-limit:]
 

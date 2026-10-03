@@ -1,0 +1,653 @@
+"""Adaptive request-rate governor: a learned per-platform ceiling with
+AUTO/USER token pools underneath it.
+
+Why predictive, not header-driven
+--------------------------------
+This app never sees a proactive rate-limit header. There is no Twitch Helix
+traffic (so no ``Ratelimit-Remaining``), YouTube sends no quota header, and
+Kick's ``Retry-After`` presence is unverified. Every signal we get is
+*reactive* — a 429 after the fact. So the ceiling here is learned from our own
+observed history: how many requests we actually issued, over what interval,
+before the limiter fired. Nothing in this module parses a header.
+
+The governor is a PREDICTIVE layer IN FRONT of ``yt_gate`` / ``kick_gate``,
+which remain the last-resort reactive backstop and are unchanged. This module
+never freezes anything, never sleeps on its own, and never raises: callers ask
+whether they may proceed and decide what to do about it.
+
+The ceiling update rule (asymmetric on purpose)
+----------------------------------------------
+A rate limit is expensive (a 30 min freeze, a requeue, a stalled preview);
+under-using the API is nearly free. So:
+
+* **Down fast.** On a limit event we compute the rate we were actually
+  travelling at when we got limited (``requests_since_event`` over the window
+  that just closed) and aim at ``SAFETY_FRACTION`` of it. We keep the
+  *smallest* trip rate ever seen as the frontier — the least aggressive rate
+  that is known to have been punished is the best evidence of where the real
+  wall is. An event can only ever lower the ceiling, never raise it.
+* **Up slowly.** After ``CLEAN_WINDOW_S`` with no event, the ceiling grows by
+  ``UP_FACTOR`` per window (1.05, i.e. ~+5% per 5 min), with catch-up steps
+  capped so a long idle does not spring back to a rate we were never proved
+  safe at.
+* **Cold start is conservative** — see ``_PLATFORM_CEILING_RPM``. We do not
+  assume a high rate for a platform we have never been limited on.
+
+Two pools, one shared ceiling — the on-demand reservation
+--------------------------------------------------------
+The ceiling is shared; the *capacity* is split:
+
+    AUTO  bucket  capacity/refill =  0.70 * ceiling
+    USER  bucket  capacity/refill =  1.00 * ceiling
+
+AUTO can never hold or regenerate more than 70% of the ceiling, so a
+background storm structurally cannot consume the on-demand reservation no
+matter how hard it runs — the headroom USER needs is never *spent*, only left
+unspent. USER is checked first at consumption and is never hard-refused (a
+user waiting on a preview must not be blocked by a budget), it just gets an
+honest ``user_exhausted`` decision in the log.
+
+This is the whole mechanism the user asked for: background work paces itself
+*before* the limit instead of discovering it with a 429.
+
+Learning counts TOTAL requests; the pools split *capacity*. The limiter
+counts every request on the IP regardless of who sent it, so the trip rate
+must be measured on the total. The reservation is about who gets to spend the
+budget, not about pretending background traffic is invisible.
+
+Concurrency
+-----------
+Each platform owns its own ``threading.Lock``. No lock is ever shared between
+platforms, so a Twitch stall (or a slow refill) can never serialise Kick or
+YouTube. The decision log has its own short-lived lock and is only touched on
+throttles, not on every request. No lock is held across DB IO — persistence
+happens after the platform lock is released.
+
+Cross-process
+-------------
+Like ``yt_gate``/``kick_gate``, the buckets are per-process (the app and the
+detached worker each hold their own). What crosses the process boundary is
+*learning*, not pacing: limit events are persisted through ``archive_db`` (the
+one store both processes already share) and seeded back in by
+``prime_from_history()``. If the persistence layer is unavailable — e.g. the
+``agent/rl-history`` lane has not landed yet — every call degrades to a
+no-op and the governor runs purely on in-process state. It never raises
+because of a missing dependency.
+
+Cost
+----
+Hot paths (HLS segments: 12 parallel fetchers, ~2,400 calls for a 4h VOD)
+call ``note_hot_call``, which bumps bucketed counters and writes **no rows**
+and takes no token. Rows are written only for limit *events*, which are rare
+by definition — that is the data the learning is made of.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, Callable, Deque, Dict, List, Literal, Optional
+
+logger = logging.getLogger(__name__)
+
+Source = Literal["auto", "user"]
+
+# --- learning tuning ---------------------------------------------------------
+# Cold-start ceilings are requests/minute, deliberately low: a wrong guess
+# upward costs a 30 min freeze, a guess downward costs nothing but patience.
+_PLATFORM_CEILING_RPM: Dict[str, float] = {
+    "youtube": 20.0,
+    "twitch": 30.0,
+    "kick": 20.0,
+}
+_DEFAULT_CEILING_RPM = 10.0  # any platform we have not calibrated yet
+_FLOOR_CEILING_RPM = 4.0     # never learn below this, however many events
+_MAX_CEILING_RPM = 120.0     # never climb above this
+
+_SAFETY_FRACTION = 0.70      # aim at 70% of the rate that actually tripped us
+_UP_FACTOR = 1.05            # ~+5% per clean window
+_CLEAN_WINDOW_S = 300.0      # 5 min event-free before one up-step
+_MAX_CATCHUP_STEPS = 4       # bounded spring-back after a long idle
+
+# --- pool split --------------------------------------------------------------
+AUTO_SHARE = 0.70            # AUTO may hold/regenerate this much of the ceiling
+_MIN_POOL_TOKENS = 2.0       # always allow a small burst so a page fetch is
+                             # never starved by a fractional bucket
+
+# --- backoff bound -----------------------------------------------------------
+MAX_AUTO_WAIT_S = 30.0       # longest a background caller should ever be told
+                             # to wait; it proceeds after this (never errors)
+
+_DECISION_LOG_MAX = 200
+_HOT_WINDOW_S = 60.0         # counters roll up per minute
+
+_clock: Callable[[], float] = time.monotonic
+
+
+def set_clock(fn: Callable[[], float]) -> None:
+    """Inject the time source (tests). All pacing maths reads this."""
+    global _clock
+    _clock = fn
+
+
+def _now() -> float:
+    return _clock()
+
+
+@dataclass(frozen=True)
+class Decision:
+    """Outcome of one admission check. Cheap to construct, JSON-ready."""
+    platform: str
+    source: str
+    allowed: bool
+    wait_s: float
+    ceiling_rpm: float
+    tokens: float
+    reason: str
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "platform": self.platform,
+            "source": self.source,
+            "allowed": self.allowed,
+            "wait_s": round(self.wait_s, 3),
+            "ceiling_rpm": round(self.ceiling_rpm, 3),
+            "tokens": round(self.tokens, 3),
+            "reason": self.reason,
+        }
+
+
+@dataclass
+class _PlatformState:
+    """Per-platform governor state. Guarded by this platform's own lock."""
+    platform: str
+    ceiling_rpm: float
+    default_rpm: float
+    # learning
+    requests_since_event: int = 0
+    window_start: float = 0.0
+    last_event_ts: float = 0.0
+    last_ramp_ts: float = 0.0
+    trip_rpm: float = 0.0
+    min_trip_rpm: float = 0.0
+    events: int = 0
+    # pools
+    auto_tokens: float = 0.0
+    auto_refill_ts: float = 0.0
+    user_tokens: float = 0.0
+    user_refill_ts: float = 0.0
+    # hot-path counters (bucketed, never rows)
+    hot_calls: int = 0
+    hot_limited: int = 0
+    hot_window_start: float = 0.0
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+
+_states: Dict[str, _PlatformState] = {}
+_registry_lock = threading.Lock()
+_log_lock = threading.Lock()
+_decisions: Deque[Dict[str, Any]] = deque(maxlen=_DECISION_LOG_MAX)
+_prime_lock = threading.Lock()
+_history_primed = False
+
+
+def _default_rpm(platform: str) -> float:
+    return _PLATFORM_CEILING_RPM.get(platform, _DEFAULT_CEILING_RPM)
+
+
+def _state(platform: str) -> _PlatformState:
+    platform = (platform or "unknown").strip().lower() or "unknown"
+    st = _states.get(platform)
+    if st is not None:
+        return st
+    with _registry_lock:
+        st = _states.get(platform)
+        if st is None:
+            st = _PlatformState(
+                platform=platform,
+                ceiling_rpm=_default_rpm(platform),
+                default_rpm=_default_rpm(platform),
+                window_start=_now(),
+                last_ramp_ts=_now(),
+                hot_window_start=_now(),
+            )
+            _states[platform] = st
+        return st
+
+
+def _coerce_source(source: Any) -> str:
+    """Unknown/absent origin is treated as AUTO — the conservative pool.
+
+    Serving background work out of the on-demand reservation is the failure
+    mode we care about; a mislabelled user request merely gets paced like
+    background work for one request.
+    """
+    s = str(source or "").strip().lower()
+    return s if s in ("auto", "user") else "auto"
+
+
+# --- capacity ----------------------------------------------------------------
+
+def _auto_capacity(ceiling: float) -> float:
+    return max(_MIN_POOL_TOKENS, ceiling * AUTO_SHARE)
+
+
+def _user_capacity(ceiling: float) -> float:
+    return max(_MIN_POOL_TOKENS, ceiling)
+
+
+def _refill(st: _PlatformState, now: float) -> None:
+    """Fill both buckets toward capacity. Caller holds the platform lock."""
+    auto_cap = _auto_capacity(st.ceiling_rpm)
+    user_cap = _user_capacity(st.ceiling_rpm)
+    auto_rate = st.ceiling_rpm * AUTO_SHARE
+    user_rate = st.ceiling_rpm
+
+    if now > st.auto_refill_ts:
+        st.auto_tokens = min(auto_cap, st.auto_tokens + auto_rate * (now - st.auto_refill_ts) / 60.0)
+    st.auto_refill_ts = now
+    if now > st.user_refill_ts:
+        st.user_tokens = min(user_cap, st.user_tokens + user_rate * (now - st.user_refill_ts) / 60.0)
+    st.user_refill_ts = now
+
+
+def _seconds_for_one_token(rate_per_min: float) -> float:
+    return 60.0 / rate_per_min if rate_per_min > 0 else MAX_AUTO_WAIT_S
+
+
+# --- ceiling learning --------------------------------------------------------
+
+def _ramp_up(st: _PlatformState, now: float) -> None:
+    """Slow recovery. Caller holds the platform lock."""
+    if st.events == 0:
+        return
+    since_ramp = now - st.last_ramp_ts
+    if since_ramp < _CLEAN_WINDOW_S:
+        return
+    steps = int(since_ramp // _CLEAN_WINDOW_S)
+    if steps <= 0:
+        return
+    steps = min(steps, _MAX_CATCHUP_STEPS)
+    st.last_ramp_ts = now
+    st.ceiling_rpm = min(_MAX_CEILING_RPM, st.ceiling_rpm * (_UP_FACTOR ** steps))
+
+
+def _record_trip(st: _PlatformState, now: float) -> None:
+    """Fold the window that just closed into the frontier estimate."""
+    elapsed = now - st.window_start
+    if elapsed < 1.0:
+        elapsed = 1.0  # avoid a nonsense rate from a sub-second window
+    if st.requests_since_event > 0:
+        trip = (st.requests_since_event / elapsed) * 60.0
+        st.trip_rpm = trip
+        st.min_trip_rpm = trip if st.min_trip_rpm <= 0 else min(st.min_trip_rpm, trip)
+    st.requests_since_event = 0
+    st.window_start = now
+
+
+# --- persistence (agent/rl-history contract) --------------------------------
+# The history lane is expected to provide these on services.archive_db:
+#   record_rate_limit(platform, kind, *, surface, origin, context,
+#                     backoff_s, recent_requests)
+#   rate_limit_summary(platform=None, since_hours=24)  -> per-platform/origin
+#     aggregate
+# They may not exist yet; every use is guarded so the governor still runs.
+
+
+def _persist_event(platform: str, kind: str, origin: str, ceiling_rpm: float,
+                   trip_rpm: float, events: int) -> None:
+    try:
+        from services import archive_db
+
+        fn = getattr(archive_db, "record_rate_limit", None)
+        if fn is None:
+            logger.debug("rate_budget: archive_db.record_rate_limit absent — event not persisted")
+            return
+        fn(
+            platform,
+            kind or "governor",
+            surface=platform,
+            origin=origin,
+            context=f"ceiling_rpm={ceiling_rpm:.2f} trip_rpm={trip_rpm:.2f} events={events}",
+        )
+    except Exception:  # noqa: BLE001 — persistence is best-effort, never fatal
+        logger.debug("rate_budget: record_rate_limit failed", exc_info=True)
+
+
+def _read_history() -> List[Dict[str, Any]]:
+    try:
+        from services import archive_db
+
+        fn = getattr(archive_db, "rate_limit_summary", None)
+        if fn is None:
+            return []
+        rows = fn(since_hours=24)
+    except Exception:  # noqa: BLE001
+        logger.debug("rate_budget: rate_limit_summary failed", exc_info=True)
+        return []
+    if isinstance(rows, dict):
+        rows = list(rows.values())
+    return [r for r in (rows or []) if isinstance(r, dict)]
+
+
+def prime_from_history(platform: Optional[str] = None) -> Dict[str, Any]:
+    """Seed ceilings from cross-process history. Idempotent, best-effort.
+
+    This is how learning crosses the process boundary: the app and the
+    detached worker each keep private buckets, but both read the same DB, so
+    a limit the worker took teaches the app. Only ever LOWERS a ceiling.
+    """
+    applied: Dict[str, float] = {}
+    for row in _read_history():
+        plat = str(row.get("platform") or "").strip().lower()
+        if not plat or (platform and plat != platform):
+            continue
+        trip = row.get("min_trip_rpm") or row.get("trip_rpm") or row.get("rate_rpm")
+        try:
+            trip_rpm = float(trip)
+        except (TypeError, ValueError):
+            continue
+        if trip_rpm <= 0:
+            continue
+        target = max(_FLOOR_CEILING_RPM, trip_rpm * _SAFETY_FRACTION)
+        st = _state(plat)
+        with st.lock:
+            if target < st.ceiling_rpm:
+                st.min_trip_rpm = st.min_trip_rpm or trip_rpm
+                st.ceiling_rpm = target
+                st.last_ramp_ts = _now()
+                applied[plat] = round(target, 2)
+    if applied:
+        logger.info("rate_budget: primed ceilings from history: %s", applied)
+    return applied
+
+
+def _maybe_prime() -> None:
+    global _history_primed
+    if _history_primed:
+        return
+    if str(os.environ.get("VODRIP_RATE_BUDGET_PRIME", "1")).strip() == "0":
+        _history_primed = True
+        return
+    with _prime_lock:
+        if _history_primed:
+            return
+        _history_primed = True  # set first: a failure must not retry per request
+        try:
+            prime_from_history()
+        except Exception:  # noqa: BLE001
+            logger.debug("rate_budget: prime_from_history failed", exc_info=True)
+
+
+# --- public API --------------------------------------------------------------
+
+def acquire(platform: str, source: Source = "auto", *, kind: Optional[str] = None) -> Decision:
+    """Admit one request and learn from it. The instrumented hot seam.
+
+    ``source`` is the origin tag ("auto" for scheduled/background work,
+    "user" for preview / manual transcribe / clip). Anything unrecognised is
+    coerced to "auto" — the conservative pool.
+
+    Never raises and never sleeps. AUTO callers that get ``allowed=False``
+    should back off for at most ``min(wait_s, MAX_AUTO_WAIT_S)`` and then
+    proceed; USER callers are never expected to wait at all.
+    """
+    _maybe_prime()
+    src = _coerce_source(source)
+    st = _state(platform)
+    decision: Decision
+    with st.lock:
+        now = _now()
+        _ramp_up(st, now)
+        _refill(st, now)
+        # The limiter sees every request, so the rate we are learning is the
+        # total — not the pool we drew the token from.
+        if st.requests_since_event == 0:
+            # Open the observation window at the FIRST request after the last
+            # event, not at the event itself. Otherwise a 5-minute clean
+            # recovery window would be averaged into the "rate we were
+            # travelling at when we got limited", and a 10 rpm burst after an
+            # idle would read as ~2 rpm — teaching the ceiling far too low.
+            st.window_start = now
+        st.requests_since_event += 1
+
+        if src == "user":
+            st.user_tokens -= 1.0
+            allowed = st.user_tokens >= 0
+            tokens = st.user_tokens
+            reason = "ok" if allowed else "user_exhausted"
+            wait_s = 0.0 if allowed else _seconds_for_one_token(st.ceiling_rpm)
+        else:
+            st.auto_tokens -= 1.0
+            allowed = st.auto_tokens >= 0
+            tokens = st.auto_tokens
+            reason = "ok" if allowed else "auto_exhausted"
+            wait_s = 0.0 if allowed else _seconds_for_one_token(st.ceiling_rpm * AUTO_SHARE)
+        decision = Decision(
+            platform=st.platform,
+            source=src,
+            allowed=allowed,
+            wait_s=wait_s,
+            ceiling_rpm=st.ceiling_rpm,
+            tokens=tokens,
+            reason=reason,
+        )
+
+    if not decision.allowed:
+        _log_decision(decision)
+    return decision
+
+
+def note_limit(platform: str, *, kind: Optional[str] = None, status: Optional[int] = None,
+               source: Source = "auto", backoff_s: Optional[float] = None) -> Decision:
+    """Record a rate-limit event. Drops the ceiling fast.
+
+    This is the only place a DB row is written, and it fires once per limit
+    event, never per request. The DB write happens after the platform lock is
+    released (no IO under lock).
+    """
+    _maybe_prime()
+    src = _coerce_source(source)
+    st = _state(platform)
+    with st.lock:
+        now = _now()
+        before = st.ceiling_rpm
+        _record_trip(st, now)
+        learned = st.min_trip_rpm * _SAFETY_FRACTION if st.min_trip_rpm > 0 else before * 0.5
+        new_ceiling = max(_FLOOR_CEILING_RPM, learned)
+        if new_ceiling > st.ceiling_rpm:
+            new_ceiling = st.ceiling_rpm  # an event never raises the ceiling
+        st.ceiling_rpm = new_ceiling
+        st.events += 1
+        st.last_event_ts = now
+        st.last_ramp_ts = now
+        # AUTO is emptied: it is the most likely source of the burst that
+        # tripped us. The USER reservation is deliberately left intact — that
+        # headroom is the point of the split, and we cannot prove who caused
+        # the event anyway.
+        st.auto_tokens = 0.0
+        st.user_tokens = min(st.user_tokens, _user_capacity(st.ceiling_rpm))
+        ceiling_rpm, trip_rpm, events = st.ceiling_rpm, st.min_trip_rpm, st.events
+        plat = st.platform
+
+    _persist_event(plat, kind or "", src, ceiling_rpm, trip_rpm, events)
+    decision = Decision(
+        platform=st.platform,
+        source=src,
+        allowed=False,
+        wait_s=0.0,
+        ceiling_rpm=ceiling_rpm,
+        tokens=0.0,
+        reason="limit_event" + (f" http_{status}" if status else ""),
+    )
+    _log_decision(decision)
+    if before > ceiling_rpm:
+        logger.info(
+            "rate_budget: %s limit event #%d — ceiling %.1f -> %.1f rpm (trip %.1f rpm)",
+            plat, events, before, ceiling_rpm, trip_rpm,
+        )
+    else:
+        logger.info(
+            "rate_budget: %s limit event #%d — ceiling held at %.1f rpm (trip %.1f rpm)",
+            plat, events, ceiling_rpm, trip_rpm,
+        )
+    return decision
+
+
+def note_hot_call(platform: str, source: Source = "auto", *, limited: bool = False,
+                  kind: Optional[str] = None) -> None:
+    """Counter-only accounting for volume paths (HLS segments).
+
+    Deliberately does NOT consume a token, does NOT block, and does NOT write
+    a row: a 4h VOD is ~2,400 segment calls across 12 parallel fetchers, so
+    per-call rows would be a log firehose, and metering CDN segment fetches
+    against the GQL/API ceiling would poison it (they are different limiters).
+    429s here still feed the ceiling via ``note_limit`` at the seam above.
+    """
+    st = _state(platform)
+    with st.lock:
+        now = _now()
+        if now - st.hot_window_start >= _HOT_WINDOW_S:
+            st.hot_window_start = now
+            st.hot_calls = 0
+            st.hot_limited = 0
+        st.hot_calls += 1
+        if limited:
+            st.hot_limited += 1
+
+
+def backoff_seconds(platform: str, source: Source = "auto") -> float:
+    """How long a caller should wait before its next request. Never negative.
+
+    Advisory only — the caller decides whether to honour it.
+    """
+    st = _state(platform)
+    src = _coerce_source(source)
+    with st.lock:
+        now = _now()
+        _ramp_up(st, now)
+        _refill(st, now)
+        if src == "user":
+            deficit = max(0.0, 1.0 - st.user_tokens)
+            rate = st.ceiling_rpm
+        else:
+            deficit = max(0.0, 1.0 - st.auto_tokens)
+            rate = st.ceiling_rpm * AUTO_SHARE
+        if deficit <= 0:
+            return 0.0
+        return min(MAX_AUTO_WAIT_S, _seconds_for_one_token(rate))
+
+
+def auto_exhausted(platform: str) -> bool:
+    """True when background work has spent its share — the scheduler's signal.
+
+    Exposed, not enforced: the 24/7 scheduler is not gated on this (see the
+    module docstring / report). A caller that wants to skip a pass checks
+    this first.
+    """
+    st = _state(platform)
+    with st.lock:
+        _refill(st, _now())
+        return st.auto_tokens < 1.0
+
+
+def scheduler_hint() -> Dict[str, Any]:
+    """Per-platform 'should background work start a pass right now?' view."""
+    out: Dict[str, Any] = {}
+    for plat in _known_platforms():
+        out[plat] = {
+            "auto_exhausted": auto_exhausted(plat),
+            "backoff_s": round(backoff_seconds(plat, "auto"), 2),
+        }
+    return out
+
+
+def _known_platforms() -> List[str]:
+    names = set(_PLATFORM_CEILING_RPM) | set(_states)
+    return sorted(names)
+
+
+# --- observability -----------------------------------------------------------
+
+def _log_decision(decision: Decision) -> None:
+    """In-memory ring buffer of the last N throttle decisions (no DB)."""
+    try:
+        with _log_lock:
+            _decisions.append(decision.as_dict())
+    except Exception:  # noqa: BLE001 — logging must never break a request
+        pass
+
+
+def recent_decisions(limit: int = 20) -> List[Dict[str, Any]]:
+    with _log_lock:
+        items = list(_decisions)
+    return items[-max(1, int(limit)):]
+
+
+def platform_status(platform: str) -> Dict[str, Any]:
+    st = _state(platform)
+    with st.lock:
+        now = _now()
+        # Advance the same way the request path does, so the endpoint reports
+        # the numbers the governor would actually act on rather than a stale
+        # snapshot. (auto_exhausted/backoff_seconds do this too.)
+        _ramp_up(st, now)
+        _refill(st, now)
+        auto_cap = _auto_capacity(st.ceiling_rpm)
+        user_cap = _user_capacity(st.ceiling_rpm)
+        hot_age = max(0.0, now - st.hot_window_start)
+        return {
+            "platform": st.platform,
+            "ceiling_rpm": round(st.ceiling_rpm, 3),
+            "default_ceiling_rpm": st.default_rpm,
+            "auto_share": AUTO_SHARE,
+            "auto": {
+                "tokens": round(max(0.0, st.auto_tokens), 3),
+                "capacity": round(auto_cap, 3),
+                "refill_rpm": round(st.ceiling_rpm * AUTO_SHARE, 3),
+                "exhausted": st.auto_tokens < 1.0,
+            },
+            "user": {
+                "tokens": round(max(0.0, st.user_tokens), 3),
+                "capacity": round(user_cap, 3),
+                "refill_rpm": round(st.ceiling_rpm, 3),
+            },
+            "learning": {
+                "events": st.events,
+                "trip_rpm": round(st.trip_rpm, 3),
+                "min_trip_rpm": round(st.min_trip_rpm, 3),
+                "seconds_since_event": (
+                    round(now - st.last_event_ts, 1) if st.events else None
+                ),
+                "ramp_pending": bool(st.events and (now - st.last_ramp_ts) >= _CLEAN_WINDOW_S),
+            },
+            "hot": {
+                "calls_last_min": st.hot_calls if hot_age < _HOT_WINDOW_S else 0,
+                "limited_last_min": st.hot_limited if hot_age < _HOT_WINDOW_S else 0,
+            },
+        }
+
+
+def status() -> Dict[str, Any]:
+    """Read-only snapshot for humans watching the governor learn."""
+    return {
+        "auto_share": AUTO_SHARE,
+        "max_auto_wait_s": MAX_AUTO_WAIT_S,
+        "platforms": [platform_status(p) for p in _known_platforms()],
+        "scheduler": scheduler_hint(),
+        "recent_decisions": recent_decisions(20),
+    }
+
+
+def reset() -> None:
+    """Drop all learned state (tests / operator reset)."""
+    global _history_primed
+    with _registry_lock:
+        _states.clear()
+    with _log_lock:
+        _decisions.clear()
+    with _prime_lock:
+        _history_primed = False

@@ -94,7 +94,7 @@ def _fetch_latest_vod(channel: dict, platform: str) -> Optional[dict]:
     if platform == "twitch":
         from services.twitch_gql_service import list_channel_videos_sync
 
-        rows = list_channel_videos_sync(_slug(channel, "twitch").lower(), limit=1)
+        rows = list_channel_videos_sync(_slug(channel, "twitch").lower(), limit=1, source="user")
         if not rows:
             return None
         r = rows[0]
@@ -110,7 +110,7 @@ def _fetch_latest_vod(channel: dict, platform: str) -> Optional[dict]:
     if platform == "kick":
         from services.kick_api_service import list_channel_videos_api
 
-        vids = list_channel_videos_api(_slug(channel, "kick").lower(), limit=1)
+        vids = list_channel_videos_api(_slug(channel, "kick").lower(), limit=1, source="user")
         if not vids:
             return None
         v = vids[0]

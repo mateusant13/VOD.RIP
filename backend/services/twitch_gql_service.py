@@ -8,11 +8,16 @@ import logging
 from services.http_fingerprint import twitch_http_headers
 import random
 import re
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urljoin
+
+# Imported at module scope: rate_budget pulls NOTHING from services at module
+# scope (its archive_db use is lazy and guarded), so this cannot cycle.
+from services.rate_budget import MAX_AUTO_WAIT_S, acquire, note_limit
 
 logger = logging.getLogger(__name__)
 
@@ -587,7 +592,27 @@ def _gql_headers() -> Dict[str, str]:
     return headers
 
 
-def _gql_request(query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
+def _governor_admit(source: str, kind: str) -> None:
+    """Pace one Twitch GQL call against the learned budget. Never raises.
+
+    Only background work waits. This is the reactive half of the story — the
+    existing callers still surface 429s as RuntimeError exactly as before.
+    """
+    try:
+        decision = acquire("twitch", source, kind=kind)  # type: ignore[arg-type]
+        if decision.allowed or decision.source == "user":
+            return
+        wait = min(MAX_AUTO_WAIT_S, decision.wait_s)
+        if wait > 0:
+            logger.debug("rate_budget: pacing Twitch %s for %.1fs (AUTO pool dry)", kind, wait)
+            time.sleep(wait)
+    except Exception:  # noqa: BLE001 — advisory only, never a new failure mode
+        logger.debug("rate_budget: admission check failed", exc_info=True)
+
+
+def _gql_request(
+    query: str, variables: Dict[str, Any], *, source: str = "auto"
+) -> Dict[str, Any]:
     payload = json.dumps({"query": query, "variables": variables}).encode("utf-8")
     req = urllib.request.Request(
         TWITCH_GQL_URL,
@@ -595,11 +620,14 @@ def _gql_request(query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
         headers=_gql_headers(),
         method="POST",
     )
+    _governor_admit(source, "gql")
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             body = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")[:200]
+        if e.code == 429:
+            note_limit("twitch", kind="gql", status=429, source=source)
         raise RuntimeError(f"Twitch GQL HTTP {e.code}: {detail}") from e
     except urllib.error.URLError as e:
         raise RuntimeError(f"Twitch GQL request failed: {e}") from e
@@ -610,7 +638,13 @@ def _gql_request(query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
     return body.get("data") or {}
 
 
-def _gql_persisted(operation_name: str, sha256_hash: str, variables: Dict[str, Any]) -> Dict[str, Any]:
+def _gql_persisted(
+    operation_name: str,
+    sha256_hash: str,
+    variables: Dict[str, Any],
+    *,
+    source: str = "auto",
+) -> Dict[str, Any]:
     payload = json.dumps({
         "operationName": operation_name,
         "variables": variables,
@@ -624,11 +658,14 @@ def _gql_persisted(operation_name: str, sha256_hash: str, variables: Dict[str, A
         headers=_gql_headers(),
         method="POST",
     )
+    _governor_admit(source, "gql_persisted")
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             body = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")[:200]
+        if e.code == 429:
+            note_limit("twitch", kind="gql_persisted", status=429, source=source)
         raise RuntimeError(f"Twitch GQL HTTP {e.code}: {detail}") from e
     except urllib.error.URLError as e:
         raise RuntimeError(f"Twitch GQL request failed: {e}") from e
@@ -646,18 +683,20 @@ def _gql_persisted_with_fallback(
     primary_hash: str,
     fallback_hash: str,
     variables: Dict[str, Any],
+    *,
+    source: str = "auto",
 ) -> Dict[str, Any]:
     try:
-        return _gql_persisted(op, primary_hash, variables)
+        return _gql_persisted(op, primary_hash, variables, source=source)
     except RuntimeError as e:
         if fallback_hash and "PersistedQueryNotFound" in str(e):
-            return _gql_persisted(op, fallback_hash, variables)
+            return _gql_persisted(op, fallback_hash, variables, source=source)
         raise
 
 
 
 def list_channel_videos_sync(
-    login: str, limit: int = 100, *, return_has_more: bool = False
+    login: str, limit: int = 100, *, return_has_more: bool = False, source: str = "auto"
 ) -> List[Dict[str, Any]]:
     """Return recent VODs/highlights/uploads for a Twitch channel login.
 
@@ -677,7 +716,11 @@ def list_channel_videos_sync(
 
     while len(out) < limit:
         batch = min(100, limit - len(out))
-        data = _gql_request(CHANNEL_VIDEOS_QUERY, {"login": login, "first": batch, "after": cursor})
+        data = _gql_request(
+            CHANNEL_VIDEOS_QUERY,
+            {"login": login, "first": batch, "after": cursor},
+            source=source,
+        )
         user = data.get("user")
         if not user:
             has_more = False
@@ -737,6 +780,7 @@ def list_channel_clips_sync(
     sort: str = "date",
     older_than_days: int = 0,
     newer_than_days: int = 0,
+    source: str = "auto",
 ) -> List[Dict[str, Any]]:
     """Return the *limit* most recent clips (<=60s).
 
@@ -800,6 +844,7 @@ def list_channel_clips_sync(
                 "ClipsCards__User",
                 CLIPS_CARDS_USER_HASH,
                 variables,
+                source=source,
             )
             user = data.get("user")
             if not user:

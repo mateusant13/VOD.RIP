@@ -47,7 +47,7 @@ def _clip_items(n: int) -> list[dict]:
 
 
 def _fake_get_json(monkeypatch, payload) -> None:
-    monkeypatch.setattr(k, "_get_json", lambda path, referer: payload)
+    monkeypatch.setattr(k, "_get_json", lambda path, referer, **kw: payload)
 
 
 def test_videos_api_returns_requested_depth(monkeypatch) -> None:

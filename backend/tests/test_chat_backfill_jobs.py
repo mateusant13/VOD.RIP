@@ -101,7 +101,7 @@ def test_kick_lane_stable_id_dedupes_repeat_kick(scratch_db, monkeypatch):
     _seed_video("1001")
     calls = {"n": 0}
 
-    def fake_page(vid, offset, size):
+    def fake_page(vid, offset, size, **kw):
         calls["n"] += 1
         return [_node(5.0)]
 
@@ -128,7 +128,7 @@ def test_kick_lane_skips_queued_and_running_jobs(scratch_db, monkeypatch):
     archive_db.update_job("tw-backfill-1004", status="running")
     calls = {"n": 0}
 
-    def fake_page(vid, offset, size):
+    def fake_page(vid, offset, size, **kw):
         calls["n"] += 1
         return [_node(5.0)]
 
@@ -150,7 +150,7 @@ def test_kick_lane_requeues_failed_row_in_place(scratch_db, monkeypatch):
     archive_db.update_job(
         "tw-backfill-1002", status="failed", error="FileNotFound: missing archive")
 
-    def fake_page(vid, offset, size):
+    def fake_page(vid, offset, size, **kw):
         return [_node(5.0)]
 
     monkeypatch.setattr(archive_twitch, "_post_comments_page", fake_page)
@@ -172,7 +172,7 @@ def test_zero_row_backfill_marks_no_chat_and_stops_repeat_kicks(scratch_db, monk
     and a repeat kick is a permanent no-op."""
     _seed_video("2001")
 
-    def empty_page(vid, offset, size):
+    def empty_page(vid, offset, size, **kw):
         return []
 
     monkeypatch.setattr(archive_twitch, "_post_comments_page", empty_page)
@@ -195,7 +195,7 @@ async def test_auto_backfill_skips_marked_videos(scratch_db, monkeypatch):
 
     _seed_video("2001")
     _seed_video("2002")
-    monkeypatch.setattr(archive_twitch, "_post_comments_page", lambda v, o, s: [])
+    monkeypatch.setattr(archive_twitch, "_post_comments_page", lambda v, o, s, **kw: [])
     archive_twitch.backfill_chat("cellbit", "2001", max_messages=100)  # stamps marker
     kicked_log: list[str] = []
     monkeypatch.setattr(
@@ -228,7 +228,7 @@ async def test_kick_backfill_and_preview_respect_marker(scratch_db, monkeypatch)
     _seed_video("3001")
     _seed_video("3002")
     _seed_video("3003")
-    monkeypatch.setattr(archive_twitch, "_post_comments_page", lambda v, o, s: [])
+    monkeypatch.setattr(archive_twitch, "_post_comments_page", lambda v, o, s, **kw: [])
     archive_twitch.backfill_chat("cellbit", "3001", max_messages=100)  # marker
     archive_twitch.backfill_chat("cellbit", "3002", max_messages=100)  # marker
     archive_db.enqueue_job("tw-backfill-3003", "chat", "twitch", "3003")  # queued

@@ -207,7 +207,7 @@ def test_interactive_kick_never_paced_or_gated(monkeypatch):
         monkeypatch.setattr(atw.time, "sleep", fake_sleep)
         monkeypatch.setattr(
             atw, "_post_comments_page",
-            lambda vid, offset, size: [{"contentOffsetSeconds": str(offset + 5)}],
+            lambda vid, offset, size, **kw: [{"contentOffsetSeconds": str(offset + 5)}],
         )
         t0 = time.monotonic()
         # Fresh video id: test_twitch_chat_job_not_gated already left a DONE
@@ -267,7 +267,7 @@ def test_interactive_backfill_fails_fast_on_429(monkeypatch):
     monkeypatch.setattr(atw.time, "sleep", fake_sleep)
     monkeypatch.setattr(
         atw, "_post_comments_page",
-        lambda vid, offset, size: (_ for _ in ()).throw(atw._RateLimited("Twitch GQL 429: nope")),
+        lambda vid, offset, size, **kw: (_ for _ in ()).throw(atw._RateLimited("Twitch GQL 429: nope")),
     )
     t0 = time.monotonic()
     try:
@@ -288,7 +288,7 @@ def test_worker_backfill_retries_429(monkeypatch):
     monkeypatch.setattr(atw.time, "sleep", lambda sec: sleeps.append(sec))
     calls = {"n": 0}
 
-    def rate_limited(vid, offset, size):
+    def rate_limited(vid, offset, size, **kw):
         calls["n"] += 1
         raise atw._RateLimited("Twitch GQL 429: nope")
 

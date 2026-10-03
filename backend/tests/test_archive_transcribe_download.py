@@ -171,7 +171,7 @@ def test_chat_backfill_heartbeats_before_page_fetch(scratch_db, monkeypatch):
 
     seen = {"fetches": 0, "hb_at_first_fetch": None}
 
-    def fake_page(vid, offset, size):
+    def fake_page(vid, offset, size, **kw):
         seen["fetches"] += 1
         if seen["fetches"] == 1:
             row = archive_db.query(

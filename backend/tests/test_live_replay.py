@@ -430,7 +430,7 @@ def test_twitch_archive_info_refuses_previous_vod_while_live() -> None:
         "live": True,
         "started_at": "2026-08-13T10:00:00Z",
     }
-    gql_mod.list_channel_videos_sync = lambda login, limit=100: [
+    gql_mod.list_channel_videos_sync = lambda login, limit=100, **kw: [
         {
             "id": "111",
             "platform": "Twitch",
@@ -460,7 +460,7 @@ def test_twitch_archive_info_allows_just_ended_broadcast_offline() -> None:
     real_videos = gql_mod.list_channel_videos_sync
     real_playback = gql_mod.get_vod_playback_sync
     gql_mod.get_channel_stream_status_sync = lambda login: {"live": False, "started_at": None}
-    gql_mod.list_channel_videos_sync = lambda login, limit=100: [
+    gql_mod.list_channel_videos_sync = lambda login, limit=100, **kw: [
         {
             "id": "222",
             "platform": "Twitch",
@@ -493,7 +493,7 @@ def test_twitch_archive_info_status_failure_keeps_old_behavior() -> None:
     real_videos = gql_mod.list_channel_videos_sync
     real_playback = gql_mod.get_vod_playback_sync
     gql_mod.get_channel_stream_status_sync = lambda login: None  # query failed
-    gql_mod.list_channel_videos_sync = lambda login, limit=100: [
+    gql_mod.list_channel_videos_sync = lambda login, limit=100, **kw: [
         {
             "id": "333",
             "platform": "Twitch",

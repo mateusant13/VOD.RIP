@@ -1050,6 +1050,20 @@ async def archive_dedupe():
             "content_groups": archive_db.content_duplicates()}
 
 
+@router.get("/api/archive/rate-budget")
+async def archive_rate_budget():
+    """Read-only view of the adaptive rate governor (no mutations, no reset).
+
+    Shows the learned per-platform ceiling, the AUTO/USER token pools under
+    it, the hot-path counters, and the last throttle decisions — enough to
+    watch the governor learn (ceiling drops on a 429, creeps back on clean
+    windows) without touching anything.
+    """
+    from services import rate_budget
+
+    return rate_budget.status()
+
+
 @router.post("/api/archive/aliases")
 async def archive_aliases(platform: str, video_id: str, canonical_key: str, note: str = ""):
     _require_platform(platform)

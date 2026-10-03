@@ -37,6 +37,7 @@ from typing import Any, Callable, Dict, List, Optional
 from services import archive_db
 from services import twitch_gql_service
 from services.archive_scheduler import _enqueue_chat_job
+from services.rate_budget import MAX_AUTO_WAIT_S, acquire, note_limit
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +203,24 @@ def ingest_channel_vods(channel: str, limit: int = 3) -> List[dict]:
 _BACKFILL_SEM = threading.BoundedSemaphore(2)
 
 
+def _governor_admit(*, interactive: bool, kind: str) -> None:
+    """Pace one Twitch GQL page against the learned budget. Never raises.
+
+    Only the background lane waits: an interactive kick is the user waiting,
+    and the governor's whole job is to keep capacity for exactly that.
+    """
+    try:
+        decision = acquire("twitch", "user" if interactive else "auto", kind=kind)
+        if decision.allowed or interactive:
+            return
+        wait = min(MAX_AUTO_WAIT_S, decision.wait_s)
+        if wait > 0:
+            logger.debug("rate_budget: pacing %s for %.1fs (AUTO pool dry)", kind, wait)
+            time.sleep(wait)
+    except Exception:  # noqa: BLE001 — advisory only, never a new failure mode
+        logger.debug("rate_budget: admission check failed", exc_info=True)
+
+
 def _message_row(node: dict) -> dict:
     """Map a GQL comment node to an archive messages row.
 
@@ -233,11 +252,22 @@ def _message_row(node: dict) -> dict:
     }
 
 
-def _post_comments_page(video_id: str, offset_sec: int, page_size: int) -> List[dict]:
+def _post_comments_page(
+    video_id: str,
+    offset_sec: int,
+    page_size: int,
+    *,
+    interactive: bool = False,
+) -> List[dict]:
     """Fetch one page of comments with offset >= *offset_sec* (GQL Int arg).
 
     Returns comment nodes (possibly empty). Raises _RateLimited on 429,
     _TransientError on 5xx/network/'service error', RuntimeError otherwise.
+
+    *interactive* is the pre-existing AUTO/USER discriminator for this path
+    (True = a user's kick off the router/preview, False = the background
+    backfill lane). It is reused verbatim by the rate governor — no second,
+    redundant origin argument.
     """
     payload = json.dumps({
         "query": VIDEO_COMMENTS_QUERY,
@@ -256,12 +286,18 @@ def _post_comments_page(video_id: str, offset_sec: int, page_size: int) -> List[
         },
         method="POST",
     )
+    # Predictively pace the background lane against the learned Twitch budget
+    # so a 4h VOD's ~1,000 comment pages stop *before* the 429, not after.
+    # Bounded, and never a failure: the page fetch proceeds either way.
+    _governor_admit(interactive=interactive, kind=f"comments {video_id}")
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             body = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")[:200]
         if e.code == 429:
+            note_limit("twitch", kind="comments", status=429,
+                       source="user" if interactive else "auto")
             raise _RateLimited(f"Twitch GQL 429: {detail}") from e
         if e.code >= 500:
             raise _TransientError(f"Twitch GQL HTTP {e.code}: {detail}") from e
@@ -650,7 +686,9 @@ def _fetch_page_with_backoff(
     backoff = BACKOFF_START_SEC
     for attempt in range(attempts):
         try:
-            return _post_comments_page(video_id, int(last_seen), page_size), retries
+            return _post_comments_page(
+                video_id, int(last_seen), page_size, interactive=interactive
+            ), retries
         except _RateLimited:
             retries += 1
             if attempt + 1 >= attempts:

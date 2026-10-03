@@ -18,6 +18,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from services import kick_gate
+from services.rate_budget import MAX_AUTO_WAIT_S, acquire, note_limit
 from services.kick_models import (
     KickChannel,
     KickVideo,
@@ -81,7 +82,44 @@ class KickRateLimitError(RuntimeError):
     """429 retries exhausted — Kick rate-limited this IP/session."""
 
 
-def _get_json(path: str, referer: str, *, timeout: float = 15.0) -> Any:
+def _governor_admit(source: str, path: str) -> None:
+    """Pace this call against the learned Kick budget. Never raises.
+
+    Background work waits when the AUTO pool is dry — that is the point of
+    the governor (back off *before* the 429). The wait is bounded by
+    MAX_AUTO_WAIT_S and we proceed afterwards, so an exhausted budget slows
+    ingest down; it never fails a metadata call.
+    """
+    try:
+        decision = acquire("kick", source, kind=path)  # type: ignore[arg-type]
+        if decision.allowed:
+            return
+        if decision.source == "user":
+            # On-demand work is never made to wait on a budget.
+            return
+        wait = min(MAX_AUTO_WAIT_S, decision.wait_s)
+        if wait > 0:
+            logger.debug("rate_budget: pacing Kick %s for %.1fs (AUTO pool dry)", path, wait)
+            time.sleep(wait)
+    except Exception:  # noqa: BLE001 — the governor is advisory, never a new failure mode
+        logger.debug("rate_budget: admission check failed", exc_info=True)
+
+
+def _get_json(
+    path: str,
+    referer: str,
+    *,
+    timeout: float = 15.0,
+    source: str = "auto",
+) -> Any:
+    """One Kick API GET — the chokepoint for 100% of Kick JSON egress.
+
+    ``source`` tags the origin for the predictive governor ("auto" for
+    background/ingest, "user" for preview/live). It is a pacing hint only:
+    when the AUTO pool is dry we wait a bounded moment and then proceed, so
+    pacing never turns a metadata call into a failure. kick_gate remains the
+    reactive backstop and its behaviour is unchanged.
+    """
     from curl_cffi import requests
 
     url = f"{_BASE}{path}"
@@ -94,6 +132,7 @@ def _get_json(path: str, referer: str, *, timeout: float = 15.0) -> Any:
                 f"Kick requests frozen for {kick_gate.gate_remaining_sec():.0f}s "
                 "(Cloudflare/rate-limit cooldown)"
             )
+        _governor_admit(source, path)
         try:
             resp = requests.get(
                 url,
@@ -119,6 +158,7 @@ def _get_json(path: str, referer: str, *, timeout: float = 15.0) -> Any:
             )
             raise KickGateError(f"Kick request blocked (Cloudflare/403): {path}")
         if resp.status_code == 429:
+            note_limit("kick", kind=f"api {path}", status=429, source=source)
             if attempt >= _BACKOFF_MAX_ATTEMPTS:
                 kick_gate.note_kick_gate_event(
                     f"429 rate-limited on {path}", kind="http_429", surface="metadata",
@@ -143,12 +183,12 @@ def _get_json(path: str, referer: str, *, timeout: float = 15.0) -> Any:
     raise RuntimeError("unreachable")  # pragma: no cover — loop always returns or raises
 
 
-def verify_channel_exists(slug: str) -> None:
+def verify_channel_exists(slug: str, *, source: str = "auto") -> None:
     """Raise ValueError when the Kick channel slug does not exist."""
     slug = (slug or "").strip()
     if not slug:
         raise ValueError("Kick channel slug is required")
-    _get_json(f"/api/v2/channels/{slug}", f"{_BASE}/{slug}/clips")
+    _get_json(f"/api/v2/channels/{slug}", f"{_BASE}/{slug}/clips", source=source)
 
 
 def _thumb_url(value: Any) -> Optional[str]:
@@ -261,16 +301,17 @@ def _clip_from_api_item(item: dict, slug: str) -> Optional[KickVideo]:
 CLIP_MAX_DURATION_SEC = 60
 
 
-def list_channel_clips_api(slug: str, limit: int = 10, *, verify: bool = True) -> List[KickVideo]:
+def list_channel_clips_api(slug: str, limit: int = 10, *, verify: bool = True,
+                           source: str = "auto") -> List[KickVideo]:
     """Last *limit* clips by date, then ranked by views (desc).
 
     Uses Kick channel clips page/API: https://kick.com/{slug}/clips
     """
     slug = (slug or "").strip().lower()
     if verify:
-        verify_channel_exists(slug)
+        verify_channel_exists(slug, source=source)
     referer = f"{_BASE}/{slug}/clips"
-    data = _get_json(f"/api/v2/channels/{slug}/clips", referer)
+    data = _get_json(f"/api/v2/channels/{slug}/clips", referer, source=source)
     raw = data.get("clips") if isinstance(data, dict) else []
     if not isinstance(raw, list):
         raise RuntimeError("Unexpected Kick clips API response")
@@ -293,11 +334,12 @@ def list_channel_clips_api(slug: str, limit: int = 10, *, verify: bool = True) -
     return parsed[: max(1, min(int(limit), KICK_CLIPS_CEILING))]
 
 
-def list_channel_clips_sync(url: str, limit: int = 10, *, sort: str = "date") -> list[dict]:
+def list_channel_clips_sync(url: str, limit: int = 10, *, sort: str = "date",
+                            source: str = "user") -> list[dict]:
     slug = extract_slug(url)
     if not slug:
         raise ValueError(f"Not a Kick channel URL: {url}")
-    clips = list_channel_clips_api(slug, limit, verify=False)
+    clips = list_channel_clips_api(slug, limit, verify=False, source=source)
     if sort == "views":
         clips = sorted(clips, key=lambda c: int(getattr(c, "views", 0) or 0), reverse=True)
     return [
@@ -317,9 +359,9 @@ def list_channel_clips_sync(url: str, limit: int = 10, *, sort: str = "date") ->
     ]
 
 
-def list_channel_videos_api(slug: str, limit: int = 20) -> List[KickVideo]:
+def list_channel_videos_api(slug: str, limit: int = 20, *, source: str = "auto") -> List[KickVideo]:
     referer = f"{_BASE}/{slug}/videos"
-    data = _get_json(f"/api/v2/channels/{slug}/videos", referer)
+    data = _get_json(f"/api/v2/channels/{slug}/videos", referer, source=source)
     if not isinstance(data, list):
         raise RuntimeError("Unexpected Kick videos API response")
     limit = max(1, min(int(limit), KICK_VIDEOS_CEILING))
@@ -505,7 +547,8 @@ def list_channel_videos_sync(url: str, limit: int = 20) -> list[dict]:
     slug = extract_slug(url)
     if not slug:
         raise ValueError(f"Not a Kick channel URL: {url}")
-    vids = list_channel_videos_api(slug, limit)
+    # Reached from the channels/preview UI, not the background ingest lane.
+    vids = list_channel_videos_api(slug, limit, source="user")
     return [
         {
             "id": v.id,

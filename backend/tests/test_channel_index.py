@@ -39,7 +39,7 @@ def _fake_platform_services(monkeypatch):
     """Offline fakes for the three platform fetchers + preview warmer."""
     calls: list[str] = []
 
-    def fake_kick(url, limit):
+    def fake_kick(url, limit, **kw):
         calls.append("Kick")
         return [{
             "id": f"k{i}",
@@ -51,7 +51,7 @@ def _fake_platform_services(monkeypatch):
             "thumbnail": f"https://kick-thumb/{i}",
         } for i in range(1, 3)]
 
-    def fake_twitch(login, limit, return_has_more=False):
+    def fake_twitch(login, limit, return_has_more=False, **kw):
         calls.append("Twitch")
         return [{
             "id": f"t{i}",

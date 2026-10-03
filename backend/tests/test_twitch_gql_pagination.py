@@ -90,7 +90,7 @@ def test_videos_first_page_has_more_true_when_connection_continues(monkeypatch) 
         _videos_page([str(i) for i in range(100, 150)], has_next=False, cursor=None),
     ]
 
-    def fake_request(query, variables):
+    def fake_request(query, variables, **kw):
         calls.append(variables)
         return pages.pop(0)
 
@@ -123,7 +123,7 @@ def test_videos_last_page_has_more_false() -> None:
     items, has_more = None, None
     orig = gql._gql_request
 
-    def fake_request(query, variables):
+    def fake_request(query, variables, **kw):
         return _videos_page([str(i) for i in range(100)], has_next=False, cursor=None)
 
     gql._gql_request = fake_request
@@ -143,7 +143,7 @@ def test_videos_saturates_exactly_at_page_boundary() -> None:
         _videos_page([str(i) for i in range(100, 200)], has_next=True, cursor="c2"),
     ]
 
-    def fake_request(query, variables):
+    def fake_request(query, variables, **kw):
         return pages.pop(0)
 
     orig = gql._gql_request
@@ -159,7 +159,7 @@ def test_videos_saturates_exactly_at_page_boundary() -> None:
 def test_videos_ceiling_clamps_request_depth(monkeypatch) -> None:
     seen: list[int] = []
 
-    def fake_request(query, variables):
+    def fake_request(query, variables, **kw):
         seen.append(variables["first"])
         return _videos_page(
             [str(i) for i in range(seen[-1])], has_next=True, cursor="c"
@@ -182,7 +182,7 @@ def test_clips_non_era_returns_requested_depth_not_10(monkeypatch) -> None:
         _clips_page([f"c{i}" for i in range(100, 200)], has_next=False),
     ]
 
-    def fake_persisted(op, hash_, variables):
+    def fake_persisted(op, hash_, variables, **kw):
         assert variables["limit"] == 100
         return pages.pop(0)
 
@@ -198,7 +198,7 @@ def test_clips_era_window_scales_depth_and_returns_deep_fetch(monkeypatch) -> No
     deep fetch is returned (the API layer window-filters + slices)."""
     pages_served = {"n": 0}
 
-    def fake_persisted(op, hash_, variables):
+    def fake_persisted(op, hash_, variables, **kw):
         pages_served["n"] += 1
         # One huge page with more to come — era crawl should keep going.
         # Hourly-spaced edges make this a genuinely date-ordered bucket (like
