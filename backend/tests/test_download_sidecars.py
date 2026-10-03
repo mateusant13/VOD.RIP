@@ -411,3 +411,95 @@ def test_atomic_write_replaces_existing_srt_without_truncating_first(_scratch_db
     assert "in trim" in target.read_text("utf-8")
     assert "stale" not in target.read_text("utf-8")
 
+
+# ── YouTube: fetch the caption track at completion (no ASR needed) ──
+
+_YT_ID = "dQw4w9WgXcQ"
+
+
+@pytest.fixture()
+def _stub_captions(monkeypatch):
+    """Replace the network fetcher (routers.subtitles._fetch_subtitles) with a
+    canned timedtext payload, so the WRITER's wiring is under test without
+    touching YouTube. Returns the recorded call log."""
+    calls: list[tuple[str, list[str]]] = []
+
+    def _fake(url, langs):
+        calls.append((url, list(langs)))
+        return {
+            "url": url, "lang": "en", "source": "auto", "has_subtitles": True,
+            "rows": [
+                {"offset_sec": 410.0, "text": "caption one"},
+                {"offset_sec": 414.0, "text": "caption two"},
+            ],
+        }
+
+    import routers.subtitles as subs
+
+    monkeypatch.setattr(subs, "_fetch_subtitles", _fake)
+    return calls
+
+
+def test_youtube_download_fetches_captions_when_archive_is_empty(_scratch_db, _stub_captions, tmp_path: Path):
+    """The download pipeline never archives, so transcript_source() is empty
+    for a plain YouTube download — the case that made the setting a no-op.
+    The writer falls back to the caption track (no ASR) and stores it, so the
+    NEXT download of the same video reads it from the archive."""
+    out = tmp_path / "yt.mp4"
+    out.write_bytes(b"video")
+    res = transcript_sidecar(str(out), "youtube", _YT_ID, crop_start=410.0, crop_end=420.0)
+    assert res["status"] == "written"
+    assert res["source"] == "youtube-captions"
+    assert res["path"] == str(tmp_path / "yt.srt")
+    body = (tmp_path / "yt.srt").read_text("utf-8")
+    # Same rebase contract as an archive transcript.
+    assert "00:00:00,000 --> 00:00:04,000" in body
+    assert "caption one" in body and "caption two" in body
+    # The proven fetcher got the canonical watch URL and the language list.
+    assert _stub_captions[0][0] == f"https://www.youtube.com/watch?v={_YT_ID}"
+    # Rows were archived exactly like the ingest does, so they are reusable.
+    assert archive_db.has_transcript("youtube", _YT_ID)
+    assert len(archive_db.transcript_for("youtube", _YT_ID)) == 2
+
+
+def test_youtube_without_captions_is_reported_not_silent(_scratch_db, monkeypatch, tmp_path: Path):
+    """A video with no caption track: say so, name the cause, write nothing."""
+    import routers.subtitles as subs
+
+    monkeypatch.setattr(subs, "_fetch_subtitles", lambda url, langs: {
+        "url": url, "lang": None, "source": None, "has_subtitles": False, "rows": [],
+    })
+    out = tmp_path / "yt.mp4"
+    out.write_bytes(b"video")
+    res = transcript_sidecar(str(out), "youtube", "zzzzzzzzzzz")
+    assert res["status"] == "unavailable"
+    assert "no caption track" in res["detail"]
+    assert not (tmp_path / "yt.srt").exists()
+
+
+def test_youtube_caption_fetch_failure_does_not_raise(_scratch_db, monkeypatch, tmp_path: Path):
+    """A caption fetch that explodes (502, bot-gate, offline) degrades to a
+    REPORTED miss — it must never fail the download that just succeeded."""
+    import routers.subtitles as subs
+
+    def _boom(url, langs):
+        raise RuntimeError("HTTP 429")
+
+    monkeypatch.setattr(subs, "_fetch_subtitles", _boom)
+    out = tmp_path / "yt.mp4"
+    out.write_bytes(b"video")
+    res = transcript_sidecar(str(out), "youtube", "yyyyyyyyyyy")
+    assert res["status"] == "unavailable"
+    assert not (tmp_path / "yt.srt").exists()
+
+
+def test_youtube_caption_fetch_can_be_disabled(_scratch_db, _stub_captions, tmp_path: Path):
+    """allow_youtube_captions=False skips the network hop entirely."""
+    out = tmp_path / "yt.mp4"
+    out.write_bytes(b"video")
+    res = transcript_sidecar(
+        str(out), "youtube", _YT_ID, allow_youtube_captions=False
+    )
+    assert res["status"] == "unavailable"
+    assert _stub_captions == []
+
