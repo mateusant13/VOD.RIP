@@ -1790,6 +1790,37 @@ def _segment_platform(url: str) -> str:
     return "cdn"
 
 
+def _range_append_is_safe(response, have: int) -> bool:
+    """True when *response* body may be appended to the *have* bytes on disk.
+
+    The server must actually honour the range: HTTP 206 with a Content-Range
+    whose first byte is exactly *have*. A 200 (full body, range ignored) or a
+    Content-Range that starts somewhere else would splice mismatched bytes
+    together, so the caller restarts from zero instead. Resuming into a
+    corrupt file is worse than re-downloading, and this is the only place
+    that can tell the two apart.
+
+    *have* == 0 (fresh segment) is always safe to write from scratch.
+    """
+    if have <= 0:
+        return True
+    if getattr(response, "status_code", None) != 206:
+        return False
+    cr = ""
+    try:
+        cr = response.headers.get("content-range") or response.headers.get("Content-Range") or ""
+    except Exception:  # noqa: BLE001 — a header-less fake must not crash us
+        return False
+    m = re.match(r"bytes\s+(\d+)\s*-\s*(\d+)\s*/\s*(\d+|\*)", cr.strip(), re.I)
+    if not m:
+        return False
+    try:
+        start = int(m.group(1))
+    except (TypeError, ValueError):
+        return False
+    return start == have
+
+
 def _download_one_segment(
     index: int,
     seg: dict,
@@ -1831,16 +1862,34 @@ def _download_one_segment(
     _check_pause_cancel(cancel_event, pause_event)
 
     path = os.path.join(temp_dir, f"{index:05d}.ts")
+    # yt-dlp's partial convention (archive_events._ensure_checkpoint and
+    # services.download_cleanup both already key on ".part"): bytes land in
+    # `<final>.part` and are renamed onto `<final>` only once the body is
+    # whole. A `<final>` with no `.part` beside it is therefore complete by
+    # construction, and a half-written segment can never be mistaken for a
+    # finished one by the concat/mux stage.
+    part = path + ".part"
     last_exc: Optional[BaseException] = None
     platform = platform or _segment_platform(seg.get("url", ""))
+    # Already-complete segment (previous attempt/segment in this same run
+    # finished and renamed it): no request at all.
+    if os.path.isfile(path) and not os.path.isfile(part):
+        if os.path.getsize(path) >= 1024:
+            return path
     for attempt in range(_SEGMENT_RETRIES):
         _check_pause_cancel(cancel_event, pause_event)
         _note_segment_call(platform, origin)
+        have = os.path.getsize(part) if os.path.isfile(part) else 0
+        req_headers = dict(headers or {})
+        if have:
+            # Resume the bytes already on disk instead of re-requesting the
+            # whole segment from zero.
+            req_headers["Range"] = f"bytes={have}-"
         try:
             with rl_counter.request_scope(platform):
                 r = requests.get(
                     seg["url"],
-                    headers=headers,
+                    headers=req_headers,
                     stream=True,
                     timeout=(_SEGMENT_CONNECT_TIMEOUT, _SEGMENT_READ_TIMEOUT),
                 )
@@ -1851,16 +1900,29 @@ def _download_one_segment(
                         f"HTTP {r.status_code} for segment {index}"
                     )
                 r.raise_for_status()
-                with open(path, "wb") as f:
+                append = _range_append_is_safe(r, have)
+                if not append and have:
+                    # Server ignored our Range (200 instead of 206, or a
+                    # Content-Range that starts somewhere else). Appending
+                    # would splice a full body onto a partial one and produce
+                    # a file with garbage in the middle — strictly worse than
+                    # re-downloading. Restart clean.
+                    logger.debug(
+                        "segment %d: server ignored Range (status %s) — restarting",
+                        index, r.status_code,
+                    )
+                    have = 0
+                with open(part, "ab" if append else "wb") as f:
                     for chunk in _iter_response_chunks(r, 256 * 1024, _SEGMENT_STALL_SECONDS):
                         _check_pause_cancel(cancel_event, pause_event)
                         if chunk:
                             f.write(chunk)
             finally:
                 r.close()
-            size = os.path.getsize(path)
+            size = os.path.getsize(part)
             if size < 1024:
                 raise RuntimeError(f"HLS segment {index} is too small ({size} bytes)")
+            os.replace(part, path)
             return path
         except _SEGMENT_NO_RETRY:
             raise

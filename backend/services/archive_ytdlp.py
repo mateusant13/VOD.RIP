@@ -19,7 +19,9 @@ from __future__ import annotations
 import html
 import json
 import logging
+import os
 import re
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -953,6 +955,91 @@ class _YtDownloadTimedOut(RuntimeError):
     extract_info (verified: hook exceptions abort the download)."""
 
 
+# --- resumable audio download -------------------------------------------------
+#
+# The transcribe worker hands download_bestaudio a FRESH mkdtemp per attempt
+# (archive_transcribe._prefetch_youtube_audio / the YouTube lane), so a
+# `continuedl` resume into that outdir could never find anything: the previous
+# attempt's .part died with its temp dir. The partial therefore has to live in
+# a STABLE per-video directory that outlives the attempt, and only the finished
+# file is handed to the caller's outdir.
+#
+# The batch this exists for is ~335 VODs / ~78 GB of audio at
+# size_estimate._DEFAULT_AUDIO_KBPS=160 — on a box where the Steady Watcher
+# suspends detached workers, a death mid-transfer used to cost the whole video
+# from byte 0.
+
+_AUDIO_RESUME_SUFFIXES = (".part", ".ytdl", ".temp")
+
+
+def _audio_resume_dir(video_id: str) -> Path:
+    """Stable per-video scratch dir for a resumable bestaudio download.
+
+    Lives under the app cache root (the same resolver the transcript-fix cache
+    uses) so it survives a process restart, and is keyed by video_id so two
+    videos never share a .part. Deliberately NOT the caller's outdir — that one
+    is deleted when the attempt ends.
+    """
+    try:
+        from services.settings import _get_appdata_dir, cache_root
+
+        root = cache_root() or _get_appdata_dir()
+    except Exception:  # noqa: BLE001 — never block a download on a path probe
+        root = Path(tempfile.gettempdir())
+    d = Path(root) / "audio-resume" / (video_id or "unknown")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _is_resume_partial(name: str) -> bool:
+    """True for yt-dlp's in-progress suffixes (never a finished download)."""
+    return name.endswith(_AUDIO_RESUME_SUFFIXES)
+
+
+def _finished_audio_files(d: Path) -> list:
+    """Complete-looking media files in *d*, ignoring .part/.ytdl scratch.
+
+    This is the 'did a download finish' decision. yt-dlp renames .part onto
+    the final name only after the body is whole, so a name without a partial
+    suffix is complete by construction — and a truncated download can never be
+    handed to the transcriber as if it were done.
+    """
+    try:
+        entries = list(d.iterdir())
+    except OSError:
+        return []
+    out = []
+    for f in entries:
+        if f.is_file() and not _is_resume_partial(f.name):
+            try:
+                if f.stat().st_size > 0:
+                    out.append(f)
+            except OSError:
+                pass
+    return out
+
+
+def _partial_bytes(d: Path) -> int:
+    """Media bytes already on disk in *d* (the resume offset).
+
+    Only ``.part`` counts: ``.ytdl`` is yt-dlp's own JSON resume-state file,
+    not media, so folding it in would overstate how much of the audio is
+    really on disk.
+    """
+    total = 0
+    try:
+        entries = list(d.iterdir())
+    except OSError:
+        return 0
+    for f in entries:
+        if f.is_file() and f.name.endswith(".part"):
+            try:
+                total += f.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
 def download_bestaudio(
     video_id: str, outdir: Path,
     *,
@@ -972,12 +1059,31 @@ def download_bestaudio(
     'downloading'/'finished' — the transcribe worker uses it to refresh
     the job heartbeat during the download, P1-2). *timeout_s* is a
     wall-clock cap on the whole download; exceeding it raises
-    _YtDownloadTimedOut (transient — caller requeues, never fails)."""
+    _YtDownloadTimedOut (transient — caller requeues, never fails).
+
+    The transfer is RESUMABLE: bytes accumulate in a stable per-video resume
+    dir (not the caller's throwaway outdir), so an attempt that dies mid-file
+    continues from the bytes already on disk instead of re-requesting the whole
+    video. A finished file is never re-fetched, and a partial is never
+    presented as a finished one."""
     from services.ytdlp_guard import guarded_youtube_dl
 
     url = _video_url(video_id)
     hooks: list[Callable[[dict], None]] = []
     deadline = time.monotonic() + max(0.0, timeout_s)
+
+    resume_dir = _audio_resume_dir(video_id)
+    # Bytes already on disk from a previous attempt. yt-dlp counts only the
+    # bytes IT pulled this run, so without folding this in a resumed download
+    # would report a percentage starting near zero even though most of the file
+    # is already there. Resumed bytes are counted ONCE — as part of the
+    # pre-existing offset, never as newly downloaded bytes.
+    resume_offset = _partial_bytes(resume_dir)
+    if resume_offset:
+        logger.info(
+            "yt-dlp %s: resuming from %.1f MiB already on disk (%s)",
+            video_id, resume_offset / (1024 * 1024), resume_dir,
+        )
 
     def _hook(d: dict) -> None:
         # Cap first: even a hook that only fires on byte progress still
@@ -988,6 +1094,13 @@ def download_bestaudio(
                 f"yt-dlp audio download exceeded {int(timeout_s)}s for {video_id}"
             )
         if progress_hook is not None:
+            if resume_offset and d.get("status") == "downloading":
+                # Report bytes-on-disk, not bytes-this-run: honest progress on
+                # a resumed transfer, with no double count (offset + new).
+                d = dict(d)
+                d["downloaded_bytes"] = (
+                    int(d.get("downloaded_bytes") or 0) + resume_offset
+                )
             progress_hook(d)
 
     hooks.append(_hook)
@@ -997,7 +1110,9 @@ def download_bestaudio(
         "no_warnings": True,
         "noplaylist": True,
         "socket_timeout": 30,
-        "outtmpl": str(outdir / "%(id)s.%(ext)s"),
+        # Continue the existing .part instead of restarting the file at byte 0.
+        "continuedl": True,
+        "outtmpl": str(resume_dir / "%(id)s.%(ext)s"),
         "progress_hooks": hooks,
         **_ytdlp_engine_opts(),
     }
@@ -1011,10 +1126,37 @@ def download_bestaudio(
         if classify_youtube_gate_error(exc) or _is_gate_error(exc):
             note_youtube_gate(str(exc)[:200], surface="download", origin="auto")
         raise
-    files = [f for f in outdir.iterdir() if f.is_file()]
+    # Pick the finished file by the .part convention, never by size alone: a
+    # leftover partial is excluded outright, so a truncated download can never
+    # be returned as the media file.
+    files = _finished_audio_files(resume_dir)
     if not files:
         raise RuntimeError(f"yt-dlp produced no audio for {video_id}")
-    return max(files, key=lambda f: f.stat().st_size)
+    src = max(files, key=lambda f: f.stat().st_size)
+
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    dest = outdir / src.name
+    try:
+        # Hand the caller a real file in ITS outdir (so its cleanup owns the
+        # bytes), leaving no copy behind in the resume dir for a later attempt
+        # to mistake for a fresh one.
+        shutil.move(str(src), str(dest))
+    except OSError:
+        if not dest.is_file():
+            raise
+    # Drain the WHOLE resume dir, partials included. yt-dlp renames the .part
+    # it consumed onto the final name, so anything still here afterwards is
+    # stale (e.g. a partial for a different container extension). Leaving it
+    # would make the next attempt resume from, and report progress against,
+    # bytes of a file that is no longer being fetched.
+    for leftover in list(resume_dir.iterdir()) if resume_dir.is_dir() else []:
+        try:
+            if leftover.is_file():
+                leftover.unlink()
+        except OSError:
+            pass
+    return dest
 
 
 def _is_permanent_download_error(exc: BaseException) -> bool:
