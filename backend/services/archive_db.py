@@ -416,6 +416,17 @@ _HB_PID_COL = False
 # serializes against other readers nor blocks on the write path's _lock. The
 # shared _conn above is NEVER handed to a reader.
 _local = threading.local()
+# Every connection _open_conn hands out, so close_connections() can release the
+# WHOLE set. threading.local values are only reachable from the thread that set
+# them: a worker/pool thread that opened a read connection and is still alive at
+# shutdown leaves a handle this module can otherwise not name. Registry under
+# _conns_lock (appended on open, drained on close) so teardown does not depend on
+# enumerating threads.
+_conns_lock = threading.Lock()
+_conns: list[sqlite3.Connection] = []
+# Bumped by close_connections() so a thread whose thread-local read connection
+# was closed underneath it re-opens instead of handing back a dead handle.
+_conn_gen = 0
 
 
 def _open_conn(path: Path) -> sqlite3.Connection:
@@ -433,6 +444,8 @@ def _open_conn(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=10000")
     conn.execute("PRAGMA synchronous=NORMAL")
+    with _conns_lock:
+        _conns.append(conn)
     return conn
 
 
@@ -455,10 +468,7 @@ def _init_schema() -> None:
     # end, so the bottom executescript is redundant on every path.
     schema_applied = False
     if _conn is not None and _conn_path != str(path):
-        try:
-            _conn.close()
-        except sqlite3.Error:
-            pass
+        _retire_conn(_conn)
         _conn = None
         _schema_ready = False
     if _conn is None:
@@ -594,24 +604,76 @@ def _get_read_conn() -> sqlite3.Connection:
     The schema-ready check runs ONCE per thread per DB path (the fast path
     below returns the cached connection without touching any lock), so steady-
     state reads are lock-free. busy_timeout/synchronous are re-applied on every
-    fresh connection (_open_conn)."""
+    fresh connection (_open_conn). close_connections() bumps the connection
+    generation, so a thread-local cached across that call re-opens instead of
+    handing back a closed handle."""
     path = str(_db_path())
     conn = getattr(_local, "read_conn", None)
     conn_path = getattr(_local, "read_conn_path", None)
-    if conn is not None and conn_path == path:
+    # The gen check is what makes close_connections() safe: a thread whose
+    # connection was closed underneath it still finds its (dead) handle in the
+    # thread-local, and must re-open instead of returning it.
+    if conn is not None and conn_path == path and getattr(_local, "read_conn_gen", 0) == _conn_gen:
         return conn
     _ensure_schema_ready()  # slow path: rebind/reopen — serialize schema init
     if conn is not None:
-        try:
-            conn.close()
-        except sqlite3.Error:
-            pass
+        _retire_conn(conn)
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = _open_conn(p)
     _local.read_conn = conn
     _local.read_conn_path = path
+    _local.read_conn_gen = _conn_gen
     return conn
+
+
+def _retire_conn(conn: sqlite3.Connection) -> None:
+    """Close one connection and drop it from the shutdown registry."""
+    with _conns_lock:
+        try:
+            _conns.remove(conn)
+        except ValueError:
+            pass
+    try:
+        conn.close()
+    except sqlite3.Error:
+        pass
+
+
+def close_connections() -> int:
+    """Close EVERY connection this module holds and return how many closed.
+
+    The app process lives forever and never needs this; the TEST process does:
+    the module-level write conn plus one read conn per thread that ever called
+    query() keep the sqlite file OPEN, and on Windows an open file cannot be
+    unlinked — so a scratch dir holding archive.db could not be deleted at
+    session end, leaking one dir per run (the warning in backend/conftest.py
+    was built on top of that leak). Idempotent, and safe to call while another
+    thread is mid-query: the loser gets sqlite3.ProgrammingError, not a
+    corrupted handle, because every path re-opens on the next call.
+
+    Must run BEFORE the directory is deleted, hence the reaper's session-end
+    ordering in backend/conftest.py.
+    """
+    global _conn, _conn_path, _schema_ready, _conn_gen
+    with _lock:  # blocks writers; readers are lock-free by design
+        with _conns_lock:
+            conns = list(_conns)
+            _conns.clear()
+            _conn_gen += 1  # stale thread-locals must re-open, not return a corpse
+        _conn = None
+        _conn_path = None
+        _schema_ready = False
+        _local.read_conn = None
+        _local.read_conn_path = None
+        closed = 0
+        for conn in conns:
+            try:
+                conn.close()
+                closed += 1
+            except sqlite3.Error:
+                pass
+    return closed
 
 
 def _ensure_kind_column(conn: sqlite3.Connection) -> None:

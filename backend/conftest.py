@@ -24,6 +24,7 @@ os.environ.setdefault("VODRIP_NO_DAEMONS", "1")
 
 import shutil
 import stat
+import sys
 import tempfile
 import time
 import warnings
@@ -56,7 +57,19 @@ def _remove_scratch_node(p: Path) -> None:
         p.unlink()
 
 
-def _wipe_vodrip_scratch(min_age_s: float) -> None:
+# The OS temp root as it was when this conftest was imported, i.e. BEFORE any
+# test module got the chance to rebind it. tests/test_transcribe_shards.py:49
+# sets tempfile.tempdir (plus TMP/TEMP) to a private scope dir so its shard
+# leak-checks are hermetic, and collection imports EVERY test module before the
+# first test runs — so by session end tempfile.gettempdir() points at that
+# private dir and the reaper was scanning the wrong root, silently skipping the
+# vodrip-tests-* dir THIS conftest mkdtemps in the real temp dir. The scratch
+# the reaper exists to clean is created before the rebind, so the root it lives
+# under must be captured before it too.
+_TEMP_ROOT_AT_IMPORT = Path(tempfile.gettempdir()).resolve()
+
+
+def _wipe_vodrip_scratch(min_age_s: float, root: Path | None = None) -> None:
     """Delete leftover test/scratch dirs in the system temp dir.
 
     Tests mkdtemp scratch dirs (vodrip-tests-*, ai-ask-tests-*, …) at
@@ -76,11 +89,17 @@ def _wipe_vodrip_scratch(min_age_s: float) -> None:
     deletes any node type and SURFACES what it could not remove (warn after
     a retry) instead of swallowing the error.
 
+    ``root`` defaults to the CURRENT gettempdir() so a test can point the wipe
+    at its own tmp_path (test_exhaust_disk_scratch does exactly that). The
+    session fixture passes _TEMP_ROOT_AT_IMPORT instead, because the root that
+    holds this session's own scratch is the one captured at import — see the
+    comment there.
+
     SAFETY: iterates the temp dir's own children only, and never follows a
     link (see _remove_scratch_node). The real data root is
     %APPDATA%\\VOD.RIP (override VODRIP_APP_DATA), which is not under the
     temp dir, and the prefix/name allowlists below match nothing there."""
-    tdir = Path(tempfile.gettempdir()).resolve()
+    tdir = Path(root) if root is not None else Path(tempfile.gettempdir()).resolve()
     now = time.time()
     stuck = []
     for p in sorted(tdir.iterdir()):
@@ -149,13 +168,60 @@ _SCRATCH_PREFIXES = (
 _SCRATCH_NAMES = ("kd_test", "vodrip-search-lab")
 
 
+# Module-level sqlite connections the tests create stay OPEN for the life of
+# the pytest process (archive_db: one shared write conn plus one read conn per
+# thread that called query(); cookie_store: one lazy module conn). On Windows an
+# open file cannot be unlinked, so the scratch dir holding archive.db /
+# cookies.db could not be deleted at session end — the reaper below reported it
+# as unremovable and one vodrip-tests-* dir leaked per run. Releasing the
+# handles is the fix; the warning stays because a handle from a live foreign
+# process is still a real leak worth surfacing.
+_DB_MODULES = ("services.archive_db", "services.cookie_store")
+
+
+def _close_scratch_db_handles() -> int:
+    """Close the sqlite connections this process holds. Returns the count.
+
+    Resolves the modules through sys.modules on purpose: importing a DB module
+    that no test touched would CREATE the very scratch DB the reaper is about
+    to delete. A module that was never loaded holds no handle.
+    """
+    closed = 0
+    for name in _DB_MODULES:
+        mod = sys.modules.get(name)
+        closer = getattr(mod, "close_connections", None) if mod else None
+        if closer is None:
+            continue
+        try:
+            closed += int(closer() or 0)
+        except Exception:  # noqa: BLE001 — teardown must not mask the wipe
+            pass
+    return closed
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _reap_vodrip_scratch():
     """Stop the temp-dir accumulation: wipe stale scratch at session start,
-    and every scratch dir this session created at session end."""
-    _wipe_vodrip_scratch(min_age_s=6 * 3600.0)  # stale from dead processes
+    and every scratch dir this session created at session end.
+
+    ORDER at session end is load-bearing: the DB handles MUST be released
+    before the wipe, or the reaper can only warn about the dirs this very
+    session locked. The close lives in THIS fixture's teardown (not in a
+    sibling session fixture in tests/conftest.py) so the two steps cannot be
+    reordered by pytest's fixture-finalization order: they are two statements
+    in one function, in the order the disk requires.
+
+    Both wipes target _TEMP_ROOT_AT_IMPORT, not the live gettempdir(): by the
+    time this teardown runs, a test module may have rebound tempfile.tempdir
+    to a private dir, and the scratch this session created is under the root
+    captured at import. (See _TEMP_ROOT_AT_IMPORT.)
+    """
+    _wipe_vodrip_scratch(min_age_s=6 * 3600.0,
+                         root=_TEMP_ROOT_AT_IMPORT)  # stale from dead procs
     yield
-    _wipe_vodrip_scratch(min_age_s=0.0)  # this session's own leftovers
+    _close_scratch_db_handles()
+    _wipe_vodrip_scratch(min_age_s=0.0,
+                         root=_TEMP_ROOT_AT_IMPORT)  # this session's own
 
 
 def pytest_collection_modifyitems(config, items):

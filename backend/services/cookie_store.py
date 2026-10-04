@@ -76,6 +76,15 @@ def _db_path() -> Path:
 _lock = threading.RLock()
 _conn: Optional[sqlite3.Connection] = None
 _schema_ready = False
+# Every connection this module hands out. A TEST fixture rebinds the store by
+# assigning ``_conn = None`` (e.g. tests/test_cookie_bridge.py:26) to force the
+# next call onto a new path — that orphans the old connection, and a
+# refcount-only object would then sit in a reference CYCLE until the cyclic
+# collector happened to run, keeping cookies.db locked on Windows long after
+# the module no longer points at it. The registry holds a strong reference, so
+# close_connections() can name and close exactly that orphan. Same arrangement
+# as archive_db._conns.
+_conns: list[sqlite3.Connection] = []
 
 
 def get_conn() -> sqlite3.Connection:
@@ -96,6 +105,7 @@ def get_conn() -> sqlite3.Connection:
             conn.execute("PRAGMA busy_timeout=10000")
             conn.execute("PRAGMA synchronous=NORMAL")
             _conn = conn
+            _conns.append(conn)
         if not _schema_ready:
             # Schema init lives here (once): the connect branch above used to
             # executescript() too, doubling the cost of the first get_conn.
@@ -103,6 +113,36 @@ def get_conn() -> sqlite3.Connection:
             _conn.commit()
             _schema_ready = True
         return _conn
+
+
+def close_connections() -> int:
+    """Close EVERY connection this module ever opened; return the count.
+
+    The app process lives forever and never needs this; the TEST process does.
+    A sqlite handle is refcount-only, so a connection orphaned by a fixture
+    that nils ``_conn`` keeps the file locked until the CYCLIC collector runs —
+    on Windows that meant cookies.db was still open at session end, the scratch
+    dir could not be deleted, and one dir leaked per run. Tracking each
+    connection in ``_conns`` makes the orphan nameable, so teardown closes it
+    deterministically instead of hoping for a gc pass.
+
+    Idempotent: the next get_conn() re-opens and re-runs the (idempotent)
+    SCHEMA, which is why the self-check below can call this instead of
+    hand-rolling the same teardown.
+    """
+    global _conn, _schema_ready
+    with _lock:
+        _conn = None
+        _schema_ready = False
+        conns, _conns[:] = list(_conns), []
+    closed = 0
+    for conn in conns:
+        try:
+            conn.close()
+            closed += 1
+        except sqlite3.Error:
+            pass
+    return closed
 
 
 def _execute(sql: str, params: Any = ()) -> sqlite3.Cursor:
@@ -493,14 +533,9 @@ if os.environ.get("VODRIP_COOKIE_SELFCHECK", "0") == "1":
         clear()
         # Close the selfcheck connection BEFORE deleting its DB — on Windows an
         # open sqlite handle blocks the unlink. (This ordering bug is exactly
-        # what leaked the old mktemp .db files into %TEMP%.)
-        if _conn is not None:
-            try:
-                _conn.close()
-            except sqlite3.Error:
-                pass
-        _conn = None
-        _schema_ready = False
+        # what leaked the old mktemp .db files into %TEMP%.) Same helper the
+        # pytest session teardown uses, so the rule lives in one place.
+        close_connections()
         try:
             os.unlink(_tmp_db)
         except OSError:
