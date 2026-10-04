@@ -252,6 +252,9 @@ export default function ChannelExplorePopup({
    *  /api/settings on mount (the feature is off by default); the ask row is
    *  hidden entirely while disabled. */
   const [aiEnabled, setAiEnabled] = useState(false);
+  /** "Save subtitles with downloads" (default on) — threaded into the in-preview
+   *  mini editor so its cut respects the user's opt-out. */
+  const [transcriptSidecar, setTranscriptSidecar] = useState(true);
   const [askOpen, setAskOpen] = useState(false);
   const [askQuestion, setAskQuestion] = useState('');
   const [askScope, setAskScope] = useState<'chat' | 'transcript' | 'all'>('all');
@@ -348,6 +351,17 @@ export default function ChannelExplorePopup({
     apiGet<{ experimental_ai_enabled?: boolean }>('/api/settings')
       .then((s) => { if (alive) setAiEnabled(s.experimental_ai_enabled === true); })
       .catch(() => { /* backend unreachable → feature stays hidden */ });
+    return () => { alive = false; };
+  }, []);
+  /** "Save subtitles with downloads" — on by default, but the user's explicit
+   *  OFF must reach the mini editor's cut too (the main window already honours
+   *  it), so the cut cannot smuggle an .srt past a setting the user turned off.
+   *  Read once on mount, same shape as the AI flag above. */
+  useEffect(() => {
+    let alive = true;
+    apiGet<{ download_transcript_sidecar?: boolean }>('/api/settings')
+      .then((s) => { if (alive) setTranscriptSidecar(s.download_transcript_sidecar !== false); })
+      .catch(() => { /* backend unreachable → keep the default (on) */ });
     return () => { alive = false; };
   }, []);
   /** One RAG question: local archive search + one LLM call (backend). */
@@ -1718,6 +1732,7 @@ export default function ChannelExplorePopup({
       }
       onNotice={showClipNotice}
       onOpenChange={setEditorOpen}
+      includeTranscript={transcriptSidecar}
       fullscreen={fullscreen}
     />
     </>

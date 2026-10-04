@@ -77,6 +77,10 @@ export interface PreviewMiniEditorProps {
   onOpenChange?: (open: boolean) => void;
   /** Fullscreen uses the lighter overlay button skin. */
   fullscreen?: boolean;
+  /** The app's "Save subtitles with downloads" setting. Undefined = on, the
+   *  product default; an explicit false is the user turning it OFF, which the
+   *  main window already honours — the cut must honour it too. */
+  includeTranscript?: boolean;
 }
 
 export default function PreviewMiniEditor({
@@ -92,6 +96,7 @@ export default function PreviewMiniEditor({
   onCutQueued,
   onOpenChange,
   fullscreen = false,
+  includeTranscript = true,
 }: PreviewMiniEditorProps) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
@@ -235,7 +240,7 @@ export default function PreviewMiniEditor({
       title,
       channel,
       durationSec: dur,
-      includeTranscript: true,
+      includeTranscript,
       includeChat: !!(chatMarkers && (chatMarkers.start != null || chatMarkers.end != null)),
       chatStartSec: chatMarkers?.start ?? null,
       chatEndSec: chatMarkers?.end ?? null,
@@ -245,10 +250,15 @@ export default function PreviewMiniEditor({
       await apiPost<{ download_id: string; status: string }>('/api/download/clip', body);
       notice(
         'ok',
-        t('Cutting {start}-{end} — the SRT sidecar is rebased to the cut', {
-          start: formatHmsFull(sel.start),
-          end: formatHmsFull(sel.end),
-        }),
+        includeTranscript
+          ? t('Cutting {start}-{end} — the SRT sidecar is rebased to the cut', {
+              start: formatHmsFull(sel.start),
+              end: formatHmsFull(sel.end),
+            })
+          : t('Cutting {start}-{end}', {
+              start: formatHmsFull(sel.start),
+              end: formatHmsFull(sel.end),
+            }),
       );
       onCutQueued?.();
     } catch (e) {
@@ -256,7 +266,7 @@ export default function PreviewMiniEditor({
     } finally {
       setBusy(false);
     }
-  }, [url, title, channel, dur, chatMarkers, notice, onCutQueued, t]);
+  }, [url, title, channel, dur, chatMarkers, includeTranscript, notice, onCutQueued, t]);
 
   // --- action: clip the same range to Twitch -------------------------------
   const clipToTwitch = useCallback(async () => {
