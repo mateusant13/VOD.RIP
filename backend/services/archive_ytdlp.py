@@ -42,6 +42,89 @@ from services.youtube_diag import is_age_gate_error
 logger = logging.getLogger(__name__)
 
 PLATFORM = "youtube"
+
+
+# --- adaptive rate governor (the yt-dlp egress seam) -------------------------
+#
+# InnerTube is metered at its one /player POST (youtube_innertube._governor_admit),
+# which is 100% of that egress. yt-dlp is the OTHER YouTube egress and had NO
+# call site at all: extract, bestaudio download, channel listing and the chat
+# backfill all went straight at YouTube, unlearned and ungoverned, while the
+# transcription path ran straight through them. One yt-dlp operation is the
+# unit we can honestly count — yt-dlp makes many inner requests per call and
+# they are not observable from here, so the token is drawn ONCE per operation,
+# at the operation's entry point.
+#
+# ENTRY POINT, NOT PER INNER REQUEST — deliberately. The pacing/metering layer
+# must not sit inside a request that another layer races on a wall: see the
+# note at youtube_innertube.py:47-60, where a sleep inside _player_request blew
+# the 2.5s _RACE_TIMEOUT_SEC profile race and had to be moved out to the
+# entry point. yt-dlp has the same shape (extract_info fans out internally), so
+# the gate lives before the `with guarded_youtube_dl(...)` block, once.
+#
+# Same accounting as the governed paths: one acquire() per egress unit, the
+# same AUTO/USER pool split, the same MAX_AUTO_WAIT_S bound. Only the outcome
+# on exhaustion differs — see _governor_admit_ytdlp.
+_YTDLP_GOVERNOR_MAX_WAIT_S = 30.0  # bounded; a job is never told to wait forever
+
+
+class YtGovernorExhausted(RuntimeError):
+    """The learned YouTube budget refused a yt-dlp operation.
+
+    TRANSIENT by construction, and deliberately worded so the job queue treats
+    it as such: the text names the rate limit so archive_db.update_job's
+    gate/rate path requeues the job instead of burning max_attempts on it, and
+    it avoids every yt_gate / age-gate marker so it is never mistaken for a
+    bot wall or a credential problem. A dry pool refills at the learned
+    ceiling, so the job drains on a later pass — this is a delay, not a
+    verdict about the video.
+    """
+
+
+def _governor_admit_ytdlp(
+    source: str = "auto", kind: str = "yt_dlp", *, interactive: bool = False,
+) -> None:
+    """Admit ONE yt-dlp operation against the learned YouTube budget.
+
+    Meters exactly one token, then bounds the consequence of an exhausted
+    pool: AUTO waits at most _YTDLP_GOVERNOR_MAX_WAIT_S and a USER caller
+    never waits at all; if the budget is still dry afterwards the operation is
+    REFUSED with a clear, attributable error. Never sleeps forever, never
+    deadlocks, and never silently proceeds into a wall it was told to avoid.
+    """
+    try:
+        from services.rate_budget import MAX_AUTO_WAIT_S, acquire
+    except Exception:  # noqa: BLE001 — governor unavailable, never a new failure
+        logger.debug("rate_budget unavailable — yt-dlp egress ungated", exc_info=True)
+        return
+    try:
+        decision = acquire(PLATFORM, source, kind=kind)  # type: ignore[arg-type]
+    except Exception:  # noqa: BLE001 — the governor is advisory, never a failure mode
+        logger.debug("rate_budget: yt-dlp admission check failed", exc_info=True)
+        return
+    if decision.allowed:
+        return
+    # On-demand work is never queued behind background work, and a USER pool
+    # is exhausted the moment it is spent — refuse it immediately and say so.
+    if interactive or decision.source == "user":
+        raise YtGovernorExhausted(
+            f"yt-dlp {kind} refused: the on-demand YouTube budget is spent "
+            f"(platform={PLATFORM} source={decision.source} "
+            f"ceiling={decision.ceiling_rpm:.1f} rpm)"
+        )
+    wait = min(_YTDLP_GOVERNOR_MAX_WAIT_S, MAX_AUTO_WAIT_S, max(0.0, float(decision.wait_s)))
+    if wait > 0:
+        logger.info(
+            "rate_budget: pacing yt-dlp %s for %.1fs (%s pool dry, ceiling %.1f rpm)",
+            kind, wait, decision.source, decision.ceiling_rpm,
+        )
+        time.sleep(wait)
+    raise YtGovernorExhausted(
+        f"yt-dlp {kind} refused: YouTube rate limit budget still exhausted after "
+        f"waiting {wait:.0f}s (platform={PLATFORM} source={decision.source} "
+        f"ceiling={decision.ceiling_rpm:.1f} rpm) — retrying later"
+    )
+
 # Priority rule: YouTube > Twitch > Kick (lower number wins).
 _CAPTION_LANG_PREF = ("pt", "pt-br", "en", "en-orig")
 # Payload fallback order: VTT (word timestamps) -> json3 -> srv3 (XML). The
@@ -501,6 +584,10 @@ def _guarded_youtube_dl(outdir: Path, *, video_id: Optional[str] = None,
     so a future on-demand caller cannot accidentally label a user's
     request as background work.
     """
+    # Governor entry point: one token per extract, taken BEFORE the call
+    # (yt-dlp fans out internally, so this is the only place we can pace it
+    # without stalling a request mid-flight).
+    _governor_admit_ytdlp(origin, "yt_dlp_extract")
     try:
         with guarded_youtube_dl(_yt_opts(outdir, video_id=video_id)) as ydl:
             yield ydl
@@ -1117,6 +1204,11 @@ def download_bestaudio(
         **_ytdlp_engine_opts(),
     }
     _apply_youtube_session(opts, video_id=video_id)
+    # Governor entry point — the transcription path's own egress. Paced once
+    # per download here, never per inner segment request: a resume re-reads
+    # hundreds of chunks inside extract_info and pacing those would hold the
+    # download hostage.
+    _governor_admit_ytdlp("auto", "yt_dlp_bestaudio")
     try:
         with guarded_youtube_dl(opts) as ydl:
             ydl.extract_info(url, download=True)
@@ -1345,6 +1437,10 @@ def list_channel_videos(channel_url: str, *, tab: str = "streams", limit: int = 
             "socket_timeout": 30,
             **_ytdlp_engine_opts(),
         }
+        # Governor entry point: one token per channel-tab walk. extract_flat
+        # makes this a single cheap listing request, so a flat channel walk is
+        # one egress unit, not one per entry.
+        _governor_admit_ytdlp("auto", "yt_dlp_channel_list")
         with guarded_youtube_dl_channel(opts) as ydl:
             info = ydl.extract_info(url, download=False)
         for e in info.get("entries") or []:
@@ -1676,6 +1772,10 @@ def resolve_youtube_display_names(limit: int = 20) -> int:
     for uid in ids:
         name = None
         try:
+            # One token per channel extract — this is the highest-frequency
+            # ungoverned YouTube egress in this module (a whole batch of
+            # distinct channel ids per run).
+            _governor_admit_ytdlp("auto", "yt_dlp_channel_meta")
             with guarded_youtube_dl_channel(
                 {"quiet": True, "no_warnings": True, "skip_download": True}
             ) as ydl:
@@ -1684,6 +1784,13 @@ def resolve_youtube_display_names(limit: int = 20) -> int:
                 )
             info = info or {}
             name = info.get("title") or info.get("channel") or info.get("uploader")
+        except YtGovernorExhausted as exc:
+            # Budget dry: stop the batch instead of paying the bounded wait
+            # once per remaining id (this loop would otherwise stall for
+            # len(ids) x wait). Unresolved ids stay unresolved and are picked
+            # up on a later run — the same contract as a bot-walled channel.
+            logger.info("display-name resolve paused at %s: %s", uid, exc)
+            break
         except Exception as exc:  # noqa: BLE001 — bot wall / dead channel
             logger.debug("display-name resolve failed for %s: %s", uid, exc)
             continue
