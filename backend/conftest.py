@@ -23,9 +23,37 @@ os.environ.setdefault("VODRIP_COOKIE_SELFCHECK", "1")
 os.environ.setdefault("VODRIP_NO_DAEMONS", "1")
 
 import shutil
+import stat
 import tempfile
 import time
+import warnings
 from pathlib import Path
+
+
+# Scratch is not always a directory: services/youtube_session.py:98 does
+# mkstemp(prefix="yt_anon_", suffix=".txt"), so a leaked cookie jar is a
+# regular FILE. shutil.rmtree is directory-only and used to run with
+# ignore_errors=True, which turned that NotADirectoryError into silence —
+# the leak was invisible and only showed up as another test's leftover.
+def _remove_scratch_node(p: Path) -> None:
+    """Delete ONE scratch node — directory or file — and let failures raise.
+
+    Generic on purpose: the old defect was not a missing prefix, it was that
+    the wiper only knew how to delete one KIND of node. Dispatching on the
+    node type is safe for every existing prefix because all of them are
+    mkdtemp scratch, which is exactly what rmtree handles; file-shaped
+    entries only become reachable through prefixes that create them.
+
+    lstat (not stat) is deliberate: a symlink/junction inside the temp dir
+    must be UNLINKED, never recursed into, so a link planted in temp can
+    never walk the wipe out to %APPDATA%/VOD.RIP or any other real data.
+    rmtree refuses a symlink outright and unlink removes a link, so both
+    branches stay inside the temp dir.
+    """
+    if stat.S_ISDIR(p.lstat().st_mode):
+        shutil.rmtree(p)  # strict — no ignore_errors, so nothing is hidden
+    else:
+        p.unlink()
 
 
 def _wipe_vodrip_scratch(min_age_s: float) -> None:
@@ -42,10 +70,20 @@ def _wipe_vodrip_scratch(min_age_s: float) -> None:
     test prefix (archive-*, ai-ask-*, kd_test/, …) leaked forever. The
     prefix list below mirrors every mkdtemp(prefix=…) in backend/tests
     today; new test scratch MUST use the ``vodrip-`` prefix so the generic
-    rule covers it (the list is the safety net for legacy names)."""
-    tdir = Path(tempfile.gettempdir())
+    rule covers it (the list is the safety net for legacy names).
+
+    DISK-01b: the mkstemp families (yt_anon_*) are FILES, so the wiper now
+    deletes any node type and SURFACES what it could not remove (warn after
+    a retry) instead of swallowing the error.
+
+    SAFETY: iterates the temp dir's own children only, and never follows a
+    link (see _remove_scratch_node). The real data root is
+    %APPDATA%\\VOD.RIP (override VODRIP_APP_DATA), which is not under the
+    temp dir, and the prefix/name allowlists below match nothing there."""
+    tdir = Path(tempfile.gettempdir()).resolve()
     now = time.time()
-    for p in tdir.iterdir():
+    stuck = []
+    for p in sorted(tdir.iterdir()):
         name = p.name
         if not (
             name.startswith(_SCRATCH_PREFIXES) or name in _SCRATCH_NAMES
@@ -54,10 +92,30 @@ def _wipe_vodrip_scratch(min_age_s: float) -> None:
         if name.startswith("vodrip-shards-"):
             continue  # worker-owned, transient while a job runs
         try:
-            if now - p.stat().st_mtime >= min_age_s:
-                shutil.rmtree(p, ignore_errors=True)
+            age_ok = now - p.lstat().st_mtime >= min_age_s
         except OSError:
-            pass
+            continue  # vanished between iterdir() and lstat()
+        if not age_ok:
+            continue
+        # Retry once: on Windows a scratch node can be transiently locked by
+        # a process that is still exiting. A second failure is a real leak and
+        # is reported below rather than lost.
+        for attempt in (1, 2):
+            try:
+                _remove_scratch_node(p)
+                break
+            except OSError:
+                if not os.path.lexists(p):
+                    break  # someone else got there first — not a leak
+                if attempt == 2:
+                    stuck.append(name)
+    if stuck:
+        warnings.warn(
+            "conftest scratch wipe could not remove %d node(s) after a "
+            "retry: %s" % (len(stuck), ", ".join(stuck[:10])),
+            UserWarning,
+            stacklevel=2,
+        )
 
 
 # Every scratch dir prefix tests create in the system temp dir (mkdtemp).
@@ -80,9 +138,14 @@ _SCRATCH_PREFIXES = (
     "transcript-fix-app-", "transcript-pipeline-", "transcript-pipeline-app-",
     "twitch-clip-chat-", "watchdog-test-", "window_hls_test_",
     "ws1-arch-", "ws1-queue-", "yt-captions-test-", "yt-display-names-", "yt-transcribe-", "twitch-transcribe-", "kick-transcribe-", "bw-a4-", "bw-auth-", "bw-crash-",
-    "yt-gate-", "yt-policy-test-", "ytdlp_aud_", "ytdlp_seg_",
+    "yt-gate-", "yt-policy-test-", "yt_anon_", "ytdlp_aud_", "ytdlp_seg_",
 )
 # Bare scratch dir names (not mkdtemp-prefixed) in the temp dir.
+# Deliberately NOT "VOD.RIP": in the SYSTEM temp dir that is the running
+# app's own tree (routers/disk.py:79, services/updater.py:169,
+# routers/live.py:1049), and in a test's tmp_path it is the autouse
+# _isolated_download_appdata dir. Never scratch — see
+# test_wipe_leaves_bare_vodrip_dir_alone.
 _SCRATCH_NAMES = ("kd_test", "vodrip-search-lab")
 
 
