@@ -1600,15 +1600,45 @@ def _thread_slot() -> _ThreadModelSlot:
 
 
 # --- Parakeet lane (sherpa-onnx) ------------------------------------------
-    # A/B verdict (2026-08-07, 60 s pt-BR segments, i5-13600K): parakeet TDT v3
-# int8 on CPU runs 2.5-5.2 RTFx vs whisper-large-v3-turbo cpu/int8 at
-# 0.26-0.6 (7-15x), ~0.7 GB less peak RSS, and outputs nothing on silence
-# (no hallucination). GPU: CUDA-enabled sherpa-onnx wheels exist since
-# 1.13.x (sherpa-onnx==X+cuda12.cudnn9 — see requirements.txt); when one is
-# importable, GPU slots run parakeet with provider='cuda', gated on the
-# measured free-VRAM allowance.
-PARAKEET_MODEL = "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
-_PARAKEET_FILES = ("encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt")
+    # Engine A/B verdict (2026-08-07, 60 s pt-BR segments, i5-13600K): parakeet
+# on CPU runs 2.5-5.2 RTFx vs whisper-large-v3-turbo cpu/int8 at 0.26-0.6 (7-15x),
+# ~0.7 GB less peak RSS, and outputs nothing on silence (no hallucination). GPU:
+# CUDA-enabled sherpa-onnx wheels exist since 1.13.x
+# (sherpa-onnx==X+cuda12.cudnn9 — see requirements.txt); when one is importable,
+# GPU slots run parakeet with provider='cuda', gated on the measured free-VRAM
+# allowance.
+#
+# MODEL = Parakeet Redux (2026-10-04). This is NOT a straight upgrade.
+# moondream/parakeet-redux is the 1.58-bit ternary re-quantisation of NVIDIA's
+# parakeet-tdt-0.6b-v3: same architecture, same tokenizer, same 25 European
+# languages, 178 MB of weights instead of ~1.2 GB. It BEATS the int8 original on
+# the 25-language FLEURS aggregate (WER 10.56 vs 11.62) and on long-form TEDLIUM
+# (2.51 vs 2.71); it is slightly WORSE on English (6.55 vs 6.26) and notably WORSE
+# in background noise (9.04 vs 6.72). This app transcribes Twitch/Kick VODs, which
+# are often noisy, so that noise regression is the real cost of the swap — accepted
+# for the ~7x size and disk/RSS win on clean speech. Reverting is a constant plus
+# two file-name changes below.
+#
+# Verified on this box BEFORE the swap: sherpa-onnx 1.13.4+cuda12.cudnn9 with
+# onnxruntime 1.30.0 registers the com.microsoft MatMulNBits contrib op the ternary
+# encoder needs, so NO dependency bump was required. Both models transcribe the
+# packaging's en/de/es/fr clips correctly on this runtime.
+PARAKEET_MODEL = "Codyfederer/sherpa-onnx-nemo-parakeet-redux"
+# Cache subdir name — deliberately NOT PARAKEET_MODEL: hf_hub_download
+# (local_dir=...) lays the files flat in the target dir, so the dir carries
+# the repo's own name, not the "<user>/" repo id. live_captions mirrors this
+# name so its lightweight probe resolves the SAME dir the ASR worker does.
+_PARAKEET_DIR_NAME = "sherpa-onnx-nemo-parakeet-redux"
+# Redux ships FLOAT onnx graphs, not ".int8" quantised ones — the ternary
+# weights live INSIDE encoder.onnx as MatMulNBits 4-bit blocks. A stale
+# ".int8.onnx" name here means the model never resolves and every ASR job
+# fails as "no model". These names are verified against the packaging.
+_PARAKEET_FILES = ("encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt")
+# The redux packaging publishes ONE archive, not loose ONNX files, so a
+# per-file hf_hub_download of the names above 404s against the real repo.
+# _parakeet_model_dir falls back to fetching this and extracting the four
+# files out of it.
+_PARAKEET_ARCHIVE = "sherpa-onnx-nemo-parakeet-redux.tar.bz2"
 _PARAAKEET_FEATURE_DIM = 128  # nemo_transducer default (80) fails — must match the model
 # Model card: 26 European languages. Intersected at runtime with the lang
 # tokens the model's tokens.txt actually carries (see _parakeet_langs), so a
@@ -1923,7 +1953,7 @@ def _parakeet_resolve_dir() -> Optional[Path]:
     hf_hub_download(local_dir=...) layout); NEVER downloads — the caller
     decides whether a download is wanted."""
     cache = _parakeet_cache_dir()
-    for d in (cache / "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8", cache):
+    for d in (cache / _PARAKEET_DIR_NAME, cache):
         if all((d / f).is_file() for f in _PARAKEET_FILES):
             return d
     return None
@@ -1942,14 +1972,73 @@ def _parakeet_model_dir() -> Path:
             "Parakeet model download needs huggingface_hub — install it or "
             "pre-seed the sherpa cache (VODRIP_SHERRPA_CACHE)"
         ) from exc
-    target = _parakeet_cache_dir() / "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
+    target = _parakeet_cache_dir() / _PARAKEET_DIR_NAME
     target.mkdir(parents=True, exist_ok=True)
-    for f in _PARAKEET_FILES:
-        logger.info("Downloading parakeet model file %s ...", f)
-        hf_hub_download(repo_id=PARAKEET_MODEL, filename=f, local_dir=str(target))
+    try:
+        for f in _PARAKEET_FILES:
+            logger.info("Downloading parakeet model file %s ...", f)
+            hf_hub_download(repo_id=PARAKEET_MODEL, filename=f, local_dir=str(target))
+    except Exception as exc:
+        # This packaging ships one tar.bz2 rather than loose files, so the
+        # per-file fetch above 404s. Undo its partial writes and take the
+        # archive instead.
+        logger.info(
+            "parakeet loose files unavailable (%s: %s) — fetching %s instead",
+            type(exc).__name__, exc, _PARAKEET_ARCHIVE,
+        )
+        for f in _PARAKEET_FILES:
+            (target / f).unlink(missing_ok=True)
+        _extract_parakeet_archive(hf_hub_download, target)
     if not all((target / f).is_file() for f in _PARAKEET_FILES):
         raise RuntimeError(f"parakeet model download incomplete in {target}")
     return target
+
+
+def _extract_parakeet_archive(hf_hub_download: Callable[..., Any], target: Path) -> None:
+    """Fetch _PARAKEET_ARCHIVE and lay the model files FLAT in ``target``.
+
+    The archive's top dir is _PARAKEET_DIR_NAME, so members are written to
+    ``target/<file>`` to match the flat hf_hub_download(local_dir=...) layout
+    that _parakeet_resolve_dir probes. Only the four model files are taken:
+    README.md, the test_wavs/ fixtures and the macOS ``._*`` AppleDouble
+    stubs are skipped.
+    """
+    import tarfile
+    from pathlib import PurePosixPath
+
+    logger.info("Downloading parakeet archive %s ...", _PARAKEET_ARCHIVE)
+    archive = Path(
+        hf_hub_download(
+            repo_id=PARAKEET_MODEL,
+            filename=_PARAKEET_ARCHIVE,
+            local_dir=str(target),
+        )
+    )
+    wanted = set(_PARAKEET_FILES)
+    got: set[str] = set()
+    with tarfile.open(archive, "r:bz2") as tf:
+        for member in tf:
+            name = PurePosixPath(member.name)
+            if (
+                member.isfile()
+                and name.name in wanted
+                and name.parts[0] == _PARAKEET_DIR_NAME
+            ):
+                src = tf.extractfile(member)
+                if src is None:
+                    continue
+                logger.info("Extracting %s from the parakeet archive ...", name.name)
+                with open(target / name.name, "wb") as fh:
+                    shutil.copyfileobj(src, fh)
+                got.add(name.name)
+    # The extracted files are the model; the 169 MB tarball is not kept
+    # (it would otherwise sit in the models folder forever).
+    archive.unlink(missing_ok=True)
+    missing = wanted - got
+    if missing:
+        raise RuntimeError(
+            f"{_PARAKEET_ARCHIVE} did not contain {sorted(missing)}"
+        )
 
 
 def _parakeet_langs() -> frozenset[str]:
@@ -2142,9 +2231,9 @@ def _load_parakeet(provider: str = "cpu") -> Any:
     t0 = time.monotonic()
     threads = _parakeet_threads()
     kwargs = dict(
-        encoder=str(d / "encoder.int8.onnx"),
-        decoder=str(d / "decoder.int8.onnx"),
-        joiner=str(d / "joiner.int8.onnx"),
+        encoder=str(d / _PARAKEET_FILES[0]),
+        decoder=str(d / _PARAKEET_FILES[1]),
+        joiner=str(d / _PARAKEET_FILES[2]),
         tokens=str(d / "tokens.txt"),
         num_threads=threads,
         sample_rate=SAMPLE_RATE,
@@ -6097,7 +6186,7 @@ def _run_module_selfcheck_body() -> None:
         # tokens.txt present -> the candidate set must narrow to the model's
         # actual lang tokens (a swapped model missing a language is a clean
         # unsupported-language failure for that job).
-        _pd = _scratch_sherpa / "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
+        _pd = _scratch_sherpa / _PARAKEET_DIR_NAME
         _pd.mkdir(parents=True, exist_ok=True)
         for _f in _PARAKEET_FILES:
             (_pd / _f).write_text("x", encoding="utf-8")  # existence is all the resolver checks

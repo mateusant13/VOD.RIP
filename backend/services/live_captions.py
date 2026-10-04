@@ -381,8 +381,16 @@ def _warm_asr() -> bool:
 # worker stack just to stat a directory — the resolution below is the same
 # as archive_transcribe._parakeet_cache_dir/_parakeet_resolve_dir, minus the
 # model load/news downloads (a pure path/file probe).
-_PARAAKEET_MODEL = "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
-_PARAAKEET_FILES = ("encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt")
+# Both of these must stay in lockstep with services.archive_transcribe
+# (PARAKEET_MODEL / _PARAKEET_FILES) — same model, same layout. Divergence
+# here makes captions_available() disagree with what the ASR worker can
+# actually load.
+_PARAAKEET_MODEL = "Codyfederer/sherpa-onnx-nemo-parakeet-redux"
+# The cache subdir is named after the repo, NOT the "<user>/" repo id —
+# archive_transcribe downloads flat into this exact name.
+_PARAAKEET_DIR_NAME = "sherpa-onnx-nemo-parakeet-redux"
+# Float graphs, not ".int8" quantised (see archive_transcribe._PARAKEET_FILES).
+_PARAAKEET_FILES = ("encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt")
 _PARAAKEET_CACHE_ENV = "VODRIP_SHERRPA_CACHE"
 
 
@@ -407,7 +415,7 @@ def _parakeet_model_dir_probe() -> Optional[Path]:
         cache = _migrated_model_dir(
             base / "parakeet-models", base.parent / "parakeet-models", "parakeet"
         )
-    for d in (cache / _PARAAKEET_MODEL, cache):
+    for d in (cache / _PARAAKEET_DIR_NAME, cache):
         if all((d / f).is_file() for f in _PARAAKEET_FILES):
             return d
     return None
