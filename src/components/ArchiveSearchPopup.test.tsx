@@ -1,11 +1,29 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, configure, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import ArchiveSearchPopup, { deepPollIsTerminal } from './ArchiveSearchPopup';
 import { ApiError } from '../hooks/useApiClient';
 import { todayIso } from '../archiveSearchUtils';
 import { setLanguage } from '../i18n';
 import type { SavedChannel } from '../types';
+
+// Give-up ceiling, NOT a synchronization mechanism.
+//
+// Every wait in this file is condition-based (waitFor/findBy), so this number
+// does not buy correctness — it only decides how long we keep polling before
+// declaring failure. It is raised from RTL's 1000ms default because of a
+// measured fact, not a hunch: ONE populated findByRole in this popup costs
+// ~290ms of pure jsdom render even on an idle box, and this file has 73 of
+// them. On a box running the backend suite alongside, or one the local CPU
+// governor is throttling, a legitimate render can therefore exceed 1000ms
+// and the test fails on a healthy component.
+//
+// Raising the ceiling does not paper over a real race: the debounce is ticked
+// on a controlled clock below, the chip-refetch assertion is a single waitFor
+// over its observable, and the negative assertions use a deterministic quiet
+// window rather than a sleep. If a wait here is genuinely broken, it now
+// takes up to 5s to fail instead of 1s — slower to notice, still failing.
+configure({ asyncUtilTimeout: 5000 });
 
 const ARCHIVE_VIDEOS = {
   videos: [
