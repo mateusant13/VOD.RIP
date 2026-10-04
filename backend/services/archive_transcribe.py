@@ -15,18 +15,18 @@ Design decisions:
     ONE insert_transcript() batch call, so a crash loses at most the
     in-flight chunk. A FULL re-run (no manifest, rows already present)
     replaces the old rows instead of appending a duplicate copy.
-  * Model cache: one process-global parakeet OfflineRecognizer by default
-    (budget 1), lazy-loaded on first job, unloaded after
-    VODRIP_WHISPER_IDLE_CLOSE seconds (default 600) without use. Multi-copy
-    mode (budget > 1 — CPU workers or opt-in VODRIP_TRANSCRIBE_GPU_COPIES)
-    gives each pool thread its own recognizer so inference runs in parallel.
-  * Hybrid pool (CUDA hosts): the worker runs the GPU copy AND CPU threads
-    at the same time — VODRIP_TRANSCRIBE_GPU_COPIES GPU slots (default 2)
-    plus VODRIP_TRANSCRIBE_WORKERS CPU slots (default 2 on <16-thread boxes,
-    3 on 16–31, 4 on 32+; 0 disables the CPU side and restores the
-    exclusive-GPU worker). Each pool thread is pinned to its slot's device
-    at thread start, so CPU threads never compete for VRAM. CPU-only hosts
-    are unchanged (WORKERS, same dynamic default).
+  * Model cache: ONE parakeet OfflineRecognizer per device ("cpu"/"cuda") in
+    _shared_models, shared by every pool thread via concurrent create_stream();
+    lazy-loaded on first job, unloaded after VODRIP_WHISPER_IDLE_CLOSE seconds
+    (default 600) without use. There is NO multi-copy mode: _ThreadModelSlot
+    holds only the per-thread Silero VAD, never a recognizer.
+  * Hybrid pool (CUDA hosts): the worker runs the GPU slot AND CPU threads
+    at the same time — always exactly ONE GPU slot (one shared CUDA
+    recognizer) plus VODRIP_TRANSCRIBE_WORKERS CPU slots (default 2 on
+    <16-thread boxes, 3 on 16–31, 4 on 32+; 0 disables the CPU side and
+    restores the exclusive-GPU worker). Each pool thread is pinned to its
+    slot's device at thread start, so CPU threads never compete for VRAM.
+    CPU-only hosts are unchanged (WORKERS, same dynamic default).
   * ONE VOD AT A TIME (VODRIP_TRANSCRIBE_JOB_CONCURRENCY, default 1): the
     pool's lanes are NOT one-VOD-per-lane. The refill claims at most N
     transcribe jobs, and the lanes become chunk workers INSIDE the single
@@ -112,7 +112,11 @@ SAMPLE_RATE = 16000
 LANG_ENV = "VODRIP_WHISPER_LANGUAGE"
 WORKERS_ENV = "VODRIP_TRANSCRIBE_WORKERS"  # CPU threads; 0 = GPU-only on CUDA hosts
 IDLE_ENV = "VODRIP_WHISPER_IDLE_CLOSE"
-GPU_COPIES_ENV = "VODRIP_TRANSCRIBE_GPU_COPIES"
+GPU_COPIES_ENV = "VODRIP_TRANSCRIBE_GPU_COPIES"  # DEPRECATED, IGNORED
+# (kept only so existing callers/tests that set it keep working — the knob is
+#  never read. Multi-copy was deliberately removed: the GPU lane is ONE shared
+#  recognizer. Do not advertise it in docs; see _gpu_copies / _worker_plan.)
+
 PARAKEET_ENV = "VODRIP_PARAAKEET"          # "0" kills the parakeet lane (clean job failure)
 PARAKEET_CACHE_ENV = "VODRIP_SHERRPA_CACHE"  # sherpa-onnx model cache override
 CPU_CAP_ENV = "VODRIP_TRANSCRIBE_CPU_CAP"  # ASR CPU-thread fraction of logical threads (hard cap)
@@ -970,7 +974,8 @@ def caption_reserved_vram_bytes() -> int:
 def _gpu_copies() -> int:
     """GPU lane: 0 (no GPU) or 1 (single shared model per device).
     ponytail: multi-copy VRAM-counting removed — one shared recognizer is
-    reused by all GPU-pinned threads via create_stream()."""
+    reused by all GPU-pinned threads via create_stream(). VODRIP_TRANSCRIBE_GPU_COPIES
+    is NOT read here (nor anywhere): it is a dead knob kept for compatibility."""
     if _parakeet_cuda_ok is False:
         return 0
     if _gpu_held_by_other() or caption_session_active():
@@ -1110,21 +1115,21 @@ def _cpu_worker_ceiling() -> int:
 def _worker_plan() -> list[tuple[str, str]]:
     """(device, compute_type) slots for the transcribe pool.
 
-    CUDA host (not forced off): GPU copies first (VODRIP_TRANSCRIBE_GPU_COPIES,
-    default 1, VRAM+RAM clamped) then CPU threads (VODRIP_TRANSCRIBE_WORKERS,
-    dynamic CPU default; 0 disables the CPU side). CPU-only host: [("cpu","int8")] *
+    CUDA host (not forced off): ONE GPU slot (a single shared CUDA
+    recognizer — VODRIP_TRANSCRIBE_GPU_COPIES was REMOVED and is ignored, see
+    GPU_COPIES_ENV) then CPU threads (VODRIP_TRANSCRIBE_WORKERS, dynamic CPU
+    default; 0 disables the CPU side). CPU-only host: [("cpu","int8")] *
     WORKERS (same dynamic default). Every CPU slot is RAM-clamped; the clamp is
     conservative on purpose because CPU and GPU copies share the same host
     RAM (ponytail: per-slot RSS is an estimate — if a box OOMs, lower
-    VODRIP_TRANSCRIBE_WORKERS or VODRIP_TRANSCRIBE_GPU_COPIES). CPU slots are
+    VODRIP_TRANSCRIBE_WORKERS). CPU slots are
     additionally capped at the VODRIP_TRANSCRIBE_CPU_CAP thread budget (40%
     of logical threads by default), GPU slots included: the CPU side shrinks
     by the GPU slot count, so len(plan) x threads-per-slot (every recognizer
     spawns num_threads) never exceeds the CPU fraction, on any machine.
 
-    A plan of exactly [("cuda","int8")] (gpu_slots==1 and cpu_slots==0) is
-    the single-global-model path: budget 1, one recognizer. Any other plan
-    -> multi-copy mode (per-thread model copies)."""
+    Every lane of a given device shares ONE recognizer (see _shared_models) —
+    there are no per-thread model copies, whatever the plan looks like."""
     device, _ = _effective_device()
     if device == "cpu":
         workers = _cpu_worker_ceiling() or _cpu_auto_workers()  # 0 == auto on CPU-only hosts
@@ -1535,8 +1540,13 @@ class _ThreadModelSlot:
 _thread_slots: dict[int, _ThreadModelSlot] = {}
 
 # --- shared model cache (one parakeet recognizer per device) ---------------
-# sherpa-onnx OfflineRecognizer is thread-safe: concurrent create_stream()
-# + decode_stream() from different threads works without per-thread copies.
+# CAUTION (measured 2026-10-04): decode_stream() on this sherpa/onnxruntime
+# build HARD-DEADLOCKS on a shared recognizer — reproducibly with the worker's
+# own 3-lane plan (all lanes wedged inside decode_stream on the first chunk of
+# the first VOD) and intermittently with a single lane. The wedged call holds
+# the GIL, so nothing inside this process can time it out; see
+# test_asr_device_reporting.py and the P0 notes in the module history. Treat
+# this cache as shared-but-fragile, not as a free multi-lane win.
 # VAD stays per-thread (stateful LSTM state).
 _shared_models: dict[str, Any] = {}       # "cuda" / "cpu" -> OfflineRecognizer
 _shared_models_lock = threading.Lock()
@@ -1658,9 +1668,9 @@ PARAKEET_LANG_CANDIDATES = frozenset({
     "no", "fi", "el", "tr", "hu", "cs", "ro", "bg", "hr", "sk", "sl", "et",
     "lv", "lt",
 })
-# A/B-measured sweet spot: 8 decode threads per lane on an i5-13600K; two
-# concurrent streams on ONE recognizer added only +18% (CPU-bound), so lanes
-# never share a recognizer — each pool thread owns its own.
+# A/B-measured sweet spot: 8 decode threads per recognizer on an i5-13600K.
+# NOTE: lanes DO share one recognizer per device (_shared_models) — this
+# constant is the per-recognizer thread count, not a copy count.
 _PARAAKEET_MAX_THREADS = 8
 
 _parakeet_ok: Optional[bool] = None  # sherpa-onnx import probe (None = unprobed)
@@ -2116,6 +2126,26 @@ class _AsrUnsupportedLanguage(_AsrRoutingError):
 class _AsrLaneUnavailable(_AsrRoutingError):
     """The calling lane has no usable parakeet: sherpa-onnx not importable,
     VODRIP_PARAAKEET=0, no CUDA wheel on a GPU slot, or VRAM too tight."""
+
+
+def _ran_device() -> tuple[str, str]:
+    """(device, compute_type) the calling lane ACTUALLY ran on.
+
+    The pool pin is a PLAN SLOT, not a record of what happened. A cuda-pinned
+    slot whose CUDA session fails to build (e.g. the bundled onnxruntime CUDA EP
+    has no kernels for this GPU's compute capability — error 1114) degrades to
+    CPU inside _load_parakeet and flips _parakeet_cuda_ok for the process, yet
+    the pin still reads ("cuda", ...). Reporting the pin there would tell the
+    user a GPU run happened when the whole VOD was decoded on the CPU, so map a
+    cuda slot onto the effective provider (_parakeet_provider honours the
+    flipped flag) and keep the pin for genuine CPU slots / off-pool callers.
+    """
+    pin = _thread_pin()
+    if pin is None:
+        return _effective_device()
+    if pin[0] == "cuda" and _parakeet_provider() != "cuda":
+        return ("cpu", pin[1])
+    return pin
 
 
 def _slot_engine(device: str) -> str:
@@ -4413,8 +4443,8 @@ def _transcribe_audio_source(
     if speech_sec < 3.0:
         wall = time.monotonic() - t0
         # The thread that ran this job may be CPU-pinned in the hybrid pool —
-        # report the actual device, not the global default.
-        _ran = _thread_pin() or _effective_device()
+        # report the device it actually ran on, not the plan slot.
+        _ran = _ran_device()
         stats = {
             "platform": platform,
             "video_id": video_id,
@@ -4624,7 +4654,7 @@ def _transcribe_audio_source(
         pass
 
     if twin_won:
-        _ran = _thread_pin() or _effective_device()
+        _ran = _ran_device()
         return {
             "platform": platform,
             "video_id": video_id,
@@ -4641,8 +4671,9 @@ def _transcribe_audio_source(
 
     wall = time.monotonic() - t0
     # Report the device that actually ran the job (hybrid pool threads may be
-    # CPU-pinned); falls back to the global default off-pool.
-    _ran = _thread_pin() or _effective_device()
+    # CPU-pinned, and a cuda slot whose session failed to build decodes on the
+    # CPU); falls back to the global default off-pool.
+    _ran = _ran_device()
     stats = {
         "platform": platform,
         "video_id": video_id,
