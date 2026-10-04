@@ -66,6 +66,20 @@ _install_lock = threading.Lock()
 _archive_worker_lock = threading.Lock()
 _archive_worker_process: Optional[subprocess.Popen] = None
 
+# runtime_dir() resolves through whisper_cache_dir(), which reads the settings
+# manager AND ranks every fixed drive — measured ~290ms on this box.
+# /api/asr/runtime is in the supervisor probe rotation, so that cost lands
+# squarely on the liveness path (a single probe measured 289ms against a
+# 100ms budget, while every other probe answered in 2-3ms). The resolved path
+# only changes when the user repoints the models folder or the disk layout
+# changes, so a short TTL keeps it off the hot path without making a Settings
+# change take minutes to apply. The env override is deliberately NOT cached:
+# tests and portable installs pin it per process and must see it immediately.
+_RUNTIME_DIR_TTL_S = 5.0
+_runtime_dir_lock = threading.Lock()
+_runtime_dir_cache: Optional[Path] = None
+_runtime_dir_cached_at = 0.0
+
 def runtime_dir() -> Path:
     """Root for the ASR runtime payload (support resolver, not API contract).
 
@@ -73,13 +87,23 @@ def runtime_dir() -> Path:
     (``whisper_cache_dir()/asr-runtime``). Pure resolver — never creates the dir
     and never touches the network.
     """
+    global _runtime_dir_cache, _runtime_dir_cached_at
     override = os.environ.get(RUNTIME_DIR_ENV, "").strip()
     if override:
         return Path(override)
+    now = time.monotonic()
+    with _runtime_dir_lock:
+        cached = _runtime_dir_cache
+        if cached is not None and (now - _runtime_dir_cached_at) < _RUNTIME_DIR_TTL_S:
+            return cached
     # Lazy: keeps this module import-light; whisper_cache_dir probes drives.
     from services.disk_hygiene import whisper_cache_dir
 
-    return whisper_cache_dir() / _SUBDIR
+    resolved = whisper_cache_dir() / _SUBDIR
+    with _runtime_dir_lock:
+        _runtime_dir_cache = resolved
+        _runtime_dir_cached_at = time.monotonic()
+    return resolved
 
 
 def runtime_executable() -> Path:

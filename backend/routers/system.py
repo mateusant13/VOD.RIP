@@ -10,7 +10,13 @@ import platform
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 
-from deps import LIVENESS_EXECUTOR, OS_EXECUTOR, settings_mgr
+from deps import (
+    LIVENESS_EXECUTOR,
+    HEALTH_EXECUTOR,
+    INFO_EXECUTOR,
+    OS_EXECUTOR,
+    settings_mgr,
+)
 from utils import media_type_for_path, validate_local_media_path
 
 logger = logging.getLogger(__name__)
@@ -61,13 +67,26 @@ async def exit_app():
 @router.get("/api/info")
 async def server_info():
     # include features so /api/info reflects opt-in state
-    try:
+    def _features() -> dict:
+        # Both imports are inside the worker, not the handler body: a lazy
+        # `import` in an async def is synchronous work ON THE EVENT LOOP,
+        # and this route is in the supervisor probe rotation, so the first
+        # probe paid the module loads inline. Same rule as
+        # asr_runtime_status below.
         from services.feature_registry import get_enabled_map
+
         # get_enabled_map() is memoized; cold cache reads settings_mgr.get()
         # (in-memory snapshot under the manager lock, may probe ffmpeg) —
-        # liveness pool (never the shared default to_thread pool).
+        # INFO_EXECUTOR, its own named pool. It must NOT share LIVENESS:
+        # the ffmpeg probe is a process spawn, not a sub-second read, and
+        # LIVENESS is the pool the lock-free /api/asr/runtime depends on
+        # (see HEALTH_EXECUTOR above for the same head-of-line reasoning).
+        # The liveness test already documents this route as INFO_EXEC.
+        return get_enabled_map()
+
+    try:
         _feats = await asyncio.get_running_loop().run_in_executor(
-            LIVENESS_EXECUTOR, get_enabled_map,
+            INFO_EXECUTOR, _features,
         )
     except Exception:
         _feats = {}
@@ -89,12 +108,24 @@ async def server_info():
 @router.get("/api/asr/runtime")
 async def asr_runtime_status() -> dict:
     """Report whether the optional speech runtime is installed."""
-    from services.asr_runtime import runtime_status
 
-    # Reads the install marker file + stats the exe — blocking FS IO;
-    # liveness pool (this endpoint is in the supervisor probe rotation).
+    def _status() -> dict:
+        # The import goes HERE, not in the handler body. A lazy `import`
+        # inside an async def is synchronous work ON THE EVENT LOOP: the
+        # first probe of this route paid the whole module load inline and
+        # was measured at 255ms while every other probe answered in 3-4ms.
+        # This endpoint is in the supervisor probe rotation, so its first
+        # call is exactly the one a watchdog sees at boot. Keeping the
+        # import lazy (it is deliberately not module-level) but moving it
+        # onto the worker thread preserves the light-import design.
+        from services.asr_runtime import runtime_status
+
+        # Reads the install marker file + stats the exe — blocking FS IO;
+        # liveness pool (this endpoint is in the supervisor probe rotation).
+        return runtime_status()
+
     return await asyncio.get_running_loop().run_in_executor(
-        LIVENESS_EXECUTOR, runtime_status,
+        LIVENESS_EXECUTOR, _status,
     )
 
 
@@ -148,6 +179,11 @@ async def health():
         # probe runs on one worker thread so a WAL-busy first-touch (the
         # shared connection serialises behind the write lock) can never
         # stall the event loop — /api/health is what supervisors watch.
+        # It runs on its OWN pool (HEALTH_EXECUTOR), not LIVENESS: these
+        # reads are the one liveness path that can block for the full
+        # busy_timeout, and sharing a 4-worker pool with the lock-free
+        # endpoints let a stalled probe queue /api/asr/runtime behind it.
+        # Off-loop protects the loop; a separate pool protects the peers.
         try:
             pending = archive_db.has_pending_jobs()
         except Exception:
@@ -185,7 +221,7 @@ async def health():
 
     pending, worker, background, activity_age, subs_pot = (
         await asyncio.get_running_loop().run_in_executor(
-            LIVENESS_EXECUTOR, _probe,
+            HEALTH_EXECUTOR, _probe,
         )
     )
     return {

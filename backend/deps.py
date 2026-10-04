@@ -71,6 +71,22 @@ OS_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="os")
 # does), so no ContextVar-dependent call belongs on these endpoints.
 LIVENESS_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="liveness")
 
+# /api/health alone. It is the ONE liveness endpoint that can block for
+# busy_timeout: its probe reads archive_db, and a settings save holding the
+# write lock pins the shared connection for up to 10s (archive_db opens with
+# timeout=10.0 / PRAGMA busy_timeout=10000). Running it off-loop stopped it
+# freezing the EVENT LOOP, but it still occupied a LIVENESS worker for the
+# whole spin — and with 4 workers, saturated health probes queue the
+# lock-free endpoints (/api/asr/runtime is a pure filesystem stat and needs
+# no lock at all) behind the very stall they exist to report. That is
+# head-of-line blocking: the measured symptom was /api/asr/runtime answering
+# in 1156ms against a 100ms liveness budget while it did no blocking work.
+# This is the mirror of the rule already applied to the ASR install ("never
+# LIVENESS: 4 install calls would saturate the 4 liveness workers and queue
+# /api/health behind app work"). Same reasoning, opposite endpoint.
+# Module-global, never shut down at request/lifespan scope, like every pool.
+HEALTH_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="health")
+
 # ── Warm-work global cap ────────────────────────────────────────────────
 # Boot warm storm spans WARM(3)+GESTURE(2)+FULL(1)+ANON(2)+sync-wave(2) and
 # every warm job runs a yt-dlp extract and/or an ffmpeg mux — a 50+ URL
