@@ -1556,9 +1556,23 @@ def _deep_enumerate(handle: str) -> tuple[list[dict], bool, int]:
     playlistend), not the show-more `has_more`: this sweep asks at the
     1000-row ceiling, where has_more is force-False by design (a deeper ask
     could never serve new rows) and would otherwise hide truncation.
+
+    Governor: every window is admitted against the learned YouTube budget by
+    the chokepoint itself (list_channel_videos_sync, source="auto"), which is
+    where the single token per window is drawn. A refused window stops the
+    WHOLE enumeration rather than the current tab: the pool is platform-wide,
+    so continuing would pay the bounded wait once per remaining tab/window and
+    stall the scheduler that drives this pass. A stop is reported as truncated
+    — the next pass re-crawls from a fresh cursor.
     """
+    from services import youtube_service
     from services.youtube_service import list_channel_videos_sync
 
+    # The governor's refusal class, borrowed from the chokepoint that owns the
+    # gate. Resolved here (not imported directly) so this file keeps working
+    # if the governor module is unavailable.
+    refusal = youtube_service._governor_refusal()
+    governor_stop = False
     merged: dict[str, dict] = {}
     truncated = False
     for tab in ("videos", "shorts", "streams"):
@@ -1573,7 +1587,26 @@ def _deep_enumerate(handle: str) -> tuple[list[dict], bool, int]:
                     enrich=False,
                     return_has_more=True,
                     return_crawl_saturation=True,
+                    # This is the sweep's own background crawl, so it opts into
+                    # the AUTO pool: it may pace a bounded wait rather than
+                    # fail fast. A USER caller (the channel panel) does not.
+                    source="auto",
                 )
+            except refusal as exc:
+                # Budget exhausted — stop the WHOLE enumeration, not just this
+                # tab. The pool is platform-wide, so the remaining tabs and
+                # windows would each pay the bounded wait again: three tabs x
+                # N windows is exactly the 20x-stall a batch loop must not do.
+                # Coverage is honestly partial and the next pass re-crawls.
+                #
+                # No acquire() here on purpose: the ONE token for this window
+                # was already drawn inside list_channel_videos_sync. This is
+                # loop control only — gating the operation again from the
+                # caller would double-charge the same logical walk.
+                logger.info("deep enumerate stopped by the rate governor: %s", exc)
+                truncated = True
+                governor_stop = True
+                break
             except Exception as exc:
                 logger.debug("deep enumerate tab %s window %s failed: %s", tab, offset, exc)
                 # A window that errored yielded NOTHING — the result set is
@@ -1598,6 +1631,8 @@ def _deep_enumerate(handle: str) -> tuple[list[dict], bool, int]:
             # non-saturated — deeper windows exist beyond the cap we did
             # not crawl. Truncated.
             truncated = True
+        if governor_stop:
+            break
     items = list(merged.values())
 
     def _ts(v: dict) -> float:

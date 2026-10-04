@@ -23,6 +23,81 @@ PlaylistKind = Literal["videos", "shorts", "streams"]
 YOUTUBE_PLAYLIST_CEILING = 1000
 
 
+# --- adaptive rate governor (this module's YouTube egress seam) -------------
+#
+# This module is the APP's YouTube channel walk — the thing that decides which
+# videos the caption sweep even looks at (routers.archive._deep_enumerate calls
+# list_channel_videos_sync; the scheduler drives that every pass). It had zero
+# rate_budget references: three guarded_youtube_dl_channel egresses going
+# straight at YouTube, unlearned and ungoverned, on the ONE path most likely
+# to hit a platform limit, because a channel walk is exactly what a rate-limit
+# detector recognises as scraping.
+#
+# The accounting is NOT a second scheme. This delegates to the yt-dlp seam
+# (archive_ytdlp._governor_admit_ytdlp) that already governs the other YouTube
+# egress, so both YouTube pools draw on the same learned ceiling with the same
+# AUTO/USER split, the same MAX_AUTO_WAIT_S bound, and the same
+# YtGovernorExhausted refusal. One implementation, one bound, one exception.
+#
+# ENTRY POINT, NOT PER INNER REQUEST — for the reason documented in
+# archive_ytdlp.py:47-67: extract_info fans out internally and is not
+# observable from here, so the token is drawn ONCE per egress operation, before
+# the `with guarded_youtube_dl_channel(...)` block. Pacing inside a request
+# would be wrong: a profile race holds a wall of 2.5s, and a sleep inside it
+# blows that race (see youtube_innertube.py:47-60).
+#
+# NOT archive_ytdlp.list_channel_videos. That is a SEPARATE, independently
+# implemented channel walk (its own opts, its own extract) whose only caller in
+# this repo is the operator script scripts/archive-ingest-yt.py; this module
+# never imports it. The two are disjoint call graphs, so gating both is two
+# tokens for two real egresses, not a double charge of one.
+#
+# The wait bound is deliberately NOT redefined here: it is
+# archive_ytdlp._YTDLP_GOVERNOR_MAX_WAIT_S, read by the seam we delegate to.
+# Two constants would be two numbers to keep in step.
+
+
+def _governor_admit_channel_walk(
+    source: str = "user", kind: str = "yt_channel_list", *, interactive: bool = False,
+) -> None:
+    """Admit ONE channel-walk egress against the learned YouTube budget.
+
+    Thin, deliberate delegation to the yt-dlp seam: it owns the bounded
+    three-way wait (min(_YTDLP_GOVERNOR_MAX_WAIT_S, MAX_AUTO_WAIT_S,
+    max(0.0, decision.wait_s)), so 1e12 / inf / nan / negative all collapse to
+    one bounded sleep) and it owns the YtGovernorExhausted refusal. Duplicating
+    that arithmetic here is how two accounting schemes drift apart.
+
+    Raises YtGovernorExhausted when the budget is spent. A USER/interactive
+    caller never sleeps — it fails fast, which matters more than usual here:
+    every app-facing call site is already wrapped in a 25-30s HTTP timeout
+    (deps.YOUTUBE_CHANNEL_FETCH_TIMEOUT_SEC), so a 30s pacing sleep would blow
+    the timeout and surface as a useless "timed out" instead of an honest
+    "rate limit, try again".
+    """
+    try:
+        from services.archive_ytdlp import _governor_admit_ytdlp
+    except Exception:  # noqa: BLE001 — governor unavailable is never a failure
+        logger.debug("yt-dlp governor seam unavailable — channel walk ungated", exc_info=True)
+        return
+    _governor_admit_ytdlp(source, kind, interactive=interactive)
+
+
+class _NeverRefused(Exception):
+    """Stand-in when the governor module is absent: never raised, so the
+    refusal catch sites below stay valid without an import guard at each one."""
+
+
+def _governor_refusal() -> type[BaseException]:
+    """The governor's refusal class — YtGovernorExhausted, or a type nothing
+    raises when the governor module is unavailable."""
+    try:
+        from services.archive_ytdlp import YtGovernorExhausted
+        return YtGovernorExhausted
+    except Exception:  # noqa: BLE001 — ungated path, nothing to catch
+        return _NeverRefused
+
+
 def channel_playlist_url(channel_ref: str, kind: PlaylistKind = "videos") -> str:
     """Build channel tab URL from handle, @handle, channel id, or full URL."""
     ref = (channel_ref or "").strip()
@@ -204,6 +279,14 @@ def _make_rss_probe():
     video metadata ("Requested format is not available"), so the probe builds
     its own opts with the default client set (same as archive_ytdlp).
     Results are cached module-wide across listings.
+
+    The probe is USER scope by construction and does not take a source
+    parameter: it only runs for an `enrich=True` /playlist=shorts listing, and
+    the one background enumerator (routers.archive._deep_enumerate — the
+    caption sweep) passes enrich=False, so no background caller ever reaches a
+    probe. Failing fast is also the safe polarity here: the probe is a
+    best-effort freshness add-on bounded to _RSS_SHORT_PROBE_BUDGET, never
+    worth making a user or a scheduler wait behind the pool.
     """
 
     def probe(vid: str) -> Optional[dict[str, Any]]:
@@ -215,6 +298,16 @@ def _make_rss_probe():
             youtube_session_from_settings,
             ytdlp_extractor_args,
         )
+
+        # A full single-video extract is its own egress unit, heavier than the
+        # flat tab walk, so it draws its own token. Placed BEFORE the
+        # best-effort try on purpose, for two reasons the handler below would
+        # otherwise defeat: a governor refusal must ESCAPE so the candidate
+        # loop can stop instead of paying the bounded wait once per remaining
+        # candidate (see _union_rss_shorts), and it must never be CACHED — a
+        # dry pool says "not now", not "this video is unprobeable", and caching
+        # it would poison the module-wide cache for the process lifetime.
+        _governor_admit_channel_walk("user", "yt_channel_rss_probe")
 
         meta: Optional[dict[str, Any]] = None
         try:
@@ -272,6 +365,13 @@ def _union_rss_shorts(
     shorts (dedup by video id; streams/VODs and member-only entries excluded).
     The caller sorts and applies :limit afterwards, so union rows participate
     in the normal date ordering.
+
+    A governor refusal from the probe STOPS the union instead of being retried
+    per candidate: the budget is a platform-wide pool, so every remaining
+    candidate would refuse too, and paying the bounded wait once per candidate
+    turns a 4-deep probe budget into a 4x stall. Freshness is best-effort by
+    construction — the tab rows we already have are kept, and the next listing
+    re-probes.
     """
     if not channel_id or not rows:
         return rows
@@ -281,6 +381,7 @@ def _union_rss_shorts(
     have = {r.get("id") for r in rows if r.get("id")}
     merged = list(rows)
     probed = 0
+    refusal = _governor_refusal()
     for r in rss:
         vid = r.get("id")
         if not vid or vid in have:
@@ -288,7 +389,11 @@ def _union_rss_shorts(
         if probed >= budget:
             break
         probed += 1
-        meta = probe(vid) if probe else None
+        try:
+            meta = probe(vid) if probe else None
+        except refusal as exc:
+            logger.info("rss-short union stopped by the rate governor: %s", exc)
+            break
         if not meta or meta.get("content_kind") != "short":
             continue
         if meta.get("availability") == "subscriber_only":
@@ -469,6 +574,7 @@ def list_channel_videos_sync(
     enrich: bool = True,
     return_has_more: bool = False,
     return_crawl_saturation: bool = False,
+    source: str = "user",
 ) -> list[dict[str, Any]]:
     """Channel tab listing (flat extract, sorted newest-first, <=limit rows).
 
@@ -488,6 +594,15 @@ def list_channel_videos_sync(
     playlistend bound at ANY requested depth, or when the tab extract failed
     outright (coverage then unknown). Consumers that must not claim complete
     coverage (deep transcript sweep) need this, not has_more.
+
+    source: AUTO/USER scope for the rate governor (see the seam above). It
+    DEFAULTS TO "user" on purpose, so the fail-safe polarity is right without
+    every caller opting in: the app-facing HTTP endpoints (routers/channels.py,
+    instant_preview) are interactive and already sit behind a 25-30s timeout,
+    so they must fail fast on a dry pool rather than pace behind background
+    work. Background work that CAN wait opts in explicitly with
+    source="auto" — the caption sweep (routers.archive._deep_enumerate) and the
+    scheduler pass that drives it. Raises YtGovernorExhausted when refused.
     """
     import yt_dlp
 
@@ -547,6 +662,18 @@ def list_channel_videos_sync(
     pl = playlist if playlist in ("videos", "shorts", "streams") else "videos"
     pl_url = channel_playlist_url(channel_ref, pl)
     fetch_failed = False
+    # Governor entry point: one token per channel-tab walk. extract_flat makes
+    # this ONE listing request, not one per entry, and the inner pageToken
+    # fan-out is not observable from here — so the token is drawn here, once,
+    # at the operation's entry point.
+    #
+    # OUTSIDE the try on purpose. The handler below is a best-effort
+    # "the tab failed, carry on" that turns into an empty listing with
+    # fetch_failed=True; a governor refusal is not a tab failure, and
+    # swallowing it would return a plausible-looking empty channel, cache it,
+    # and let the caption sweep conclude the channel has no videos. It must
+    # propagate to the caller, which reports it as a rate limit.
+    _governor_admit_channel_walk(source, "yt_channel_list")
     try:
         with guarded_youtube_dl_channel(base_opts) as ydl:
             info = ydl.extract_info(pl_url, download=False)
@@ -708,6 +835,12 @@ def search_channel_videos_sync(handle: str, query: str, limit: int = 20) -> list
     apply_ytdlp_cookie_opts(base_opts, session, auto_auth=auto_auth)
     url = channel_search_url(handle, query)
     out: list[dict] = []
+    # Governor entry point: one token per channel-scoped search walk. The
+    # search UI is strictly on-demand (routers.archive remote-search fallback,
+    # behind a 25s timeout), so this is USER scope and never paces: a refusal
+    # propagates so the router can say "rate limited" instead of handing the
+    # user a silent empty hit list from the `except` below.
+    _governor_admit_channel_walk("user", "yt_channel_search")
     try:
         with guarded_youtube_dl_channel(base_opts) as ydl:
             info = ydl.extract_info(url, download=False)
