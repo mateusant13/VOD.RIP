@@ -3,7 +3,7 @@
  *
  * Run: npx playwright test --config=e2e/playwright.config.ts e2e/tests/frame-mode.spec.ts
  */
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Locator, type Page } from '@playwright/test';
 
 // The playwright config sets UI_URL to the webServer's port; fall back to the
 // conventional dev port so a lone-file run still works.
@@ -24,6 +24,22 @@ async function mockSettingsRoute(page: Page) {
       }),
     });
   });
+}
+
+/**
+ * Idle guide (no drag in flight): VISIBLE but faint, and click-through.
+ *
+ * This used to assert `opacity: 0`, which is the behaviour the bug report
+ * was about — a frame grid you cannot see gives the user nothing to aim at,
+ * so dragging "never works". The guide now shows at low opacity whenever
+ * frame mode is on and brightens to 1 during a drag.
+ */
+async function expectIdleGuide(overlay: Locator) {
+  const opacity = await overlay.evaluate((el) => parseFloat(el.style.opacity));
+  expect(opacity).toBeGreaterThan(0);
+  expect(opacity).toBeLessThan(1);
+  // Click-through when idle so the base channel cards stay grabbable.
+  await expect(overlay).toHaveCSS('pointer-events', 'none');
 }
 
 test.describe('Frame mode', () => {
@@ -55,9 +71,9 @@ test.describe('Frame mode', () => {
 
     const overlay = page.locator('[data-frame-overlay]');
     await expect(overlay).toBeVisible();
-    // Tiling guide is hidden while idle and reveals only mid-drag.
-    await expect(overlay).toHaveCSS('opacity', '0');
-    await expect(overlay).toHaveCSS('pointer-events', 'none');
+    // The guide is faintly visible while idle, so there is a target to aim
+    // at before any drag starts, and it stays click-through.
+    await expectIdleGuide(overlay);
     await expect(page.locator('[data-frame-cell="0"]')).toBeVisible();
     await expect(page.locator('[data-frame-cell="5"]')).toBeVisible();
 
@@ -72,16 +88,14 @@ test.describe('Frame mode', () => {
     await page.goto(UI_URL);
     const overlay = page.locator('[data-frame-overlay]');
     await expect(overlay).toBeVisible({ timeout: 15_000 });
-    // Tiling guide is hidden while idle so the base channel grid is unblocked.
-    await expect(overlay).toHaveCSS('opacity', '0');
-    // Click-through when idle so the base channel cards stay grabbable.
-    await expect(overlay).toHaveCSS('pointer-events', 'none');
+    // Faint but present while idle, and click-through.
+    await expectIdleGuide(overlay);
 
     await page.evaluate(() => {
       document.dispatchEvent(new DragEvent('dragstart', { bubbles: true, cancelable: true }));
     });
 
-    // Guide appears + becomes drop-capable mid-drag.
+    // Guide brightens + becomes drop-capable mid-drag.
     await expect(overlay).toHaveCSS('opacity', '1');
     await expect(overlay).toHaveCSS('pointer-events', 'auto');
 
@@ -89,8 +103,8 @@ test.describe('Frame mode', () => {
       document.dispatchEvent(new DragEvent('dragend', { bubbles: true, cancelable: true }));
     });
 
-    await expect(overlay).toHaveCSS('opacity', '0');
-    await expect(overlay).toHaveCSS('pointer-events', 'none');
+    // Back to the idle guide — still visible, still click-through.
+    await expectIdleGuide(overlay);
   });
   test('restores frame mode from localStorage on reload', async ({ page }) => {
     await page.addInitScript(() => {

@@ -93,6 +93,44 @@ async function mockPreviewSession(page: Page) {
   });
 }
 
+/**
+ * Live player for the seeded channel: the channel reports live and the live
+ * session POST is stubbed, so the popup mounts without real Kick media.
+ */
+async function mockLiveChannel(page: Page) {
+  await page.route('**/api/channels/ch_e2e_frame/live', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        channel_id: 'ch_e2e_frame',
+        live: [
+          {
+            platform: 'kick',
+            is_live: true,
+            title: 'E2E live snap',
+            url: 'https://kick.com/e2eframe',
+            headers: {},
+            type: 'hls',
+          },
+        ],
+      }),
+    }),
+  );
+  await page.route('**/api/preview/live', (route) => {
+    if (route.request().method() !== 'POST') return route.fallback();
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        session_id: 'e2e-live-snap',
+        master_url: '/api/preview/hls/e2e-live-snap/master.m3u8',
+        kind: 'hls',
+      }),
+    });
+  });
+}
+
 test.describe('Frame mode popup snap', () => {
   test.beforeEach(async ({ page }) => {
     await mockSettingsWithChannel(page);
@@ -103,7 +141,6 @@ test.describe('Frame mode popup snap', () => {
       localStorage.setItem('vodrip.firstTime.cookieInstall', '1');
     });
   });
-
   /** Find a grab point on the popup body that the drag guard accepts. */
   async function findGrabPoint(page: Page) {
     const grab = await page.evaluate(() => {
@@ -255,5 +292,133 @@ test.describe('Frame mode popup snap', () => {
     expect(after.y).toBeGreaterThanOrEqual(c.y - 2);
     expect(after.x + after.width).toBeLessThanOrEqual(c.x + c.width + 2);
     expect(after.y + after.height).toBeLessThanOrEqual(c.y + c.height + 2);
+  });
+
+  // --- Live player windows -------------------------------------------------
+  // LivePlayerPopup had no frameMode/frameSnapRect props, never armed the grid
+  // and dragged through a private mousedown + window-listener path, so a live
+  // preview could NEVER be snapped — snap was unreachable code for it. It is
+  // now a frame window like the explore popup: same attribute arm, same shared
+  // pin, real mouse drag.
+  test('dragging a live player body snaps it into a frame cell', async ({ page }) => {
+    await mockLiveChannel(page);
+    await page.goto(UI_URL);
+    await expect(page.locator('.vod-app-shell')).toBeVisible({ timeout: 60_000 });
+
+    await page.evaluate(() => {
+      const b = [...document.querySelectorAll('button')].find((x) =>
+        /^(channels|canais)$/i.test((x.textContent || '').trim()),
+      );
+      b?.click();
+    });
+    await expect(page.locator('[data-channel-row]').first()).toBeVisible({ timeout: 10_000 });
+
+    const badge = page.locator('[data-channel-row]').getByRole('button', {
+      name: /Live|Ao vivo|En vivo/i,
+    }).first();
+    await expect(badge).toBeVisible({ timeout: 20_000 });
+    await badge.click();
+
+    const popup = page.locator('[data-live-popup]');
+    await expect(popup).toBeVisible({ timeout: 15_000 });
+    // The frame contract is a single attribute — nothing else has to opt in.
+    await expect(popup).toHaveAttribute('data-frame-window', /^live:/);
+
+    const cell = page.locator('[data-frame-cell="0"]');
+    const cellBox = (await cell.boundingBox())!;
+    expect(cellBox).toBeTruthy();
+
+    // Grab the popup BODY (not the header, not a control) and drag it in.
+    const grab = await page.evaluate(() => {
+      const p = document.querySelector<HTMLElement>('[data-live-popup]');
+      if (!p) return null;
+      const r = p.getBoundingClientRect();
+      for (const frac of [0.5, 0.4, 0.6, 0.3, 0.7]) {
+        const x = r.x + r.width / 2;
+        const y = r.y + r.height * frac;
+        const el = document.elementFromPoint(x, y);
+        if (el && !el.closest('button, input, select, textarea, a, [role="slider"]')) {
+          return { x, y };
+        }
+      }
+      return null;
+    });
+    expect(grab).not.toBeNull();
+
+    await page.mouse.move(grab!.x, grab!.y);
+    await page.mouse.down();
+    const overlay = page.locator('[data-frame-overlay]');
+    await expect(overlay).toHaveCSS('pointer-events', 'auto');
+    await page.mouse.move(cellBox.x + cellBox.width / 2, cellBox.y + cellBox.height / 2, { steps: 6 });
+    await page.mouse.up();
+
+    // Pinned inside cell 0 — same containment/centering contract as the
+    // explore popup above.
+    await expect.poll(async () => {
+      const a = (await popup.boundingBox())!;
+      return Math.max(
+        Math.abs(a.x + a.width / 2 - (cellBox.x + cellBox.width / 2)),
+        Math.abs(a.y + a.height / 2 - (cellBox.y + cellBox.height / 2)),
+      );
+    }, { timeout: 5_000 }).toBeLessThan(12);
+
+    const pinned = (await popup.boundingBox())!;
+    expect(pinned.x).toBeGreaterThanOrEqual(cellBox.x - 2);
+    expect(pinned.y).toBeGreaterThanOrEqual(cellBox.y - 2);
+    expect(pinned.x + pinned.width).toBeLessThanOrEqual(cellBox.x + cellBox.width + 2);
+    expect(pinned.y + pinned.height).toBeLessThanOrEqual(cellBox.y + cellBox.height + 2);
+  });
+
+  test('a snapped live player does not jump on unrelated re-renders', async ({ page }) => {
+    await mockLiveChannel(page);
+    await page.goto(UI_URL);
+    await expect(page.locator('.vod-app-shell')).toBeVisible({ timeout: 60_000 });
+
+    await page.evaluate(() => {
+      const b = [...document.querySelectorAll('button')].find((x) =>
+        /^(channels|canais)$/i.test((x.textContent || '').trim()),
+      );
+      b?.click();
+    });
+    await expect(page.locator('[data-channel-row]').first()).toBeVisible({ timeout: 10_000 });
+    const badge = page.locator('[data-channel-row]').getByRole('button', {
+      name: /Live|Ao vivo|En vivo/i,
+    }).first();
+    await expect(badge).toBeVisible({ timeout: 20_000 });
+    await badge.click();
+
+    const popup = page.locator('[data-live-popup]');
+    await expect(popup).toBeVisible({ timeout: 15_000 });
+    const cellBox = (await page.locator('[data-frame-cell="0"]').boundingBox())!;
+
+    const grab = await page.evaluate(() => {
+      const p = document.querySelector<HTMLElement>('[data-live-popup]');
+      if (!p) return null;
+      const r = p.getBoundingClientRect();
+      const x = r.x + r.width / 2;
+      const y = r.y + r.height / 2;
+      const el = document.elementFromPoint(x, y);
+      return el && !el.closest('button, input, select, textarea, a, [role="slider"]') ? { x, y } : null;
+    });
+    expect(grab).not.toBeNull();
+    await page.mouse.move(grab!.x, grab!.y);
+    await page.mouse.down();
+    await page.mouse.move(cellBox.x + cellBox.width / 2, cellBox.y + cellBox.height / 2, { steps: 6 });
+    await page.mouse.up();
+
+    // The regression: the snap rect used to be a fresh object literal on every
+    // App render and a dep of the pin effect, so timeupdate / chat / quality
+    // churn re-pinned the window. It must stay put across a burst of renders.
+    await expect.poll(async () => {
+      const a = (await popup.boundingBox())!;
+      return Math.abs(a.x + a.width / 2 - (cellBox.x + cellBox.width / 2));
+    }, { timeout: 5_000 }).toBeLessThan(12);
+
+    const before = (await popup.boundingBox())!;
+    await page.waitForTimeout(2_500);
+    const after = (await popup.boundingBox())!;
+    expect(Math.abs(after.x - before.x)).toBeLessThanOrEqual(2);
+    expect(Math.abs(after.y - before.y)).toBeLessThanOrEqual(2);
+    expect(Math.abs(after.width - before.width)).toBeLessThanOrEqual(2);
   });
 });
