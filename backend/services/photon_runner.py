@@ -21,10 +21,24 @@ Protocol (one job per process — see photon_asr.py for the caller):
     argv[1]  path to a JSON request file:
              {"model": str, "sample_rate": int, "timestamps": str,
               "pcm_path": str, "pcm_dtype": "float32",
+              "weights_dir": str,
               "clips": [{"start": float, "end": float}, ...]}
              clip start/end are seconds into the single PCM file; the runner
              slices it and hands each clip to the model on its own, so
              clip-local timestamps are what comes back.
+
+             weights_dir is a LOCAL directory holding the checkpoint, and it
+             is the whole of the offline contract. Passed as kestrel's
+             model_path, which is what stops the engine from resolving the
+             model over the network: with model_path unset, RuntimeConfig
+             resolves the checkpoint through the Hub, and a 170 MB fetch
+             inside the caller's 120 s wall clock would be indistinguishable
+             from a Photon hang. The caller always sets the field, so a
+             missing or truncated checkpoint is reported here by name -
+             BEFORE the multi-gigabyte torch import, so the answer is a
+             one-line envelope rather than a slow opaque failure. A request
+             with no weights_dir at all is a hand-built one (the tests) and
+             skips the check, leaving the import error as the answer.
     stdout   exactly one JSON line:
              {"ok": true,  "clips": [{"language": str|None,
                                       "segments": [{"text", "start", "end",
@@ -39,11 +53,53 @@ no VOD.RIP dependencies. Keep it that way.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import traceback
+from pathlib import Path
+from typing import Optional
 
 # A response line larger than this is a runaway transcript, not a result.
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+
+# The prefix the caller matches on to raise its own distinct error. Kept in
+# sync with services/photon_asr.py:WEIGHTS_MISSING_MARKER.
+WEIGHTS_MISSING_MARKER = "photon weights missing"
+
+# What kestrel's loader reads out of a checkpoint directory before it touches
+# the device. The caller decides whether ternary.json belongs (it knows the
+# repo's manifest), so only the common three are asserted here.
+_REQUIRED_WEIGHTS = ("config.json", "tokenizer.json", "model.safetensors")
+# A checkpoint file is never this small; 0 bytes is an interrupted transfer
+# that would otherwise fail deep inside safetensors as if the engine were
+# broken. os.stat, not lstat: a cache snapshot entry is normally a symlink.
+_MIN_WEIGHT_BYTES = 1024
+
+
+def _weights_problem(weights_dir: str) -> Optional[str]:
+    """None when the directory can be loaded, else why it cannot.
+
+    Cheap on purpose — a few stat calls, no hashing, no imports — because it
+    runs before the heavy ones and its whole job is to answer in
+    milliseconds.
+    """
+    if not weights_dir:
+        return "the request carried no weights directory"
+    root = Path(weights_dir)
+    if not root.is_dir():
+        return f"{root} is not a directory"
+    bad = []
+    for name in _REQUIRED_WEIGHTS:
+        try:
+            size = os.stat(root / name).st_size
+        except OSError:
+            bad.append(f"{name} (absent)")
+            continue
+        if size < _MIN_WEIGHT_BYTES:
+            bad.append(f"{name} ({size} bytes)")
+    if bad:
+        return f"{root} - " + ", ".join(bad)
+    return None
 
 
 def _fail(message: str) -> "int":
@@ -115,6 +171,20 @@ def main(argv: list[str]) -> int:
     if not pcm_path:
         return _fail("photon_runner: request carries no pcm_path")
 
+    # The weights gate, BEFORE the imports below. torch + kestrel are
+    # gigabytes and seconds; a missing checkpoint is a setup fact, and the
+    # only way to keep "not installed" from being reported as "hung" is to
+    # answer it here, cheaply and by name. Gated on the field being present
+    # so a hand-built request (the tests) still gets the import error.
+    weights_dir = str(req.get("weights_dir") or "").strip()
+    if "weights_dir" in req:
+        problem = _weights_problem(weights_dir)
+        if problem:
+            return _fail(
+                f"{WEIGHTS_MISSING_MARKER}: {problem}. This is a setup problem, "
+                f"not a hang - sherpa-onnx is unaffected."
+            )
+
     # Imported here, not at module scope: a missing/broken Photon install must
     # fail as a clean error envelope on stdout, never as an import traceback
     # that the caller has to guess at.
@@ -131,8 +201,18 @@ def main(argv: list[str]) -> int:
     if pcm.ndim != 1 or pcm.size == 0:
         return _fail("pcm file is empty or not mono")
 
+    # model_path (not the model string) is what keeps this offline: kestrel's
+    # RuntimeConfig resolves the checkpoint over the network whenever
+    # model_path is unset, and the parakeet runtime then loads
+    # cfg.model_path or the repo id. A local directory short-circuits both,
+    # and the ternary branch is chosen from the files on disk, so a local
+    # copy of the same snapshot loads the identical model.
     try:
-        client = photon(model_name)
+        client = (
+            photon(model_name, model_path=weights_dir)
+            if weights_dir
+            else photon(model_name)
+        )
     except Exception as exc:
         return _fail(f"photon engine creation failed: {exc}")
 
