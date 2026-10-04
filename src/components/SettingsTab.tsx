@@ -39,6 +39,7 @@ type Props = {
 const SETTING_KEYS = [
   'download_folder', 'download_threads', 'max_cache_mb', 'skip_youtube_startup_warm',
   'start_with_windows', 'download_layout', 'download_transcript_sidecar',
+  'download_transcript_sidecar_format',
   'archive_vod_keep_count', 'whisper_model_cache', 'yt_subtitles_first',
   'asr_language',
   'cache_dir', 'data_dir',
@@ -311,12 +312,30 @@ export default function SettingsTab({
           </pre>
         </div>
         <Toggle
-          label={t('Save transcript .txt with downloads')}
-          info={t('When a transcript already exists, write a subtitle-style .txt next to the video. On by default.')}
+          label={t('Save subtitles with downloads')}
+          info={t('Writes a .srt subtitle next to the video — the format video editors import. YouTube fetches its captions at download time; Twitch/Kick reuse the archived transcript (archive the VOD, or the clip’s source VOD, first). On by default.')}
           checked={settings.download_transcript_sidecar !== false}
           onChange={(c) => setSettings({ ...settings, download_transcript_sidecar: c })}
-          ariaLabel="save transcript txt with downloads"
+          ariaLabel="save subtitles with downloads"
         />
+        {settings.download_transcript_sidecar !== false && (
+          <div className="flex flex-col gap-1">
+            <FieldCaption>{t('Subtitle file type')}</FieldCaption>
+            <select
+              className="border-2 border-zinc-800 bg-zinc-950 px-2 py-1 font-mono text-[10px] text-zinc-300"
+              value={settings.download_transcript_sidecar_format || 'srt'}
+              onChange={(e) => setSettings({
+                ...settings,
+                download_transcript_sidecar_format: e.target.value as 'srt' | 'srt+txt' | 'txt',
+              })}
+              aria-label="subtitle file type"
+            >
+              <option value="srt">{t('Subtitles (.srt) — recommended')}</option>
+              <option value="srt+txt">{t('Subtitles (.srt) + plain text (.txt)')}</option>
+              <option value="txt">{t('Plain text (.txt) only')}</option>
+            </select>
+          </div>
+        )}
         <div className="grid grid-cols-2 gap-2">
           <div className="flex flex-col gap-1.5">
             <FieldCaption noWrap>{t('Download Threads')}</FieldCaption>
