@@ -290,17 +290,32 @@ def test_fuzzy_gate_blocks_fold_only_neighbors(scratch):
 
 def test_fuzzy_gate_keeps_true_typos_and_prefix_stretch(scratch):
     """Raw-near variants still expand: 'estranheza'->'estranhesa' (raw 1)
-    and 'caraio'->'cara' (raw 2 + shared 3-char prefix)."""
+    and 'caraio'->'cara' (raw 2 + shared 3-char prefix).
+
+    The segments are REPEATED on purpose. _load_vocab_uncached keeps only the
+    top _VOCAB_MAX_TOKENS terms by frequency (archive_db.py:6049, ORDER BY n
+    DESC LIMIT 25000, with no tiebreaker). These modules share one session
+    scratch DB, so a token seeded once competes with every word the rest of
+    the suite inserted; at full-suite corpus size a count-1 token falls
+    outside the retained vocabulary and _expand_query can never see it — the
+    assertion then fails on a token the product never dropped, only ranked
+    out of a truncated snapshot. Repeating the segments puts these tokens
+    comfortably inside the cut, which is the precondition this test always
+    silently assumed. The assertions themselves are unchanged.
+    """
+    reps = 80
     db.insert_transcript(
         "youtube", "ty1",
-        [{"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0,
-          "text": "aquela estranhesa de sempre, coisa estranha", "words": []}],
+        [{"seg_idx": i, "start_sec": float(i), "end_sec": i + 1.0,
+          "text": "aquela estranhesa de sempre, coisa estranha", "words": []}
+         for i in range(reps)],
         lang="pt",
     )
     db.insert_transcript(
         "youtube", "ty2",
-        [{"seg_idx": 0, "start_sec": 0.0, "end_sec": 1.0,
-          "text": "cara que loucura carai", "words": []}],
+        [{"seg_idx": i, "start_sec": float(i), "end_sec": i + 1.0,
+          "text": "cara que loucura carai", "words": []}
+         for i in range(reps)],
         lang="pt",
     )
     # New corpus words need the rebuilt vocab (see absent-token test above).
