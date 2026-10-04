@@ -81,6 +81,46 @@ const ptBR: Record<string, string> = {
     'Inicia oculto na bandeja ao ligar o PC e mantém transcrição, indexação e captura de chat rodando em segundo plano de forma discreta',
   'Transcription': 'Transcrição',
   'Disk & Storage': 'Disco e armazenamento',
+  // ── Platform Requests (rate governor) ───────────────────────
+  'Platform Requests': 'Requisições às plataformas',
+  'How fast VOD.RIP may talk to YouTube, Twitch and Kick. The ceiling is learned from real rate-limit trips: it drops fast when a platform pushes back and creeps back up after clean minutes.':
+    'Com que velocidade o VOD.RIP pode falar com YouTube, Twitch e Kick. O teto é aprendido com limites de taxa reais: cai rápido quando a plataforma responde e sobe devagar após minutos sem problema.',
+  'Refresh': 'Atualizar',
+  'Reading the governor…': 'Lendo o governador…',
+  'Background work waits at most {sec}s for a free slot, then goes ahead anyway — it is never blocked.':
+    'O trabalho em segundo plano espera no máximo {sec}s por uma vaga e depois segue mesmo assim — ele nunca é bloqueado.',
+  'Could not reach the rate governor ({msg}). No values are shown — an unreachable governor is not a governor reporting zero.':
+    'Não foi possível contatar o governador de requisições ({msg}). Nenhum valor é exibido — um governador inacessível não é um governador reportando zero.',
+  '{rpm} req/min': '{rpm} req/min',
+  'Allowed right now: {rpm} requests per minute.': 'Permitido agora: {rpm} requisições por minuto.',
+  'Learned down from the {rpm} req/min default.': 'Reduzido a partir do padrão de {rpm} req/min.',
+  'Background work (AUTO)': 'Trabalho em segundo plano (AUTO)',
+  'Your actions (USER)': 'Suas ações (USER)',
+  'Learning': 'Aprendizado',
+  'Recent throttles': 'Limitações recentes',
+  'None held back right now.': 'Nada retido no momento.',
+  '{left} of {cap} left': 'restam {left} de {cap}',
+  'May use {pct}% of the ceiling — never more, so a background storm cannot spend your share.':
+    'Pode usar {pct}% do teto — nunca mais, assim uma enxurrada em segundo plano não consegue gastar a sua parte.',
+  'Spent for now — background work retries in about {sec}s.':
+    'Esgotado por enquanto — o trabalho em segundo plano tenta de novo em cerca de {sec}s.',
+  'Spent for now — background work is being held back.':
+    'Esgotado por enquanto — o trabalho em segundo plano está sendo segurado.',
+  'Gets all {rpm} req/min. Background work can never draw from this reserve.':
+    'Recebe todos os {rpm} req/min. O trabalho em segundo plano nunca usa esta reserva.',
+  '{count} limit events recorded · last one {ago} ago.':
+    '{count} eventos de limite registrados · o último há {ago}.',
+  '{count} limit events recorded.': '{count} eventos de limite registrados.',
+  'Lowest rate that ever tripped it: {rpm} req/min.':
+    'Menor taxa que já o derrubou: {rpm} req/min.',
+  'No rate-limit events recorded in this session.':
+    'Nenhum evento de limite de taxa registrado nesta sessão.',
+  'Ceiling learned earlier from saved history (lowest recorded trip {rpm} req/min).':
+    'Teto aprendido antes pelo histórico salvo (menor taxa registrada que o derrubou: {rpm} req/min).',
+  'A clean window has passed — the ceiling will step back up slightly on the next request.':
+    'Passou uma janela sem problemas — o teto sobe um pouco na próxima requisição.',
+  '{count} background requests were held back. This list lives in memory only and clears when the app restarts.':
+    '{count} requisições em segundo plano foram retidas. Esta lista fica só na memória e some quando o app reinicia.',
   'Updates': 'Atualizações',
   'v{version} available': 'v{version} disponível',
   'release': 'lançamento',
@@ -814,6 +854,46 @@ const es: Record<string, string> = {
     'Se inicia oculto en la bandeja al encender el PC y mantiene transcripción, indexación y captura de chat funcionando silenciosamente en segundo plano',
   'Transcription': 'Transcripción',
   'Disk & Storage': 'Disco y almacenamiento',
+  // ── Platform Requests (rate governor) ───────────────────────
+  'Platform Requests': 'Solicitudes a las plataformas',
+  'How fast VOD.RIP may talk to YouTube, Twitch and Kick. The ceiling is learned from real rate-limit trips: it drops fast when a platform pushes back and creeps back up after clean minutes.':
+    'Con qué velocidad puede hablar VOD.RIP con YouTube, Twitch y Kick. El límite se aprende de bloqueos reales de tasa: baja rápido cuando una plataforma responde y sube despacio tras minutos sin problemas.',
+  'Refresh': 'Actualizar',
+  'Reading the governor…': 'Leyendo el gobernador…',
+  'Background work waits at most {sec}s for a free slot, then goes ahead anyway — it is never blocked.':
+    'El trabajo en segundo plano espera como mucho {sec}s por un hueco y luego sigue igualmente — nunca queda bloqueado.',
+  'Could not reach the rate governor ({msg}). No values are shown — an unreachable governor is not a governor reporting zero.':
+    'No se pudo contactar con el gobernador de solicitudes ({msg}). No se muestra ningún valor — un gobernador inaccesible no es un gobernador que informa de cero.',
+  '{rpm} req/min': '{rpm} req/min',
+  'Allowed right now: {rpm} requests per minute.': 'Permitido ahora: {rpm} solicitudes por minuto.',
+  'Learned down from the {rpm} req/min default.': 'Reducido desde el valor inicial de {rpm} req/min.',
+  'Background work (AUTO)': 'Trabajo en segundo plano (AUTO)',
+  'Your actions (USER)': 'Tus acciones (USER)',
+  'Learning': 'Aprendizaje',
+  'Recent throttles': 'Limitaciones recientes',
+  'None held back right now.': 'Ahora mismo no hay nada retenido.',
+  '{left} of {cap} left': 'quedan {left} de {cap}',
+  'May use {pct}% of the ceiling — never more, so a background storm cannot spend your share.':
+    'Puede usar el {pct}% del límite — nunca más, así una avalancha en segundo plano no puede gastar tu parte.',
+  'Spent for now — background work retries in about {sec}s.':
+    'Agotado por ahora — el trabajo en segundo plano reintenta en unos {sec}s.',
+  'Spent for now — background work is being held back.':
+    'Agotado por ahora — el trabajo en segundo plano está siendo retenido.',
+  'Gets all {rpm} req/min. Background work can never draw from this reserve.':
+    'Recibe todos los {rpm} req/min. El trabajo en segundo plano nunca usa esta reserva.',
+  '{count} limit events recorded · last one {ago} ago.':
+    '{count} eventos de límite registrados · el último hace {ago}.',
+  '{count} limit events recorded.': '{count} eventos de límite registrados.',
+  'Lowest rate that ever tripped it: {rpm} req/min.':
+    'Tasa más baja que llegó a bloquearlo: {rpm} req/min.',
+  'No rate-limit events recorded in this session.':
+    'No se ha registrado ningún evento de límite de tasa en esta sesión.',
+  'Ceiling learned earlier from saved history (lowest recorded trip {rpm} req/min).':
+    'Límite aprendido antes a partir del historial guardado (tráfico más bajo registrado que lo bloqueó: {rpm} req/min).',
+  'A clean window has passed — the ceiling will step back up slightly on the next request.':
+    'Ha pasado una ventana sin problemas — el límite subirá un poco en la próxima solicitud.',
+  '{count} background requests were held back. This list lives in memory only and clears when the app restarts.':
+    'Se retuvieron {count} solicitudes en segundo plano. Esta lista solo vive en memoria y se borra al reiniciar la app.',
   'Updates': 'Actualizaciones',
   'v{version} available': 'v{version} disponible',
   'release': 'versión',

@@ -1,12 +1,13 @@
 import { type Dispatch, type ReactNode, type SetStateAction, useEffect, useState } from 'react';
 import {
-  AlertTriangle, CheckCircle2, ChevronDown, FolderOpen, HardDrive, Languages, Loader2, Mic, RefreshCw, Settings2, ShieldCheck, Sparkles, StopCircle,
+  Activity, AlertTriangle, CheckCircle2, ChevronDown, FolderOpen, HardDrive, Languages, Loader2, Mic, RefreshCw, Settings2, ShieldCheck, Sparkles, StopCircle,
   type LucideIcon,
 } from 'lucide-react';
 import FieldCaption from './FieldCaption';
 import InfoHint from './InfoHint';
 import CookieBridgeSection, { type BridgeStatus } from './CookieBridgeSection';
 import DiskSection from './DiskSection';
+import RateGovernorSection from './RateGovernorSection';
 import TranscriptionSection from './TranscriptionSection';
 import NumberField from './NumberField';
 import Toggle from './Toggle';
@@ -420,6 +421,21 @@ export default function SettingsTab({
         onToggle={() => toggleCard('disk')}
       >
         <DiskSection settings={settings} setSettings={setSettings} />
+      </SettingsCard>
+
+      {/* ── Platform Requests ──────────────────────────────────────
+          Sits with the other infrastructure cards, directly above the
+          Cookie Bridge (also platform behaviour): this is where a user
+          looks when a platform is being slow or a download is pacing
+          itself. Mounted INSIDE the card, so nothing is fetched until
+          the card is actually opened. */}
+      <SettingsCard
+        icon={Activity}
+        title={t('Platform Requests')}
+        open={!!openCards.rate}
+        onToggle={() => toggleCard('rate')}
+      >
+        <RateGovernorSection />
       </SettingsCard>
 
 

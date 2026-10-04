@@ -255,6 +255,58 @@ export interface DisksResponse {
   model_cache?: string;
 }
 
+/** Token pool for one origin under a platform's ceiling (rate_budget). */
+export interface RateBudgetPool {
+  tokens: number;
+  capacity: number;
+  refill_rpm: number;
+  exhausted?: boolean;
+}
+
+/**
+ * What the governor has LEARNED so far. `seconds_since_event` is null when no
+ * event was ever recorded — "not measured" must never render as 0, because a
+ * fabricated zero reads as a clean window.
+ */
+export interface RateBudgetLearning {
+  events: number;
+  trip_rpm: number;
+  min_trip_rpm: number;
+  seconds_since_event: number | null;
+  ramp_pending: boolean;
+}
+
+/** One platform row of GET /api/archive/rate-budget. */
+export interface RateBudgetPlatform {
+  platform: string;
+  ceiling_rpm: number;
+  default_ceiling_rpm: number;
+  auto_share: number;
+  auto: RateBudgetPool;
+  user: RateBudgetPool;
+  learning: RateBudgetLearning;
+  hot?: { calls_last_min: number; limited_last_min: number };
+}
+
+export interface RateBudgetDecision {
+  platform: string;
+  source: string;
+  allowed: boolean;
+  wait_s: number;
+  ceiling_rpm: number;
+  tokens: number;
+  reason: string;
+}
+
+/** Read-only view of the adaptive rate governor (Settings > Platform Requests). */
+export interface RateBudgetStatus {
+  auto_share: number;
+  max_auto_wait_s: number;
+  platforms: RateBudgetPlatform[];
+  scheduler?: Record<string, { auto_exhausted: boolean; backoff_s: number }>;
+  recent_decisions?: RateBudgetDecision[];
+}
+
 export interface UpdateInfo {
   version: string;
   release_notes?: string;
