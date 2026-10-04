@@ -139,12 +139,12 @@ def test_hint_is_replayed_on_a_cache_hit(seed, counted):
 # --- 2. invalidation on write --------------------------------------------
 
 def test_transcript_insert_invalidates(seed, counted):
-    before = _texts(archive_db.search(WORD))
+    before = _texts(archive_db.search(WORD, source="transcript"))
     assert len(counted) == 1
     archive_db.insert_transcript("twitch", VID, [{
         "seg_idx": 1, "start_sec": 2.0, "end_sec": 3.0, "text": f"second {WORD}",
     }])
-    after = _texts(archive_db.search(WORD))
+    after = _texts(archive_db.search(WORD, source="transcript"))
     assert len(counted) == 2, "a content write must retire the entry"
     assert len(after) == len(before) + 1, "the new segment must be visible"
 
@@ -153,6 +153,10 @@ def test_transcript_delete_invalidates(seed, counted):
     archive_db.insert_transcript("twitch", VID, [{
         "seg_idx": 1, "start_sec": 2.0, "end_sec": 3.0, "text": f"second {WORD}",
     }])
+    # Kept as the unscoped form: it asserts BOTH that the two deleted segments
+    # vanish AND that the undeleted title hit survives, so a blunt "wipe every
+    # cached result" would fail it. Scoping to source="transcript" (the other
+    # side of the merge) only proves the weaker half.
     # Two transcript hits (seg 0 + seg 1) plus the video's TITLE hit, which
     # also contains WORD — the title pass is on by default.
     assert len(archive_db.search(WORD)) == 3

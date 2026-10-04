@@ -933,6 +933,11 @@ def _migrate_transcript_data(conn: sqlite3.Connection) -> None:
                 f"IN ({','.join('?' * len(chunk))})",
                 chunk,
             )
+        # This migration rewrites transcript TEXT and lang on the raw
+        # connection, so it never reaches execute()'s SQL match — retire the
+        # search cache by hand. Unconditional: a boot migration runs once, so
+        # an extra bump costs nothing and cannot be skipped by a caller.
+        _bump_content_ref("transcripts")
 
 
 def _ensure_spam_column(conn: sqlite3.Connection) -> None:
@@ -2148,9 +2153,11 @@ def set_message_display_name(platform: str, user_id: str, display_name: str) -> 
                 (display_name, platform, user_id),
             )
             if cur.rowcount:
-                # display_name is a searched field, and this UPDATE bypasses
-                # the execute() funnel (see _SEARCH_CACHE_TTL_S).
-                _bump_search_gen()
+                # display_name feeds the author filter and rides on every hit
+                # for that user; the raw-connection write bypasses execute().
+                # _bump_content_ref also retires the search generation, so it
+                # subsumes a bare _bump_search_gen() here.
+                _bump_content_ref("messages")
             return cur.rowcount
 
 
@@ -6263,9 +6270,19 @@ _rowcount_lock = threading.Lock()
 
 def _bump_content_ref(table: str) -> None:
     """Invalidate the row-count cache for a content table after a write, so
-    the next vocab/bigram warm probe sees the new COUNT(*)."""
+    the next vocab/bigram warm probe sees the new COUNT(*).
+
+    It also retires the search result cache. This hook is the one every
+    content-write path already carries — including the two that write on the
+    shared connection directly and therefore never reach execute()'s SQL
+    match (insert_messages' batched chat insert, insert_transcript) — so
+    tying the search cache to it closes those holes in one place instead of
+    duplicating the call at each site. _bump_search_gen takes only the leaf
+    cache lock, never _rowcount_lock's counterpart, so the two are safe to
+    call in sequence here."""
     with _rowcount_lock:
         _rowcount_cache.pop(table, None)
+    _bump_search_gen()
 
 
 def _table_row_count(table: str) -> int:
