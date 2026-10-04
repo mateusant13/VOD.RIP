@@ -67,18 +67,72 @@ _archive_worker_lock = threading.Lock()
 _archive_worker_process: Optional[subprocess.Popen] = None
 
 # runtime_dir() resolves through whisper_cache_dir(), which reads the settings
-# manager AND ranks every fixed drive — measured ~290ms on this box.
-# /api/asr/runtime is in the supervisor probe rotation, so that cost lands
-# squarely on the liveness path (a single probe measured 289ms against a
-# 100ms budget, while every other probe answered in 2-3ms). The resolved path
-# only changes when the user repoints the models folder or the disk layout
-# changes, so a short TTL keeps it off the hot path without making a Settings
-# change take minutes to apply. The env override is deliberately NOT cached:
-# tests and portable installs pin it per process and must see it immediately.
+# manager AND ranks every fixed drive. That ranking is NOT bounded: it reaches
+# services/disk_detect._storage_layout, which spawns `powershell` to run
+# Get-PhysicalDisk + Get-Partition whenever its own 60s TTL lapses — measured
+# 2066ms on this box. /api/asr/runtime is in the supervisor probe rotation with
+# a 100ms budget, so a plain TTL cache is NOT enough: a 5s TTL on runtime_dir()
+# only moved the same ~2s subprocess onto whichever probe crossed the disk
+# layout's 60s boundary (~1 probe per minute, and a 10s busy-save window hits
+# it ~17% of runs — the 1156ms/2298ms /api/asr/runtime samples).
+#
+# So this is stale-while-revalidate: a caller NEVER re-resolves once a value is
+# cached. It gets the last resolved path immediately and the re-resolve (the
+# settings read + the PowerShell spawn) runs on a single-flight daemon thread.
+# Same shape the live-status path already uses for a slow refresh
+# (routers/live._submit_refresh + its stale-bound reuse at live.py:461-467).
+# Only a genuinely cold first call blocks, and that one is unavoidable: there
+# is nothing to serve yet. TTL only governs how often the background refresh
+# re-checks, so a Settings repoint still lands within TTL + refresh time.
+# The env override is deliberately NOT cached: tests and portable installs pin
+# it per process and must see it immediately.
 _RUNTIME_DIR_TTL_S = 5.0
 _runtime_dir_lock = threading.Lock()
 _runtime_dir_cache: Optional[Path] = None
 _runtime_dir_cached_at = 0.0
+_runtime_dir_refreshing = False
+
+
+def _resolve_runtime_dir() -> Path:
+    """Uncached resolve of the ASR runtime root. BLOCKS.
+
+    Reads the settings manager and ranks every fixed drive, which can spawn
+    PowerShell. Only the mutating install path and a cold first read may pay
+    that; every other caller goes through runtime_dir()'s cached read.
+    """
+    # Lazy: keeps this module import-light; whisper_cache_dir probes drives.
+    from services.disk_hygiene import whisper_cache_dir
+
+    return whisper_cache_dir() / _SUBDIR
+
+
+def _refresh_runtime_dir() -> None:
+    """Background re-resolve body. Never raises into the caller's thread."""
+    global _runtime_dir_cache, _runtime_dir_cached_at, _runtime_dir_refreshing
+    try:
+        resolved = _resolve_runtime_dir()
+    except Exception:  # noqa: BLE001 — a failed re-resolve keeps the last good path
+        logger.debug("asr runtime dir refresh failed", exc_info=True)
+    else:
+        with _runtime_dir_lock:
+            _runtime_dir_cache = resolved
+            _runtime_dir_cached_at = time.monotonic()
+    finally:
+        with _runtime_dir_lock:
+            _runtime_dir_refreshing = False
+
+
+def _start_runtime_dir_refresh() -> None:
+    """Kick the single-flight background re-resolve (deduped, daemon)."""
+    global _runtime_dir_refreshing
+    with _runtime_dir_lock:
+        if _runtime_dir_refreshing:
+            return
+        _runtime_dir_refreshing = True
+    threading.Thread(
+        target=_refresh_runtime_dir, name="asr-runtime-dir", daemon=True
+    ).start()
+
 
 def runtime_dir() -> Path:
     """Root for the ASR runtime payload (support resolver, not API contract).
@@ -86,6 +140,11 @@ def runtime_dir() -> Path:
     Precedence: ``VODRIP_ASR_RUNTIME_DIR`` env -> the AI-models folder
     (``whisper_cache_dir()/asr-runtime``). Pure resolver — never creates the dir
     and never touches the network.
+
+    Cached read: once a path is resolved, callers get it back without ever
+    re-running the drive ranking (see the note on _RUNTIME_DIR_TTL_S for why
+    that cost is unbounded). The mutating path must NOT use this — see
+    ensure_runtime().
     """
     global _runtime_dir_cache, _runtime_dir_cached_at
     override = os.environ.get(RUNTIME_DIR_ENV, "").strip()
@@ -94,12 +153,16 @@ def runtime_dir() -> Path:
     now = time.monotonic()
     with _runtime_dir_lock:
         cached = _runtime_dir_cache
-        if cached is not None and (now - _runtime_dir_cached_at) < _RUNTIME_DIR_TTL_S:
-            return cached
-    # Lazy: keeps this module import-light; whisper_cache_dir probes drives.
-    from services.disk_hygiene import whisper_cache_dir
-
-    resolved = whisper_cache_dir() / _SUBDIR
+        fresh = cached is not None and (now - _runtime_dir_cached_at) < _RUNTIME_DIR_TTL_S
+    if fresh:
+        return cached
+    if cached is not None:
+        # Stale-while-revalidate: hand back the last good path NOW and
+        # re-resolve off-thread. This is what keeps a liveness probe off the
+        # PowerShell spawn.
+        _start_runtime_dir_refresh()
+        return cached
+    resolved = _resolve_runtime_dir()  # cold: nothing cached, block once
     with _runtime_dir_lock:
         _runtime_dir_cache = resolved
         _runtime_dir_cached_at = time.monotonic()
@@ -164,13 +227,23 @@ def ensure_runtime(
     download / extraction. This is the ONLY call that ever downloads.
     """
     # Fast path — no lock, no network for the already-installed case.
-    if _is_complete(runtime_dir()):
-        return runtime_dir()
+    # UNCACHED resolve: runtime_dir() is a cached READ (see the note on
+    # _RUNTIME_DIR_TTL_S) and is deliberately allowed to serve a slightly
+    # stale path. This is the path that WRITES — if the user repointed the
+    # AI-models folder seconds ago, a cached value would download the whole
+    # multi-GB runtime into the folder they just abandoned, and the newly
+    # chosen folder would silently stay empty. An install is minutes long and
+    # user-initiated, so it can always afford to resolve fresh.
+    d = _resolve_runtime_dir()
+    if _is_complete(d):
+        return d
 
     with _install_lock:
         # Re-check under the lock: another thread may have just installed.
-        if _is_complete(runtime_dir()):
-            return runtime_dir()
+        # Re-resolve too — settings may have moved while we waited.
+        d = _resolve_runtime_dir()
+        if _is_complete(d):
+            return d
 
         manifest_url = (
             os.environ.get(MANIFEST_URL_ENV, "").strip() or _DEFAULT_MANIFEST_URL
@@ -203,7 +276,9 @@ def ensure_runtime(
                 f"ASR runtime manifest 'executable' {executable!r} is not in 'files'"
             )
 
-        d = runtime_dir()
+        # Fresh resolve for the download target — never the cached read
+        # (same reason as the fast path above: this is the write).
+        d = _resolve_runtime_dir()
         parent = d.parent
         parent.mkdir(parents=True, exist_ok=True)
         staging = parent / f".{d.name}.staging.{secrets.token_hex(6)}"
