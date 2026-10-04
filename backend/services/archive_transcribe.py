@@ -48,6 +48,15 @@ Design decisions:
     slots run parakeet with provider='cuda', gated on the measured free-VRAM
     allowance. Model auto-downloads on first use into the sherpa cache
     (VODRIP_SHERRPA_CACHE or an AI-models-folder sibling).
+  * Photon accelerator (opt-in, VODRIP_PHOTON_ASR=1): Moondream 2.6.1 runs the
+    same Parakeet Redux weights on CUDA at a measured 137x realtime on this
+    box, but it HANGS rather than raising and has no CPU path, so it runs as a
+    SIDECAR SUBPROCESS on the GPU slot the pool already hands out
+    (services/photon_asr.py + services/photon_runner.py). Every failure falls
+    back to the sherpa-onnx path above: _decode_batch is the single decode seam
+    on both production paths, a hard per-run timeout kills a hung sidecar, and
+    a circuit breaker retires a repeatedly failing accelerator for the rest of
+    the process. Off by default; sherpa-onnx is the default.
   * Device: _real_gpu_info() — a COMPUTE-level probe (nvidia-smi memory
     query and/or the CUDA runtime's device count + context init), never
     adapter names — a Virtual Display Driver / name-spoofed adapter has no
@@ -81,7 +90,7 @@ from itertools import count
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
-from services import archive_db, transcript_fix
+from services import archive_db, photon_asr, transcript_fix
 try:
     from services.resource_governor import get_governor, _GOVERNOR_TARGET, _GOVERNOR_BACKOFF, _GOVERNOR_CLAMP
     _GOVERNOR_AVAILABLE = True
@@ -2476,6 +2485,244 @@ def _transcribe_batch_parakeet(
     return out
 
 
+# --- Photon accelerator (opt-in GPU sidecar; sherpa-onnx stays guaranteed) --
+#
+# Photon (Moondream 2.6.1) runs the same Parakeet Redux weights on CUDA at a
+# measured RTF of 137x on this box (8:00 of audio in 3.51 s, 1.75 GB VRAM after
+# load). It is a GPU-slot accelerator and NOTHING else:
+#
+#   * it occupies the GPU slot the pool machinery already hands out
+#     (_worker_plan / _hybrid_chunk_slots) - no parallel scheduler was invented
+#     for it;
+#   * every failure - off, no venv, no CUDA, hang, crash, garbage, empty
+#     answer - falls back to _transcribe_batch_parakeet below and is logged;
+#   * it has no CPU path at all (kestrel's native extension reports
+#     ternary_gemm_isa() == "scalar" and raises NotImplementedError), so it can
+#     never be the only engine, and sherpa-onnx remains the default;
+#   * it lives in a separate process because the engine HANGS rather than
+#     raising (2 of 3 launches hung in engine creation, 1 on its third call:
+#     0% CPU, frozen resident set, no exception). A hang inside the worker
+#     wedges VOD.RIP; a hang inside a child we kill costs one batch.
+#
+# The seam below is the ONLY decode entry point on both production paths
+# (_transcribe_chunks_hybrid's GPU lane and the sequential loop in
+# _transcribe_audio_source) - a registration nothing calls is the failure mode
+# this codebase has already paid for three times.
+
+# A batch whose clips span more than this is not worth a >100 MB PCM handoff
+# file; the accelerator steps aside and sherpa-onnx takes the batch.
+_PHOTON_MAX_SPAN_SEC = 1800.0
+
+
+def _photon_gpu_allowed() -> bool:
+    """May the Photon sidecar take this GPU slot right now?
+
+    Every condition is a FALL BACK, never a wait: the accelerator is only
+    allowed to be an accelerator. Checked in the order a resource is most
+    likely to be gone.
+
+      1. the switch is on, the venv + sidecar exist and the circuit breaker
+         is closed (services/photon_asr.py owns all three);
+      2. not a CPU lane, and not a lane that already fell back to CPU;
+      3. no live-caption session - the captioner owns the card;
+      4. no foreign CUDA allocation - this is a shared GPU;
+      5. the governor is not in backoff / RAM pause ("restrictive mood");
+      6. measured free VRAM covers the measured Photon footprint.
+    """
+    if not photon_asr.available():
+        return False
+    if caption_session_active():
+        return False
+    if _gpu_held_by_other():
+        return False
+    if _thread_cpu_fallback():
+        return False
+    try:
+        if '_GOVERNOR_AVAILABLE' in globals() and _GOVERNOR_AVAILABLE:
+            g = get_governor()
+            if g.state.cpu_raw >= _GOVERNOR_BACKOFF or g.ram_pause():
+                return False
+    except Exception:
+        pass
+    floor = photon_asr.min_vram_bytes()
+    # Unknown free VRAM (0 = probe failed) trusts the parakeet gate, which
+    # already decided this lane may hold a GPU slot.
+    allowance = _gpu_vram_allowance()
+    if allowance <= 0:
+        return _parakeet_gpu_allowed()
+    return allowance >= floor
+
+
+def _photon_segments(
+    segs: Any,
+    clip_start: float,
+    clip_end: float,
+) -> list[dict]:
+    """Photon segments -> the transcript contract, in absolute video time.
+
+    Mirrors _clip_items exactly (same rounding, same end clamp, same word
+    keys) so a Photon batch is indistinguishable downstream from a sherpa-onnx
+    batch: transcript_fix's weak path keys on 'conf', which Photon's
+    per-word 'probability' feeds. Anything structurally wrong is dropped -
+    the accelerator must never be able to write a bad row.
+    """
+    out: list[dict] = []
+    if not isinstance(segs, list):
+        return out
+    for seg in segs:
+        if not isinstance(seg, dict):
+            continue
+        text = str(seg.get("text") or "").strip()
+        if not text:
+            continue
+        words: list[dict] = []
+        for word in (seg.get("words") or []):
+            if not isinstance(word, dict):
+                continue
+            wtext = str(word.get("word") or "").strip()
+            try:
+                wstart = float(word["start"])
+                wend = float(word["end"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not wtext or not (wstart >= 0.0 and wend >= wstart):
+                continue
+            item = {
+                "word": wtext,
+                "start": round(wstart + clip_start, 3),
+                "end": round(wend + clip_start, 3),
+            }
+            prob = word.get("probability")
+            if isinstance(prob, (int, float)) and not isinstance(prob, bool):
+                item["conf"] = float(prob)
+            words.append(item)
+        try:
+            sstart = float(seg["start"])
+            send = float(seg["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (sstart >= 0.0 and send >= sstart):
+            continue
+        last_word_end = (words[-1]["end"] if words else float(clip_end - clip_start)) + clip_start
+        out.append({
+            # start_sec is the CLIP start, exactly like _clip_items: the
+            # resume manifest and seg_idx allocation are built on "a chunk
+            # starts at its clip start", and the word timestamps carry the
+            # within-clip detail. Photon may trim leading silence, which must
+            # not move the chunk boundary.
+            "start_sec": round(clip_start, 3),
+            "end_sec": round(min(clip_end, last_word_end + 0.3), 3),
+            "text": text,
+            "words": words,
+        })
+    return out
+
+
+def _decode_batch_photon(
+    audio: Any,
+    chunks: list[tuple[float, float]],
+    language: Optional[str],
+    clip_offsets: Optional[list[float]],
+) -> list[tuple[list[dict], Optional[str]]]:
+    """One Photon batch in, the _transcribe_batch_parakeet shape out.
+
+    Raises services.photon_asr.PhotonUnavailable / PhotonTimeout /
+    PhotonProtocolError on every failure mode; the caller falls back.
+    """
+    lo = int(min(cs for cs, _ in chunks) * SAMPLE_RATE)
+    hi = int(max(ce for _, ce in chunks) * SAMPLE_RATE)
+    if lo < 0 or hi > int(getattr(audio, "size", 0)):
+        raise photon_asr.PhotonUnavailable(
+            f"batch clips ({lo}-{hi} samples) fall outside the {getattr(audio, 'size', 0)}-sample buffer"
+        )
+    shift = lo / SAMPLE_RATE
+    span = audio[lo:hi] if (lo, hi) != (0, int(getattr(audio, "size", 0))) else audio
+    results = photon_asr.transcribe_batch(
+        span,
+        [(cs - shift, ce - shift) for cs, ce in chunks],
+        sample_rate=SAMPLE_RATE,
+    )
+    out: list[tuple[list[dict], Optional[str]]] = []
+    for i, (cs, ce) in enumerate(chunks):
+        base = 0.0 if clip_offsets is None else clip_offsets[i]
+        clip_start = cs + base
+        entry = results[i] if isinstance(results[i], dict) else {}
+        out.append((
+            _photon_segments(entry.get("segments"), clip_start, ce + base),
+            language,  # echoes the requested language exactly as sherpa does
+        ))
+    return out
+
+
+def _decode_batch(
+    rec: Any,
+    audio: Any,
+    chunks: list[tuple[float, float]],
+    language: Optional[str],
+    *,
+    clip_offsets: Optional[list[float]] = None,
+    batch_size: int = 1,
+    use_cuda: bool = False,
+) -> list[tuple[list[dict], Optional[str]]]:
+    """THE batch-decode seam: Photon (opt-in GPU accelerator) over sherpa-onnx
+    (the guaranteed engine).
+
+    Both production decode paths call this and nothing else. Photon is tried
+    only on a GPU slot, only when _photon_gpu_allowed() says the card is
+    free, and only for a batch small enough to hand over cheaply. Any failure
+    at all - unavailable, hang, crash, garbage, empty - is logged at warning
+    and answered by the sherpa-onnx call underneath, so a broken accelerator
+    costs speed, never the transcript.
+    """
+    allowed = False
+    if use_cuda and chunks:
+        try:
+            allowed = _photon_gpu_allowed()
+        except Exception:
+            # A probe failure (nvidia-smi, the governor) is not a reason to
+            # fail a job; it is a reason not to accelerate.
+            logger.exception("photon gate probe failed - skipping the accelerator")
+            allowed = False
+    if allowed:
+        span = max(ce for _, ce in chunks) - min(cs for cs, _ in chunks)
+        if span <= _PHOTON_MAX_SPAN_SEC:
+            try:
+                return _decode_batch_photon(audio, chunks, language, clip_offsets)
+            except photon_asr.PhotonUnavailable as exc:
+                logger.warning(
+                    "photon accelerator unavailable - falling back to "
+                    "sherpa-onnx for this batch: %s", exc,
+                )
+            except Exception:
+                # An accelerator bug must never fail the job: the guaranteed
+                # engine is one line below. Logged WITH its traceback so a
+                # surprise here is visible rather than silently absorbed.
+                logger.exception(
+                    "photon accelerator raised - falling back to sherpa-onnx"
+                )
+        else:
+            logger.info(
+                "photon skipped: batch spans %.0fs (cap %.0fs) - sherpa-onnx",
+                span, _PHOTON_MAX_SPAN_SEC,
+            )
+    return _transcribe_batch_parakeet(
+        rec, audio, chunks, language, clip_offsets=clip_offsets, batch_size=batch_size,
+    )
+
+
+def _decode_use_cuda() -> bool:
+    """Does the calling thread hold a GPU slot?
+
+    The sequential path's claim to the card is its pool-thread pin (the same
+    (device, compute_type) slot _worker_plan handed out); direct callers and
+    the legacy single-model path fall back to the process default.
+    """
+    pin = _thread_pin()
+    if pin is not None:
+        return pin[0] == "cuda"
+    return _effective_device()[0] == "cuda"
+
+
 # --- audio decode ---------------------------------------------------------
 
 def decode_audio(path: str, ffmpeg_bin: Optional[str] = None) -> "Any":
@@ -3577,14 +3824,15 @@ def _transcribe_chunks_hybrid(
                     batch_audio, concat_clips, clip_offsets = _clips_to_audio(
                         sharded_audio, run,
                     )
-                    batch_out = _transcribe_batch_parakeet(
+                    batch_out = _decode_batch(
                         local_model, batch_audio, concat_clips, language,
-                        clip_offsets=clip_offsets, **engine_kwargs,
+                        clip_offsets=clip_offsets, use_cuda=use_cuda,
+                        **engine_kwargs,
                     )
                 else:
-                    batch_out = _transcribe_batch_parakeet(
+                    batch_out = _decode_batch(
                         local_model, audio, [c for _, c in run], language,
-                        **engine_kwargs,
+                        use_cuda=use_cuda, **engine_kwargs,
                     )
                 (chunk_segs, detected) = batch_out[0]
                 _commit_chunk_rows(
@@ -4266,6 +4514,7 @@ def _transcribe_audio_source(
         # byte-identical to pre-batch runs).
         engine_batch = _parakeet_batch_size()
         engine_kwargs = {"batch_size": engine_batch}
+        use_cuda = _decode_use_cuda()
         while ci < n_chunks:
             cs, ce = chunks[ci]
             if ci not in missing_set:
@@ -4283,13 +4532,14 @@ def _transcribe_audio_source(
                 ci += 1
             if sharded_audio is not None:
                 batch_audio, concat_clips, clip_offsets = _clips_to_audio(sharded_audio, run)
-                batch_out = _transcribe_batch_parakeet(
+                batch_out = _decode_batch(
                     model, batch_audio, concat_clips, language, clip_offsets=clip_offsets,
-                    **engine_kwargs,
+                    use_cuda=use_cuda, **engine_kwargs,
                 )
             else:
-                batch_out = _transcribe_batch_parakeet(
-                    model, audio, [c for _, c in run], language, **engine_kwargs,
+                batch_out = _decode_batch(
+                    model, audio, [c for _, c in run], language,
+                    use_cuda=use_cuda, **engine_kwargs,
                 )
             for (ci2, _), (chunk_segs, detected) in zip(run, batch_out):
                 # _transcribe_batch_parakeet echoes the requested language back
@@ -4414,6 +4664,31 @@ def _transcribe_audio_source(
         # (the done-time channel-language correction stamps the family).
         "lang": detected_lang if language is None else None,
     }
+    # Accelerator visibility. An accelerator that runs invisibly is
+    # indistinguishable from one that never runs - the exact "a feature that
+    # exists and never runs" failure this path was wired to avoid. The counters
+    # are process-wide (the sidecar and its breaker outlive one job), so the
+    # scope says so instead of implying per-job numbers.
+    _photon = photon_asr.stats()
+    if _photon["enabled"] or _photon["attempts"]:
+        stats["photon"] = {
+            "scope": "process",
+            "enabled": _photon["enabled"],
+            "attempts": _photon["attempts"],
+            "ok": _photon["ok"],
+            "timeouts": _photon["timeouts"],
+            "errors": _photon["errors"],
+            "rejected": _photon["rejected"],
+            "breaker_open": _photon["breaker_open"],
+            "last_error": _photon["last_error"],
+        }
+        logger.info(
+            "transcribe %s/%s photon: %d/%d batches ok, %d timeouts, %d errors, "
+            "%d rejected, breaker=%s (last: %s)",
+            platform, video_id, _photon["ok"], _photon["attempts"],
+            _photon["timeouts"], _photon["errors"], _photon["rejected"],
+            _photon["breaker_open"], _photon["last_error"][:160] or "-",
+        )
     if fix_on:
         stats["transcript_fix"] = fix_stats
         logger.info(
