@@ -647,7 +647,18 @@ def _is_iso_date(value: str) -> bool:
 
 @router.get("/api/archive/videos")
 async def archive_videos(platform: str | None = None, channel: str | None = None):
-    return {"videos": archive_db.list_videos(platform, channel)}
+    videos = archive_db.list_videos(platform, channel)
+    # Age-gated videos show WHY they have no captions and what would fix it.
+    # The marker alone (captions_unavailable_at) is indistinguishable from an
+    # ordinary "no captions" verdict, which is what made the age-gate loop
+    # invisible to the user.
+    parked = _age_parked_snapshot()
+    if parked:
+        for v in videos:
+            reason = parked.get(str(v.get("video_id") or ""))
+            if reason:
+                v["captions_parked_reason"] = reason
+    return {"videos": videos}
 
 
 @router.post("/api/archive/videos")
@@ -1896,6 +1907,9 @@ def _run_channel_caption_ingest(
 
         _deep_seed_video_rows(handle, videos)
         ids = [str(v.get("id") or "") for v in videos]
+        # Same un-park as the deep sweep: an age-gated video is credential-
+        # bound, so a signed-in session makes it a caption candidate again.
+        _unpark_age_gated_if_authenticated()
         covered, _marked = _deep_covered_ids(
             ids[cursor:] if cursor < len(ids) else []
         )
@@ -1964,6 +1978,130 @@ def _yt_default_budget() -> int:
     return int(_yt_ingest_budget())
 
 
+# --- age-gated caption park (reversible) -------------------------------------
+#
+# An age-gated video is a TERMINAL no-captions verdict for an anonymous
+# request: YouTube answers "Sign in to confirm your age" and no amount of
+# retrying substitutes for credentials (no anonymous player client passes it
+# anymore — see youtube_diag.is_age_gate_error). It must NOT be confused with
+# the IP-level bot gate: the refusal text contains the gate's "sign in to
+# confirm" marker, so yt_gate.classify_youtube_gate_error claims it and it
+# lands in the branch that deliberately writes NO per-video marker ("that is
+# IP state, not a verdict about the video"). Correct for a bot wall, fatal
+# here: the same video was re-attempted on an endless ~30-minute loop — 33
+# identical rate-limit events in 24h, all naming one video.
+#
+# Parked the way the transcribe path already parks an age-gated JOB
+# (archive_ytdlp.ingest_video -> AGE_GATE_JOB_MARKER -> archive_db.update_job
+# terminal check -> archive_scheduler._requeue_failed_transcribe_job): terminal
+# NOW, reversible LATER. The marker is the existing videos.captions_unavailable_at
+# stamp this sweep already honours — NOT transcript_kind='blocked', which is
+# the irreversible ASR verdict. It is cleared by any successful caption
+# ingest, and _unpark_age_gated_if_authenticated() clears it the moment an
+# authenticated YouTube session exists (the same predicate the sibling fix and
+# the cookie-bridge `youtube_authenticated` signal use).
+_age_park_lock = threading.Lock()
+_age_parked: dict[str, str] = {}  # video_id -> user-facing park reason
+
+
+def _age_gate_park_reason() -> str:
+    """Why this video has no captions, and what would fix it.
+
+    Deliberately the same two states the age gate already reports elsewhere
+    (youtube_diag.age_gate_actionable_message on the download/transcribe job
+    error, and the cookie-bridge `youtube_authenticated` signal): no session
+    configured vs a session that was rejected. They need different user
+    actions, and the caption sweep is the path that actually hit the gate, so
+    the reason has to name the remedy here too. Wording is caption-specific —
+    the download path's "cannot be downloaded/watched" verb is wrong for a
+    video that simply has no captions.
+    """
+    try:
+        from services.youtube_session import youtube_session_configured
+
+        configured = bool(youtube_session_configured())
+    except Exception:
+        # A failed probe must never claim "you are signed in".
+        configured = False
+    if not configured:
+        return (
+            "Age-restricted video — YouTube serves no captions to an "
+            "anonymous request, and no signed-in YouTube session is "
+            "configured. Open Settings > Cookie Bridge, sign in to YouTube, "
+            "then re-run the caption sweep."
+        )
+    return (
+        "Age-restricted video — the configured YouTube session was rejected "
+        "(YouTube rotates account cookies while a YouTube tab is open), so no "
+        "captions could be read. Sign in again from a private window via "
+        "Settings > Cookie Bridge, then re-run the caption sweep."
+    )
+
+
+def _park_age_gated(video_id: str) -> str:
+    """Park one age-gated video: per-video marker + the user-facing reason.
+
+    Stamping captions_unavailable_at is what terminates the retry: the sweep's
+    covered/marked probe (_deep_covered_ids) and the scheduler's
+    _youtube_covered both pre-skip a fresh marker, so the video is attempted
+    once and then left alone. Returns the reason for the caller to surface.
+    """
+    reason = _age_gate_park_reason()
+    vid = str(video_id or "")
+    with _age_park_lock:
+        _age_parked[vid] = reason
+    try:
+        archive_db.mark_captions_unavailable("youtube", vid)
+    except Exception:
+        logger.debug("age-gate park marker failed for %s", vid, exc_info=True)
+    logger.info("youtube %s age-gated — parked (no captions without a signed-in session)", vid)
+    return reason
+
+
+def _unpark_age_gated_if_authenticated() -> int:
+    """Release age-gated caption parks once a signed-in YouTube session exists.
+
+    The mirror of archive_scheduler._requeue_failed_transcribe_job: an age
+    gate is credential-bound, so it resolves the moment an authenticated
+    session appears. Clearing the marker makes the video a caption-sweep
+    candidate again — that is the difference between "sign in and it works"
+    and a video that never processes. Returns how many were released.
+    """
+    with _age_park_lock:
+        parked = list(_age_parked)
+    if not parked:
+        return 0
+    try:
+        from services.youtube_session import youtube_session_configured
+
+        if not youtube_session_configured():
+            return 0
+    except Exception:
+        return 0  # probe failed — stay parked rather than hammer
+    released = 0
+    for vid in parked:
+        try:
+            archive_db.clear_captions_unavailable("youtube", vid)
+        except Exception:
+            logger.debug("age-gate un-park failed for %s", vid, exc_info=True)
+            continue
+        with _age_park_lock:
+            _age_parked.pop(vid, None)
+        released += 1
+    if released:
+        logger.info(
+            "released %d age-gated caption park(s) — authenticated YouTube session present",
+            released,
+        )
+    return released
+
+
+def _age_parked_snapshot() -> dict[str, str]:
+    """{video_id: reason} for the parked age gates, for the API surface."""
+    with _age_park_lock:
+        return dict(_age_parked)
+
+
 def _paced_caption_fetch(video_id: str, handle: str) -> bool:
     """One paced caption fetch+store for the channel caption ingest.
 
@@ -1971,8 +2109,10 @@ def _paced_caption_fetch(video_id: str, handle: str) -> bool:
     no-captions verdict or failure (the failure stamps the negative marker
     so it is not re-fetched for a day). Bot-gate classification mirrors the
     deep-search worker: transport errors are stamped; IP-gate errors park
-    and are NOT stamped as video verdicts."""
+    and are NOT stamped as video verdicts; an age gate is parked as a
+    reversible per-video verdict (see the note above _park_age_gated)."""
     from services import yt_gate
+    from services.youtube_diag import is_age_gate_error
 
     with _deep_pace_lock:
         now = time.monotonic()
@@ -1983,6 +2123,12 @@ def _paced_caption_fetch(video_id: str, handle: str) -> bool:
     try:
         payload = _deep_fetch_transcript(video_id)
     except Exception as exc:
+        # Age gate BEFORE the gate classifier: its text contains the bot
+        # gate's "sign in to confirm" marker, so the classifier would claim
+        # it and this video would be re-attempted forever.
+        if is_age_gate_error(exc):
+            _park_age_gated(video_id)
+            return False
         if yt_gate.classify_youtube_gate_error(exc):
             yt_gate.note_youtube_gate(
                 str(exc)[:200], surface="captions", origin="auto",
@@ -2059,6 +2205,7 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
     paced 2-way caption fetches -> write-through -> match. Per-video errors
     skip+count; only a total enumeration failure errors the job."""
     from services import yt_gate
+    from services.youtube_diag import is_age_gate_error
 
     with _deep_jobs_lock:
         job = _deep_jobs.get(job_id)
@@ -2066,7 +2213,7 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
         return
     cancel: threading.Event = job["cancel"]
     results: list[dict] = []
-    counters = {"scanned": 0, "no_transcript": 0}
+    counters = {"scanned": 0, "no_transcript": 0, "age_parked": 0}
     counters_lock = threading.Lock()
     # Persisted cursor: how far _scanned_ (so a post-restart resume, or a
     # status poll that finds no in-memory job, recovers a truthful position).
@@ -2080,6 +2227,13 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
         with counters_lock:
             counters["scanned"] += scanned
             counters["no_transcript"] += missing
+
+    def _bump_age_parked() -> None:
+        """Videos parked this sweep because YouTube age-gated them. Counted
+        separately from no_transcript so the UI can say WHY they have no
+        captions (credentials, not "nothing to archive")."""
+        with counters_lock:
+            counters["age_parked"] += 1
 
     def _persist() -> None:
         """Best-effort deep_jobs upsert for THIS sweep (id = job_id). Called
@@ -2110,6 +2264,7 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
         with counters_lock, _deep_jobs_lock:
             job["scanned"] = counters["scanned"]
             job["no_transcript"] = counters["no_transcript"]
+            job["age_parked"] = counters["age_parked"]
             job["truncated_results"] = _truncated_results
             job["results"] = list(results)
         # Throttle the persisted cursor to _DEEP_CURSOR_EVERY scanned rows;
@@ -2209,6 +2364,10 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
             job["enumerated_total"] = enumerated_total
         _deep_seed_video_rows(handle, videos)
         _persist()  # record total/enumerated_total up front
+        # Release any age-gated park before the covered/marked probe, so a
+        # video parked while the user was signed out becomes a candidate again
+        # the moment they sign in (the probe reads the marker this clears).
+        _unpark_age_gated_if_authenticated()
         ids = [str(v.get("id") or "") for v in videos]
         videos_by_id = {
             str(v.get("id") or ""): v
@@ -2271,12 +2430,27 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
             try:
                 payload = _deep_fetch_transcript(vid)
             except Exception as exc:
+                # Age gate FIRST, and terminal. Its text contains the bot
+                # gate's "sign in to confirm" marker, so classify_youtube_gate_error
+                # claims it and the branch below (correctly, for an IP bot wall)
+                # writes NO per-video marker — which re-attempted this one video
+                # every ~30 min for 24h straight. Retrying an age-gated video
+                # never succeeds without cookies, so park it reversibly and do
+                # not spend a second attempt or a pace slot on it.
+                if is_age_gate_error(exc):
+                    _park_age_gated(vid)
+                    _bump_age_parked()
+                    _bump(1, 1)
+                    _flush()
+                    return
                 if yt_gate.classify_youtube_gate_error(exc):
                     yt_gate.note_youtube_gate(
                         str(exc)[:200], surface="captions", origin="auto",
                     )
                     # The IP is gated — not this video. Do NOT stamp the
                     # marker; park until the freeze lifts, then retry once.
+                    # (A genuine bot wall only: the age gate, which IS a
+                    # per-video verdict, returned above.)
                     # A paused sweep must not burn a pace slot here either.
                     if _wait_pause() and _wait_gate() and _wait_pace():
                         try:
@@ -2539,6 +2713,10 @@ async def archive_search_deep_status(job_id: str):
                 "scanned": job["scanned"],
                 "total": job["total"],
                 "no_transcript": job["no_transcript"],
+                # Videos YouTube age-gated (parked: no captions without a
+                # signed-in session) — the why behind some of no_transcript,
+                # with the remedy in /api/archive/videos.
+                "age_parked": int(job.get("age_parked") or 0),
                 "truncated": job["truncated"],
                 "truncated_results": bool(job.get("truncated_results")),
                 "results": list(job["results"]),
@@ -2569,6 +2747,9 @@ async def archive_search_deep_status(job_id: str):
         "scanned": int(r["scanned"] or 0),
         "total": int(r["total"] or 0),
         "no_transcript": int(r["no_transcript"] or 0),
+        # Not persisted in deep_jobs (the counter is per-run in-memory state),
+        # so a DB-recovered job reports 0 rather than inventing a number.
+        "age_parked": 0,
         "truncated": bool(int(r["truncated"] or 0)),
         "truncated_results": False,
         "results": [],
