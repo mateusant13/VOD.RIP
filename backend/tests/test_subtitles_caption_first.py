@@ -94,7 +94,7 @@ def _patch_player(monkeypatch, data, kind: str = "ok", status: int = 200) -> dic
     """Fake the InnerTube player call; the returned dict records the call."""
     calls: dict = {}
 
-    def fake(video_id, profile, read_timeout, session=None, http=None):
+    def fake(video_id, profile, read_timeout, session=None, http=None, source="auto"):
         calls["video_id"] = video_id
         calls["profile"] = profile
         calls["timeout"] = read_timeout

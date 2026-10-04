@@ -1,4 +1,5 @@
 """InnerTube fast-path helpers."""
+import pytest
 from unittest.mock import MagicMock, patch
 
 from services.youtube_innertube import (
@@ -16,6 +17,29 @@ from services.youtube_innertube import (
     _record_playability,
 )
 from services.youtube_session import YouTubeSession
+
+
+@pytest.fixture(autouse=True)
+def _no_governor_pacing():
+    """Drop the rate governor's real-time wait to zero for this module.
+
+    Same neutralisation test_rl_counter.py applies to the Twitch/Kick legs:
+    innertube_extract_info paces a background extract against the learned
+    YouTube budget and can sleep up to rate_budget.MAX_AUTO_WAIT_S. None of
+    these tests assert on pacing, and a client race that goes dry mid-suite
+    would otherwise add real wall-clock for nothing.
+
+    Only the wait is neutralised — ``_governor_admit()`` still meters every
+    /player POST, so the budget is exercised exactly as it is in production.
+    The patch targets the source module because youtube_innertube imports
+    MAX_AUTO_WAIT_S lazily, inside the function, at call time.
+    """
+    from services import rate_budget
+
+    saved = rate_budget.MAX_AUTO_WAIT_S
+    rate_budget.MAX_AUTO_WAIT_S = 0.0
+    yield
+    rate_budget.MAX_AUTO_WAIT_S = saved
 
 
 def test_enrich_client_context_drops_forced_locale():

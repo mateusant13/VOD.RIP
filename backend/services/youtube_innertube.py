@@ -44,6 +44,77 @@ if TYPE_CHECKING:
 FailureKind = Literal["ok", "retry", "fatal"]
 
 
+# --- adaptive rate governor (predictive, in front of yt_gate) ---------------
+# InnerTube is where YouTube rate-limits us, and the app never saw a Helix
+# header or a quota header to key off — every signal is a reactive bot wall
+# after the fact. So the budget is learned from our own history and enforced
+# HERE, at the one /player POST, which is 100% of InnerTube egress.
+#
+# The pacing sleep deliberately does NOT live at the POST. A single
+# ``innertube_extract_info`` races every client profile in parallel under a
+# ``_RACE_TIMEOUT_SEC`` (2.5s) wall, so a thread that slept up to
+# ``MAX_AUTO_WAIT_S`` (30s) inside ``_player_request`` would blow the race
+# budget and turn pacing into a guaranteed extract miss. Pacing therefore
+# happens ONCE at the entry point, before the race starts, where a background
+# caller is genuinely queueing rather than racing a socket; metering happens
+# per real POST, which is what the limiter actually counts.
+
+
+def _governor_admit(source: str, kind: str) -> None:
+    """Meter one InnerTube request against the learned YouTube budget.
+
+    Consumes exactly one token from the caller's pool and learns the trip rate.
+    Never sleeps and never raises: the AUTO/USER split is enforced here (AUTO
+    cannot hold more than 0.70x the ceiling, so background work structurally
+    cannot spend the on-demand reserve), and a USER caller is never made to
+    wait. Advisory only — a dry pool slows us down, it never fails a fetch.
+    """
+    try:
+        from services.rate_budget import acquire
+
+        acquire("youtube", source, kind=kind)  # type: ignore[arg-type]
+    except Exception:  # noqa: BLE001 — the governor is advisory, never a new failure mode
+        logger.debug("rate_budget: admission check failed", exc_info=True)
+
+
+def _governor_pace(source: str, kind: str) -> None:
+    """Pace one whole extract against the budget. Only AUTO ever waits.
+
+    Uses ``backoff_seconds`` (advisory, consumes no token) so the wait cannot
+    double-count against the per-POST metering in ``_governor_admit``. The
+    wait is bounded by ``MAX_AUTO_WAIT_S`` and we proceed afterwards, so an
+    exhausted budget delays ingest; it never turns a metadata call into a
+    failure. A USER caller returns immediately — on-demand work is never made
+    to queue behind background work.
+    """
+    try:
+        from services.rate_budget import MAX_AUTO_WAIT_S, backoff_seconds
+
+        if str(source or "").strip().lower() != "auto":
+            return
+        wait = min(MAX_AUTO_WAIT_S, backoff_seconds("youtube", "auto"))
+        if wait > 0:
+            logger.debug("rate_budget: pacing YouTube %s for %.1fs (AUTO pool dry)", kind, wait)
+            time.sleep(wait)
+    except Exception:  # noqa: BLE001 — advisory only, never a new failure mode
+        logger.debug("rate_budget: pacing check failed", exc_info=True)
+
+
+def _governor_note_limit(status: Optional[int], source: str, kind: str) -> None:
+    """Fold a real InnerTube limit response into the learned ceiling.
+
+    This is the YouTube half of the governor's learning loop: the event drops
+    the ceiling immediately, and ``yt_gate`` stays the reactive freeze that
+    stops us hammering during the fallout. Both halves never raise.
+    """
+    try:
+        from services.rate_budget import note_limit
+
+        note_limit("youtube", kind=kind, status=status, source=source)  # type: ignore[arg-type]
+    except Exception:  # noqa: BLE001 — instrumentation must never break a fetch
+        logger.debug("rate_budget: note_limit failed", exc_info=True)
+
+
 @dataclass(frozen=True)
 class _ClientProfile:
     name: str
@@ -759,11 +830,15 @@ def _player_request(
     read_timeout: float,
     session: Optional["YouTubeSession"] = None,
     http: Optional[requests.Session] = None,
+    source: str = "auto",
 ) -> tuple[Optional[dict], int, FailureKind]:
     body = _player_body(video_id, profile, session)
     headers = _merge_headers(profile, session)
     client = http or _http_for(session)
     timeout = (_CONNECT_TIMEOUT_SEC, read_timeout)
+    # Meter this POST against the learned budget. No sleep here — see the
+    # module note above: the client race owns a 2.5s wall it must not lose.
+    _governor_admit(source, "innertube_player")
     try:
         resp = client.post(
             _INNERTUBE_PLAYER_URL,
@@ -780,6 +855,8 @@ def _player_request(
         logger.debug(
             "InnerTube %s HTTP %s for %s", profile.name, resp.status_code, video_id,
         )
+        if resp.status_code == 429:
+            _governor_note_limit(429, source, "innertube_player")
         return None, resp.status_code, http_kind
 
     try:
@@ -936,10 +1013,11 @@ def _resolve_profile(
     profile: _ClientProfile,
     session: Optional["YouTubeSession"],
     read_timeout: float,
+    source: str = "auto",
 ) -> Optional[dict[str, Any]]:
     http = _http_for(session)
     data, _status, kind = _player_request(
-        video_id, profile, read_timeout, session=session, http=http,
+        video_id, profile, read_timeout, session=session, http=http, source=source,
     )
     if kind == "fatal" or kind != "ok" or not data:
         return None
@@ -1035,17 +1113,18 @@ def _race_profiles(
     session: Optional["YouTubeSession"],
     read_timeout: float,
     wall_timeout: float,
+    source: str = "auto",
 ) -> Optional[dict[str, Any]]:
     if not profiles:
         return None
     if len(profiles) == 1:
-        return _resolve_profile(video_id, profiles[0], session, read_timeout)
+        return _resolve_profile(video_id, profiles[0], session, read_timeout, source)
 
     winner: Optional[dict[str, Any]] = None
     pool = ThreadPoolExecutor(max_workers=len(profiles), thread_name_prefix="innertube")
     try:
         futures = {
-            pool.submit(_resolve_profile, video_id, profile, session, read_timeout): profile
+            pool.submit(_resolve_profile, video_id, profile, session, read_timeout, source): profile
             for profile in profiles
         }
         try:
@@ -1082,6 +1161,7 @@ def _collect_merged_innertube_info(
     video_id: str,
     session: Optional["YouTubeSession"],
     read_timeout: float,
+    source: str = "auto",
 ) -> Optional[dict[str, Any]]:
     """Merge formats from every InnerTube client in _CLIENT_ORDER.
 
@@ -1107,7 +1187,7 @@ def _collect_merged_innertube_info(
         else:
             timeout = min(read_timeout, _READ_TIMEOUT_PLAYER_SEC)
         data, _status, kind = _player_request(
-            video_id, profile, timeout, session=session, http=http,
+            video_id, profile, timeout, session=session, http=http, source=source,
         )
         if kind != "ok" or not data:
             if _is_bot_gate(data):
@@ -1123,6 +1203,10 @@ def _collect_merged_innertube_info(
                         note_youtube_gate("innertube LOGIN_REQUIRED bot gate")
                     except Exception:
                         pass
+                    # A bot wall is a rate limit with a different name: teach
+                    # the governor from it too, so the ceiling drops before we
+                    # spend another request finding the same wall.
+                    _governor_note_limit(429, source, "innertube_bot_gate")
                     break
             continue
         if meta_data is None:
@@ -1441,8 +1525,19 @@ def innertube_extract_info(
     *,
     allow_session_refresh: bool = True,
     preview_fast: bool = False,
+    source: str = "auto",
 ) -> Optional[dict[str, Any]]:
-    """Resolve YouTube metadata + streams via merged InnerTube clients."""
+    """Resolve YouTube metadata + streams via merged InnerTube clients.
+
+    *source* ('auto' background worker / 'user' on-demand) tags the adaptive
+    rate governor. It defaults to 'auto' on purpose: an unlabelled egress is
+    background work, and AUTO is the pool that is allowed to wait. Only
+    background callers are ever paced, and only for a bounded moment.
+    """
+    # Pace the extract as a whole, once, before the profile race starts. The
+    # per-POST metering happens in _player_request; this only supplies the
+    # wait, so the two cannot double-charge the same request.
+    _governor_pace(source, "innertube_extract")
     video_id = extract_video_id(url)
     if session is None:
         from services.youtube_session import youtube_session_from_settings
@@ -1472,7 +1567,7 @@ def innertube_extract_info(
         read_timeout = timeout if timeout is not None else _READ_TIMEOUT_PLAYER_SEC
         wall_timeout = _RACE_TIMEOUT_SEC
     profiles = _profiles_for_session(session)
-    info = _race_profiles(profiles, video_id, session, read_timeout, wall_timeout)
+    info = _race_profiles(profiles, video_id, session, read_timeout, wall_timeout, source)
     if info:
         _ensure_info_created_at(info, video_id, session)
         from services.youtube_diag import log_extract_ok
@@ -1484,7 +1579,7 @@ def innertube_extract_info(
         log_extract_fail(video_id, "innertube_preview_race_miss", session)
         return None
 
-    info = _collect_merged_innertube_info(video_id, session, read_timeout)
+    info = _collect_merged_innertube_info(video_id, session, read_timeout, source)
     if info:
         _ensure_info_created_at(info, video_id, session)
         from services.youtube_diag import log_extract_ok
@@ -1498,14 +1593,14 @@ def innertube_extract_info(
         invalidate_anonymous_session()
         fresh = youtube_session_from_settings(video_id=video_id)
         info = _race_profiles(
-            _profiles_for_session(fresh), video_id, fresh, read_timeout, _RACE_TIMEOUT_SEC,
+            _profiles_for_session(fresh), video_id, fresh, read_timeout, _RACE_TIMEOUT_SEC, source,
         )
         if info:
             _ensure_info_created_at(info, video_id, fresh)
             from services.youtube_diag import log_extract_ok
             log_extract_ok(video_id, "innertube_race_fresh", info, fresh)
             return info
-        info = _collect_merged_innertube_info(video_id, fresh, read_timeout)
+        info = _collect_merged_innertube_info(video_id, fresh, read_timeout, source)
         if info:
             _ensure_info_created_at(info, video_id, fresh)
             from services.youtube_diag import log_extract_ok
@@ -1524,7 +1619,7 @@ def innertube_extract_info(
             session, video_id, auto_auth=auto_auth, fetch_pot=False,
         )
         if strong is not session:
-            info = _collect_merged_innertube_info(video_id, strong, read_timeout)
+            info = _collect_merged_innertube_info(video_id, strong, read_timeout, source)
             if info:
                 from services.youtube_diag import log_extract_ok
                 log_extract_ok(video_id, "innertube_strengthened", info, strong)

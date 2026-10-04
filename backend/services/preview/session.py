@@ -2766,13 +2766,17 @@ def _reextract_youtube_for_preview(full_url: str) -> dict:
 
     vid = extract_video_id(full_url)
     if vid:
-        merged_info = _collect_merged_innertube_info(vid, session, 12.0)
+        # source='user': this is the on-demand preview the user is watching.
+        # It draws from the USER reserve, which background work structurally
+        # cannot spend, and is never paced or made to wait on a budget.
+        merged_info = _collect_merged_innertube_info(vid, session, 12.0, "user")
         if merged_info and not _youtube_info_is_dash_only_progressive(merged_info):
             return merged_info
     info = innertube_extract_info(
         full_url,
         session=session,
         allow_session_refresh=True,
+        source="user",
     )
     if info and not _youtube_info_is_dash_only_progressive(info):
         return info
