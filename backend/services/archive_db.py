@@ -45,6 +45,51 @@ PLATFORMS = ("youtube", "twitch", "kick")
 # so stream VODs were indistinguishable from regular uploads in the index.
 KINDS = ("vod", "clip", "short", "live", "stream", "video")
 
+# The rate_limit_events DDL, as a CONSTANT that SCHEMA concatenates, so there
+# is exactly one copy of it in this file. That is what lets
+# _ensure_rate_limit_events() create the table itself instead of deferring to
+# SCHEMA's executescript: the prose below is the same text that used to sit
+# inline in SCHEMA, and the "-- Rate-limit / bot-gate HISTORY" marker is
+# preserved verbatim because backend/tests/test_rate_limit_history.py derives
+# its pre-change schema fixture by partitioning SCHEMA on it.
+_RL_EVENT_DDL = """
+-- Rate-limit / bot-gate HISTORY. The gates (services.yt_gate,
+-- services.kick_gate) hold a per-process monotonic deadline that dies with
+-- the process, so nothing could be learned from them: every restart reset
+-- the knowledge to zero. This table is the durable record of WHEN each
+-- platform limits us, on WHICH surface, and — the field that makes adaptive
+-- throttling possible at all — whether the request that tripped it was
+-- background work ('auto') or something a user is waiting on ('user').
+-- Read-only consumers: /api/archive/rate-limits/{recent,summary}.
+-- Row volume is tiny (one row per real limit event, pruned at
+-- RATE_LIMIT_RETENTION_DAYS), so this stays cheap next to a 485MB archive.
+CREATE TABLE IF NOT EXISTS rate_limit_events (
+  id              INTEGER PRIMARY KEY,   -- append-only log; rowid is the order
+  ts              TEXT NOT NULL,          -- ISO-8601 UTC (_now_iso), lexicographically comparable
+  platform        TEXT NOT NULL
+                  CHECK (platform IN ('youtube','twitch','kick','other')),
+  surface         TEXT NOT NULL DEFAULT 'other'
+                  CHECK (surface IN ('metadata','chat','captions','download',
+                                     'live-status','other')),
+  kind            TEXT NOT NULL
+                  CHECK (kind IN ('http_429','http_403','bot_gate','captcha',
+                                  'soft_neg','proactive_low','other')),
+  origin          TEXT NOT NULL DEFAULT 'auto'
+                  CHECK (origin IN ('auto','user')),
+  -- Load context at the moment of the event. NULL means "not measured" and
+  -- is never coerced to 0: a gate that cannot see request counts must not
+  -- fabricate a clean-window of zero requests.
+  recent_requests INTEGER,   -- requests this process had issued in the window
+  in_flight       INTEGER,   -- concurrent requests at signal time
+  context         TEXT,       -- free text: URL template, job id, error marker
+  backoff_s       REAL        -- cooldown actually applied, if any
+);
+-- Every read is a time-window scan (recent/summary) plus a per-platform
+-- grouping; the (platform, ts) index serves both and the ts-only index
+-- serves the retention prune.
+CREATE INDEX IF NOT EXISTS idx_rl_events_ts ON rate_limit_events(ts);
+CREATE INDEX IF NOT EXISTS idx_rl_events_platform_ts ON rate_limit_events(platform, ts);"""
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS videos (
   platform      TEXT NOT NULL CHECK (platform IN ('youtube','twitch','kick')),
@@ -268,44 +313,7 @@ CREATE TABLE IF NOT EXISTS user_focus (
   PRIMARY KEY (platform, video_id)
 );
 CREATE INDEX IF NOT EXISTS idx_user_focus_at ON user_focus(focused_at);
-
--- Rate-limit / bot-gate HISTORY. The gates (services.yt_gate,
--- services.kick_gate) hold a per-process monotonic deadline that dies with
--- the process, so nothing could be learned from them: every restart reset
--- the knowledge to zero. This table is the durable record of WHEN each
--- platform limits us, on WHICH surface, and — the field that makes adaptive
--- throttling possible at all — whether the request that tripped it was
--- background work ('auto') or something a user is waiting on ('user').
--- Read-only consumers: /api/archive/rate-limits/{recent,summary}.
--- Row volume is tiny (one row per real limit event, pruned at
--- RATE_LIMIT_RETENTION_DAYS), so this stays cheap next to a 485MB archive.
-CREATE TABLE IF NOT EXISTS rate_limit_events (
-  id              INTEGER PRIMARY KEY,   -- append-only log; rowid is the order
-  ts              TEXT NOT NULL,          -- ISO-8601 UTC (_now_iso), lexicographically comparable
-  platform        TEXT NOT NULL
-                  CHECK (platform IN ('youtube','twitch','kick','other')),
-  surface         TEXT NOT NULL DEFAULT 'other'
-                  CHECK (surface IN ('metadata','chat','captions','download',
-                                     'live-status','other')),
-  kind            TEXT NOT NULL
-                  CHECK (kind IN ('http_429','http_403','bot_gate','captcha',
-                                  'soft_neg','proactive_low','other')),
-  origin          TEXT NOT NULL DEFAULT 'auto'
-                  CHECK (origin IN ('auto','user')),
-  -- Load context at the moment of the event. NULL means "not measured" and
-  -- is never coerced to 0: a gate that cannot see request counts must not
-  -- fabricate a clean-window of zero requests.
-  recent_requests INTEGER,   -- requests this process had issued in the window
-  in_flight       INTEGER,   -- concurrent requests at signal time
-  context         TEXT,       -- free text: URL template, job id, error marker
-  backoff_s       REAL        -- cooldown actually applied, if any
-);
--- Every read is a time-window scan (recent/summary) plus a per-platform
--- grouping; the (platform, ts) index serves both and the ts-only index
--- serves the retention prune.
-CREATE INDEX IF NOT EXISTS idx_rl_events_ts ON rate_limit_events(ts);
-CREATE INDEX IF NOT EXISTS idx_rl_events_platform_ts ON rate_limit_events(platform, ts);
-"""
+""" + _RL_EVENT_DDL
 
 
 def _data_dir_inputs() -> tuple[str, str, Optional[Path]]:
@@ -1296,25 +1304,72 @@ _RL_EVENT_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _split_ddl(script: str) -> list[str]:
+    """Split a DDL script into its complete statements, one list item each.
+
+    `sqlite3.complete_statement` is the same completeness test the sqlite3
+    module applies internally, so this splits exactly where a DDL is safe to
+    split and never cuts a statement in half; leading `--` comment lines stay
+    attached to the statement they introduce.
+
+    Used instead of `executescript` because that implicitly COMMITs a pending
+    transaction before it runs. This migration sits in the middle of a larger
+    idempotent batch in _init_schema, and a batch should not have its
+    transaction boundary moved by one statement of it.
+    """
+    out: list[str] = []
+    buf = ""
+    for line in script.splitlines(keepends=True):
+        buf += line
+        if sqlite3.complete_statement(buf):
+            stmt = buf.strip()
+            if stmt:
+                out.append(stmt)
+            buf = ""
+    tail = buf.strip()
+    if tail:
+        out.append(tail)
+    return out
+
+
 def _ensure_rate_limit_events(conn: sqlite3.Connection) -> None:
     """Idempotent migration: the rate-limit history table + its columns.
 
-    SCHEMA's `CREATE TABLE IF NOT EXISTS` already covers the normal old-DB
-    path (an archive written before this lane has no such table, so the
-    statement simply creates it — it never touches transcripts/messages,
-    which is what a 485MB archive cannot afford). What is left here is the
-    column backfill for the rarer case: a DB whose rate_limit_events was
-    created by an EARLIER build of this table, or one where a later lane
-    appended a field to _RL_EVENT_COLUMNS. The PRAGMA table_info guard
-    makes repeated calls no-ops, and ALTER TABLE ADD COLUMN is additive and
-    instant (no table rewrite).
+    Self-sufficient: when the table is ABSENT this creates it (from the one
+    shared DDL, _RL_EVENT_DDL) instead of deferring to SCHEMA, and when it is
+    PRESENT it backfills any column a later lane appended to
+    _RL_EVENT_COLUMNS. Both halves are guarded, so repeated calls are no-ops
+    and two processes racing on the same archive both succeed — CREATE TABLE
+    IF NOT EXISTS plus the PRAGMA table_info check are both race-safe, and
+    ALTER TABLE ADD COLUMN is additive and instant (no table rewrite), which
+    is what a 485MB archive can afford.
+
+    Why the create half exists: this used to `return` when the table was
+    absent, on the assumption that SCHEMA's executescript had already created
+    it. That made the one migration named after this table incapable of
+    creating it, and the failure was invisible — record_rate_limit() catches
+    every exception at debug level, so a missing table looked exactly like a
+    platform that simply never got limited, and prime_from_history() returned
+    {} forever. A long-lived archive now gets its history table from the same
+    call that backfills its columns, with no dependency on statement order.
     """
     try:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(rate_limit_events)")}
     except sqlite3.Error:
         return
     if not cols:
-        return  # table absent — SCHEMA creates it whole on this same open
+        # Absent: create the whole table (DDL + both indexes), one statement
+        # at a time so an enclosing transaction is left for _init_schema to
+        # commit. Either/or with the ALTER loop below, never both.
+        try:
+            for stmt in _split_ddl(_RL_EVENT_DDL):
+                conn.execute(stmt)
+        except sqlite3.Error:
+            logger.debug("rate_limit_events: create failed", exc_info=True)
+            return
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(rate_limit_events)")}
+        if not cols:
+            return
     for name, decl in _RL_EVENT_COLUMNS:
         if name not in cols:
             conn.execute(f"ALTER TABLE rate_limit_events ADD COLUMN {name} {decl}")
