@@ -163,6 +163,49 @@ def test_ensure_is_a_noop_when_the_table_is_already_right():
     assert after == before
 
 
+def test_ensure_creates_the_table_without_committing_the_callers_work(tmp_path):
+    """The create path must not move the caller's transaction boundary.
+
+    This migration runs in the middle of a larger batch in _init_schema, so
+    it must not commit what the caller had pending. `executescript` would:
+    it implicitly COMMITs before it runs. The guard here is that each DDL
+    statement goes through conn.execute instead.
+    """
+    db = tmp_path / "txn.db"
+    conn = sqlite3.connect(db, isolation_level="DEFERRED")
+    try:
+        conn.executescript(
+            "CREATE TABLE videos (platform TEXT NOT NULL, video_id TEXT NOT NULL,"
+            " channel TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL"
+            " DEFAULT 'known', kind TEXT NOT NULL DEFAULT 'vod',"
+            " created_at TEXT NOT NULL, updated_at TEXT NOT NULL,"
+            " PRIMARY KEY (platform, video_id));"
+        )
+        # A pending change the caller has NOT committed yet.
+        conn.execute(
+            "INSERT INTO videos (platform, video_id, channel, title,"
+            " created_at, updated_at)"
+            " VALUES ('twitch', 'pending', 'c', 'uncommitted', 'x', 'x')")
+        assert conn.in_transaction, "precondition: work is pending"
+
+        archive_db._ensure_rate_limit_events(conn=conn)
+
+        assert conn.in_transaction, (
+            "the migration committed the caller's pending work — it must "
+            "leave the transaction for _init_schema to commit")
+        conn.rollback()
+        # The rolled-back row is gone AND the table this migration created
+        # came back with the rollback: both shared the caller's transaction.
+        assert "rate_limit_events" not in _tables(conn)
+        conn.rollback()
+        # Re-run outside any transaction: the table must then land for good.
+        archive_db._ensure_rate_limit_events(conn=conn)
+        conn.commit()
+        assert "rate_limit_events" in _tables(conn)
+    finally:
+        conn.close()
+
+
 # --- 3. an existing DB is migrated forward, in place ------------------------
 
 def test_existing_db_without_the_table_gains_it_and_keeps_everything(tmp_path):

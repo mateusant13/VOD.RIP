@@ -1304,6 +1304,34 @@ _RL_EVENT_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _split_ddl(script: str) -> list[str]:
+    """Split a DDL script into its complete statements, one list item each.
+
+    `sqlite3.complete_statement` is the same completeness test the sqlite3
+    module applies internally, so this splits exactly where a DDL is safe to
+    split and never cuts a statement in half; leading `--` comment lines stay
+    attached to the statement they introduce.
+
+    Used instead of `executescript` because that implicitly COMMITs a pending
+    transaction before it runs. This migration sits in the middle of a larger
+    idempotent batch in _init_schema, and a batch should not have its
+    transaction boundary moved by one statement of it.
+    """
+    out: list[str] = []
+    buf = ""
+    for line in script.splitlines(keepends=True):
+        buf += line
+        if sqlite3.complete_statement(buf):
+            stmt = buf.strip()
+            if stmt:
+                out.append(stmt)
+            buf = ""
+    tail = buf.strip()
+    if tail:
+        out.append(tail)
+    return out
+
+
 def _ensure_rate_limit_events(conn: sqlite3.Connection) -> None:
     """Idempotent migration: the rate-limit history table + its columns.
 
@@ -1330,11 +1358,12 @@ def _ensure_rate_limit_events(conn: sqlite3.Connection) -> None:
     except sqlite3.Error:
         return
     if not cols:
-        # Absent: create the whole table (DDL + both indexes) in one go.
-        # executescript commits any open transaction first, so this must run
-        # outside the ALTER loop below — it is an either/or branch, never both.
+        # Absent: create the whole table (DDL + both indexes), one statement
+        # at a time so an enclosing transaction is left for _init_schema to
+        # commit. Either/or with the ALTER loop below, never both.
         try:
-            conn.executescript(_RL_EVENT_DDL)
+            for stmt in _split_ddl(_RL_EVENT_DDL):
+                conn.execute(stmt)
         except sqlite3.Error:
             logger.debug("rate_limit_events: create failed", exc_info=True)
             return
