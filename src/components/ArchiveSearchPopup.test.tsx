@@ -76,6 +76,72 @@ function searchUrlWith(fetchMock: ReturnType<typeof vi.fn>, needle: string): str
   return searchUrls(fetchMock).find((u) => u.includes(needle));
 }
 
+/** Mirrors SEARCH_DEBOUNCE_MS in ArchiveSearchPopup.tsx. */
+const SEARCH_DEBOUNCE_MS = 250;
+
+/**
+ * Ticks the popup's 250ms search debounce on a TEMPORARY fake clock, then
+ * hands the real clock back.
+ *
+ * The debounce is a real setTimeout in the component (ArchiveSearchPopup.tsx,
+ * the inputQuery -> query effect). A starved event loop can stretch that
+ * timer arbitrarily, so every test that typed a query was betting on the
+ * machine being idle inside a waitFor default. Ticking it on a controlled
+ * clock removes the bet.
+ *
+ * NOTE this is a robustness fix, not a speed fix: measured on this file, the
+ * conversion moved the total by ~0 (21166ms -> 21245ms over 73 tests). The
+ * file's runtime is jsdom/RTL CPU (a single populated findByRole costs ~290ms
+ * here), not timer waiting. Do not expect this to make the suite faster.
+ *
+ * The clock cannot simply stay faked: RTL's waitFor decides whether to drive
+ * the clock itself via jestFakeTimersAreEnabled(), which returns false without
+ * a global jest, so a vitest fake clock is invisible to it, its own interval
+ * would never fire, and every waitFor/findBy would hang. Hence: fake, tick,
+ * restore, and only then wait. The debounced search resolves over microtasks
+ * (the fetch stub is async), so its rows are already committed by the time the
+ * real-timer wait starts.
+ *
+ * The window is one debounce (~250ms), well under the 2s deep-search poll, so
+ * no other component timer can be reached. If the component's debounce ever
+ * grows past SEARCH_DEBOUNCE_MS the timer never fires and the following
+ * waitFor times out - a loud failure, not a silent pass.
+ */
+async function flushDebounce() {
+  vi.useFakeTimers();
+  try {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS + 1);
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
+/** Types into the debounced search box and settles the debounce. */
+async function typeQuery(input: HTMLElement, value: string) {
+  fireEvent.change(input, { target: { value } });
+  await flushDebounce();
+}
+
+/**
+ * Advances a quiet window on the temporary fake clock and asserts nothing fired
+ * during it — the deterministic replacement for "sleep N ms and hope". Used for
+ * negative assertions (no extra request fired), where a real sleep proves only
+ * that the machine was not busy.
+ */
+async function expectQuiet(fn: () => void, ms = SEARCH_DEBOUNCE_MS - 1) {
+  vi.useFakeTimers();
+  try {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(ms);
+    });
+    fn();
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.useRealTimers(); // deep tests fake the clock — never leak it
@@ -188,7 +254,7 @@ describe('ArchiveSearchPopup', () => {
       />,
     );
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     const row = await screen.findByRole('button', { name: /zebra stripes/i });
 
@@ -209,7 +275,7 @@ describe('ArchiveSearchPopup', () => {
     const onOpenHit = vi.fn();
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={onOpenHit} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     const row = await screen.findByRole('button', { name: /zebra stripes/i });
     fireEvent.click(row);
@@ -228,7 +294,7 @@ describe('ArchiveSearchPopup', () => {
     const onOpenHit = vi.fn();
     render(<ArchiveSearchPopup zIndex={10} onClose={onClose} onOpenHit={onOpenHit} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     expect(await screen.findByText(/2 results/i)).toBeInTheDocument();
 
@@ -273,7 +339,7 @@ describe('ArchiveSearchPopup', () => {
       />,
     );
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     const row = await screen.findByRole('button', { name: /zebra synth row/i });
     fireEvent.click(row);
@@ -299,7 +365,7 @@ describe('ArchiveSearchPopup', () => {
     ]);
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     const transcriptionRow = await screen.findByRole('button', { name: /zebra stripes/i });
     expect(within(transcriptionRow).getByText('transcription')).toBeInTheDocument();
@@ -316,7 +382,7 @@ describe('ArchiveSearchPopup', () => {
     ]);
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     const row = await screen.findByRole('button', { name: /zebra stripes/i });
     const svgs = within(row).getAllByLabelText(/Twitch|YouTube/);
@@ -335,7 +401,7 @@ describe('ArchiveSearchPopup', () => {
     ]);
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     expect(await screen.findByRole('button', { name: /zebra stripes/i })).toBeInTheDocument();
 
@@ -374,13 +440,22 @@ describe('ArchiveSearchPopup', () => {
     vi.stubGlobal('fetch', fetchMock);
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     const row = await screen.findByRole('button', { name: /zebra stripes/i });
     expect(row).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'VOD' }));
-    await waitFor(() => expect(calls).toBe(2));
-    expect(screen.queryByRole('button', { name: /zebra stripes/i })).toBeNull();
+    // Wait on the DOM condition that IS the property, and on the refetch being
+    // issued, inside the SAME wait. The old form waited on calls (a plain
+    // variable the fetch stub increments BEFORE React commits the blanked list)
+    // and then asserted the row synchronously, so it raced the commit and lost
+    // whenever the event loop was slow. The refetch promise stays unresolved
+    // across this whole wait, so the request is provably in flight while the
+    // stale row is asserted gone.
+    await waitFor(() => {
+      expect(calls).toBe(2);
+      expect(screen.queryByRole('button', { name: /zebra stripes/i })).toBeNull();
+    });
 
     resolvePending!(json({ hits: [], enriching: [] }));
     await screen.findByText(/No results for "zebra"/);
@@ -391,7 +466,7 @@ describe('ArchiveSearchPopup', () => {
     const onOpenHit = vi.fn();
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={onOpenHit} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     fireEvent.click(await screen.findByRole('button', { name: /zebra stripes/i }));
     expect(onOpenHit).toHaveBeenCalledTimes(1);
@@ -409,7 +484,7 @@ describe('ArchiveSearchPopup', () => {
     const onOpenHit = vi.fn();
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={onOpenHit} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     fireEvent.click(await screen.findByRole('button', { name: /zebra stripes/i }));
     const targetsArg = onOpenHit.mock.calls[0][2] as Array<{ platform: string; video?: { video_id: string } | undefined }>;
@@ -428,7 +503,7 @@ describe('ArchiveSearchPopup', () => {
     expect(screen.queryByRole('button', { name: 'ambos' })).toBeNull();
     expect(screen.getByRole('button', { name: 'título' })).toHaveAttribute('aria-pressed', 'true');
     const input = screen.getByPlaceholderText(/PESQUISAR/);
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     const row = await screen.findByRole('button', { name: /zebra stripes/i });
     expect(within(row).getByText('transcrição')).toBeInTheDocument();
@@ -444,7 +519,7 @@ describe('ArchiveSearchPopup', () => {
     const fetchMock = mockFetch();
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     // The opening selection (transcripts + chat + video, titles ON — F7) is
     // the full triple = the backend's 'both', so the param is OMITTED:
@@ -481,7 +556,7 @@ describe('ArchiveSearchPopup', () => {
     const fetchMock = mockFetch();
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     expect(searchUrlWith(fetchMock, 'q=zebra')).not.toContain('semantic=');
 
@@ -528,7 +603,7 @@ describe('ArchiveSearchPopup', () => {
     expect(savedOpt).toBeTruthy();
 
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
 
     fireEvent.change(select, { target: { value: 'srdogg,srdoglol' } });
@@ -549,7 +624,7 @@ describe('ArchiveSearchPopup', () => {
     );
     await waitFor(() => expect(seeded).toHaveBeenCalled());
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(seeded, 'q=zebra&channel=titiltei')).toBeTruthy());
     first.unmount();
 
@@ -564,7 +639,7 @@ describe('ArchiveSearchPopup', () => {
     );
     await waitFor(() => expect(plain).toHaveBeenCalled());
     const input2 = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input2, { target: { value: 'zebra' } });
+    await typeQuery(input2, 'zebra');
     await waitFor(() => expect(searchUrlWith(plain, 'q=zebra')).toBeTruthy());
     const urls = searchUrls(plain).filter((u) => u.includes('q=zebra'));
     expect(urls[urls.length - 1]).not.toContain('channel=');
@@ -605,7 +680,7 @@ describe('ArchiveSearchPopup', () => {
     const fetchMock = mockFetch();
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
 
     // Default: EVERY DAY checked, no date params sent.
@@ -639,7 +714,7 @@ describe('ArchiveSearchPopup', () => {
     const fetchMock = mockFetch();
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
 
     const today = todayIso();
@@ -658,7 +733,7 @@ describe('ArchiveSearchPopup', () => {
     const fetchMock = mockFetch();
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
 
     // From only → date_to injected as today (open-ended would reach into
@@ -688,7 +763,7 @@ describe('ArchiveSearchPopup', () => {
     const fetchMock = mockFetch(hits);
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
 
     // Both languages present → chips visible.
@@ -713,7 +788,7 @@ describe('ArchiveSearchPopup', () => {
     ]);
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     await screen.findByRole('button', { name: /ola mundo/i });
     expect(screen.queryByRole('button', { name: 'PT-BR' })).toBeNull();
@@ -737,7 +812,7 @@ describe('ArchiveSearchPopup', () => {
     expect(screen.getByRole('button', { name: 'transcription' })).toBeInTheDocument();
 
     const input = screen.getByPlaceholderText('SEARCH THIS VIDEO...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     const url = searchUrlWith(fetchMock, 'q=zebra')!;
     expect(url).toContain('video_id=v1');
@@ -760,7 +835,7 @@ describe('ArchiveSearchPopup', () => {
     const onOpenHit = vi.fn();
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={onOpenHit} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     await waitFor(() =>
       expect(
@@ -801,13 +876,13 @@ describe('ArchiveSearchPopup', () => {
     });
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() =>
       expect(screen.getByText(/Indexing 1 video.*chat backfill/i)).toBeInTheDocument(),
     );
     // Next response idle → the line clears.
     current = [];
-    fireEvent.change(input, { target: { value: 'zebra2' } });
+    await typeQuery(input, 'zebra2');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra2')).toBeTruthy());
     await waitFor(() =>
       expect(screen.queryByText(/Indexing 1 video/i)).toBeNull(),
@@ -835,7 +910,7 @@ describe('ArchiveSearchPopup', () => {
     });
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     const chip = await screen.findByLabelText('Channel scope hint');
     expect(chip.textContent).toContain('scoped to srdogg');
 
@@ -858,8 +933,7 @@ describe('ArchiveSearchPopup', () => {
     });
     expect(screen.queryByLabelText('Channel scope hint')).toBeNull();
     const count = localUrls(searchUrls(fetchMock)).length;
-    await new Promise<void>((r) => setTimeout(r, 150));
-    expect(localUrls(searchUrls(fetchMock)).length).toBe(count);
+    await expectQuiet(() => expect(localUrls(searchUrls(fetchMock)).length).toBe(count));
   });
 
   it('scope object identity changes (App re-renders) do not re-fire the search', async () => {
@@ -913,7 +987,7 @@ describe('ArchiveSearchPopup', () => {
       />,
     );
     const input = screen.getByPlaceholderText('SEARCH THIS VIDEO...');
-    fireEvent.change(input, { target: { value: 'maranguape' } });
+    await typeQuery(input, 'maranguape');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=maranguape')).toBeTruthy());
     // Response state settled: hits + enriching + channel_hint applied.
     await screen.findByLabelText('Channel scope hint');
@@ -930,8 +1004,7 @@ describe('ArchiveSearchPopup', () => {
         scope={{ videoId: 'v1', title: 'VOD A' }}
       />,
     );
-    await new Promise<void>((r) => setTimeout(r, 150));
-    expect(localSearchCount()).toBe(countAfterSettle);
+    await expectQuiet(() => expect(localSearchCount()).toBe(countAfterSettle));
   });
 
   it('chat hit opens the whole history from the hit (half=0), not a ±30s slice', async () => {
@@ -967,7 +1040,7 @@ describe('ArchiveSearchPopup', () => {
     });
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     const row = await screen.findByRole('button', { name: /zebra stripes/i });
     fireEvent.click(row);
@@ -1026,7 +1099,7 @@ describe('ArchiveSearchPopup', () => {
     });
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     fireEvent.click(await screen.findByRole('button', { name: /zebra stripes/i }));
     // Page 1 lands from the hit offset; the tail note says more is coming.
@@ -1090,7 +1163,7 @@ describe('ArchiveSearchPopup', () => {
     });
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     const row = await screen.findByRole('button', { name: /zebra stripes/i });
     fireEvent.click(row);
@@ -1139,7 +1212,7 @@ describe('ArchiveSearchPopup', () => {
       />,
     );
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     fireEvent.click(await screen.findByRole('button', { name: /zebra stripes/i }));
     await screen.findByText(/way past the old 60s window/i);
@@ -1182,7 +1255,7 @@ describe('ArchiveSearchPopup', () => {
       />,
     );
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'vale da estranheza' } });
+    await typeQuery(input, 'vale da estranheza');
     await waitFor(() => expect(searchUrlWith(fetchMock, '/api/archive/search/remote')).toBeTruthy());
     expect(searchUrlWith(fetchMock, '/api/archive/search/remote')).toContain('channel=gaveta');
     await screen.findByText('YouTube results · @gaveta');
@@ -1218,7 +1291,7 @@ describe('ArchiveSearchPopup', () => {
       />,
     );
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, '/api/archive/search/remote')).toBeTruthy());
     expect(searchUrlWith(fetchMock, '/api/archive/search/remote')).toContain('channel=srdogg');
     await screen.findByText('ARCHIVED ONLY HIT');
@@ -1246,7 +1319,7 @@ describe('ArchiveSearchPopup', () => {
       />,
     );
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, '/api/archive/search/remote')).toBeTruthy());
     await screen.findByText('YouTube search timed out — try again');
     // Local hit still renders alongside the remote error note.
@@ -1261,7 +1334,7 @@ describe('ArchiveSearchPopup', () => {
     const fetchMock = mockFetch([{ ...HIT, date: hitDate }]);
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const query = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(query, { target: { value: 'zebra' } });
+    await typeQuery(query, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     const row = await screen.findByRole('button', { name: /zebra stripes/i });
     expect(row).toHaveTextContent('2 days ago');
@@ -1275,7 +1348,7 @@ describe('ArchiveSearchPopup', () => {
     const fetchMock = mockFetch([HIT]);
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const query = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(query, { target: { value: 'zebra' } });
+    await typeQuery(query, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     const row = await screen.findByRole('button', { name: /zebra stripes/i });
     expect(row).not.toHaveTextContent(/today|yesterday|\d+ (day|week|month|year)s? ago/);
@@ -1297,7 +1370,7 @@ describe('ArchiveSearchPopup USER filter', () => {
     const fetchMock = mockFetch([HIT]);
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const query = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(query, { target: { value: 'zebra' } });
+    await typeQuery(query, 'zebra');
     const user = screen.getByLabelText('Chat author');
     fireEvent.change(user, { target: { value: '@Scriptingkata' } });
     await waitFor(() => expect(searchUrlWith(fetchMock, 'username=Scriptingkata')).toBeTruthy());
@@ -1317,7 +1390,7 @@ describe('ArchiveSearchPopup USER filter', () => {
     const fetchMock = mockFetch([{ ...HIT, kind: 'message', author: '@Scriptingkata' }]);
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const query = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(query, { target: { value: 'zebra' } });
+    await typeQuery(query, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     expect(await screen.findByText('@Scriptingkata:')).toBeInTheDocument();
   });
@@ -1402,7 +1475,7 @@ describe('ArchiveSearchPopup batch-3', () => {
     // Deselect transcription → chat+video subset (no transcript for CONTEXT).
     fireEvent.click(screen.getByRole('button', { name: 'transcription' }));
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra&source=chat%2Cvideo')).toBeTruthy());
     expect(screen.getByRole('button', { name: 'CONTEXT' })).toBeDisabled();
     // Semantic never reaches the wire for non-transcript filters.
@@ -1434,7 +1507,7 @@ describe('ArchiveSearchPopup batch-3', () => {
     });
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() =>
       expect(
         screen.getByText(/Indexing 3 videos \(chat backfill \(2\), transcription\)/),
@@ -1466,7 +1539,7 @@ describe('ArchiveSearchPopup batch-3', () => {
     });
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await screen.findByRole('button', { name: /zebra stripes/i });
     const afterFirst = searchCalls;
     fireEvent.click(screen.getByRole('button', { name: 'Refresh search' }));
@@ -1495,7 +1568,7 @@ describe('ArchiveSearchPopup batch-3', () => {
     });
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await screen.findByRole('button', { name: /zebra stripes/i });
     const afterFirst = searchCalls;
     // No ArrowDown happened → activeIdx is -1 → Enter re-runs instead of selecting.
@@ -1537,7 +1610,7 @@ describe('ArchiveSearchPopup batch-3', () => {
     });
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     fireEvent.click(await screen.findByRole('button', { name: /zebra stripes/i }));
     await screen.findByText('twitch row');
@@ -1607,7 +1680,7 @@ describe('ArchiveSearchPopup batch-3', () => {
     });
     render(<ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     fireEvent.click(await screen.findByRole('button', { name: /zebra stripes/i }));
     await screen.findByText('first page');
@@ -1671,7 +1744,7 @@ describe('ArchiveSearchPopup batch-3', () => {
     const onClose = vi.fn();
     render(<ArchiveSearchPopup zIndex={10} onClose={onClose} onOpenHit={() => {}} />);
     const input = screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...');
-    fireEvent.change(input, { target: { value: 'zebra' } });
+    await typeQuery(input, 'zebra');
     await waitFor(() => expect(searchUrlWith(fetchMock, 'q=zebra')).toBeTruthy());
     fireEvent.click(await screen.findByRole('button', { name: /zebra stripes/i }));
     await screen.findByText('twitch row');
@@ -1708,9 +1781,10 @@ describe('ArchiveSearchPopup deep transcript search', () => {
         initialChannel="gaveta"
       />,
     );
-    fireEvent.change(screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...'), {
-      target: { value: 'vale da estranheza' },
-    });
+    await typeQuery(
+      screen.getByPlaceholderText('SEARCH TRANSCRIPTS + CHAT...'),
+      'vale da estranheza',
+    );
     await waitFor(() => expect(searchUrlWith(fetchMock, '/api/archive/search/remote')).toBeTruthy());
   }
 
