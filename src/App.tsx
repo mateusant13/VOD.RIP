@@ -33,6 +33,7 @@ import ChannelExplorePopup, { type ExplorePopupVod } from './ChannelExplorePopup
 import ArchiveSearchPopup from './components/ArchiveSearchPopup';
 import { buildArchiveVodUrl, formatArchiveOffset, pickLeastOpenedTarget, type ArchiveOpenTarget, type ArchiveSearchHit, type ArchiveVideoRow } from './archiveSearchUtils';
 import { archiveVideoIdFromUrl, isNativeArchiveVideoId } from './archiveScope';
+import { useArchiveFocusSignal } from './archiveFocus';
 import LocalFilePopup, { type LocalFilePopupItem } from './LocalFilePopup';
 import PreviewQualityMenu from './PreviewQualityMenu';
 import { LivePlayerPopup } from './components/LivePlayerPopup';
@@ -775,6 +776,17 @@ export default function App() {
   const [popupZOrder, setPopupZOrder] = useState<Record<string, number>>({});
   const explorePauseMapRef = useRef(new Map<string, () => void>());
   const popupZCounterRef = useRef(0);
+  // User focus (the owner's "pause the others when the user interacts with
+  // one"): the worker restricts transcribe claims to the VOD the user is
+  // watching RIGHT NOW. Driven off the popup ladder rather than the open
+  // handlers so every way in — channel list, archive search, mirror picking —
+  // is covered by the one seam, and following the z-rank means clicking an
+  // older window up front moves the pause with it.
+  const archiveFocusCandidates = useMemo(
+    () => explorePopups.map((p) => ({ id: p.id, platform: p.vod.platform, videoId: p.vod.videoId })),
+    [explorePopups],
+  );
+  useArchiveFocusSignal(archiveFocusCandidates, popupZOrder);
   const [initialPanelLayout] = useState(loadPanelLayout);
   // Frame mode: bottom-right fixed checkbox, persists to localStorage vodrip.ui.frameMode
   const [frameMode, setFrameMode] = useState<boolean>(() => {
