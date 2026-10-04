@@ -278,7 +278,7 @@ def test_enumerate_dedupes_sorts_and_reports_truncation(monkeypatch):
 
     calls: list[dict] = []
 
-    def fake_list(handle, limit, *, playlist, enrich, return_has_more, return_crawl_saturation=False, start=0):
+    def fake_list(handle, limit, *, playlist, enrich, return_has_more, return_crawl_saturation=False, start=0, source="user"):
         calls.append({"playlist": playlist, "limit": limit, "start": start})
         assert return_has_more and return_crawl_saturation, "deep must ask the raw signal"
         if playlist == "videos":
@@ -306,7 +306,7 @@ def test_enumerate_dedupes_sorts_and_reports_truncation(monkeypatch):
 
     # A clean crawl (nothing saturated, no errors, under ceiling) stays
     # truncated=False — the flag must not latch on.
-    def clean_list(handle, limit, *, playlist, enrich, return_has_more, return_crawl_saturation=False, start=0):
+    def clean_list(handle, limit, *, playlist, enrich, return_has_more, return_crawl_saturation=False, start=0, source="user"):
         return [_video(f"{playlist}1", "2024-01-01T00:00:00+00:00")], False, False
 
     monkeypatch.setattr(youtube_service, "list_channel_videos_sync", clean_list)
@@ -316,7 +316,7 @@ def test_enumerate_dedupes_sorts_and_reports_truncation(monkeypatch):
     # A tab of exactly _DEEP_TAB_LIMIT rows saturates window 1, and the
     # EMPTY window 2 resolves it — fully covered, NOT truncated (a second
     # page covers it; acceptance iii).
-    def full_list(handle, limit, *, playlist, enrich, return_has_more, return_crawl_saturation=False, start=0):
+    def full_list(handle, limit, *, playlist, enrich, return_has_more, return_crawl_saturation=False, start=0, source="user"):
         if start == 0:
             rows = [_video(f"{playlist}{i}", f"2023-01-01T00:00:{i % 60:02d}+00:00")
                     for i in range(archive._DEEP_TAB_LIMIT)]
