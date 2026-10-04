@@ -318,6 +318,35 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
     return hits.filter((h) => hitPlatforms(h).some((p) => platformFilter.includes(p)));
   }, [hits, platformFilter]);
 
+  /** What the result set actually contains, per source. The chips above filter
+   *  the REQUEST; this reports what came back, so a chat-heavy result set no
+   *  longer reads as a flat list of "transcription" rows. Plain text, not
+   *  buttons: the source chips own filtering, this only counts. */
+  const hitFacets = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const h of displayHits) counts.set(h.kind, (counts.get(h.kind) ?? 0) + 1);
+    return (['transcript', 'message', 'title'] as const)
+      .filter((k) => counts.has(k))
+      .map((k) => ({
+        key: k,
+        label: KIND_BADGE_LABEL[k] ? t(KIND_BADGE_LABEL[k]) : k,
+        count: counts.get(k) ?? 0,
+      }));
+  }, [displayHits, t]);
+
+  /** Per-video hit counts, keyed exactly like the rows (platform:video_id), so
+   *  a mirrored hit never splits a group. Drives the group headers: without
+   *  them, a result set mixing transcript/chat/title across videos reads as
+   *  one undifferentiated list. */
+  const hitGroups = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const h of displayHits) {
+      const k = `${(h.platform || '').toLowerCase()}:${h.video_id}`;
+      counts.set(k, (counts.get(k) ?? 0) + 1);
+    }
+    return counts;
+  }, [displayHits]);
+
   /** Deep-sweep rows obey the chips, like every other section.
    *  SOURCE axis: the sweep scans transcripts only — it never runs a chat or
    *  title pass — so the whole section is empty once TRANSCRIPTION is off.
@@ -1395,6 +1424,28 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
         </div>
       )}
 
+      {/* Facet row — the SOURCE breakdown of what came back, plus how many
+          videos it spans. Answers "why does this look like 40 transcription
+          rows?" before the user has to scroll and count badges. */}
+      {status === 'done' && displayHits.length > 0 && hitFacets.length > 0 && (
+        <div
+          data-hit-facets
+          className="flex items-center gap-2 flex-wrap shrink-0 -mt-0.5 text-[9px] font-mono uppercase tracking-widest"
+        >
+          {hitFacets.map((f) => (
+            <span key={f.key} className="text-zinc-500">
+              {f.label}
+              <span className="text-zinc-300"> {f.count}</span>
+            </span>
+          ))}
+          {hitGroups.size > 1 && (
+            <span className="text-zinc-600">
+              · {t('{n} videos', { n: hitGroups.size })}
+            </span>
+          )}
+        </div>
+      )}
+
       {/* ── HITS — incremental: only `visibleCount` rows are mounted; the
           scroll handler reveals the next chunk so an uncapped literal search
           stays smooth. Hidden while a refetch is in flight: with a 100k-row
@@ -1427,8 +1478,31 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
             if (cursor < snippet.length) nodes.push(snippet.slice(cursor));
             const isSelected = selected?.hit === hit;
             const isActive = activeIdx === idx;
+            // Group boundary: consecutive hits from the same video share one
+            // sticky header instead of repeating the title on every row. Keyed
+            // on the same platform:video_id the rows use, so a mirrored hit
+            // never splits a group.
+            const groupKey = `${(hit.platform || '').toLowerCase()}:${hit.video_id}`;
+            const prevHit = idx > 0 ? displayHits[idx - 1] : undefined;
+            const startsGroup =
+              !prevHit ||
+              `${(prevHit.platform || '').toLowerCase()}:${prevHit.video_id}` !== groupKey;
             return (
-              <div key={`${hit.kind}:${hit.platform}:${hit.video_id}:${hit.offset_sec}`} className="flex items-stretch gap-1">
+              <React.Fragment key={`${hit.kind}:${hit.platform}:${hit.video_id}:${hit.offset_sec}`}>
+                {startsGroup && (
+                  <div
+                    data-hit-group={groupKey}
+                    className="sticky top-0 z-[1] flex items-center gap-1.5 min-w-0 bg-zinc-950/95 backdrop-blur-sm border-b border-zinc-800 px-1 pt-1.5 pb-1"
+                  >
+                    <span className="text-[11px] font-bold text-zinc-100 truncate min-w-0 flex-1">
+                      {videoTitle(video, hit)}
+                    </span>
+                    <span className="text-[9px] font-mono text-zinc-500 shrink-0">
+                      {hitGroups.get(groupKey)}
+                    </span>
+                  </div>
+                )}
+                <div className="flex items-stretch gap-1">
                 <button
                   ref={(el) => { hitRefs.current[idx] = el; }}
                   type="button"
@@ -1467,9 +1541,10 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                       {kindLabel(hit.video_kind)}
                     </span>
                   )}
-                  <span className="text-[9px] font-bold uppercase truncate text-zinc-200 min-w-0 flex-1">
-                    {videoTitle(video, hit)}
-                  </span>
+                  {/* The video title moved to the group header — repeating it
+                      on every row is what made a mixed result set read as
+                      soup. The row keeps its kind/lang/platform/offset cues. */}
+                  <span className="flex-1" />
                   <span className="text-[9px] font-mono text-zinc-400 shrink-0">
                     {formatArchiveOffset(hit.offset_sec)}
                   </span>
@@ -1504,6 +1579,7 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                   </button>
                 )}
               </div>
+              </React.Fragment>
             );
           })}
         </div>

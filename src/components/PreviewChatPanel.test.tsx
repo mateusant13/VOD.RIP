@@ -997,11 +997,22 @@ describe('PreviewChatPanel', () => {
     rtlRender(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
     await waitFor(() => expect(screen.getByText('hello world')).toBeTruthy());
     const input = screen.getByRole('textbox', { name: 'Search transcript' });
-    fireEvent.change(input, { target: { value: 'second' } });
-    // The input echoes immediately, the list does not: nothing is filtered
-    // until the debounce elapses.
-    expect((input as HTMLInputElement).value).toBe('second');
-    expect(screen.queryByText('1/1')).toBeNull();
-    await waitFor(() => expect(screen.getByText('1/1')).toBeTruthy());
+    // Driven off a fake clock on purpose: this asserts the DEBOUNCE BOUNDARY,
+    // so a wall-clock 200ms wait against waitFor's 1s budget is a flake
+    // waiting for a busy machine (it failed once at ~5x headroom).
+    vi.useFakeTimers();
+    try {
+      fireEvent.change(input, { target: { value: 'second' } });
+      // The input echoes immediately, the list does not: nothing is filtered
+      // until the debounce elapses.
+      expect((input as HTMLInputElement).value).toBe('second');
+      expect(screen.queryByText('1/1')).toBeNull();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(250); // > SEARCH_DEBOUNCE_MS
+      });
+      expect(screen.getByText('1/1')).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
