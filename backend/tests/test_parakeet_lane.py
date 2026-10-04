@@ -165,12 +165,64 @@ def test_langs_intersect_with_model_tokens(tmp_path, monkeypatch):
     # pre-download: the candidate set is authoritative
     assert at._parakeet_langs() == at.PARAKEET_LANG_CANDIDATES
     # model dir present -> routing narrows to the model's actual lang tokens
-    d = tmp_path / "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
+    d = tmp_path / at._PARAKEET_DIR_NAME
     d.mkdir()
     for f in at._PARAKEET_FILES:
         (d / f).write_text("x", encoding="utf-8")
     (d / "tokens.txt").write_text("<|pt|> 0\n<|ja|> 1\n<|zh|> 2\n", encoding="utf-8")
     assert at._parakeet_langs() == {"pt"}
+
+
+def test_model_is_redux_with_the_real_packaging_names():
+    """The one parakeet model, with the file names the packaging REALLY has.
+
+    Redux ships float graphs, not ".int8" quantised ones (the ternary weights
+    live inside encoder.onnx as MatMulNBits blocks). A wrong name here does not
+    degrade quality — it makes every ASR job fail as "no model", because
+    _parakeet_resolve_dir probes the cache on exactly these names.
+    """
+    assert at.PARAKEET_MODEL == "Codyfederer/sherpa-onnx-nemo-parakeet-redux"
+    assert at._PARAKEET_DIR_NAME == "sherpa-onnx-nemo-parakeet-redux"
+    assert at._PARAKEET_FILES == (
+        "encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"
+    )
+    assert not any(".int8." in f for f in at._PARAKEET_FILES), (
+        "redux has no .int8.onnx files — a stale name means the model never "
+        "resolves and every job fails as no-model"
+    )
+    # the archive is named after the dir and holds the four files flat
+    assert at._PARAKEET_ARCHIVE == at._PARAKEET_DIR_NAME + ".tar.bz2"
+    # _load_parakeet indexes the tuple positionally (encoder/decoder/joiner)
+    assert at._PARAKEET_FILES[:3] == ("encoder.onnx", "decoder.onnx", "joiner.onnx")
+    assert at._PARAKEET_FILES[3] == "tokens.txt"
+    # same architecture as the int8 model it replaces
+    assert at._PARAAKEET_FEATURE_DIM == 128
+
+
+def test_live_captions_mirror_cannot_drift():
+    """live_captions keeps a LIGHTWEIGHT copy of the model identity so
+    captions_available() can stat the dir without importing the heavy worker.
+    The copy exists only to avoid that import — so a drifted copy reports
+    captions as unavailable (or available) opposite to what ASR can load.
+    """
+    from services import live_captions as lc
+
+    assert lc._PARAAKEET_MODEL == at.PARAKEET_MODEL
+    assert lc._PARAAKEET_FILES == at._PARAKEET_FILES
+    assert lc._PARAAKEET_DIR_NAME == at._PARAKEET_DIR_NAME
+
+
+def test_live_captions_probe_matches_asr_resolve_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv(at.PARAKEET_CACHE_ENV, str(tmp_path))
+    from services import live_captions as lc
+
+    assert lc._parakeet_model_dir_probe() is None
+    assert at._parakeet_resolve_dir() is None
+    d = tmp_path / at._PARAKEET_DIR_NAME
+    d.mkdir()
+    for f in at._PARAKEET_FILES:
+        (d / f).write_text("x", encoding="utf-8")
+    assert lc._parakeet_model_dir_probe() == at._parakeet_resolve_dir() == d
 
 
 def test_langs_empty_when_lane_unavailable():
@@ -188,10 +240,10 @@ def test_cache_dir_override_and_models_folder_subdir(tmp_path, monkeypatch):
     # ...unless the legacy drive-root sibling still holds the model (migration:
     # empty models-folder copy -> legacy reused, no re-download).
     legacy = tmp_path / "parakeet-models"
-    (legacy / "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8").mkdir(parents=True)
+    (legacy / at._PARAKEET_DIR_NAME).mkdir(parents=True)
     assert at._parakeet_cache_dir() == legacy
     # a populated models-folder copy wins over the legacy sibling.
-    (tmp_path / "VOD.RIP-models" / "parakeet-models" / "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8").mkdir(parents=True)
+    (tmp_path / "VOD.RIP-models" / "parakeet-models" / at._PARAKEET_DIR_NAME).mkdir(parents=True)
     assert at._parakeet_cache_dir() == tmp_path / "VOD.RIP-models" / "parakeet-models"
 
 

@@ -149,9 +149,19 @@ def test_parakeet_cache_lives_under_models_root(monkeypatch, tmp_path):
 # --- no whisper download default (engine reality) --------------------------
 
 def test_fixed_engine_model_is_parakeet():
-    """The engine model id is the fixed sherpa int8 parakeet repo — no
+    """The engine model id is the fixed sherpa parakeet redux repo — no
     faster-whisper id anywhere near the default."""
-    assert PARAKEET_MODEL == "csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
+    # Pinned to the ONE parakeet the app ships. Redux is the ternary
+    # re-quantisation of parakeet-tdt-0.6b-v3 (same architecture, tokenizer
+    # and 25 languages; 178 MB vs ~1.2 GB). Pinned so a silent model swap
+    # cannot land; the no-faster-whisper intent below is unchanged.
+    assert PARAKEET_MODEL == "Codyfederer/sherpa-onnx-nemo-parakeet-redux"
+    assert "parakeet" in PARAKEET_MODEL.lower(), (
+        "the ASR default must still be a parakeet model"
+    )
+    assert "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8" not in PARAKEET_MODEL, (
+        "the old int8 parakeet must be gone — redux replaced it"
+    )
     assert "faster-whisper" not in PARAKEET_MODEL
     assert archive_transcribe._asr_model_name() == PARAKEET_MODEL
 
