@@ -2877,6 +2877,23 @@ def update_job(job_id: str, *, status: Optional[str] = None,
             or ("ASR unsupported" in err)
             or ("ASR unavailable" in err)
         )
+        # Age gate — terminal AND parked, not merely "retried until attempts
+        # run out". YouTube serves this refusal for an UNAUTHENTICATED request
+        # and no anonymous player client passes it anymore, so every retry
+        # fails identically; only credentials can change the outcome. Left in
+        # the normal path it re-queued on the exponential curve forever (the
+        # job was neither terminal nor rate-classified), which is what the user
+        # saw as a job failing every 30s with no explanation. Parked here: the
+        # job goes 'failed' with the actionable message, and
+        # _requeue_failed_transcribe_job keeps it parked until an
+        # authenticated session exists.
+        try:
+            from services.youtube_diag import is_age_gate_job_error
+
+            if is_age_gate_job_error(err):
+                terminal = True
+        except Exception:
+            pass
         # Gate-aware retry: YouTube bot-gate failures surface as playability
         # RuntimeErrors, not HTTP 429s — the string markers alone miss them,
         # so also run the yt_gate classifier (string-safe) plus the explicit

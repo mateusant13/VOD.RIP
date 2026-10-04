@@ -607,6 +607,53 @@ def resolve_ytdlp_cookiefile(session: YouTubeSession, explicit: Optional[str] = 
     return _bridge_cookiefile()
 
 
+def youtube_session_configured(
+    session: Optional[YouTubeSession] = None,
+) -> bool:
+    """True when an AUTHENTICATED YouTube session is actually wired up.
+
+    The distinction this exists for: an age-gated refusal is credential-bound,
+    and the honest thing to tell the user differs by state —
+
+      False -> nothing is configured at all (no manual cookie file, no bridge
+               export, no --cookies-from-browser). "Set up YouTube sign-in."
+      True  -> a session IS configured and YouTube still refused. The cookies
+               are present but rejected — almost always the rotation problem
+               (YouTube rotates account cookies while a YouTube tab is open), so
+               the fix is a re-capture, not a retry.
+
+    An anonymous bootstrap jar (``yt_anon_``) is deliberately NOT an
+    authenticated session: it carries visitor_data/cookie_header only, so it
+    can never satisfy an age gate. Counting it would make every
+    credential-blocked failure report as "your session was rejected", which is
+    the misleading branch. Mirrors resolve_ytdlp_cookiefile's ordering, minus
+    the anonymous fallback."""
+    if session is None:
+        session = youtube_session_from_settings()
+    # Manual --cookies-from-browser needs no cookie file.
+    if (session.cookies_from_browser or "").strip():
+        return True
+    try:
+        cookie_path = resolve_ytdlp_cookiefile(session)
+    except Exception:
+        cookie_path = None
+    if not cookie_path:
+        # Bridge export absent — the last remaining source is the app's own
+        # short-lived cookie cache (services.youtube_auth).
+        try:
+            from services.youtube_auth import find_fresh_cookie_cache
+
+            cookie_path = find_fresh_cookie_cache()
+        except Exception:
+            cookie_path = None
+    if not cookie_path:
+        return False
+    try:
+        return not Path(cookie_path).name.startswith(_ANON_JAR_PREFIX)
+    except (TypeError, ValueError):
+        return True
+
+
 def apply_ytdlp_cookie_opts(
     opts: dict,
     session: YouTubeSession,

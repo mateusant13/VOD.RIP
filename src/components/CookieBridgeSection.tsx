@@ -28,6 +28,13 @@ export interface BridgeStatus {
   paired: boolean;
   enabled: boolean;
   platforms: Record<string, PlatformBridgeStatus>;
+  /**
+   * An AUTHENTICATED YouTube session is actually wired up (manual cookie file /
+   * bridge export / cookies-from-browser). Lets this section tell "you never
+   * signed in" apart from "YouTube rejected the session you have" — the two
+   * need different actions. Absent on an older backend; treated as unknown.
+   */
+  youtube_authenticated?: boolean;
 }
 
 interface ExtSource {
@@ -271,6 +278,57 @@ export default function CookieBridgeSection({
           <span className="text-zinc-400">{t('no cookies stored')}</span>
         )}
       </div>
+
+      {/* Honest YouTube auth state. Age-restricted videos are public but need a
+          signed-in, age-verified account, and YouTube has closed the anonymous
+          paths — so an age-gate failure is a credential problem, not a network
+          one. Say which of the two we are in instead of a generic failure. */}
+      <p className="text-[11px] font-mono leading-relaxed">
+        <span className="text-zinc-400">{t('YouTube sign-in:')}</span>{' '}
+        {status?.youtube_authenticated === true ? (
+          <span className="text-emerald-500">
+            {t('session connected — age-restricted videos will work.')}
+          </span>
+        ) : status?.youtube_authenticated === false ? (
+          <span className="text-amber-500">
+            {t('not connected — age-restricted videos cannot be downloaded. Sign in below.')}
+          </span>
+        ) : (
+          <span className="text-zinc-400">{t('unknown')}</span>
+        )}
+      </p>
+
+      {/* Rotation-safe capture, kept here so the fix is discoverable inside the
+          app instead of a wiki. YouTube rotates account cookies while a
+          YouTube tab is open, so a cookie export from an ordinary tab can be
+          invalidated within hours; a private window that is closed right after
+          the export is never rotated again. */}
+      <details className="text-[11px] font-mono border-2 border-zinc-800 px-2.5 py-2">
+        <summary className="cursor-pointer text-zinc-300 select-none">
+          {t('Age-restricted video? Capture the YouTube session so it lasts')}
+        </summary>
+        <ol className="mt-2 flex flex-col gap-1 text-zinc-400 list-decimal pl-4 leading-relaxed">
+          <li>
+            {t(
+              'Open a private/incognito window and sign in to YouTube. Use a throwaway account if you can — a personal account risks a YouTube ban.',
+            )}
+          </li>
+          <li>
+            {t('In that same window, go to https://www.youtube.com/robots.txt')}
+          </li>
+          <li>
+            {t(
+              'Export the youtube.com cookies from this window, then close the window immediately — a closed window is never rotated.',
+            )}
+          </li>
+          <li>
+            {t(
+              'Keep the Cookie Bridge enabled so the session reaches this app. Do NOT point an exporter at a normal tab: those cookies rotate within hours.',
+            )}
+          </li>
+          <li>{t('Then retry the failed job — it picks up on its own.')}</li>
+        </ol>
+      </details>
 
       {token ? (
         <div className="flex items-center gap-2">

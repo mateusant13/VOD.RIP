@@ -35,6 +35,7 @@ from services import archive_db, transcript_fix
 from services.chat_sinks.yt_live import _base_usec_from_info
 from services.ytdlp_ffmpeg import _ytdlp_engine_opts
 from services.ytdlp_guard import guarded_youtube_dl, guarded_youtube_dl_channel
+from services.youtube_diag import is_age_gate_error
 
 logger = logging.getLogger(__name__)
 
@@ -892,7 +893,28 @@ def ingest_video(id_or_url: str, *, temp_dir: Optional[Path] = None) -> dict:
             # path keys off the error text, and 'extract error' alone never
             # matched it. A gate-classified failure names the gate so the
             # retry deadline tracks the freeze instead of hot-retrying.
-            if _is_gate_error(exc):
+            #
+            # Age gate is checked FIRST and is neither gate nor retryable: it
+            # is a per-video refusal for an UNAUTHENTICATED request, and no
+            # anonymous client passes it anymore. It must not be confused with
+            # the IP-level bot gate (whose "sign in to confirm" marker this
+            # text also contains) and must not fall through to the generic
+            # branch, which requeued it on the exponential curve forever.
+            if is_age_gate_error(exc):
+                from services.youtube_diag import (
+                    AGE_GATE_JOB_MARKER,
+                    age_gate_actionable_message,
+                )
+
+                logger.warning(
+                    "youtube %s age-gated (no authenticated session) — parked, "
+                    "not retried: %s",
+                    video_id, exc,
+                )
+                # Marker first: job errors are truncated to 400 chars and the
+                # terminal/parked check in archive_db.update_job reads the text.
+                error = f"{AGE_GATE_JOB_MARKER}: {age_gate_actionable_message()}"
+            elif _is_gate_error(exc):
                 from services.yt_gate import note_youtube_gate
 
                 note_youtube_gate(str(exc)[:200], surface="download", origin="auto")

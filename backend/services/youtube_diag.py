@@ -75,6 +75,32 @@ _AGE_GATE_MARKERS = (
     "age gate",
     "age_verification_required",
     "inappropriate for some users",
+    # yt-dlp serves the refusal in the LOGIN/UI language of the request, so an
+    # English-only list silently misses every non-English install — the live
+    # pt-BR failure ("Faça login para confirmar sua idade") missed entirely and
+    # was reported as a retryable transient. Language-neutral phrasings
+    # ("confirm"/"confirmar" + "age"/"idade") are listed per language, plus the
+    # per-language noun/adjective pairs, so a translated refusal still matches.
+    "confirmar sua idade",                     # pt-BR
+    "confirmar a sua idade",                   # pt-BR (pt-PT)
+    "confirme sua idade",                      # pt-BR (imperative)
+    "confirm your age",                        # pt-PT
+    "faça login para confirmar sua idade",     # pt-BR (full refusal)
+    "faca login para confirmar sua idade",     # pt-BR (no accents)
+    "login para confirmar sua idade",          # pt-BR (substring)
+    "verifique sua idade",                     # pt-BR
+    "conteúdo restrito por idade",             # pt-BR
+    "conteudo restrito por idade",             # pt-BR (no accents)
+    "restrito por idade",                      # pt-BR
+    "confirma tu edad",                        # es
+    "verificación de edad",                    # es
+    "contenido restringido por edad",          # es
+    "confirmez votre âge",                     # fr
+    "vérifiez votre âge",                      # fr
+    "bestätige dein alter",                    # de
+    "confirma la tua età",                     # it
+    "age verification required",               # en (spaced variant)
+    "age verification",                        # en (generic, catches en/en-GB)
 )
 
 
@@ -87,9 +113,27 @@ def is_age_gate_error(exc: BaseException) -> bool:
     no anonymous player client (web, web_embedded, android_vr, web_safari)
     passes the age gate anymore; the app's cookie_bridge login flow is the
     only path.
+
+    Marker matching is case-insensitive and must stay LANGUAGE-COMPLETE: this
+    predicate drives the 403-vs-503 status, the user-facing text, and the
+    terminal (no-retry) decision. A marker miss on a non-English refusal makes
+    the app report a permanent, credential-blocked failure as a transient
+    "try again" and re-queue it forever.
     """
     low = str(exc).lower()
     return any(marker in low for marker in _AGE_GATE_MARKERS)
+
+
+# Stamped into an archive_jobs.error for an age-gate failure so the queue's
+# terminal check (archive_db.update_job) can recognise it from the error TEXT
+# alone — the same contract the existing terminal markers use. It must survive
+# the [:400] truncation applied to job errors, so it goes at the FRONT.
+AGE_GATE_JOB_MARKER = "age-gate-needs-login"
+
+
+def is_age_gate_job_error(error: Optional[str]) -> bool:
+    """True when a stored job error is a parked age-gate failure."""
+    return AGE_GATE_JOB_MARKER in (error or "").lower()
 
 
 # Monitor-only taxonomy marker for the subtitles PO-Token policy (yt-dlp
@@ -344,17 +388,48 @@ def youtube_http_status(exc: BaseException) -> int:
     return 500
 
 
+def age_gate_actionable_message(*, preview: bool = False) -> str:
+    """Actionable text for an age-gate refusal, honest about session state.
+
+    Two states, because they need different user actions and telling the user
+    to "sign in" when they already did is worse than saying nothing:
+
+      no session configured -> set up the app's own YouTube sign-in
+      session rejected      -> re-capture (cookies were rotated)
+
+    An age-restricted video is public; it just needs a signed-in,
+    age-verified account. YouTube has closed the anonymous paths, so no
+    amount of retrying substitutes for credentials — the message must not
+    imply a retry could fix it."""
+    verb = "watched" if preview else "downloaded"
+    try:
+        from services.youtube_session import youtube_session_configured
+
+        configured = youtube_session_configured()
+    except Exception:
+        # Never let a probe failure turn an honest message into a generic one.
+        configured = False
+    if not configured:
+        return (
+            f"Age-restricted video — no signed-in YouTube session is configured, "
+            f"so it cannot be {verb}. Open Settings > Cookie Bridge, sign in to "
+            f"YouTube, then retry this job."
+        )
+    return (
+        f"Age-restricted video — the configured YouTube session was rejected "
+        f"(YouTube rotates account cookies while a YouTube tab is open), so it "
+        f"cannot be {verb}. Sign in again from a private window via "
+        f"Settings > Cookie Bridge, then retry this job."
+    )
+
+
 def youtube_user_message(exc: BaseException, *, preview: bool = False) -> str:
     """Sanitize YouTube errors for API/UI — never mention cookies or bot jargon."""
     low = str(exc).lower()
     # Definitive age gate — retrying never helps without a logged-in account;
     # the app's YouTube sign-in flow (cookie_bridge) is the only unlock.
     if is_age_gate_error(exc):
-        return (
-            "This video is age-restricted — sign in to YouTube to watch it."
-            if preview
-            else "This video is age-restricted — sign in to YouTube to download it."
-        )
+        return age_gate_actionable_message(preview=preview)
     if any(
         x in low
         for x in (

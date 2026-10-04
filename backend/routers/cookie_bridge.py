@@ -10,7 +10,8 @@ GET  /api/session/cookies/pull?platform=&token=  — Netscape cookies.txt (text/
     X-Cookie-Bridge-Token header or matching token query param and an
     enabled, paired bridge.
 GET  /api/session/cookies/status — {paired, enabled, platforms:{platform:{count, lastGrabAt, expiredCount}},
-    youtube_gate_active, youtube_gate_remaining_sec} (the any-tab bot-gate banner polls these)
+    youtube_authenticated, youtube_gate_active, youtube_gate_remaining_sec} (the any-tab bot-gate banner polls
+    these; youtube_authenticated distinguishes "no YouTube session configured" from "session rejected")
 GET  /api/session/cookies/token  — the paired token (Settings diagnostics).
 POST /api/session/cookies/enable|disable — kill switch (consent toggle).
 GET  /api/session/cookies/extension/extension.crx — the packed extension.
@@ -1022,6 +1023,16 @@ async def session_cookies_auto_install(body: Optional[dict] = None):
     return {"ok": True, "started": True, "state": "running"}
 
 
+def _youtube_authenticated() -> bool:
+    """True when an authenticated YouTube session is wired up. Never raises."""
+    try:
+        from services.youtube_session import youtube_session_configured
+
+        return bool(youtube_session_configured())
+    except Exception:
+        return False
+
+
 @router.get("/api/session/cookies/status")
 async def session_cookies_status(request: Request):
     _require_loopback(request)
@@ -1054,6 +1065,13 @@ async def session_cookies_status(request: Request):
         # any-tab banner polls these. Gating/freeze logic stays in yt_gate.
         "youtube_gate_active": gate_sec > 0,
         "youtube_gate_remaining_sec": gate_sec,
+        # Is an AUTHENTICATED YouTube session actually wired up (manual cookie
+        # file / bridge export / --cookies-from-browser)? The Settings section
+        # needs this to tell "you never signed in" apart from "YouTube
+        # rejected the session you have" — the two need different actions, and
+        # guessing wrong is what made the age-gate failure look like a random
+        # network error. An anonymous bootstrap jar does NOT count.
+        "youtube_authenticated": _youtube_authenticated(),
         # One-click auto-install mirror — state: idle|running|done|error.
         "auto_install": {
             "state": ai["state"],

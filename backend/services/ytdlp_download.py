@@ -53,7 +53,7 @@ from services.ytdlp_hls import (
 )
 from services.ytdlp_cache import _get_cache_dir, _prune_cache_dir
 from services.os_services import _NO_WINDOW
-from services.youtube_diag import is_age_gate_error
+from services.youtube_diag import age_gate_actionable_message, is_age_gate_error
 
 logger = logging.getLogger(__name__)
 
@@ -1127,8 +1127,10 @@ def sanitize_download_error(exc: BaseException) -> str:
     # Definitive age gate — retrying NEVER helps without a logged-in account
     # (no anonymous player client passes it since 2024+; verified 2026-08-12
     # on yt-dlp 2026.07.04). Say so instead of the transient bot-gate line.
+    # Shared with the API/preview surfaces so the download panel and the job
+    # error never disagree about what is wrong or what to do.
     if is_age_gate_error(exc):
-        return "This video is age-restricted — sign in to YouTube to download it."
+        return age_gate_actionable_message()
     if "sign in to confirm" in low or "not a bot" in low:
         return (
             "Preview unavailable for this video — try again in a moment."

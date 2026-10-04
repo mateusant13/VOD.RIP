@@ -561,10 +561,37 @@ def _requeue_failed_transcribe_job(
     P1-1: a job that exhausted max_attempts is NEVER requeued — the
     worker's 3-attempt cap marked it failed as a final verdict, and
     resurrecting it would restart the same doomed cycle (a permanently
-    failing remote VOD re-downloading ~350 MB of audio every hour)."""
+    failing remote VOD re-downloading ~350 MB of audio every hour).
+
+    Age-gate jobs are parked the same way, but REVERSIBLY: the refusal is
+    credential-bound, so it resolves the moment an authenticated YouTube
+    session exists. While no session is configured the job stays 'failed'
+    with its actionable message instead of cycling once an hour; the moment
+    one appears the next pass requeues it and it drains. That is the whole
+    difference between a user who sees "sign in and retry" and a job that
+    fails forever."""
     row = archive_db.query(
-        "SELECT attempts, max_attempts FROM archive_jobs WHERE id = ?", (job_id,)
+        "SELECT attempts, max_attempts, platform, error FROM archive_jobs WHERE id = ?",
+        (job_id,),
     )
+    try:
+        from services.youtube_diag import is_age_gate_job_error
+
+        age_parked = bool(row) and is_age_gate_job_error(row[0]["error"])
+    except Exception:
+        age_parked = False
+    if age_parked:
+        try:
+            from services.youtube_session import youtube_session_configured
+
+            if not youtube_session_configured():
+                logger.info(
+                    "scheduler kept age-gated job %s parked — no authenticated "
+                    "YouTube session configured", job_id,
+                )
+                return False
+        except Exception:
+            return False  # probe failed — stay parked rather than hammer
     if row and int(row[0]["attempts"] or 0) >= int(row[0]["max_attempts"] or 3):
         logger.debug(
             "scheduler skipped failed transcribe job %s — attempts exhausted",
