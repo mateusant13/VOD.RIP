@@ -623,6 +623,93 @@ def _governor_admit(source: str, kind: str) -> None:
         logger.debug("rate_budget: admission check failed", exc_info=True)
 
 
+# GQL error messages that mean "you are being rate limited", as opposed to every
+# other reason a GraphQL response can carry an `errors` array.
+#
+# PROVENANCE, stated honestly: the SHAPE below is verified from this module's own
+# code - `body.get("errors")` then `body["errors"][0].get("message", ...)` at the
+# two call sites, and a real canned body of the same shape in
+# tests/test_rl_counter.py (`[{"errors": [{"message": "PersistedQueryNotFound"}]}]`).
+# No `extensions`/`code` field is read anywhere in this codebase, so the
+# classifier deliberately keys on `message` ALONE and invents no field names.
+# The MARKER TEXT is not from an archived production body: errors.jsonl holds no
+# Twitch rate-limit body (only transport/subscriber errors), so these are the
+# narrow, unambiguous rate-limit phrases and nothing looser. A missed marker
+# leaves us exactly where we are today (silent); a loose one would pace a
+# platform that never limited us, which is the worse failure.
+_GQL_RATE_LIMIT_MARKERS = (
+    "too many requests",
+    "rate limit",
+    "rate-limit",
+    "ratelimit",
+    "exceeded the ratelimit",
+    "temporarily blocked",
+)
+
+
+def _gql_errors_indicate_rate_limit(body: Any) -> bool:
+    """True when a 200-with-errors is Twitch rate limiting us, not a bad query.
+
+    Twitch signals throttling as **HTTP 200 carrying an `errors` array**, so the
+    `HTTPError`/`e.code == 429` branch below is close to unreachable for the one
+    platform that talks to it most. That is why the live history had 33 rows and
+    not one of them was Twitch.
+
+    FALSE-POSITIVE DISCIPLINE: an `errors` array is also how Twitch reports a bad
+    query, a dead channel, an auth failure, a stale persisted hash, or a partial
+    response. None of those are rate limits, and none of them may lower a
+    ceiling - pacing a platform that never limited us is worse than staying
+    silent. So the default is False and only an explicit rate-limit phrase in an
+    error message flips it. Anything unreadable (non-dict body, non-list
+    `errors`, non-dict entry, missing/non-string message) is False by
+    construction, not by exception handling.
+    """
+    if not isinstance(body, dict):
+        return False
+    errors = body.get("errors")
+    if not isinstance(errors, (list, tuple)) or not errors:
+        return False
+    for err in errors:
+        if not isinstance(err, dict):
+            continue
+        message = err.get("message")
+        if not isinstance(message, str):
+            continue
+        lowered = message.lower()
+        if any(marker in lowered for marker in _GQL_RATE_LIMIT_MARKERS):
+            return True
+    return False
+
+
+def _note_gql_rate_limit(body: Any, kind: str, source: str) -> None:
+    """Fold a 200-with-errors rate limit into the learned ceiling.
+
+    ``status=429`` is the governor's "this was a rate limit" vocabulary, not a
+    claim about the wire: the HTTP status really was 200. The precedent is
+    ``youtube_innertube._governor_note_limit(429, ..., "innertube_bot_gate")``
+    (youtube_innertube.py:1209), which does the same for a bot wall - a bot wall
+    is "a rate limit with a different name" by that module's own comment.
+
+    ``kind`` is ``other`` and that is deliberate, not a fallback. The
+    ``rate_limit_events.kind`` column is normalized against a CLOSED allowlist
+    (``archive_db.RATE_LIMIT_KINDS``), and it has no class for "a rate limit the
+    platform reported inside a 200 body". The two candidates are both lies:
+    ``http_429`` claims we saw a 429, and ``bot_gate`` is a different platform's
+    different failure. ``other`` is what the column honestly holds, and it is
+    already what the governor's own rows carry on the live archive, so these
+    events are consistent with the 3 existing ``other`` rows rather than
+    inventing a new class. Widening the taxonomy is archive_db's call, not this
+    seam's.
+
+    The existing RuntimeError is still raised by the caller: this only adds the
+    learning, it never changes what the caller sees.
+    """
+    try:
+        note_limit("twitch", kind=kind, status=429, source=source)
+    except Exception:  # noqa: BLE001 - instrumentation must never break a fetch
+        logger.debug("rate_budget: note_limit failed for Twitch GQL", exc_info=True)
+
+
 def _gql_request(
     query: str, variables: Dict[str, Any], *, source: str = "auto"
 ) -> Dict[str, Any]:
@@ -650,6 +737,8 @@ def _gql_request(
         raise RuntimeError(f"Twitch GQL request failed: {e}") from e
 
     if body.get("errors"):
+        if _gql_errors_indicate_rate_limit(body):
+            _note_gql_rate_limit(body, "other", source)
         msg = body["errors"][0].get("message", "Unknown GQL error")
         raise RuntimeError(msg)
     return body.get("data") or {}
@@ -695,6 +784,8 @@ def _gql_persisted(
     if isinstance(body, list):
         body = body[0] if body else {}
     if body.get("errors"):
+        if _gql_errors_indicate_rate_limit(body):
+            _note_gql_rate_limit(body, "other", source)
         msg = body["errors"][0].get("message", "Unknown GQL error")
         raise RuntimeError(msg)
     return body.get("data") or {}
