@@ -31,10 +31,16 @@ jobs:
           pip install -r backend/requirements.txt
           pip install pytest pytest-asyncio
           npm ci
+      - name: Verify node_modules is complete
+        run: npm run verify:install
       - name: Type-check frontend
-        run: npx tsc --noEmit
+        # `npm run typecheck` runs the guard first and then the LOCAL tsc shim.
+        # Do NOT use `npx tsc` here: with node_modules/.bin missing, npx fetches
+        # a TypeScript from the network or a global install and reports success
+        # against a tree that never compiled anything.
+        run: npm run typecheck
       - name: Frontend unit tests
-        run: npx vitest run
+        run: npm run test:unit
       - name: Lint Python (ruff)
         run: |
           pip install ruff
