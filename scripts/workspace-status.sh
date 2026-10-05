@@ -214,22 +214,45 @@ LANE_N=0; LANE_QUIET=0
 if [ ! -f "$MANIFEST" ]; then
   GATE_LANES_REASON="no manifest at $MANIFEST"
 else
-  # reduced-fidelity collision check: exact shared path, and a literal sitting
-  # under a directory glob. The PowerShell tool does the full segment-overlap
-  # analysis and remains the authority.
+  # Segment-overlap collision check, matching workspace-status.ps1.
+  #
+  # A gate that MISSES a collision is worse than no gate, because it grants
+  # false assurance. So where the PowerShell tool converts a glob segment to a
+  # regex and tests it, awk here takes the conservative route: a segment
+  # containing * or ? is assumed to reach anything. That can over-report, which
+  # costs one line of output; it cannot under-report. workspace-status.ps1
+  # remains the authority and is the one to read when this fires.
   LANE_N="$(tail -n +2 "$MANIFEST" | grep -c . || true)"
   COLLISIONS="$(tail -n +2 "$MANIFEST" | awk -F'\t' '
+    function seg_overlap(x, y) {
+      if (x == y) return 1
+      if (x ~ /[*?]/ || y ~ /[*?]/) return 1     # wildcard reaches anything
+      return 0
+    }
+    function overlaps(p, q,   np, nq, i, xa, xb) {
+      np = split(p, A, "/"); nq = split(q, B, "/")
+      n = (np > nq ? np : nq)
+      for (i = 1; i <= n; i++) {
+        # one glob exhausted mid-walk: assume the shorter one could name a
+        # directory, which is the safe direction
+        if (i > np || i > nq) return 1
+        if (!seg_overlap(A[i], B[i])) return 0
+      }
+      return 1
+    }
     NF >= 3 {
       n = split($3, arr, ",")
-      for (i = 1; i <= n; i++) if (arr[i] != "") { m++; lid[m] = $1; lpath[m] = arr[i] }
+      for (i = 1; i <= n; i++) if (arr[i] != "") {
+        m++; lid[m] = $1; lpath[m] = arr[i]
+        lwild[m] = (arr[i] ~ /[*?]/ || arr[i] ~ /\//) ? 1 : 0
+      }
     }
     END {
       c = 0
       for (a = 1; a <= m; a++) for (b = a + 1; b <= m; b++) {
         if (lid[a] == "" || lid[b] == "" || lid[a] == lid[b]) continue
         if (lpath[a] == lpath[b]) { c++; continue }
-        if (lpath[b] ~ /^[^*?]*\/$/ && index(lpath[a], lpath[b]) == 1) c++
-        if (lpath[a] ~ /^[^*?]*\/$/ && index(lpath[b], lpath[a]) == 1) c++
+        if (overlaps(lpath[a], lpath[b])) c++
       }
       print c + 0
     }' 2>/dev/null || echo 0)"
@@ -322,7 +345,7 @@ fi
 echo
 echo "LANES"
 if [ -f "$MANIFEST" ]; then
-  printf '  declared=%s  collisions=%s   (reduced-fidelity check; workspace-status.ps1 is the authority)\n' "$LANE_N" "${COLLISIONS:-0}"
+  printf '  declared=%s  collisions=%s   (segment-overlap, conservative on wildcards; workspace-status.ps1 is the authority)\n' "$LANE_N" "${COLLISIONS:-0}"
 else
   echo "  manifest          $MANIFEST   absent"
   echo "  reason            $GATE_LANES_REASON"
