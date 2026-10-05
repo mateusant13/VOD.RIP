@@ -1,0 +1,2 @@
+lane_id	scope	owns	branch	worktree	dispatched_at	state	contact
+wsstatus	workspace observability: read-only status report + lane manifest	docs/workspace.md,docs/lane-ownership.tsv,scripts/workspace-status.ps1,scripts/workspace-status.tests.ps1,scripts/lane-ownership.ps1	agent/wsstatus	I:\TEMP\wt-wsstatus	2026-10-05T03:05:00Z	wip
