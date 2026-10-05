@@ -57,6 +57,7 @@ import {
   type ArchiveVideoRow,
 } from '../archiveSearchUtils';
 import { deriveChannelDisplayName, displayTitle } from '../channelUtils';
+import { ageParkedCount } from '../captionsPark';
 import { resolveChatColor } from '../chatColors';
 import { seekToTimestamp } from '../seekToTimestamp';
 import { useI18n } from '../i18n';
@@ -122,6 +123,12 @@ type DeepJobStatus = {
   scanned: number;
   total: number;
   no_transcript: number;
+  /** Videos the sweep PARKED behind a YouTube age gate this run. Counted
+   *  inside no_transcript as well (the user asked for a transcript and got
+   *  none), but reported separately: these have a fix — sign in to YouTube —
+   *  which the other "no transcript" reasons do not. Absent on an older
+   *  backend; ageParkedCount() reads it as 0 so the line is unchanged. */
+  age_parked?: number;
   truncated: boolean;
   results: DeepHit[];
   error?: string | null;
@@ -1737,6 +1744,9 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                     missing: deepJob.no_transcript,
                   })
                 : t('Searching transcripts…')}
+              {ageParkedCount(deepJob) > 0
+                ? ` · ${t('captionsPark.sweepClause', { count: ageParkedCount(deepJob) })}`
+                : ''}
               {deepJob.truncated ? ` · ${t('list truncated')}` : ''}
             </p>
           )}
@@ -1751,6 +1761,9 @@ export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSe
                       missing: deepJob.no_transcript,
                     })
                   : t('No transcript matches in {scanned} scanned videos', { scanned: deepJob.scanned })}
+              {ageParkedCount(deepJob) > 0
+                ? ` · ${t('captionsPark.sweepClause', { count: ageParkedCount(deepJob) })}`
+                : ''}
               {deepJob.truncated ? ` · ${t('list truncated')}` : ''}
             </p>
           )}

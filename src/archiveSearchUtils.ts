@@ -52,6 +52,12 @@ export interface ArchiveVideoRow {
   canonical_key?: string | null;
   status?: string | null;
   kind?: string | null;
+  /** Backend-stamped user-facing reason this video's captions are PARKED
+   *  behind a YouTube age gate (and what would release it). Reversible: the
+   *  park clears on sign-in, so this is never a permanent "no captions".
+   *  Absent on older builds and on every non-parked row — treat missing as
+   *  "not parked", never as an empty state. */
+  captions_parked_reason?: string | null;
 }
 
 export const ARCHIVE_PLATFORMS = ['youtube', 'twitch', 'kick'] as const;
