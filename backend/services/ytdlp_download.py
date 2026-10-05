@@ -26,6 +26,7 @@ from services import ytdlp_env  # noqa: F401 — YTDLP_NO_PLUGINS before yt-dlp 
 # bypasses it and the real extractor runs. See archive_ytdlp.py:41 and
 # backend/tests/test_guard_binding_seam.py.
 from services import ytdlp_guard
+from services.audio_format import AUDIO_ONLY_FORMAT_SPEC
 import yt_dlp
 from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
 
@@ -978,7 +979,7 @@ def _build_ydl_opts(
     # UI default is "source" — not a valid yt-dlp format id; omit so HLS clip
     # extraction picks the best m3u8 variant (same as test_downloads.py).
     if audio_only:
-        opts["format"] = "bestaudio/best"
+        opts["format"] = AUDIO_ONLY_FORMAT_SPEC
         opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",

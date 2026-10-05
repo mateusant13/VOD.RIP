@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from services import archive_db, transcript_fix, ytdlp_guard
+from services.audio_format import AUDIO_ONLY_FORMAT_SPEC
 from services.chat_sinks.yt_live import _base_usec_from_info
 from services.ytdlp_ffmpeg import _ytdlp_engine_opts
 from services.youtube_diag import is_age_gate_error
@@ -1176,7 +1177,7 @@ def _partial_bytes(d: Path) -> int:
 # an mhtml storyboard. When the list genuinely has no audio, yt-dlp raises
 # "Requested format is not available", the transcribe worker requeues, and
 # nobody pays 5x the bytes for a speech-to-text job.
-_AUDIO_ONLY_FORMAT_SPEC = "bestaudio/best[vcodec=none][acodec!=none]"
+_AUDIO_ONLY_FORMAT_SPEC = AUDIO_ONLY_FORMAT_SPEC  # one definition; see services/audio_format.py
 
 
 def download_bestaudio(

@@ -27,6 +27,7 @@ import requests
 from services import rl_counter
 from services import ytdlp_env  # noqa: F401 ÔÇö YTDLP_NO_PLUGINS before yt-dlp import
 from services import ytdlp_guard
+from services.audio_format import AUDIO_ONLY_FORMAT_SPEC
 from services.os_services import _NO_WINDOW
 from services.ytdlp_ffmpeg import (
     MIN_VALID_OUTPUT_BYTES,
@@ -4070,7 +4071,7 @@ def _ytdlp_audio_section_download(
                 "quiet": True,
                 "no_warnings": True,
                 "noplaylist": True,
-                "format": "bestaudio/best",
+                "format": AUDIO_ONLY_FORMAT_SPEC,
                 "download_ranges": download_range_func(None, [(start_sec, end_sec)]),
                 "force_keyframes_at_cuts": True,
                 # Abort when the CDN crawls (0.00B/s observed on this IP) —
