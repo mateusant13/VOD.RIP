@@ -433,13 +433,21 @@ def _process_is_alive(pid: int) -> bool:
         return False
 
 
-def _progress_marks() -> str:
+def _progress_marks() -> Optional[str]:
     """A string that changes iff the child made observable progress.
 
     Reads only the child's own bookkeeping: the heartbeat of every 'running'
     job row (stamped per completed chunk and per yt-dlp progress event) plus
-    the worker_heartbeats rows. Read-only; returns "" when the DB is
-    unreachable so a DB hiccup can never read as a stall."""
+    the worker_heartbeats rows. Read-only.
+
+    Returns None when the marks are UNOBSERVABLE (the DB is unreachable), which
+    is deliberately distinct from an empty string. An empty string is a real
+    reading: the child has no running job rows and no worker heartbeat yet. An
+    unobservable reading is the absence of a reading, and the caller must not
+    treat two of those in a row as "the marks are frozen" - that would let a
+    database hiccup read as a stalled worker, kill a healthy child, and file
+    the kill under a decode deadlock it never had.
+    """
     try:
         from services import archive_db
 
@@ -451,7 +459,7 @@ def _progress_marks() -> str:
             "SELECT tag, at FROM worker_heartbeats ORDER BY tag"
         )
     except Exception:
-        return ""
+        return None
     return "|".join(f"{r['id']}={r['hb']}" for r in jobs) + "#" + "|".join(
         f"{r['tag']}={r['at']}" for r in beats
     )
@@ -483,6 +491,21 @@ def _stall_state(
         holder["last_progress_wall"] = now
         holder["cpu_baseline"] = cpu_seconds
         return None
+    if marks is None:
+        # Unobservable, not frozen. Re-arm the clock so the bound is measured
+        # from the first reading we can actually see, and keep the CPU baseline
+        # fresh. Without this, N consecutive DB failures look like a stall.
+        holder["last_marks"] = None
+        holder["last_progress_wall"] = now
+        holder["cpu_baseline"] = cpu_seconds
+        return None
+    if holder["last_marks"] is None:
+        # First observable reading after a blind patch: re-arm rather than
+        # compare against a value we never had.
+        holder["last_marks"] = marks
+        holder["last_progress_wall"] = now
+        holder["cpu_baseline"] = cpu_seconds
+        return None
     if marks != holder["last_marks"]:
         holder["last_marks"] = marks
         holder["last_progress_wall"] = now
@@ -502,9 +525,17 @@ def _stall_state(
     if now - float(holder["last_progress_wall"]) < bound_s:
         return None
     held = now - float(holder["last_progress_wall"])
+    # State only what was measured. "No job-progress mark moved for Ns while the
+    # child consumed Xs of CPU" is the entire finding. A GIL-held decode is the
+    # hypothesis this watchdog was built for, but it is NOT established by this
+    # evidence: an unreachable database, a dead socket, or a lock elsewhere are
+    # all consistent with the same reading, and they have different fixes. A log
+    # that names the cause sends the next reader to the wrong subsystem.
     reason = (
-        f"ASR worker wedged: no job progress for {int(held)}s "
-        f"and {used:.2f}s CPU (GIL held in decode)"
+        f"ASR worker wedged: no observable progress for {int(held)}s "
+        f"while consuming {used:.2f}s CPU "
+        f"(cause not established: a GIL-held decode, an unreachable database, "
+        f"and a blocked socket all present this same signature)"
     )
     holder["error"] = reason  # latched here, as download_manager does, so a
     return reason               # caller that only re-polls gets one verdict

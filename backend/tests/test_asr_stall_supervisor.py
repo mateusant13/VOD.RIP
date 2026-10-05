@@ -553,12 +553,36 @@ def test_pure_state_latches_and_inactive_never_stalls():
 
 
 def test_progress_marks_tolerate_an_unreachable_db(monkeypatch):
-    """A DB hiccup must read as 'no evidence', never as a stall."""
+    """A DB hiccup must read as 'no evidence', never as a stall.
+
+    'No evidence' and 'an empty set of marks' are different readings. The old
+    encoding returned "" for both, and the watchdog compared marks for
+    INEQUALITY -- so two consecutive DB failures compared equal and read as
+    'the marks are frozen'. With an idle child that armed the bound and killed
+    a healthy process, then filed the kill under a decode deadlock that never
+    happened. Unobservable is now None, and the bound restarts on it.
+    """
     def boom(*_a, **_kw):
         raise RuntimeError("database is locked")
 
     monkeypatch.setattr(archive_db, "query", boom)
-    assert ws._progress_marks() == ""
+    assert ws._progress_marks() is None, "an unreachable DB is not an empty mark set"
+
+    # The claim this test was named for, and never actually asserted: N
+    # consecutive unobservable readings must not produce a stall verdict, even
+    # with a completely idle child and a long elapsed wall time.
+    h = _holder()
+    for _ in range(10):
+        assert ws._stall_state(h, 0.0, marks=None, cpu_seconds=0.0) is None
+    assert ws._stall_state(h, 10**6, marks=None, cpu_seconds=0.0) is None, (
+        "an unreachable database must not be able to declare a stall"
+    )
+
+    # The first OBSERVABLE reading after a blind patch re-arms rather than
+    # compares against a value it never had.
+    assert ws._stall_state(h, 10**6 + 1, marks="a", cpu_seconds=0.0) is None
+    assert ws._stall_state(h, 10**9, marks="a", cpu_seconds=0.0)
+
     # And a dead child must not be reportable as stalled either.
     assert ws._process_cpu_seconds(99999999) is None
 
