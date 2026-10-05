@@ -239,13 +239,17 @@ def test_decode_streams_batched_order_preserved():
     # absolute timestamps stay monotonic and per-window
     assert [o[0][0]["start_sec"] for o in out] == [0.0, 10.0, 20.0, 30.0, 40.0]
 
-    # sharded path: concat-relative clips + absolute offsets
+    # sharded path: clips are positioned INSIDE the concatenated batch buffer
+    # and clip_offsets carries each clip's absolute start. The in-buffer
+    # position is a slicing detail, NOT video time, so it must not appear in
+    # a timestamp: each window lands on its own absolute video position, and
+    # never on that position plus the speech that preceded it in the buffer.
     offsets = [100.0, 200.0, 300.0, 400.0, 500.0]
     out2 = at._transcribe_batch_parakeet(
         _FakeRec(["a", "b", "c"]), audio, chunks, "pt",
         clip_offsets=offsets, batch_size=3,
     )
-    assert [o[0][0]["start_sec"] for o in out2] == [100.0, 210.0, 320.0, 430.0, 540.0], (
+    assert [o[0][0]["start_sec"] for o in out2] == [100.0, 200.0, 300.0, 400.0, 500.0], (
         "clip offsets must shift each window to its absolute video position"
     )
     assert all(o[1] == "pt" for o in out2)
