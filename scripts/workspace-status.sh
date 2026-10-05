@@ -214,21 +214,25 @@ LANE_N=0; LANE_QUIET=0
 if [ ! -f "$MANIFEST" ]; then
   GATE_LANES_REASON="no manifest at $MANIFEST"
 else
-  # reduced-fidelity collision check: exact shared path, and a literal under a
-  # directory glob. The PowerShell tool does the full segment-overlap analysis.
+  # reduced-fidelity collision check: exact shared path, and a literal sitting
+  # under a directory glob. The PowerShell tool does the full segment-overlap
+  # analysis and remains the authority.
   LANE_N="$(tail -n +2 "$MANIFEST" | grep -c . || true)"
   COLLISIONS="$(tail -n +2 "$MANIFEST" | awk -F'\t' '
-    { for (i=1;i<=split($3,a,",");i++) if (a[i]!="") { id[NR]=$1; p[NR]=a[i] } }
-    END { n=0
-          for (a=1;a<=NR;a++) for (b=a+1;b<=NR;b++) {
-            if (id[a]==""||id[b]==""||id[a]==id[b]) continue
-            if (p[a]==p[b]) { n++; continue }
-            # literal x under glob y
-            if (p[a] ~ /^[^*?]*$/ && index(p[b], substr(p[a],1,length(p[b])-length(p[b])+0))>0) {}
-            if (p[b] ~ /^[^*?]*$/ && index(p[a], p[b])==1) n++
-            if (p[a] ~ /^[^*?]*$/ && index(p[b], p[b])==1 && substr(p[b],length(p[b]))=="/") n++
-          }
-          print n }' || echo 0)"
+    NF >= 3 {
+      n = split($3, arr, ",")
+      for (i = 1; i <= n; i++) if (arr[i] != "") { m++; lid[m] = $1; lpath[m] = arr[i] }
+    }
+    END {
+      c = 0
+      for (a = 1; a <= m; a++) for (b = a + 1; b <= m; b++) {
+        if (lid[a] == "" || lid[b] == "" || lid[a] == lid[b]) continue
+        if (lpath[a] == lpath[b]) { c++; continue }
+        if (lpath[b] ~ /^[^*?]*\/$/ && index(lpath[a], lpath[b]) == 1) c++
+        if (lpath[a] ~ /^[^*?]*\/$/ && index(lpath[b], lpath[a]) == 1) c++
+      }
+      print c + 0
+    }' 2>/dev/null || echo 0)"
   [ "${COLLISIONS:-0}" -gt 0 ] && GATE_WT="FAIL"
   GATE_LANES="ok"; GATE_LANES_REASON=""
 fi
@@ -290,8 +294,19 @@ printf '  ceiling           %s files   (population = full count of node_modules,
 [ -n "$GATE_DEPS_REASON" ] && echo "  reason            $GATE_DEPS_REASON"
 [ "$GATE_DEPS" = "FAIL" ] && echo '  >> Any tsc/vitest PASS reported right now is a FALSE GREEN.'
 echo
-echo "DISK   population = fixed drives (df, whole volumes)"
-df -h 2>/dev/null | awk 'NR==1 || /^\// {printf "  %-10s free %6s  size %6s\n", $9, $4, $2}'
+echo "DISK   population = df whole volumes, capped at ${WS_DISK_CAP:-12} rows"
+printf '  %-24s %8s %10s\n' MOUNT FREE SIZE
+# The LABEL is field 1 (the drive), but the NUMBERS are counted from the END:
+# an msys mount name can contain a space (C:/Program Files/Git), and counting
+# from the front would shift that row's numbers into the wrong columns. A
+# shifted column is a wrong number; a truncated label is only cosmetic.
+df -h 2>/dev/null |
+  awk 'NR > 1 && NF >= 6 { printf "  %-24s %8s %10s\n", $1, $(NF-2), $(NF-4) }' |
+  head -n "${WS_DISK_CAP:-12}"
+_dfn="$(df -h 2>/dev/null | awk 'NR > 1 && NF >= 6' | wc -l | tr -d ' ')"
+_cap="${WS_DISK_CAP:-12}"
+_dsh=$_dfn; [ "$_dsh" -gt "$_cap" ] && _dsh=$_cap
+echo "  rows shown: $_dsh of $_dfn df rows"
 echo
 echo "LIVE PROBE"
 if [ "$GATE_PROBE" = "ok" ]; then
