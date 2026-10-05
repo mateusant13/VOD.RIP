@@ -176,6 +176,13 @@ Who is currently editing what. Read from `docs/lane-ownership.tsv`.
 * `QUIET` means a lane has gone away without tidying up: its worktree is gone,
   its branch is gone, or it was dispatched a long time ago with no commits
   since. A quiet lane is a stale claim on files.
+* **Read `dispatched_at` honestly.** For a lane you registered yourself, it is
+  the real dispatch time and the staleness rule works as described above. For a
+  lane that was **auto-registered from a measurement snapshot**, it is the time
+  the snapshot was taken, not a dispatch claim - and for those lanes staleness
+  can only ever fire on `worktree_gone` or `branch_gone`, never on age. Those
+  rows say so in their `scope` field. Do not read a low `age` on an
+  auto-registered row as evidence that its owner is still working.
 * `!! FILE OWNERSHIP COLLISIONS` is the loud one. It means two lanes' file lists
   overlap. Two writers on one file has already destroyed work in this repo, so
   the `add` command **refuses** to create an overlapping lane in the first
