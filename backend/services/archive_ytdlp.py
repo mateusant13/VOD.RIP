@@ -1153,6 +1153,32 @@ def _partial_bytes(d: Path) -> int:
     return total
 
 
+# The speech recogniser gets AUDIO. Never video.
+#
+# `bestaudio/best` is the defect: yt-dlp reads `/` as a fallback chain, and its
+# `best` selector means "best format containing BOTH video and audio". So the
+# moment an extract returns no audio-only format, the chain falls through to a
+# muxed h264+aac progressive stream (itag 18) and this function pulls the
+# VIDEO bitrate to feed parakeet.
+#
+# That fall-through is not hypothetical on this box: with the production
+# session (auth=cookies_file+po_token+visitor_data) the n-challenge solver is
+# unavailable ("n challenge solving failed: Some formats may be missing"), so
+# every audio-only itag (140/251) drops out of the format list and `bestaudio`
+# has nothing left to match. A real 30-minute download measured 2026-10-05
+# came back 156,344,296 bytes — 695 kbps for a file whose audio track is
+# 128 kbps, with a 564 kbps h264 stream riding along.
+#
+# Both rungs are constrained: the tail must still have no video AND must
+# still carry audio. The `acodec!=none` half is not decoration — a real
+# format list on this box also contains the sb0-sb3 storyboards, which are
+# `vcodec=none` too, so a `vcodec=none`-only tail could hand the transcriber
+# an mhtml storyboard. When the list genuinely has no audio, yt-dlp raises
+# "Requested format is not available", the transcribe worker requeues, and
+# nobody pays 5x the bytes for a speech-to-text job.
+_AUDIO_ONLY_FORMAT_SPEC = "bestaudio/best[vcodec=none][acodec!=none]"
+
+
 def download_bestaudio(
     video_id: str, outdir: Path,
     *,
@@ -1217,7 +1243,7 @@ def download_bestaudio(
 
     hooks.append(_hook)
     opts = {
-        "format": "bestaudio/best",
+        "format": _AUDIO_ONLY_FORMAT_SPEC,
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
