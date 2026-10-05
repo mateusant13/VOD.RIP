@@ -6,6 +6,18 @@ import json
 import logging
 
 from services import rl_counter
+# The MODULE, never the name. This import used to sit INSIDE
+# _twitch_vod_playback_for_estimate, as `from services.ytdlp_guard import
+# guarded_youtube_dl` — a function-local BINDING of the name, which is the
+# exact shape of the defect this comment exists to prevent:
+# `monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl", stub)` is the one
+# process-wide seam, and a binding silently bypasses it, so a test that
+# patched the consumer attribute looked correct while this call reached the
+# REAL extractor and issued a live network request to twitch.tv. Reading the
+# attribute off the module resolves it at call time, so one patch intercepts
+# every egress here. See archive_ytdlp.py:41 and
+# backend/tests/test_guard_binding_seam.py.
+from services import ytdlp_guard
 from services.http_fingerprint import twitch_http_headers
 import random
 import re
@@ -937,10 +949,8 @@ def _twitch_vod_playback_for_estimate(video_id: str) -> tuple[Optional[str], dic
     empty_headers: dict = twitch_http_headers()
     try:
         import yt_dlp
-
-        from services.ytdlp_guard import guarded_youtube_dl
         url = f"https://www.twitch.tv/videos/{video_id}"
-        with guarded_youtube_dl({
+        with ytdlp_guard.guarded_youtube_dl({
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,

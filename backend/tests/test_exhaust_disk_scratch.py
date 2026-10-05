@@ -65,9 +65,13 @@ def test_wipe_covers_non_vodrip_leak_families(monkeypatch, tmp_path):
 def test_wipe_keeps_fresh_dirs(monkeypatch, tmp_path):
     _make_dirs(tmp_path, ["ai-ask-tests-fresh", "vodrip-tests-fresh"], age_sec=0)
     monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
-    _ct._wipe_vodrip_scratch(min_age_s=3600.0)
+    with pytest.warns(UserWarning, match="younger than"):
+        report = _ct._wipe_vodrip_scratch(min_age_s=3600.0)
     left = sorted(p.name for p in tmp_path.iterdir())
     assert left == ["VOD.RIP", "ai-ask-tests-fresh", "vodrip-tests-fresh"]
+    # kept ON PURPOSE, and the report says which nodes and why
+    assert report.kept_young == ("ai-ask-tests-fresh", "vodrip-tests-fresh"), report
+    assert report.removed == (), report
 
 
 def test_wipe_never_touches_worker_shards(monkeypatch, tmp_path):
@@ -115,8 +119,10 @@ def test_wipe_keeps_fresh_files(monkeypatch, tmp_path):
     jar = tmp_path / "yt_anon_fresh.txt"
     jar.write_text("x", encoding="utf-8")
     monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
-    _ct._wipe_vodrip_scratch(min_age_s=3600.0)
+    with pytest.warns(UserWarning, match="younger than"):
+        report = _ct._wipe_vodrip_scratch(min_age_s=3600.0)
     assert jar.exists()
+    assert report.kept_young == ("yt_anon_fresh.txt",), report
 
 
 def test_wipe_surfaces_unremovable_scratch(monkeypatch, tmp_path):
@@ -256,6 +262,182 @@ def test_transcribe_selfcheck_gated_behind_env():
     )
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "1", "selfcheck opt-in must run the probe"
+
+
+# --- reaper honesty: a skip is a REPORT, not a silence --------------------
+# The reaper used to gate on `now - mtime >= min_age_s` and `continue` when
+# that was false, with nothing said. Two things were lost:
+#
+#  1. "declined on purpose" and "could not do its job" looked identical —
+#     a reaper that quietly kept something is indistinguishable from one
+#     that cleaned it, and the reader has no way to tell which happened;
+#  2. a node whose NTFS mtime is a hair AHEAD of time.time() has a
+#     NEGATIVE age, fails `>= 0.0`, and was therefore skipped SILENTLY.
+#     That is the flake in test_wipe_surfaces_unremovable_scratch above: it
+#     writes a jar and immediately expects the reaper to try (and fail) to
+#     remove it; a sub-tick future mtime made the reaper skip instead, no
+#     warning was raised, and pytest.warns failed with DID NOT WARN.
+#     Real, intermittent, and impossible to reproduce on demand.
+#
+# Every test below drives mtime EXPLICITLY with os.utime. Nothing here sleeps
+# and hopes: the same age is presented on every run, so these tests are red or
+# green deterministically, which is the whole point — a flake cannot be pinned
+# by a test that would flake with it.
+
+
+def test_reaper_reaps_a_node_stamped_a_hair_in_the_future(monkeypatch, tmp_path):
+    """Sub-tick clock skew is NOT "too young" — it is a node just written.
+
+    A negative age means the FILE timestamp is ahead of our clock read, not
+    that the node is fresh: Windows stamps file times from a system clock that
+    is coarse (and NTP slews it), so a node written microseconds ago can carry
+    an mtime slightly in the future. Treating that as "too young to touch" made
+    the reaper skip a node in the caller's own root, silently.
+
+    Skew here is 0.5 s — orders of magnitude above the in-process wall-clock
+    drift between the os.utime below and the reaper's own time.time() read
+    (microseconds), so the age is negative on EVERY run, not usually.
+    """
+    jar = tmp_path / "yt_anon_skewed.txt"
+    jar.write_text("x", encoding="utf-8")
+    skewed = time.time() + 0.5
+    os.utime(jar, (skewed, skewed))
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+
+    report = _ct._wipe_vodrip_scratch(min_age_s=0.0)
+
+    assert not jar.exists(), (
+        "a sub-tick-future mtime is clock skew, not a reason to decline; "
+        "the node was written in this same run and min_age_s=0.0 asks for it"
+    )
+    assert "yt_anon_skewed.txt" in report.removed, (
+        f"and the reaper must say it removed it, got {report!r}"
+    )
+
+
+def test_reaper_reports_a_node_younger_than_the_floor(monkeypatch, tmp_path):
+    """A node below the age floor is KEPT — deliberately, and said out loud."""
+    fresh = tmp_path / "vodrip-tests-young"
+    fresh.mkdir()
+    old = time.time() - 30.0  # 30 s old, floor is an hour
+    os.utime(fresh, (old, old))
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+
+    with pytest.warns(UserWarning, match="vodrip-tests-young"):
+        report = _ct._wipe_vodrip_scratch(min_age_s=3600.0)
+
+    assert fresh.exists(), "a node below the floor must survive"
+    assert "vodrip-tests-young" in report.kept_young, (
+        f"the decline must be in the report, got {report!r}"
+    )
+    assert "vodrip-tests-young" not in report.removed
+
+
+def test_reaper_keeps_and_warns_about_a_bogus_future_stamp(monkeypatch, tmp_path):
+    """A stamp far in the future is an ANOMALY, not freshness.
+
+    Such a node can never age past the floor — its timestamp has to arrive
+    first — so every future run skips it too, forever. The old code skipped it
+    silently, which is a permanent leak wearing the costume of a policy skip.
+    It is kept (we do not delete a node whose timestamp we do not understand)
+    but it is reported.
+    """
+    far = tmp_path / "vodrip-tests-far-future"
+    far.mkdir()
+    stamped = time.time() + 3600.0  # an hour ahead: far beyond clock skew
+    os.utime(far, (stamped, stamped))
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+
+    with pytest.warns(UserWarning, match="vodrip-tests-far-future"):
+        report = _ct._wipe_vodrip_scratch(min_age_s=0.0)
+
+    assert far.exists(), "a bogus future stamp is kept, not deleted"
+    assert "vodrip-tests-far-future" in report.kept_future, (
+        f"it must be reported as un-reapable, got {report!r}"
+    )
+    assert report.kept_young == (), "it is NOT a too-young skip; keep the reasons apart"
+
+
+def test_reaper_reports_an_unremovable_node_by_name(monkeypatch, tmp_path):
+    """Failure to clean stays visible, and the report names the node."""
+    jar = tmp_path / "yt_anon_stuck.txt"
+    jar.write_text("x", encoding="utf-8")
+    old = time.time() - 2 * 3600
+    os.utime(jar, (old, old))
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+
+    real_unlink = Path.unlink
+    attempts = []
+
+    def flaky_unlink(self, *a, **k):
+        attempts.append(self.name)
+        raise PermissionError(5, "Access is denied", str(self))
+
+    monkeypatch.setattr(Path, "unlink", flaky_unlink)
+    try:
+        with pytest.warns(UserWarning, match="yt_anon_stuck.txt"):
+            report = _ct._wipe_vodrip_scratch(min_age_s=0.0)
+    finally:
+        monkeypatch.setattr(Path, "unlink", real_unlink)
+
+    assert len(attempts) >= 2, f"expected a retry, got {len(attempts)} attempt(s)"
+    assert jar.exists(), "nothing could remove it"
+    assert "yt_anon_stuck.txt" in report.stuck, (
+        f"an uncleaned node must be in the report, got {report!r}"
+    )
+    assert report.kept_young == () and report.kept_future == (), (
+        "a retry failure is 'stuck', not 'too young' — the reasons must not blur"
+    )
+
+
+def test_reaper_report_partitions_every_outcome(monkeypatch, tmp_path):
+    """One sweep, five nodes, FOUR different answers — none of them silence.
+
+    This is the property the old signature could not express: a caller could
+    only learn the reaper's outcome from the filesystem afterwards, and a node
+    it had no intention of removing was indistinguishable from one it cleaned.
+
+    ``skewed`` is the interesting one. Its mtime is AHEAD of the clock, and
+    with an hour's floor it must land in kept_young — clamped to an age of
+    zero, judged like any node written this second — and NOT in kept_future.
+    A regression that read "negative age" as "wrong timestamp" would put it
+    with the node that is genuinely future-dated, and this fails.
+    """
+    stale = tmp_path / "vodrip-tests-stale"
+    young = tmp_path / "vodrip-tests-young"
+    skewed = tmp_path / "vodrip-tests-skewed"
+    future = tmp_path / "vodrip-tests-future"
+    stuck = tmp_path / "yt_anon_stuck.txt"
+    for d in (stale, young, skewed, future):
+        d.mkdir()
+    stuck.write_text("x", encoding="utf-8")
+    t = time.time()
+    os.utime(stale, (t - 2 * 3600, t - 2 * 3600))  # older than the floor
+    os.utime(stuck, (t - 2 * 3600, t - 2 * 3600))  # older than the floor...
+    os.utime(young, (t - 5, t - 5))                # ...but newer
+    os.utime(skewed, (t + 0.5, t + 0.5))           # clock skew, this run
+    os.utime(future, (t + 7200, t + 7200))         # bogus stamp
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+
+    real_unlink = Path.unlink
+
+    def locked_unlink(self, *a, **k):
+        raise PermissionError(5, "Access is denied", str(self))
+
+    monkeypatch.setattr(Path, "unlink", locked_unlink)
+    try:
+        with pytest.warns(UserWarning):
+            report = _ct._wipe_vodrip_scratch(min_age_s=3600.0)
+    finally:
+        monkeypatch.setattr(Path, "unlink", real_unlink)
+
+    assert report.removed == ("vodrip-tests-stale",), report
+    assert report.kept_young == ("vodrip-tests-skewed", "vodrip-tests-young"), report
+    assert report.kept_future == ("vodrip-tests-future",), report
+    assert report.stuck == ("yt_anon_stuck.txt",), report
+    assert not stale.exists()
+    assert young.exists() and skewed.exists() and future.exists()
+    assert stuck.exists(), "the locked node is a leak the reaper must report"
 
 
 if __name__ == "__main__":

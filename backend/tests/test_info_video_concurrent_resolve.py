@@ -14,6 +14,7 @@ import time
 import pytest
 
 from services import ytdlp_download as yd
+from services import ytdlp_guard
 from services import youtube_innertube as it
 
 
@@ -256,7 +257,9 @@ def test_non_youtube_submits_exactly_one_executor_job(monkeypatch, tmp_path):
                 "formats": _formats("t", [720]),
             }
 
-    monkeypatch.setattr(yd, "guarded_youtube_dl", lambda opts: FakeYdl())
+    # the guard MODULE is the one process-wide seam; the consumer attribute is
+    # not (see backend/tests/test_guard_binding_seam.py)
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl", lambda opts: FakeYdl())
     monkeypatch.setattr("services.ytdlp_ffmpeg._ytdlp_engine_opts", lambda: {})
 
     info = asyncio.run(yd.get_video_info("https://www.twitch.tv/videos/2833943352"))

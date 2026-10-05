@@ -99,6 +99,7 @@ def test_get_video_info_runs_extract_on_info_executor(monkeypatch, tmp_path):
     import asyncio
 
     from services import ytdlp_download as _yd
+    from services import ytdlp_guard
 
     class _RecordingExecutor:
         def __init__(self, inner):
@@ -112,7 +113,11 @@ def test_get_video_info_runs_extract_on_info_executor(monkeypatch, tmp_path):
     recorder = _RecordingExecutor(INFO_EXECUTOR)
     monkeypatch.setattr("deps.INFO_EXECUTOR", recorder)
     monkeypatch.setattr(_yd, "_get_cache_dir", lambda: tmp_path)
-    monkeypatch.setattr(_yd, "guarded_youtube_dl", lambda opts: _FakeYdl())
+    # patch the guard MODULE — the one process-wide seam. Patching the consumer
+    # attribute (`_yd.guarded_youtube_dl`) intercepts module-global lookups only
+    # and is bypassed by a function-local re-import; see
+    # backend/tests/test_guard_binding_seam.py.
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl", lambda opts: _FakeYdl())
     monkeypatch.setattr("services.ytdlp_ffmpeg._ytdlp_engine_opts", lambda: {})
 
     info = asyncio.run(

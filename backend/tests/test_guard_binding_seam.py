@@ -44,29 +44,40 @@ from pathlib import Path
 
 import pytest
 
-from services import archive_ytdlp, ytdlp_guard, youtube_service
+from services import (
+    archive_ytdlp,
+    twitch_gql_service,
+    ytdlp_download,
+    ytdlp_guard,
+    youtube_service,
+)
+from routers import subtitles as subtitles_router
 
 _GUARD_NAMES = ("guarded_youtube_dl", "guarded_youtube_dl_channel")
 
-# The three modules this lane unified. They must carry ZERO name bindings.
-_CONSUMED = (archive_ytdlp, youtube_service)
+# Every module that reaches the guard. They must carry ZERO name bindings.
+# The last three were converted from the allowlist below — twitch_gql_service
+# was the function-local one, i.e. a live instance of the exact escape this
+# file exists to prevent.
+_CONSUMED = (
+    archive_ytdlp,
+    youtube_service,
+    ytdlp_download,
+    twitch_gql_service,
+    subtitles_router,
+)
 
-# Bindings that still exist elsewhere in the tree, outside this lane's
-# ownership. They are listed so the repo-wide scan below can distinguish a
-# KNOWN escape from a NEW one: a module that is not listed here fails if it
-# binds a guard name at any scope, and a listed module that gets fixed simply
-# stops matching — it never false-fails for being correct.
+# Known escapes, by path. EMPTY ON PURPOSE: the three entries that used to be
+# here (services/twitch_gql_service.py, services/ytdlp_download.py,
+# routers/subtitles.py) have been converted, and every converted module is now
+# enforced directly in _CONSUMED above.
 #
-# TODO(owner): convert these three; the last one is function-local and is a
-# live escape of exactly the kind this file exists to prevent.
-#   services/twitch_gql_service.py  — function-local, in a try block
-#   services/ytdlp_download.py      — module level
-#   routers/subtitles.py            — module level
-_KNOWN_NAME_BINDINGS = {
-    "routers/subtitles.py",
-    "services/twitch_gql_service.py",
-    "services/ytdlp_download.py",
-}
+# Keep it empty. A path here is a hole in the repo-wide scan below: that scan is
+# what stops a FIFTH offender from appearing in a file nobody was watching, and
+# a binding is only allowlisted until someone converts it. Adding an entry here
+# needs the AST checks to be run against that module first — which is what the
+# conversion did.
+_KNOWN_NAME_BINDINGS: set[str] = set()
 
 _BACKEND_ROOT = Path(archive_ytdlp.__file__).resolve().parents[1]
 
@@ -143,7 +154,10 @@ def test_all_consumers_share_one_seam_object():
     """Same module object everywhere — so one patch covers every consumer."""
     from services import ytdlp_hls
 
-    for mod in (archive_ytdlp, youtube_service, ytdlp_hls):
+    for mod in (
+        archive_ytdlp, youtube_service, ytdlp_hls,
+        ytdlp_download, twitch_gql_service, subtitles_router,
+    ):
         assert mod.ytdlp_guard is ytdlp_guard, (
             f"{mod.__name__} holds a different guard module"
         )

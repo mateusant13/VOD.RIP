@@ -21,6 +21,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app import app
 from routers import subtitles as subtitles_router
+from services import ytdlp_guard
 
 VTT_PT = """WEBVTT
 Kind: captions
@@ -117,7 +118,12 @@ def _patch_guard(monkeypatch, fake: _FakeYdl) -> None:
     def _guard(opts):
         yield fake
 
-    monkeypatch.setattr(subtitles_router, "guarded_youtube_dl", _guard)
+    # THE SEAM: patch the guard MODULE, never the consumer attribute. This line
+    # used to patch `subtitles_router.guarded_youtube_dl` — a name binding that
+    # only intercepted module-global lookups, so a function-local re-import
+    # bypassed it and the real extractor reached YouTube from this test. See
+    # backend/tests/test_guard_binding_seam.py.
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl", _guard)
 
 
 @pytest.fixture
@@ -389,7 +395,7 @@ async def test_extract_failure_is_502(client, monkeypatch):
         raise RuntimeError("network down")
         yield  # pragma: no cover
 
-    monkeypatch.setattr(subtitles_router, "guarded_youtube_dl", _boom)
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl", _boom)
 
     resp = await client.get(
         "/api/subtitles",
