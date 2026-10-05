@@ -55,6 +55,34 @@ counts every request on the IP regardless of who sent it, so the trip rate
 must be measured on the total. The reservation is about who gets to spend the
 budget, not about pretending background traffic is invisible.
 
+What the governor learns from — and why the loop cannot run away
+----------------------------------------------------------------
+A history row written here is an **observed platform trip**, never one of our
+own admission decisions. ``note_limit`` is called from exactly one kind of
+place: a caller that just received a real ``status=429`` (twitch_gql_service,
+kick_api_service, archive_twitch, youtube_innertube). The governor pacing
+itself — ``auto_exhausted`` / ``user_exhausted`` out of ``acquire`` — never
+calls ``note_limit`` and never writes a row; it goes to the in-memory decision
+ring only. So the 70% figure is applied to a *measurement of the platform's
+wall*, not to an echo of our own budgeting. That is the decision, and it is
+why this loop is not the "governor grades its own homework" failure.
+
+There IS still a genuine self-coupling, and it is stated here rather than
+assumed away: the ceiling sets the rate we admit, the admitted rate is what we
+measure, and that measurement feeds the ceiling. Two properties bound it.
+
+* **It only ever closes on a real 429.** No trip, no row, no coupling.
+* **It cannot run away downward.** ``prime_from_history`` lowers only
+  (``if target < st.ceiling_rpm``) and never below ``_FLOOR_CEILING_RPM``, so
+  a long run of low-rate trips settles at the floor and stops. It cannot run
+  away upward either: ``_recent_requests_value`` bounds the stored reading by
+  the number of requests actually issued, so no fabricated burst can teach the
+  history a rate we never travelled at and switch the throttle off.
+
+Test ``test_learned_ceiling_cannot_ratchet_past_the_floor`` in
+``test_rate_budget_persist_recent_requests.py`` is the guard on the first
+property; ``..._never_claims_a_load_it_did_not_produce`` guards the second.
+
 Concurrency
 -----------
 Each platform owns its own ``threading.Lock``. No lock is ever shared between
@@ -84,6 +112,7 @@ by definition — that is the data the learning is made of.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 import time
@@ -307,8 +336,57 @@ def _record_trip(st: _PlatformState, now: float) -> None:
 # They may not exist yet; every use is guarded so the governor still runs.
 
 
+def _recent_requests_value(requests: int, trip_rpm: float) -> Optional[int]:
+    """`recent_requests` for an event the governor wrote itself. Unit bridge.
+
+    THE UNIT IS NOT OURS TO PICK. The column is documented as rl_counter's
+    "requests in the trailing 60 s window" (rl_counter.py:63-67, BUCKET_SEC=10,
+    WINDOW_SEC=60), which is ALREADY a requests-per-minute number, and
+    ``rate_limit_summary`` means the column to produce ``observed_rate_per_min``
+    (archive_db.py:3399-3402). yt_gate/kick_gate therefore store a
+    trailing-60s COUNT. A row written here lands in the SAME
+    ``(platform, origin)`` group as those rows and is averaged into the same
+    mean, so it must carry the same quantity or it poisons the group.
+
+    Our observation window runs from the first request after the last event to
+    this one, so it is NOT 60 s long and the raw ``requests`` count must never
+    be stored as-is: over a 20-minute window a count of 400 would be read as
+    400 rpm, and the group mean — and with it the learned ceiling — would be
+    off by the window length. The trailing-60s count is bounded from both sides
+    and the two bounds are the two obvious candidates:
+
+    * window SHORTER than 60 s -> the count itself; every request we issued is
+      inside the last minute. A 31-request burst inside 0.4 s is 31 requests
+      in the last minute, NOT the 1860 rpm that ``_record_trip``'s one-second
+      floor extrapolates it to. Storing that extrapolation would tell the
+      history "we tripped at 1860 rpm, stop throttling" — a runaway in the
+      direction that DISABLES the very protection this module exists for.
+    * window LONGER than 60 s -> the window's own average rate, our best
+      estimate of the last minute's share of it.
+
+    Taking the smaller satisfies both branches at once. It is also the reading
+    that cannot run away upward: the value is never larger than the number of
+    requests we really did issue, so history can never claim a load this
+    process did not produce.
+
+    Returns None — never 0 — when the window measured nothing, or when the
+    estimate is below one-request resolution. An unmeasured load must not
+    become a fabricated zero: 0 is a real reading of "a clean window", it
+    drags the group mean down and ratchets the ceiling to the floor. The
+    governor's own doctrine, and yt_gate/kick_gate's ("None is written
+    straight through: 'not measured' must never become 0").
+    """
+    if requests is None or requests <= 0:
+        return None
+    if trip_rpm is None or not math.isfinite(trip_rpm):
+        return None
+    value = int(round(min(float(requests), trip_rpm)))
+    return value if value > 0 else None
+
+
 def _persist_event(platform: str, kind: str, origin: str, ceiling_rpm: float,
-                   trip_rpm: float, events: int) -> None:
+                   trip_rpm: float, events: int,
+                   recent_requests: Optional[int] = None) -> None:
     try:
         from services import archive_db
 
@@ -322,6 +400,7 @@ def _persist_event(platform: str, kind: str, origin: str, ceiling_rpm: float,
             surface=platform,
             origin=origin,
             context=f"ceiling_rpm={ceiling_rpm:.2f} trip_rpm={trip_rpm:.2f} events={events}",
+            recent_requests=recent_requests,
         )
     except Exception:  # noqa: BLE001 — persistence is best-effort, never fatal
         logger.debug("rate_budget: record_rate_limit failed", exc_info=True)
@@ -508,7 +587,13 @@ def note_limit(platform: str, *, kind: Optional[str] = None, status: Optional[in
     with st.lock:
         now = _now()
         before = st.ceiling_rpm
+        # Capture the load BEFORE _record_trip zeroes the window; afterwards
+        # st.trip_rpm holds THIS event's rate (the frontier min is a different
+        # quantity and is not what the column means). Convert to the column's
+        # trailing-60s unit while the count is still live.
+        window_requests = st.requests_since_event
         _record_trip(st, now)
+        recent_requests = _recent_requests_value(window_requests, st.trip_rpm)
         learned = st.min_trip_rpm * _SAFETY_FRACTION if st.min_trip_rpm > 0 else before * 0.5
         new_ceiling = max(_FLOOR_CEILING_RPM, learned)
         if new_ceiling > st.ceiling_rpm:
@@ -526,7 +611,7 @@ def note_limit(platform: str, *, kind: Optional[str] = None, status: Optional[in
         ceiling_rpm, trip_rpm, events = st.ceiling_rpm, st.min_trip_rpm, st.events
         plat = st.platform
 
-    _persist_event(plat, kind or "", src, ceiling_rpm, trip_rpm, events)
+    _persist_event(plat, kind or "", src, ceiling_rpm, trip_rpm, events, recent_requests)
     decision = Decision(
         platform=st.platform,
         source=src,
