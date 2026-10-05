@@ -693,6 +693,18 @@ const ptBR: Record<string, string> = {
     'A sessão do YouTube que este app tem foi rejeitada, então nenhuma legenda pôde ser lida. Entre de novo e este vídeo volta para a varredura de legendas.',
   'captionsPark.unknown':
     'Este vídeo é restrito por idade, então nenhuma legenda pôde ser lida. Entre no YouTube e ele volta para a varredura de legendas.',
+  // ── Frontend crash boundary (crash.*) ──────────────────────────────────
+  'crash.title': 'O app encontrou um erro',
+  'crash.body':
+    'Algo no app lançou um erro durante a renderização. Os detalhes abaixo foram registrados — copie-os antes de recarregar se precisar relatar o problema.',
+  'crash.reload': 'Recarregar o app',
+  'crash.dismiss': 'Dispensar e tentar continuar',
+  'crash.errorLabel': 'Erro',
+  'crash.componentStackLabel': 'Pilha de componentes',
+  'crash.noComponentStack': '(nenhuma pilha de componentes foi informada)',
+  'crash.previousLabel': 'Erros anteriores nesta sessão',
+  'crash.persistedNote': 'Salvo neste navegador em vodrip.ui.frontendCrashLog.',
+  'crash.unknownError': 'Ocorreu um erro desconhecido.',
   'captionsPark.reversible':
     'Não é uma falha, e nada se perde: o bloqueio se solta sozinho assim que o YouTube estiver autenticado.',
   'captionsPark.openSettings': 'Abrir Cookie Bridge',
@@ -867,6 +879,18 @@ const en: Record<string, string> = {
     'The YouTube session this app has was rejected, so no captions could be read. Sign in again and this video goes back into the caption sweep.',
   'captionsPark.unknown':
     'This video is age-restricted, so no captions could be read. Sign in to YouTube and it goes back into the caption sweep.',
+  // ── Frontend crash boundary (crash.*) ──────────────────────────────────
+  'crash.title': 'The app hit an error',
+  'crash.body':
+    'Something in the app threw while rendering. The details below are what was recorded — copy them before reloading if you need to report it.',
+  'crash.reload': 'Reload the app',
+  'crash.dismiss': 'Dismiss and try to continue',
+  'crash.errorLabel': 'Error',
+  'crash.componentStackLabel': 'Component stack',
+  'crash.noComponentStack': '(no component stack was reported)',
+  'crash.previousLabel': 'Earlier crashes this session',
+  'crash.persistedNote': 'Saved in this browser under vodrip.ui.frontendCrashLog.',
+  'crash.unknownError': 'An unknown error occurred.',
   'captionsPark.reversible':
     'Not a failure, and nothing is lost: the park releases itself the moment YouTube is signed in.',
   'captionsPark.openSettings': 'Open Cookie Bridge',
@@ -1519,6 +1543,18 @@ const es: Record<string, string> = {
     'La sesión de YouTube que tiene esta app fue rechazada, así que no se pudieron leer subtítulos. Inicia sesión de nuevo y este vídeo vuelve al barrido de subtítulos.',
   'captionsPark.unknown':
     'Este vídeo tiene restricción de edad, así que no se pudieron leer subtítulos. Inicia sesión en YouTube y vuelve al barrido de subtítulos.',
+  // ── Frontend crash boundary (crash.*) ──────────────────────────────────
+  'crash.title': 'La app encontró un error',
+  'crash.body':
+    'Algo en la app lanzó un error durante el renderizado. Los detalles de abajo son lo que quedó registrado: cópialos antes de recargar si necesitas reportarlo.',
+  'crash.reload': 'Recargar la app',
+  'crash.dismiss': 'Descartar y tratar de continuar',
+  'crash.errorLabel': 'Error',
+  'crash.componentStackLabel': 'Pila de componentes',
+  'crash.noComponentStack': '(no se informó ninguna pila de componentes)',
+  'crash.previousLabel': 'Errores anteriores en esta sesión',
+  'crash.persistedNote': 'Guardado en este navegador en vodrip.ui.frontendCrashLog.',
+  'crash.unknownError': 'Ocurrió un error desconocido.',
   'captionsPark.reversible':
     'No es un fallo, y no se pierde nada: el bloqueo se libera solo en cuanto YouTube tenga la sesión iniciada.',
   'captionsPark.openSettings': 'Abrir Cookie Bridge',
