@@ -112,6 +112,14 @@ def assert_ytdlp_safe() -> None:
 # solve time; it is deliberately NOT enabled — one source, one grant.
 EJS_REMOTE_SOLVER_COMPONENTS = ("ejs:github",)
 
+#: The two cache entries `_web_release_source` can leave behind, named after
+#: yt-dlp's own `ScriptType` values (verified: ScriptType.LIB.value == 'lib',
+#: ScriptType.CORE.value == 'core'; `cache.py::_get_cache_fn` writes
+#: `<root>/<section>/<key>.json`). Both are remote-fetched JavaScript and both
+#: are read back by `_cached_source`, which does not consult
+#: `remote_components` — so revoking the grant has to remove both.
+_EJS_CACHED_SOLVER_FILES = ("core.json", "lib.json")
+
 _EXECUTE_REMOTE_SOLVER_ENV = "VODRIP_YT_EXECUTE_REMOTE_CHALLENGE_SOLVER"
 
 _EJS_STATE_REPORTED: bool = False
@@ -193,15 +201,26 @@ def _apply_remote_challenge_solver(out: dict[str, Any]) -> dict[str, Any]:
     set `remote_components` cannot smuggle it past the seam, and so the
     disabled state is explicit rather than "whatever the caller passed".
 
-    WHEN DISABLED, IT ALSO PURGES THE CACHED SOLVER SCRIPT. This is not
-    decoration — it is what makes the documented revert real. yt-dlp caches the
-    downloaded `lib.js` under `<cachedir>/challenge-solver/lib.json`
-    (ejs.py `_web_release_source` → `ie.cache.store`), and its
-    `_cached_source` reads that file WITHOUT consulting `remote_components`.
-    So `remote_components=[]` alone stops the FETCH but not the USE: a box
-    where the solver ran once would keep executing the cached script and keep
-    returning audio-only formats, and "I set it to 0" would be a false claim.
-    Purge makes off mean off.
+    WHEN DISABLED, IT ALSO PURGES THE CACHED SOLVER SCRIPTS. This is not
+    decoration — it is what makes the documented revert real. yt-dlp caches
+    BOTH halves of the challenge solver under
+    `<cachedir>/challenge-solver/<script_type>.json` (ejs.py
+    `_web_release_source` -> `ie.cache.store`), and its `_cached_source` reads
+    them WITHOUT consulting `remote_components`. So `remote_components=[]`
+    alone stops the FETCH but not the USE: a box where the solver ran once
+    would keep executing the cached scripts, and "I set it to 0" would be a
+    false claim. Purge makes off mean off.
+
+    BOTH files, not just `lib.json`. `_iter_script_sources` yields
+    PYPACKAGE -> CACHE -> BUILTIN -> WEB, so a cached entry outranks the
+    vendored one, and `_web_release_source` is what wrote BOTH `core.json`
+    and `lib.json` (it is called per `script_type`). Purging only `lib.json`
+    would leave the box loading and executing a cached remote `core.js` while
+    the operator was told the grant was fully off. The behavioural symptom
+    hides it — the vendored `lib` stubs are 245-byte shims that need the npm
+    package, so the n-challenge stays unsolved either way — which is exactly
+    why the security claim has to be checked against the source order rather
+    than against "did the formats come back".
     """
     _report_ejs_state_once()
     if execute_remote_challenge_solver():
@@ -215,10 +234,13 @@ def _apply_remote_challenge_solver(out: dict[str, Any]) -> dict[str, Any]:
 def _purge_cached_solver_script(cachedir: Any) -> None:
     """Delete yt-dlp's cached n-challenge solver script, best-effort.
 
-    Only ever removes ONE known file (`challenge-solver/lib.json`) inside the
-    cache dir yt-dlp itself would use. Never raises: a failure here must not
-    break yt-dlp, it is logged and the run continues. Guarded to run once per
-    process so a per-extract call does not stat the disk on every request.
+    Only ever removes the TWO known files (`challenge-solver/core.json` and
+    `challenge-solver/lib.json`) inside the cache dir yt-dlp itself would use,
+    and nothing else — the same cache dir holds the po_token (`sigfuncs`) and
+    the POT, and deleting those would break authentication. Never raises: a
+    failure here must not break yt-dlp, it is logged and the run continues.
+    Guarded to run once per process so a per-extract call does not stat the
+    disk on every request.
     """
     global _EJS_PURGE_DONE
     if _EJS_PURGE_DONE:
@@ -233,14 +255,15 @@ def _purge_cached_solver_script(cachedir: Any) -> None:
                 os.path.join(Path.home(), ".cache")
             )
             root = Path(cache_home) / "yt-dlp"
-        target = root / "challenge-solver" / "lib.json"
-        if target.is_file():
-            target.unlink()
-            logger.info(
-                "yt-dlp: purged cached n-challenge solver script %s (solver "
-                "disabled; the grant is fully off, not just unfetched)",
-                target,
-            )
+        for name in _EJS_CACHED_SOLVER_FILES:
+            target = root / "challenge-solver" / name
+            if target.is_file():
+                target.unlink()
+                logger.info(
+                    "yt-dlp: purged cached n-challenge solver script %s (solver "
+                    "disabled; the grant is fully off, not just unfetched)",
+                    target,
+                )
     except OSError as exc:
         logger.warning("yt-dlp: could not purge cached solver script: %s", exc)
 

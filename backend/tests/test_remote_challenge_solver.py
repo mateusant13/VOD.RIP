@@ -198,6 +198,65 @@ def test_disabling_purges_the_cached_solver_script(monkeypatch, tmp_path):
     )
 
 
+def test_disabling_purges_the_cached_CORE_script_too(monkeypatch, tmp_path):
+    """Purging only `lib.json` leaves the grant half on.
+
+    `_iter_script_sources` yields PYPACKAGE -> CACHE -> BUILTIN -> WEB, and
+    `_web_release_source` (the only thing that consults `remote_components`)
+    is what wrote BOTH `core.json` and `lib.json` — it runs per
+    `script_type`. So a box that solved once, then had the knob set to 0,
+    would keep loading and EXECUTING a cached remote `core.js` straight from
+    the cache, ahead of the vendored copy, while the operator had been told
+    the grant was fully off.
+
+    This is the assertion the original purge could not have passed: it moved
+    the target from a single file to a tuple, and this test fails against the
+    single-file version.
+
+    The behavioural symptom hides this — the vendored `lib` stubs are ~245-byte
+    shims that require the npm package, so the n-challenge stays unsolved
+    either way and the audio-only itags stay absent. Only reading the source
+    order tells you the box is still executing remote JS.
+    """
+    cachedir = tmp_path / "yt-dlp"
+    for name in ("core.json", "lib.json"):
+        p = cachedir / "challenge-solver" / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text('{"yt-dlp_version": "x", "data": {}}', encoding="utf-8")
+
+    monkeypatch.setenv(ENV, "0")
+    monkeypatch.setattr(ytdlp_guard, "_EJS_PURGE_DONE", False, raising=False)
+    sanitize_ytdlp_opts({"cachedir": str(cachedir)})
+
+    for name in ("core.json", "lib.json"):
+        assert not (cachedir / "challenge-solver" / name).exists(), (
+            f"cached remote solver {name} survived: the grant is unfetched but "
+            "still executed, so 'set it to 0' does not actually turn it off"
+        )
+
+
+def test_the_purge_file_list_matches_what_yt_dlp_actually_caches():
+    """The purge list is pinned against the INSTALLED yt-dlp, not against a guess.
+
+    `_web_release_source` caches by `ScriptType.value`, and `cache.py` appends
+    `.json`. If a yt-dlp upgrade renames or adds a script type, this fails
+    instead of silently leaving one behind — which is the failure this whole
+    purge exists to prevent.
+    """
+    yt_dlp = pytest.importorskip("yt_dlp")
+    from yt_dlp.extractor.youtube.jsc._builtin.ejs import ScriptType
+
+    expected = {f"{t.value}.json" for t in ScriptType}
+    assert set(ytdlp_guard._EJS_CACHED_SOLVER_FILES) == expected, (
+        f"yt-dlp caches {sorted(expected)} for the challenge solver, but the "
+        f"revoke path only removes {sorted(ytdlp_guard._EJS_CACHED_SOLVER_FILES)}"
+    )
+    # And the section name is the one yt-dlp itself uses.
+    from yt_dlp.extractor.youtube.jsc._builtin.ejs import EJSBaseJCP
+
+    assert EJSBaseJCP._CACHE_SECTION == "challenge-solver"
+
+
 def test_disabling_leaves_unrelated_cache_files_alone(monkeypatch, tmp_path):
     """The purge must remove ONE known file, not the cache dir.
 
