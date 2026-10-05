@@ -166,6 +166,42 @@ def _get_json(
             # Cloudflare classification (bot block): record the event and
             # arm the gate cooldown; consecutive events escalate to a long
             # freeze (kick_gate).
+            #
+            # WHY THIS ALSO TEACHES THE GOVERNOR (the deliberate call)
+            # --------------------------------------------------------
+            # A Kick 403 is not purely one thing or the other, and the two
+            # treatments are not alternatives - they answer different questions:
+            #
+            #   * kick_gate answers "should we keep hammering right now?" and
+            #     answers it with TIME (a 60 s cooldown escalating to a 30 min
+            #     freeze). It is the reactive backstop.
+            #   * the governor answers "how fast may we go at all?" and answers
+            #     it with RATE. It is the predictive layer, and it is the layer
+            #     the owner actually asked for.
+            #
+            # A Cloudflare block is triggered by request RATE and IP reputation
+            # together; a client that halves its rate and backs off is a less
+            # attractive target, so the rate signal is real evidence even when
+            # the block is also a bot verdict. This is the same call the
+            # YouTube side already makes one layer over:
+            # youtube_innertube.py:1206-1209 notes a bot wall "is a rate limit
+            # with a different name" and feeds `innertube_bot_gate` to the
+            # governor. Doing it for Kick only would leave Kick the one platform
+            # whose limiter the governor cannot hear.
+            #
+            # Deliberately ADDITIVE, never a replacement: the gate still arms and
+            # the KickGateError below still raises, so this changes only what the
+            # governor LEARNS, never what the caller sees. And because
+            # `note_limit` can only ever lower a ceiling (rate_budget.py:599-600)
+            # down to a floor of _FLOOR_CEILING_RPM, a 403 that was really a bot
+            # verdict costs a slow climb back, never an unthrottled burst.
+            #
+            # kind="http_403" is the closed taxonomy's own name for "we saw a
+            # hard HTTP 403" (archive_db.RATE_LIMIT_KINDS), so the governor's row
+            # and the gate's row agree on the class. A descriptive kind like
+            # f"api {path} 403" would normalize to "other" and lose the one
+            # fact that makes the row queryable.
+            note_limit("kick", kind="http_403", status=403, source=origin)
             kick_gate.note_kick_gate_event(
                 f"403 on {path}", kind="http_403", surface="metadata",
                 origin=origin,
