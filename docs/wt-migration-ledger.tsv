@@ -47,3 +47,13 @@ wtsrt	I:/TEMP/wtsrt	done	I:/vod-rip-wt/done/wtsrt	ddf38515a3c470f2111b064331f041
 # done/. The arm now derives the lane's real state and asserts the registry is
 # unchanged. The worktree was MOVED to archive/, never deleted.
 wt-asrsup-selftest-leftover	i:/vod-rip-wt/wip/wt-asrsup	archive	i:/vod-rip-wt/archive/wt-asrsup-selftest-leftover	54477f21ba025f6c4d5574822180a1a1ffdc9180	2026-10-05T11:59:29Z
+wt-archivescratch	I:/TEMP/wt-archivescratch	unsure	I:/vod-rip-wt/unsure/wt-archivescratch	d5f83428c1ebe23d848a465afafaa3fd4ef9cd97	2026-10-05T23:51:32Z
+wt-audiofmt2	I:/TEMP/wt-audiofmt2	wip	I:/vod-rip-wt/wip/wt-audiofmt2	6fbbc421d38ee40c6a48d99d861276c8719261a3	2026-10-05T23:51:53Z
+wt-dw	I:/TEMP/wt-dw	done	I:/vod-rip-wt/done/wt-dw	a6129ceabab16aaec798e757ec89569b08d005c6	2026-10-05T23:52:04Z
+wt-ejs	I:/TEMP/wt-ejs	wip	I:/vod-rip-wt/wip/wt-ejs	48fdaaedab61381bed11941488e7238a05c495bd	2026-10-05T23:52:36Z
+wt-ejscore	I:/TEMP/wt-ejscore	unsure	I:/vod-rip-wt/unsure/wt-ejscore	270a4900c02935c5aa07390dedfbe35ab0139762	2026-10-05T23:52:59Z
+wt-nmdev	I:/TEMP/wt-nmdev	done	I:/vod-rip-wt/done/wt-nmdev	91fd88d3aa30a570531ea9ce9beddfd4424e3844	2026-10-05T23:53:20Z
+wt-nmguard	I:/TEMP/wt-nmguard	done	I:/vod-rip-wt/done/wt-nmguard	ec87700d4ba9bfb7a5ed0c4228131fbf23023515	2026-10-05T23:53:31Z
+wt-nmwire	I:/TEMP/wt-nmwire	done	I:/vod-rip-wt/done/wt-nmwire	4a96dc5b751ad9a889e771716b3e3a58584709a1	2026-10-05T23:53:38Z
+wt-refcheck	I:/TEMP/wt-refcheck	unsure	I:/vod-rip-wt/unsure/wt-refcheck	066030349ba6b5b59bcd5dc24f846e128acaa88d	2026-10-05T23:53:47Z
+wt-scratch-class	I:/TEMP/wt-scratch-class	unsure	I:/vod-rip-wt/unsure/wt-scratch-class	7c5b10273c4ea6ee91584ca69f622f74db1e1834	2026-10-05T23:53:55Z

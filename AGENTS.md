@@ -311,7 +311,7 @@ Rules:
 - Pagefile: `H:\pagefile.sys` 16GB fixed (same NVMe as C: so it mounts at boot).
 
 
-## Worktrees: the root is `I:`, and the migration is already done
+## Worktrees: the root is `I:`, and every move is ledgered
 
 **`scripts/worktree-roots.tsv` is the source of truth for this project. Read it
 before touching anything worktree-shaped.** It is repo-scoped on purpose; the
@@ -334,14 +334,47 @@ the shared row is wrong for us:
 storage move. Measured: ~1.29 GiB across the worktrees, and it stays exactly
 where it was. Do not present a migration as freeing space.
 
-**The migration is DONE, and it is reversible.** `docs/wt-migration-ledger.tsv`
-has one row per move: `lane, original_path, state, new_path, sha, moved_utc`.
-Undo one with `scripts/wt-restore.sh --lane <lane>`, undo all with
-`scripts/wt-restore.sh --all`. **Nothing in that ledger is a deletion record.**
-10 worktrees were deliberately left in place because they carry a
-`node_modules` JUNCTION — `git worktree remove` destroyed a dependency tree
-through one of those — so they are not moved either. Retiring them is the
-owner's call, not a script's.
+**Every move is ledgered, and every move is reversible.**
+`docs/wt-migration-ledger.tsv` has one row per move: `lane, original_path,
+state, new_path, sha, moved_utc`. Undo one with `scripts/wt-restore.sh --lane
+<lane>`, undo all with `scripts/wt-restore.sh --all`. **Nothing in that ledger
+is a deletion record.**
+
+Measured 2026-10-05 from `git worktree list --porcelain`: **60 registered
+worktrees = 1 primary + 47 under the root + 12 strays still in `I:/TEMP`.**
+Before that pass it was 1 + 37 + 22; 10 junction-free lanes were migrated and
+the total stayed at 60, which is the number that proves none was lost.
+Per state: `wip` 6, `unsure` 9, `done` 30, `archive` 2.
+
+- Each lane's state was **measured, not assumed**: `wip` = the branch has
+  commits `main` lacks, `unsure` = merged-or-not but the tree is dirty,
+  `done` = merged AND clean, `archive` = abandoned with a recorded reason.
+- The **12 junctioned lanes are refused on purpose.** `wt-migrate.sh` exits 3
+  and NO-OPs on them. `git worktree remove` destroyed a dependency tree in this
+  project through exactly such a junction, so a junctioned tree is not moved
+  either. They stay in `I:/TEMP`. Retiring them is the owner's call, not a
+  script's.
+
+### Never merge one of these branches wholesale
+
+Six parked lanes hold commits `main` lacks, and the three-dot diff makes them
+look valuable: `agent/ejs-remote-solver` (17 commits),
+`agent/shorts-crashfix-review` (11), `agent/obsv` (9),
+`agent/audio-only-both-sites` (3), `agent/clip-editor` (1),
+`agent/flake-hunt` (1).
+
+**They are STALE, and merging one would gut `main`.** The two-dot diff
+(`git diff main <branch>`) is 77-157 files and the direction is overwhelmingly
+DELETION of what `main` already has — `live_upcoming_backoff.py -205`,
+`archive_db.py 881`, `archive_transcribe.py 675`,
+`scripts/lib/worktree-roots.sh -372`, `docs/wt-migration-ledger.tsv -49`,
+`AGENTS.md -181`. Their merge bases are old tips (8d4fe23c, 53643d57,
+5848b5df, 27e9da74, bd346e6d, de3774e0).
+
+Take the useful fragment **file by file** — cherry-pick the commit or port the
+hunk. Never the branch. And measure "is this already in main" as
+`git diff main <branch>`: an empty diff means the content IS in main and only
+the history differs.
 
 **Create lanes only through the chokepoint**, never `git worktree add <path>`
 by hand:
