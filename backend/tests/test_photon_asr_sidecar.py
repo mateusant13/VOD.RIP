@@ -367,18 +367,18 @@ def test_decode_batch_uses_photon_on_a_gpu_slot(monkeypatch, tmp_path):
         clip_offsets=[10.0, 12.0], use_cuda=True,
     )
     assert rec.calls == 0, "sherpa must not run when the accelerator answered"
-    # Absolute video time via the SAME formula as _clip_items: clip_start =
-    # clip position in the batch buffer + clip_offsets[i]. Photon mirrors the
-    # guaranteed path exactly, so a Photon batch is indistinguishable from a
-    # sherpa-onnx batch downstream. (That shared formula double-counts the
-    # offset for clips after the first in a multi-window sharded batch - a
-    # pre-existing behaviour of _transcribe_batch_parakeet, deliberately not
-    # "fixed" here: the two engines must agree, and changing the guaranteed
-    # path's timestamps is out of scope for an accelerator.)
+    # Absolute video time via the SAME helper as the guaranteed path:
+    # _absolute_clip_bounds. A clip's position inside the batch buffer is a
+    # slicing detail; clip_offsets[i] is the clip's absolute start. Photon
+    # mirrors the guaranteed path exactly, so a Photon batch is
+    # indistinguishable from a sherpa-onnx batch downstream.
     assert out[0][0][0]["start_sec"] == 10.0
     assert out[0][0][0]["words"][0]["start"] == 10.0
     assert out[0][0][0]["words"][0]["conf"] == 0.99
-    assert out[1][0][0]["start_sec"] == 14.0  # 2.0 (in-buffer) + 12.0 (offset)
+    # 12.0 is this clip's OWN absolute start (clip_offsets[1]). It is not
+    # 14.0: adding the in-buffer position (2.0) to the absolute offset counts
+    # the same instant twice and lands every clip after the first late.
+    assert out[1][0][0]["start_sec"] == 12.0  # clip_offsets[1], nothing added
     assert out[0][1] == "en"
 
 

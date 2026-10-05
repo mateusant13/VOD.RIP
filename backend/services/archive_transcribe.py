@@ -2392,6 +2392,32 @@ def _parakeet_words(
     return words
 
 
+def _absolute_clip_bounds(
+    cs: float, ce: float, base: Optional[float],
+) -> tuple[float, float]:
+    """A clip's [start, end] in absolute video time.
+
+    ``base`` is None on the full-audio path, where ``cs``/``ce`` already ARE
+    absolute. On the sharded batched path ``cs``/``ce`` are the clip's
+    position INSIDE the concatenated batch buffer - a slicing detail, kept
+    only so the caller can cut audio back out of the buffer - while ``base``
+    is the clip's absolute start. The two describe the SAME instant, so they
+    are alternatives and NOT summands: adding them put every clip after the
+    first in a batch that clip's in-buffer position late, silently, in the
+    SRT the user downloads (2 s for a 2 s first window).
+
+    The duration is carried across rather than re-derived from the requested
+    window, so the end stays bounded by the audio the engine actually
+    decoded: a clip whose read was clamped at the end of the sharded audio
+    ends where the audio ends, not where the request did.
+
+    THE ONLY place absolute clip bounds are computed - both engines call it,
+    so a Photon batch cannot drift from a sherpa-onnx batch."""
+    if base is None:
+        return cs, ce
+    return base, base + (ce - cs)
+
+
 def _transcribe_batch_parakeet(
     rec: Any,
     audio: "Any",
@@ -2426,7 +2452,7 @@ def _transcribe_batch_parakeet(
     # so a long job (> idle timeout) looked "idle" and got unloaded mid-run
     # (plan collapse to CPU + crashed process). Any inference IS use.
     _parakeet_last_used = time.monotonic()
-    def _clip_items(stream: Any, cs: float, ce: float, base: float) -> list[dict]:
+    def _clip_items(stream: Any, clip_start: float, clip_end: float) -> list[dict]:
         res = stream.result
         text = (res.text or "").strip()
         if not text:
@@ -2437,16 +2463,15 @@ def _transcribe_batch_parakeet(
             getattr(res, "ys_log_probs", None),
         )
         # The recognizer only ever sees the per-clip slice, so its word
-        # timestamps are relative to the CLIP, not the video. The absolute
-        # clip start is cs+base (sharded: concat-relative cs + absolute
-        # offset; full-audio: cs is already absolute, base is 0). Without
-        # this offset every clip past the first stored end_sec = the first
-        # clip's speech end and clip-relative word times.
-        clip_start = cs + base
-        last_word_end = (words[-1]["end"] if words else float(ce - cs)) + clip_start
+        # timestamps are relative to the CLIP, not the video; clip_start /
+        # clip_end are that slice's absolute bounds (see
+        # _absolute_clip_bounds). Without them every clip past the first
+        # stored end_sec = the first clip's speech end and clip-relative
+        # word times.
+        last_word_end = (words[-1]["end"] if words else float(clip_end - clip_start)) + clip_start
         return [{
             "start_sec": round(clip_start, 3),
-            "end_sec": round(min(ce + base, last_word_end + 0.3), 3),
+            "end_sec": round(min(clip_end, last_word_end + 0.3), 3),
             "text": text,
             "words": [
                 {**w, "start": round(w["start"] + clip_start, 3),
@@ -2483,8 +2508,11 @@ def _transcribe_batch_parakeet(
                     rec.decode_streams(streams)
                 items = []
                 for j, (cs, ce) in enumerate(sub):
-                    base = 0.0 if clip_offsets is None else clip_offsets[offset + j]
-                    items.append((_clip_items(streams[j], cs, ce, base), language))
+                    base = None if clip_offsets is None else clip_offsets[offset + j]
+                    items.append((
+                        _clip_items(streams[j], *_absolute_clip_bounds(cs, ce, base)),
+                        language,
+                    ))
                 return items
             except Exception as exc:
                 if len(sub) <= 1 or not any(m in str(exc) for m in _alloc_markers):
@@ -2504,14 +2532,14 @@ def _transcribe_batch_parakeet(
             out.extend(_decode_streams_safe(sub, i))
         return out
     for i, (cs, ce) in enumerate(chunks):
-        base = 0.0 if clip_offsets is None else clip_offsets[i]
+        base = None if clip_offsets is None else clip_offsets[i]
         s0, s1 = int(cs * SAMPLE_RATE), int(ce * SAMPLE_RATE)
         clip = audio[s0:s1]
         stream = rec.create_stream()
         stream.accept_waveform(SAMPLE_RATE, clip)
         with transcription_cpu_limiter(_parakeet_threads()):
             rec.decode_stream(stream)
-        out.append((_clip_items(stream, cs, ce, base), language))
+        out.append((_clip_items(stream, *_absolute_clip_bounds(cs, ce, base)), language))
     return out
 
 
@@ -2633,7 +2661,11 @@ def _photon_segments(
             continue
         if not (sstart >= 0.0 and send >= sstart):
             continue
-        last_word_end = (words[-1]["end"] if words else float(clip_end - clip_start)) + clip_start
+        # `words` are ALREADY absolute (shifted by clip_start above), so they
+        # must NOT be shifted a second time. _clip_items works from
+        # clip-relative times and does add clip_start; the number is the same,
+        # which is what "mirrors _clip_items exactly" has to mean.
+        last_word_end = words[-1]["end"] if words else float(clip_end)
         out.append({
             # start_sec is the CLIP start, exactly like _clip_items: the
             # resume manifest and seg_idx allocation are built on "a chunk
@@ -2674,11 +2706,11 @@ def _decode_batch_photon(
     )
     out: list[tuple[list[dict], Optional[str]]] = []
     for i, (cs, ce) in enumerate(chunks):
-        base = 0.0 if clip_offsets is None else clip_offsets[i]
-        clip_start = cs + base
+        base = None if clip_offsets is None else clip_offsets[i]
+        clip_start, clip_end = _absolute_clip_bounds(cs, ce, base)
         entry = results[i] if isinstance(results[i], dict) else {}
         out.append((
-            _photon_segments(entry.get("segments"), clip_start, ce + base),
+            _photon_segments(entry.get("segments"), clip_start, clip_end),
             language,  # echoes the requested language exactly as sherpa does
         ))
     return out
