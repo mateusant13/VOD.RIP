@@ -84,7 +84,11 @@ def clock():
     yield c
     rate_budget.set_clock(time.monotonic)
     rate_budget.reset()
+    # Both gates are module-global and outlive this test. Leaving either armed
+    # leaks into later modules — e.g. test_rate_budget.py asserts the Kick gate
+    # is NOT armed — so disarm what this file's writer tests switched on.
     yt_gate.clear_youtube_gate()
+    kick_gate.clear_kick_gate()
 
 
 @pytest.fixture()
