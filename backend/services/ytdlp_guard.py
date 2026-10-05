@@ -77,8 +77,137 @@ def assert_ytdlp_safe() -> None:
         )
 
 
+# --- remote challenge solver (yt-dlp "remote components") -------------------
+#
+# WHAT THIS IS. YouTube gates its adaptive (audio-only) streams behind an
+# "n challenge" that must be solved by EXECUTING JavaScript. yt-dlp ships the
+# `core` half of the solver locally but NOT the `lib` half, so out of the box
+# the challenge cannot be solved and every audio-only itag (140/251) drops out
+# of the format list. The observable symptom was that the transcription lane
+# fell through `bestaudio` to muxed itag 18 and fed h264 video to a speech
+# recogniser (see archive_ytdlp._AUDIO_ONLY_FORMAT_SPEC).
+#
+# THE SECURITY CONSEQUENCE, PLAINLY: turning this on makes yt-dlp DOWNLOAD
+# JavaScript from a remote source (a GitHub release asset) and EXECUTE it,
+# with the local JS runtime (deno/node), during challenge solving. That is
+# remote code execution by design. It is bounded — the asset URL is pinned to
+# a yt-dlp-pinned version tag, and yt-dlp verifies the downloaded script
+# against a hash that is vendored INSIDE the installed yt-dlp
+# (jsc/_builtin/vendor/_info.py HASHES), refusing it on mismatch — but it is
+# a real, permanent trust grant, not a toggle we can pretend is free.
+#
+# THE KNOB. `VODRIP_YT_EXECUTE_REMOTE_CHALLENGE_SOLVER` reads as what it does.
+# It is deliberately named "execute" so nobody enables it by accident. Set it
+# to 1/true/yes/on to allow; 0/false/no/off (or unset — the default) forbids.
+# ONE documented way to turn it off: set it to `0`. That restores the previous
+# behaviour exactly: no remote fetch, challenge unsolved, audio-only formats
+# absent, and the transcription lane requeues instead of downloading video.
+#
+# WHY IT LIVES HERE AND NOT IN A CALLER. `sanitize_ytdlp_opts` is the function
+# that already decides `fetch_pot`, and it runs on the single guarded egress
+# seam, so a future refactor cannot quietly drop the option: the regression
+# test asserts the EFFECTIVE opts at the seam, not a constant.
+
+# Only the pinned GitHub release asset. `ejs:npm` would pull npm packages at
+# solve time; it is deliberately NOT enabled — one source, one grant.
+EJS_REMOTE_SOLVER_COMPONENTS = ("ejs:github",)
+
+_EXECUTE_REMOTE_SOLVER_ENV = "VODRIP_YT_EXECUTE_REMOTE_CHALLENGE_SOLVER"
+
+_EJS_STATE_REPORTED: bool = False
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def execute_remote_challenge_solver() -> bool:
+    """Whether yt-dlp may download+execute the remote n-challenge solver.
+
+    Default False. The owner authorised enabling it, but it stays a NAMED,
+    reversible setting rather than a hardcoded default, so "is this box
+    executing remote JS?" is one env var to answer.
+    """
+    return _env_flag(_EXECUTE_REMOTE_SOLVER_ENV, default=False)
+
+
+def _ejs_vendor_manifest() -> dict:
+    """Pinned solver version + expected script hash from the INSTALLED yt-dlp.
+
+    Read from the package so "what code ran" is answerable later: the version
+    tag yt-dlp requests and the sha3-512 it verifies the download against both
+    come from here, not from us.
+    """
+    try:
+        from yt_dlp.extractor.youtube.jsc._builtin.vendor import _info
+
+        return {
+            "version": _info.VERSION,
+            "lib_min_hash": _info.HASHES.get("yt.solver.lib.min.js", ""),
+        }
+    except Exception:  # pragma: no cover - yt-dlp internals moved
+        return {}
+
+
+def _report_ejs_state_once() -> None:
+    """Log the resolved component/version/hash exactly once per process.
+
+    This is the audit line: it names the source, the pinned version and the
+    hash that gates the download, so a log search answers "did this box
+    execute remote JS, and which bytes?".
+    """
+    global _EJS_STATE_REPORTED
+    if _EJS_STATE_REPORTED:
+        return
+    _EJS_STATE_REPORTED = True
+    if not execute_remote_challenge_solver():
+        logger.info(
+            "yt-dlp remote challenge solver DISABLED (%s not set) — n-challenge "
+            "stays unsolved, audio-only formats absent",
+            _EXECUTE_REMOTE_SOLVER_ENV,
+        )
+        return
+    man = _ejs_vendor_manifest()
+    logger.warning(
+        "yt-dlp remote challenge solver ENABLED: yt-dlp will DOWNLOAD and "
+        "EXECUTE JavaScript from github.com/yt-dlp/ejs releases (v%s) to solve "
+        "YouTube's n-challenge. Expected lib.min.js sha3-512=%s. Turn off with "
+        "%s=0.",
+        man.get("version", "unknown"),
+        (man.get("lib_min_hash") or "unknown")[:16],
+        _EXECUTE_REMOTE_SOLVER_ENV,
+    )
+
+
+def _apply_remote_challenge_solver(out: dict[str, Any]) -> dict[str, Any]:
+    """Set (or clear) `remote_components` on the effective yt-dlp opts.
+
+    Always writes the key — enabled OR disabled — so a caller that previously
+    set `remote_components` cannot smuggle it past the seam, and so the
+    disabled state is explicit rather than "whatever the caller passed".
+    """
+    _report_ejs_state_once()
+    if execute_remote_challenge_solver():
+        out["remote_components"] = list(EJS_REMOTE_SOLVER_COMPONENTS)
+    else:
+        out["remote_components"] = []
+    return out
+
+
 def sanitize_ytdlp_opts(opts: dict[str, Any]) -> dict[str, Any]:
-    """Strip blocked keys; enable bgutil fetch_pot when the POT server is up."""
+    """Strip blocked keys; enable bgutil fetch_pot when the POT server is up.
+
+    Also decides `remote_components` — the option that lets yt-dlp download and
+    execute the remote n-challenge solver. See the block comment above it; the
+    knob is VODRIP_YT_EXECUTE_REMOTE_CHALLENGE_SOLVER (=0 reverts).
+    """
     out = dict(opts)
     ext = out.get("extractor_args")
     if not isinstance(ext, dict):
@@ -101,7 +230,7 @@ def sanitize_ytdlp_opts(opts: dict[str, Any]) -> dict[str, Any]:
     if bgutil:
         ext["youtubepot-bgutilhttp"] = bgutil
     out["extractor_args"] = ext
-    return out
+    return _apply_remote_challenge_solver(out)
 
 
 _EXPECTED_YTDLP_MARKERS = (
