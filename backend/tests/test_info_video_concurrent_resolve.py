@@ -259,7 +259,7 @@ def test_non_youtube_submits_exactly_one_executor_job(monkeypatch, tmp_path):
 
     # the guard MODULE is the one process-wide seam; the consumer attribute is
     # not (see backend/tests/test_guard_binding_seam.py)
-    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl", lambda opts: FakeYdl())
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl", lambda opts, **_control: FakeYdl())
     monkeypatch.setattr("services.ytdlp_ffmpeg._ytdlp_engine_opts", lambda: {})
 
     info = asyncio.run(yd.get_video_info("https://www.twitch.tv/videos/2833943352"))

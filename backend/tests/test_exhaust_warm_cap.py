@@ -117,7 +117,7 @@ def test_get_video_info_runs_extract_on_info_executor(monkeypatch, tmp_path):
     # attribute (`_yd.guarded_youtube_dl`) intercepts module-global lookups only
     # and is bypassed by a function-local re-import; see
     # backend/tests/test_guard_binding_seam.py.
-    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl", lambda opts: _FakeYdl())
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl", lambda opts, **_control: _FakeYdl())
     monkeypatch.setattr("services.ytdlp_ffmpeg._ytdlp_engine_opts", lambda: {})
 
     info = asyncio.run(
