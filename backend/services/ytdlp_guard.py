@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import logging
 import os
@@ -12,6 +13,7 @@ from typing import Any, Iterator
 
 from services import rl_counter
 from services import ytdlp_env  # noqa: F401
+from services import ytdlp_outcomes
 
 logger = logging.getLogger(__name__)
 
@@ -124,9 +126,26 @@ class _YtdlpConsoleLogger:
     console — those are normal conditions surfaced in the UI/job rows.
     Warnings are deduped process-wide on the NORMALIZED message (video-id
     prefix stripped), so per-video repeats of the same environmental note
-    (EJS "no JS runtime", GVS PO token, SABR/DRM skips) log once."""
+    (EJS "no JS runtime", GVS PO token, SABR/DRM skips) log once.
+
+    WHY THE VOCABULARY IS A SEPARATE MODULE: an earlier version of this filter
+    was a substring list (_EXPECTED_YTDLP_MARKERS) tested against the message.
+    It did not match the messages that actually dominated the live error ring
+    — of 500 retained records, 411 were yt-dlp errors and the highest-volume
+    shapes ("This channel does not have a streams tab", "Unable to download
+    API page: HTTP Error 404", "Faça login para confirmar que você não é um
+    bot") were NOT in the list, so ~324 of them reached the ring as errors
+    while genuinely expected conditions. services.ytdlp_outcomes is a closed
+    vocabulary with anchored markers and, crucially, an `unknown` default: a
+    line it does not recognise stays a real error and keeps its log record.
+
+    Errors are counted per code (process-wide) so an operator can tell "the
+    filter is working" from "yt-dlp went quiet" — a bare drop would make both
+    look identical, which is the honesty discipline 3f4ceb9 applied to
+    /api/asr/runtime."""
 
     _seen_warnings: set[str] = set()  # class-level: shared across instances
+    _expected_counts: "collections.Counter[str]" = collections.Counter()
 
     def __init__(self) -> None:
         pass
@@ -143,10 +162,21 @@ class _YtdlpConsoleLogger:
         logger.warning("yt-dlp: %s", text)
 
     def error(self, msg):
-        if any(m in str(msg).lower() for m in _EXPECTED_YTDLP_MARKERS):
-            logger.debug("yt-dlp expected error: %s", msg)
-        else:
-            logger.error("yt-dlp: %s", msg)
+        text = str(msg)
+        code = ytdlp_outcomes.classify(text)
+        if ytdlp_outcomes.is_expected(code):
+            type(self)._expected_counts[code] += 1
+            logger.debug("yt-dlp expected error [%s]: %s", code, msg)
+            return
+        # NOT expected (or unrecognised): a real error. It keeps its log
+        # record — the ring buffer's budget belongs to defects.
+        logger.error("yt-dlp: %s", msg)
+
+    @classmethod
+    def expected_counts(cls) -> "collections.Counter[str]":
+        """{outcome_code: times seen} since process start. A code absent here
+        was never observed — which is NOT the same as a count of zero."""
+        return collections.Counter(cls._expected_counts)
 
 
 def ytdlp_console_logger():
