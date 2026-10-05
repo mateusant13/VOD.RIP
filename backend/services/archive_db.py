@@ -2954,18 +2954,21 @@ def update_job(job_id: str, *, status: Optional[str] = None,
     race and must not assume the row moved. Purely additive: every existing
     caller omits it and gets the previous unconditional UPDATE.
     """
+    # One stamp for all three liveness columns so they are directly
+    # comparable — a work mark that is a second older than the heartbeat it
+    # is meant to accompany would be its own lie.
+    now = _now_iso()
     sets = ["updated_at = ?", "heartbeat = ?"]
-    params: list[Any] = [_now_iso(), _now_iso()]
+    params: list[Any] = [now, now]
     # work_heartbeat: a call carrying NO work is a LIVENESS touch, not a
     # claim. Every bare `update_job(job_id)` in the backend is a watchdog
     # (archive_transcribe._dl_progress / _fetch_heartbeat, archive_twitch's
     # page heartbeat) refreshing the row so the coarse stale window does not
     # fire mid-download. Those touches must NOT advance the work signal —
-    # see _ensure_jobs_work_heartbeat_column. One stamp shared by all three
-    # columns so they are directly comparable.
+    # see _ensure_jobs_work_heartbeat_column.
     if progress is not None or status is not None:
         sets.append("work_heartbeat = ?")
-        params.append(_now_iso())
+        params.append(now)
     if status == "failed":
         # TASK10 immortal retry queue: a failed job is requeued with a
         # next_retry_at deadline unless the failure is terminal (file
