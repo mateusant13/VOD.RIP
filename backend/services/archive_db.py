@@ -544,6 +544,7 @@ def _init_schema() -> None:
         _ensure_jobs_kind_chat(_conn)
         _ensure_jobs_heartbeat_column(_conn)
         _ensure_jobs_retry_columns(_conn)
+        _ensure_jobs_work_heartbeat_column(_conn)
         _ensure_jobs_status_paused(_conn)
         _ensure_rate_limit_events(_conn)
         rebuilt = _migrate_fts_contentless(_conn)
@@ -1233,7 +1234,8 @@ def _ensure_jobs_status_paused(conn: sqlite3.Connection) -> None:
              heartbeat    TEXT,
              attempts     INTEGER NOT NULL DEFAULT 0,
              max_attempts INTEGER NOT NULL DEFAULT 3,
-             next_retry_at TEXT
+             next_retry_at TEXT,
+             work_heartbeat TEXT
            )"""
     )
     # Copy only the columns this DB actually has; anything absent takes the
@@ -1241,7 +1243,7 @@ def _ensure_jobs_status_paused(conn: sqlite3.Connection) -> None:
     target = [
         "id", "kind", "platform", "video_id", "status", "progress", "error",
         "priority", "created_at", "updated_at", "heartbeat",
-        "attempts", "max_attempts", "next_retry_at",
+        "attempts", "max_attempts", "next_retry_at", "work_heartbeat",
     ]
     cols = [c for c in target if c in existing]
     conn.execute(
@@ -1285,6 +1287,36 @@ def _ensure_jobs_retry_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE archive_jobs ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3")
     if "next_retry_at" not in cols:
         conn.execute("ALTER TABLE archive_jobs ADD COLUMN next_retry_at TEXT")
+
+
+def _ensure_jobs_work_heartbeat_column(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: add archive_jobs.work_heartbeat.
+
+    `heartbeat` and `updated_at` are stamped by `update_job` on EVERY call,
+    including calls that carry no work at all — the download watchdogs
+    (archive_transcribe._dl_progress, _fetch_heartbeat) and the twitch page
+    heartbeat (archive_twitch) all issue a bare `update_job(job_id)` every
+    few minutes purely to hold the coarse stale-reclaim window open across a
+    long blocking download. So "the heartbeat advanced" cannot distinguish a
+    job being worked on from a timestamp being refreshed for free, which is
+    exactly how a job that computes nothing held a row 'running' for two
+    months on the live archive.
+
+    work_heartbeat is the second, stricter stamp: it advances ONLY on a
+    work-bearing update (one carrying progress and/or status) and on a real
+    claim. A liveness touch cannot move it, so a stuck download ages out on
+    this signal even while the watchdog keeps the coarse heartbeat fresh, and
+    an executor's claim is recorded as a fact instead of being inferred from
+    a free-to-refresh timestamp. NULL for rows that never claimed (a fresh
+    enqueue), matching heartbeat's NULL-until-touched convention.
+
+    Additive only; PRAGMA table_info guard makes repeated calls no-ops. Runs
+    before _ensure_jobs_status_paused so that rebuild's DDL is the final
+    shape, as its docstring requires.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(archive_jobs)")}
+    if "work_heartbeat" not in cols:
+        conn.execute("ALTER TABLE archive_jobs ADD COLUMN work_heartbeat TEXT")
 
 
 # Columns of rate_limit_events declared in SCHEMA, in order. A later lane
@@ -2924,6 +2956,16 @@ def update_job(job_id: str, *, status: Optional[str] = None,
     """
     sets = ["updated_at = ?", "heartbeat = ?"]
     params: list[Any] = [_now_iso(), _now_iso()]
+    # work_heartbeat: a call carrying NO work is a LIVENESS touch, not a
+    # claim. Every bare `update_job(job_id)` in the backend is a watchdog
+    # (archive_transcribe._dl_progress / _fetch_heartbeat, archive_twitch's
+    # page heartbeat) refreshing the row so the coarse stale window does not
+    # fire mid-download. Those touches must NOT advance the work signal —
+    # see _ensure_jobs_work_heartbeat_column. One stamp shared by all three
+    # columns so they are directly comparable.
+    if progress is not None or status is not None:
+        sets.append("work_heartbeat = ?")
+        params.append(_now_iso())
     if status == "failed":
         # TASK10 immortal retry queue: a failed job is requeued with a
         # next_retry_at deadline unless the failure is terminal (file
@@ -2982,11 +3024,8 @@ def update_job(job_id: str, *, status: Optional[str] = None,
             or ("bot-gate" in err.lower())
             or _gate
         )
-        row = query(
-            "SELECT attempts, max_attempts FROM archive_jobs WHERE id = ?", (job_id,)
-        )
-        attempts = int(row[0]["attempts"] or 0) + 1 if row else 1
-        max_attempts = int(row[0]["max_attempts"] or 0) or 3 if row else 3
+        row_attempts, max_attempts = attempt_budget(job_id)
+        attempts = row_attempts + 1
         sets.append("attempts = ?")
         params.append(attempts)
         if terminal or (attempts >= max_attempts and not rate):
@@ -3085,6 +3124,53 @@ def _now_iso_plus(seconds: float) -> str:
     from datetime import datetime, timedelta, timezone
 
     return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat(timespec="seconds")
+
+
+def attempt_budget(job_id: str) -> tuple[int, int]:
+    """(attempts_so_far, max_attempts) for `job_id`.
+
+    One reader for the whole attempt arithmetic, so a crash release and a
+    stale-reclaim relaunch can never disagree about how much budget a job has
+    left. A row that does not exist reads as (0, 3), which makes its first
+    attempt 1 of 3 — identical to the pre-existing inline read.
+    """
+    rows = query(
+        "SELECT attempts, max_attempts FROM archive_jobs WHERE id = ?", (job_id,)
+    )
+    if not rows:
+        return 0, 3
+    return int(rows[0]["attempts"] or 0), (int(rows[0]["max_attempts"] or 0) or 3)
+
+
+def reclaim_relaunch_plan(attempts: int, max_attempts: int) -> dict:
+    """Pure: what ONE stale-reclaim relaunch costs. No I/O, no clock.
+
+    The reclaim is a relaunch, so it spends an attempt: `attempts + 1`, judged
+    against the same `max_attempts` the crash path uses, with the backoff on
+    the same `_retry_delay_sec` curve. That is the whole immortality fix — a
+    compare-and-set that re-stamped the heartbeat without touching the budget
+    left `attempts` at 0 forever, so `max_attempts` was unreachable and a
+    wedged row was relaunched every 2 h indefinitely (the two-month-old
+    chat-youtube-0FH0wZfZ82Q row on the live archive).
+
+    It classifies NOTHING, on purpose. A reclaim is not a crash, so it does
+    not run the error-string terminal/rate classifiers in `update_job`: a
+    reclaim reports what it saw (a stale window, no work), never a cause the
+    user did not produce. `exhausted` is reached by budget alone, which is
+    what bounds the loop.
+
+    Returns {'attempts', 'exhausted', 'backoff_s'}. `attempts` is the value
+    the reclaim must WRITE; the caller keeps the pre-charge value to guard the
+    compare-and-set, so a second racing reclaim cannot double-charge.
+    """
+    charged = attempts + 1
+    return {
+        "attempts": charged,
+        "exhausted": charged >= max_attempts,
+        # rate=False: a reclaim is not a rate failure, so this is the plain
+        # 60 * 2^(n-1) curve rather than the gate-waiting branch.
+        "backoff_s": _retry_delay_sec(charged, False),
+    }
 
 
 def clear_finished_jobs() -> int:
