@@ -21,6 +21,43 @@ only looks. If you want the same thing as data an agent can read, add `-Json`.
 
 ---
 
+## The decision this makes faster
+
+One sentence, because a panel that cannot name its decision is a panel.
+
+> **"Of the worktrees in front of me, which can I release right now, and which
+> must I not touch?"**
+
+That is the decision this console exists to make fast. It is not "what is the
+health of the system" - that is what the running-service probe is for. This one
+is about the *workspace*: 50-odd separate checkouts, each holding uncommitted
+work, each with a shared `node_modules` that can be destroyed by removing the
+wrong one.
+
+Answering it used to mean running `git worktree list`, then `git status` in every
+directory by hand, then remembering which branches had merged. That is ~50
+sequential commands and it is wrong the moment a lane lands mid-way through.
+It is now one command that takes about 25 seconds, and it answers three things
+at once:
+
+1. **Releaseable** - `MERGED=yes`, `DIRTY=0`, not named in any lane's `owns`.
+   Measured population on 2026-10-05: **34 of 53** worktrees qualified.
+2. **In flight** - dirty or unmerged, and therefore holding work that exists
+   nowhere else. Measured: **18 of 53**.
+3. **Do not touch** - `<<JUNCTION` (removal can follow the link into the shared
+   `node_modules`) or `<<DIR-GONE` (git still lists it, the directory is gone).
+   Measured: **11 junctions**.
+
+The number that changed a decision on that run: three lanes were listed in the
+ownership manifest at paths that **no longer exist**, because another lane was
+actively migrating worktrees from `I:\TEMP\` into `I:\vod-rip-wt\{wip,done,
+unsure,archive}\` while the manifest still named the old ones. Nothing had crashed
+and nothing had errored. The record had simply gone quietly out of date - which
+is the failure this console is built to make visible instead of leaving to
+memory.
+
+---
+
 ## What the three answers mean
 
 The last line of the report is the verdict, and the process exit code says the
@@ -171,10 +208,30 @@ appears in no lane's `owns` list. See the rollback below.
 * **Any worktree with `<<JUNCTION`.** Removing it can delete the shared
   `node_modules` the other lanes depend on. Remove the junction first, by hand,
   deliberately - or do not remove the worktree.
-* **The other two `archive.db` files** (on `G:` and in `%APPDATA%`). They are
-  orphaned predecessors. The live database is `H:\VOD.RIP-data\archive.db`.
-  Never delete them here, and never quote a count from them: two wrong reports
-  this week came from reading an orphan and believing it.
+* **The two orphaned `archive.db` files.** There are three `archive.db` files
+  on this machine and the app opens exactly one:
+
+  | path | status |
+  |---|---|
+  | `H:\VOD.RIP-data\archive.db` | **LIVE - the one the app opens** |
+  | `G:\VOD.RIP-data\archive.db` | orphaned predecessor |
+  | `%APPDATA%\VOD.RIP\archive.db` | orphaned predecessor |
+
+  The live one is on `H:` because every override (`VODRIP_ARCHIVE_DB`,
+  `VODRIP_DATA_DIR`, and `settings.data_dir`) is unset, so resolution falls
+  through to the automatic tier, which picks the fastest bus drive with room -
+  here `H:`. Both predecessors were left behind by an earlier "copy the database
+  to the new disk and keep the old one" migration.
+
+  Two rules follow. **Never delete an orphan as part of cleanup** - that is your
+  decision, and this toolchain does not make it for you. **Never quote a count
+  read from an orphan.** Two separate wrong reports this week came from reading
+  the `%APPDATA%` orphan and believing it was production, because `errors.jsonl`
+  is written to `%APPDATA%` daily and made the stale file look alive. Logs in
+  `%APPDATA%` do not mean the database is there. If you need a number from the
+  archive, name the exact file you read in the same breath as the number.
+
+  This status tool opens no database at all, so it cannot introduce that error.
 
 ---
 
