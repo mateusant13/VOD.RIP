@@ -533,6 +533,7 @@ def _init_schema() -> None:
         _ensure_channel_language_column(_conn)
         _ensure_original_columns(_conn)
         _ensure_captions_unavailable_column(_conn)
+        _ensure_captions_unavailable_kind_column(_conn)
         _ensure_transcript_kind_column(_conn)
         _ensure_original_failed_column(_conn)
         _ensure_lang_column(_conn)
@@ -845,6 +846,50 @@ def _ensure_captions_unavailable_column(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(videos)")}
     if "captions_unavailable_at" not in cols:
         conn.execute("ALTER TABLE videos ADD COLUMN captions_unavailable_at TEXT")
+
+
+# The persisted vocabulary of videos.captions_unavailable_kind — the ONE place
+# that decides what an age-gate park looks like in the DB. NULL = an ordinary
+# "this video has no captions" verdict, which the marker already meant before
+# this column existed.
+#
+# Why a code and not a sentence: the marker row is the durable state, and the
+# frontend renders what it reads. Storing English prose would make the UI
+# string-match it to know WHICH remedy applies (no session vs a rejected
+# session) — a wording edit would silently break every client. A code is a
+# contract; the sentence is derived from it at read time
+# (routers/archive._age_gate_park_text).
+CAPTIONS_PARK_AGE_GATE_NO_SESSION = "age_gate_no_session"
+CAPTIONS_PARK_AGE_GATE_SESSION_REJECTED = "age_gate_session_rejected"
+CAPTIONS_PARK_AGE_GATE_KINDS: tuple[str, ...] = (
+    CAPTIONS_PARK_AGE_GATE_NO_SESSION,
+    CAPTIONS_PARK_AGE_GATE_SESSION_REJECTED,
+)
+
+
+def _ensure_captions_unavailable_kind_column(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: add videos.captions_unavailable_kind.
+
+    The no-captions marker (captions_unavailable_at) is shared by every kind of
+    captionless verdict, so on its own it cannot tell the UI that a video is
+    parked waiting on the user's sign-in — that is exactly the "indistinguishable
+    from an ordinary no-captions verdict" gap the videos endpoint documents.
+    This column carries the classification ON THE SAME ROW: it is not a second
+    copy of whether the video is parked (that stays captions_unavailable_at, and
+    is still cleared by a successful caption ingest and by release), only WHY.
+
+    Deliberately NOT transcript_kind='blocked': that is the irreversible
+    terminal ASR verdict. An age gate is credential-bound and must stay
+    reversible, so it rides the reversible marker. Plain nullable TEXT — same
+    pattern as _ensure_captions_unavailable_column. The composite index keeps
+    the polled park query off a full videos scan."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(videos)")}
+    if "captions_unavailable_kind" not in cols:
+        conn.execute("ALTER TABLE videos ADD COLUMN captions_unavailable_kind TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_videos_captions_unavailable_kind "
+        "ON videos(platform, captions_unavailable_kind)"
+    )
 
 
 def _ensure_transcript_kind_column(conn: sqlite3.Connection) -> None:
@@ -3915,27 +3960,43 @@ def captions_cover(platform: str, video_id: str, *, subtitles_first: Optional[bo
     return bool(transcript_for(platform, video_id))
 
 
-def mark_captions_unavailable(platform: str, video_id: str) -> None:
+def mark_captions_unavailable(
+    platform: str, video_id: str, *, kind: Optional[str] = None
+) -> None:
     """Stamp the no-captions marker (persistent re-extract cooldown).
 
     Set by ingest_video when an ingest stored zero caption segments; the
     scheduler skips re-extract while the stamp is fresh
     (CAPTIONS_UNAVAILABLE_FRESH_S). No row (platform+video_id absent)
-    writes nothing — the marker only ever rides an existing row."""
+    writes nothing — the marker only ever rides an existing row.
+
+    `kind` classifies the verdict ON THE SAME ROW and defaults to None: an
+    ordinary "no captions" verdict writes NULL, which is also what un-classifies
+    a video whose earlier age-gate park has since been re-stamped by a plain
+    captionless fetch (a stale code must never outlive its cause). An age-gate
+    park passes one of CAPTIONS_PARK_AGE_GATE_KINDS; the park is reversible and
+    is released by clear_captions_unavailable, so the marker stays terminal-now
+    / reversible-later — never transcript_kind='blocked'."""
+
     execute(
-        "UPDATE videos SET captions_unavailable_at = ? WHERE platform = ? AND video_id = ?",
-        (_now_iso(), platform, video_id),
+        "UPDATE videos SET captions_unavailable_at = ?, captions_unavailable_kind = ? "
+        "WHERE platform = ? AND video_id = ?",
+        (_now_iso(), str(kind) if kind else None, platform, video_id),
     )
 
 
 def clear_captions_unavailable(platform: str, video_id: str) -> None:
-    """Clear the no-captions marker after a successful caption ingest.
+    """Clear the no-captions marker after a successful caption ingest — or a
+    release of a reversible age-gate park.
 
     A later ingest that DID find captions must immediately make the video
     a re-extract candidate again (e.g. captions were added to the upload
-    after the marker was stamped)."""
+    after the marker was stamped). The classification goes with the stamp: a
+    cleared row is an un-marked row, so a later ordinary no-captions verdict
+    cannot inherit a dead age-gate code."""
     execute(
-        "UPDATE videos SET captions_unavailable_at = NULL WHERE platform = ? AND video_id = ?",
+        "UPDATE videos SET captions_unavailable_at = NULL, captions_unavailable_kind = NULL "
+        "WHERE platform = ? AND video_id = ?",
         (platform, video_id),
     )
 
@@ -3947,6 +4008,68 @@ def captions_unavailable_at(platform: str, video_id: str) -> Optional[str]:
         (platform, video_id),
     )
     return row[0]["captions_unavailable_at"] if row else None
+
+
+def captions_unavailable_kind(platform: str, video_id: str) -> Optional[str]:
+    """Stored no-captions classification (a CAPTIONS_PARK_AGE_GATE_* code) or
+    None for an ordinary captionless verdict / an unmarked video."""
+    row = query(
+        "SELECT captions_unavailable_kind FROM videos "
+        "WHERE platform = ? AND video_id = ?",
+        (platform, video_id),
+    )
+    return row[0]["captions_unavailable_kind"] if row else None
+
+
+def age_gate_parked_videos(
+    platform: str = "youtube", *, fresh_seconds: Optional[float] = None
+) -> list[dict]:
+    """Every video currently PARKED on the YouTube age gate, from the DB.
+
+    The park is durable: it is the captions_unavailable_at marker plus its
+    age-gate classification, on the video row, so this is the same set after a
+    restart (or for a job recovered from the database) that it is in a live
+    process. Callers that want only the cooldown the sweep still honours pass
+    fresh_seconds (the archive's CAPTIONS_UNAVAILABLE_FRESH_S): a stamp older
+    than that is a re-attempt candidate, not a park, and must not be reported
+    to the user as one.
+
+    Returns [{video_id, kind, parked_at}] newest-stamp-last. An unparseable
+    stamp is treated as ABSENT (retry once) — the same rule
+    _deep_covered_ids applies — so a corrupt row can never be a permanent
+    park."""
+    ph = ",".join("?" * len(CAPTIONS_PARK_AGE_GATE_KINDS))
+    rows = query(
+        "SELECT video_id, captions_unavailable_kind, captions_unavailable_at "
+        "FROM videos WHERE platform = ? AND captions_unavailable_at IS NOT NULL "
+        f"AND captions_unavailable_kind IN ({ph})",
+        (platform, *CAPTIONS_PARK_AGE_GATE_KINDS),
+    )
+    out: list[dict] = []
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    for r in rows:
+        code = str(r["captions_unavailable_kind"] or "")
+        if code not in CAPTIONS_PARK_AGE_GATE_KINDS:
+            continue
+        try:
+            parked_at = datetime.fromisoformat(str(r["captions_unavailable_at"]))
+        except (TypeError, ValueError):
+            continue
+        if (
+            fresh_seconds is not None
+            and now - parked_at >= timedelta(seconds=float(fresh_seconds))
+        ):
+            continue  # cooldown expired — a candidate again, not a park
+        out.append(
+            {
+                "video_id": str(r["video_id"]),
+                "kind": code,
+                "parked_at": str(r["captions_unavailable_at"]),
+            }
+        )
+    return out
 
 
 def mark_video_transcript_kind(platform: str, video_id: str, kind: str) -> None:
