@@ -99,6 +99,15 @@ import { fmtDuration, formatClipDurationHuman, fmtDateAndAgo, fmtViews, parseVid
 import type { VideoInfo, ChannelVideo, ListedChannelVideo, SavedChannel, ChannelPreviewBadge, AppSettings, UpdateInfo, DownloadState, DownloadsResponse, Tab, LayoutPanelBoundsInput, PersistedPanelLayout, PreviewSessionResponse, PanelPos } from './types';
 import { detectUrlPlatform, isClipUrl, detectVideoPlatform, bestAvailableQuality, channelVideoDurationSec, videoInfoDurationSec, syncDurationFromPreviewSession, isLikelyClip, isMembersOnlyVideo, isPublicVideo, mergeVodLists, mergeClipLists, channelClipsMissing, channelVodsMissing, channelStreamsMissing, channelHasCachedContent, effectivePlatformFlags, hiddenPlatformCounts, mergeClipPlatformsFetched, mergeVodPlatformsFetched, buildVodUrl, parseChannelInput, slugFromVideoUrl, isChannelAlreadySaved, dedupeLiveEntries, dedupeSavedChannels, deriveChannelDisplayName, normalizeSavedChannel, displayTitle, loadSavedChannels, orderChannelsForSync, persistChannels, isHiddenChannelPlatformError, channelVodSubline, reorderChannelsById, mapApiChannelItem, channelInsertIndex, estimateDownloadBytes, resolveVideoThumbnail, findCachedVideoThumbnail, isSyntheticArchiveId, CHANNEL_INITIAL_VISIBLE, CHANNEL_EXPAND_STEP, CHANNEL_FETCH_LIMIT, CHANNEL_INCREMENTAL_LIMIT, CHANNEL_CLIP_FETCH_LIMIT, CHANNEL_UI_STORAGE_KEY, loadStoredChannelUi, channelPlatformVisibleSlice, channelPlatformCanExpand, channelShowMoreNeedsFetch, nextChannelPage, stalePageResponse, sortChannelVideosByMode, CHANNEL_RECENT_DAYS, channelLinkDraftFromParsed, channelLinkDraftSlugs, type ChannelLinkDraft, loadStoredChannelLiveStatuses, persistChannelLiveStatuses, shouldDropChannelFromLivePoll, type StoredChannelLiveStatus } from './channelUtils';
 import ChannelLinkCard from './components/ChannelLinkCard';
+import {
+  backendContentForFilter,
+  isChannelContentFilter,
+  isClipLikeFilter,
+  isShortsVideo,
+  selectChannelContent,
+  type ChannelContentFilter,
+} from './channelContentFilter';
+import { newWindowId } from './windowId';
 import { YOUTUBE_COLOR, platformAccentColor, platformStyleKey, platformActiveBorder, vodCheckboxStyle } from './platformColors';
 import { clampTrimEndpoints, trimButtonDeltaForEndpoint, adjustTrimEndpointByDelta, zoomWindowFromView, fracToSec, zoomTrimViewAround, resolveTimestampSeek, TRIM_ZOOM_STEP, type TrimRangeOpts, type TrimViewWindow } from './trimUtils';
 import { setPreviewTime, resetPreviewTime, getPreviewTime } from './hooks/usePreviewTime';
@@ -279,7 +288,7 @@ interface ChannelRowProps {
   clearChannelRefreshFlight: (channelId: string, mode?: 'vods' | 'clips' | 'streams') => void;
   startEditChannelLinks: (id: string) => void;
   removePlatformFromChannel: (channelId: string, platform: 'Kick' | 'Twitch' | 'YouTube') => void;
-  channelContentFilter: 'vods' | 'clips' | 'streams';
+  channelContentFilter: ChannelContentFilter;
   setSavedChannels: Dispatch<SetStateAction<SavedChannel[]>>;
   setChannelDragId: Dispatch<SetStateAction<string | null>>;
   setChannelDropInsertIndex: Dispatch<SetStateAction<number | null>>;
@@ -1067,7 +1076,7 @@ export default function App() {
   const [channelBeyondRecent, setChannelBeyondRecent] = useState<
     Partial<Record<'Kick' | 'Twitch' | 'YouTube', boolean>>
   >({});
-  const [channelContentFilter, setChannelContentFilter] = useState<'vods' | 'clips' | 'streams'>(
+  const [channelContentFilter, setChannelContentFilter] = useState<ChannelContentFilter>(
     initialChannelUi.content,
   );
   /** Clip listing: time range (server filter) + sort key. Defaults to Today. */
@@ -1124,16 +1133,17 @@ export default function App() {
     // at the source for every tab.
     const visible = (list: ChannelVideo[] | undefined) =>
       (list ?? []).filter((v) => isPublicVideo(v));
-    if (channelContentFilter === 'clips') return visible(selectedChannel.clipVideos);
-    if (channelContentFilter === 'streams') {
-      return visible(selectedChannel.vodVideos).filter((v) => v.content_kind === 'stream');
-    }
-    // Multi-platform UI: recorded YouTube broadcasts (kind 'stream') belong
-    // in the channel's VOD list — the /streams tab content is now merged
-    // into the vods fetch. YouTube-only mode keeps them out of "Videos"
-    // because its dedicated "VODs" tab shows them.
-    return visible(selectedChannel.vodVideos).filter((v) =>
-      youtubePlatformOnly ? v.content_kind !== 'stream' && v.content_kind !== 'clip' : v.content_kind !== 'clip',
+    // Shorts and Clips are ONE cached list (the backend's `clips` payload is a
+    // merge of the YouTube shorts playlist with the Twitch/Kick clip crawls -
+    // see channelContentFilter.ts) presented as two filters. Splitting there is
+    // what keeps a Short out of Clips instead of showing the pile twice.
+    return selectChannelContent(
+      channelContentFilter,
+      {
+        clipVideos: visible(selectedChannel.clipVideos),
+        vodVideos: visible(selectedChannel.vodVideos),
+      },
+      { youtubePlatformOnly, keyOf: buildVodUrl },
     );
   }, [selectedChannel, channelContentFilter, youtubePlatformOnly]);
 
@@ -1278,16 +1288,25 @@ export default function App() {
     return null;
   }, [bulkDownloadPlatforms]);
 
+  // Two different questions, deliberately two flags.
+  //   clipsMode      - DISPLAY: the era window and the "Most Views" sort, which
+  //                    are Clips-only controls (the Range/Views UI is rendered
+  //                    for `clips` only), so Shorts keeps date order and is not
+  //                    cut down to the selected era.
+  //   clipsPayloadMode - PAYLOAD: Shorts are served by the backend's `clips`
+  //                    response, so paging/has-more bookkeeping must follow the
+  //                    clips list or "Show more" would page the wrong counter.
   const clipsMode = channelContentFilter === 'clips';
+  const clipsPayloadMode = isClipLikeFilter(channelContentFilter);
   const streamsMode = channelContentFilter === 'streams';
   // Per-platform "backend has deeper pages" signal for the current mode.
   // useCallback keeps a stable identity so handleExpandChannelList (which
   // reads it) is not recreated on every render (P2-7).
   const platformHasMore = useCallback((p: 'Kick' | 'Twitch' | 'YouTube'): boolean => {
-    if (clipsMode) return selectedChannel?.clipHasMore ?? false;
+    if (clipsPayloadMode) return selectedChannel?.clipHasMore ?? false;
     if (streamsMode) return p === 'YouTube' ? (selectedChannel?.streamHasMore ?? false) : false;
     return selectedChannel?.vodHasMore ?? false;
-  }, [clipsMode, streamsMode, selectedChannel]);
+  }, [clipsPayloadMode, streamsMode, selectedChannel]);
   const canExpandKick = effectiveKickEnabled && channelHasKick && channelPlatformCanExpand(
     kickChannelVideos, kickVisibleLimit, channelBeyondRecent.Kick ?? false, clipsMode,
     platformHasMore('Kick'),
@@ -3524,7 +3543,10 @@ export default function App() {
       warmYoutubePreview(vodUrl);
       warmYoutubePreviewFull(vodUrl, 500);
     }
-    const isClipItem = v.content_kind === 'clip' || channelContentFilter === 'clips' || isLikelyClip(v);
+    // A Short is played through the same cheap path as a clip (no long-form
+    // YouTube resolve/mux), so both clip-like filters set this. Without it a
+    // Short on the Shorts tab would try the long-VOD warm path and stall.
+    const isClipItem = v.content_kind === 'clip' || isClipLikeFilter(channelContentFilter) || isLikelyClip(v);
     const vod: ExplorePopupVod = {
       url: buildVodUrl(v),
       title: displayTitle(v),
@@ -3549,7 +3571,10 @@ export default function App() {
         bringPopupToFront(existing.id);
         return prev;
       }
-      const id = crypto.randomUUID();
+      // NOT crypto.randomUUID(): that is secure-context only, and this runs
+      // inside a setState updater, so an insecure context threw a TypeError as
+      // a render-phase error and blanked the whole app. See windowId.ts.
+      const id = newWindowId();
       bringPopupToFront(id);
       const next = [...prev, { id, vod, layoutIndex: prev.length }];
       if (next.length > MAX_EXPLORE_POPUPS) {
@@ -3650,7 +3675,10 @@ export default function App() {
     };
     setExplorePopups((prev) => {
       const next = prev.filter((p) => p.vod.url !== vodUrl);
-      const id = crypto.randomUUID();
+      // NOT crypto.randomUUID(): that is secure-context only, and this runs
+      // inside a setState updater, so an insecure context threw a TypeError as
+      // a render-phase error and blanked the whole app. See windowId.ts.
+      const id = newWindowId();
       bringPopupToFront(id);
       const after = [...next, { id, vod, layoutIndex: next.length }];
       if (after.length > MAX_EXPLORE_POPUPS) {
@@ -4897,7 +4925,7 @@ export default function App() {
   const refreshChannel = useCallback(async (
     channelId: string,
     channelOverride?: SavedChannel,
-    contentMode?: 'vods' | 'clips' | 'streams',
+    contentMode?: ChannelContentFilter,
     opts?: { incremental?: boolean; silent?: boolean; force?: boolean; page?: number },
   ) => {
     const ch = channelOverride ?? savedChannelsRef.current.find((c) => c.id === channelId);
@@ -4916,10 +4944,14 @@ export default function App() {
     // Page fetches dedupe per (channel, mode, page): rapid Show-more clicks
     // must not fire N concurrent copies of the same page, and a slow older
     // page must not interleave with a newer one (see stalePageResponse).
-    const flightKey = pageFetch ? `${channelId}:${mode}:page:${pageNum}` : `${channelId}:${mode}`;
+    // Keyed by the BACKEND content, not the UI filter: `shorts` and `clips`
+    // hit the same endpoint, so they must share one in-flight request instead
+    // of racing two identical fetches.
+    const backendMode = backendContentForFilter(mode);
+    const flightKey = pageFetch ? `${channelId}:${backendMode}:page:${pageNum}` : `${channelId}:${backendMode}`;
 
     if (opts?.force) {
-      clearChannelRefreshFlight(channelId, mode);
+      clearChannelRefreshFlight(channelId, backendMode);
     }
 
     if (!incremental) {
@@ -4947,17 +4979,26 @@ export default function App() {
     const wantYoutube = true;
 
     try {
-      if (mode === 'clips') {
+      // `shorts` and `clips` share ONE backend request (the clips payload is a
+      // merge of the YouTube shorts playlist with the Twitch/Kick clip crawls),
+      // so both take this branch and are split on arrival — see
+      // channelContentFilter.ts RULE 2.
+      if (isClipLikeFilter(mode)) {
         const slug = ch.kickSlug?.trim() || ch.twitchSlug?.trim() || ch.youtubeSlug?.trim() || '';
         const clipPlatforms = ['Kick', 'Twitch'];
         if (ch.youtubeSlug?.trim()) clipPlatforms.push('YouTube');
+        // Shorts have no Range control of their own, so inheriting the Clips
+        // era window (default "Today") would leave the Shorts tab showing only
+        // today's rows and read as an empty channel. Shorts therefore always
+        // fetch the full window (days=0 => All) and sort by date.
+        const shortsMode = mode === 'shorts';
         const params = new URLSearchParams({
           platforms: clipPlatforms.join(','),
           limit: String(CHANNEL_CLIP_FETCH_LIMIT),
           page: String(pageNum),
-          days: String(clipRangeDays),
-          min_days: String(clipRangeMinDays),
-          sort: clipSort,
+          days: String(shortsMode ? 0 : clipRangeDays),
+          min_days: String(shortsMode ? 0 : clipRangeMinDays),
+          sort: shortsMode ? 'date' : clipSort,
           kick_slug: ch.kickSlug,
           twitch_login: ch.twitchSlug,
           youtube_slug: ch.youtubeSlug,
@@ -5281,7 +5322,9 @@ export default function App() {
     const mode = channelContentFilter;
 
     const needsFetch =
-      mode === 'clips'
+      isClipLikeFilter(mode)
+        // Shorts live in the clips payload, so the same "is the clips cache
+        // populated" question applies to both.
         ? channelClipsMissing(ch, effectiveKickEnabled, effectiveTwitchEnabled, effectiveYoutubeEnabled)
         : mode === 'streams'
           ? channelStreamsMissing(ch, effectiveYoutubeEnabled)
@@ -5324,6 +5367,10 @@ export default function App() {
   }, [selectedChannelId]);
 
   useEffect(() => {
+    // Only `streams` is YouTube-only, so only `streams` is reset when YouTube
+    // is not the sole platform. `shorts` is deliberately NOT reset: separating
+    // Shorts from Clips in multi-platform mode is the whole point of the
+    // filter, and falling back to `vods` here would undo it.
     if (channelContentFilter === 'streams' && !youtubePlatformOnly) {
       setChannelContentFilter('vods');
     }
@@ -5492,7 +5539,7 @@ export default function App() {
     channelRefreshPromisesRef.current.delete(`${id}:clips`);
     channelRefreshPromisesRef.current.delete(`${id}:streams`);
     await refreshChannel(id, entry, 'vods', { force: true });
-    if (channelContentFilter === 'clips' && (kick || twitch || youtube)) {
+    if (isClipLikeFilter(channelContentFilter) && (kick || twitch || youtube)) {
       await refreshChannel(id, entry, 'clips');
     }
     if (channelContentFilter === 'streams' && youtube) {
@@ -5718,7 +5765,7 @@ export default function App() {
       )) needsFetch = true;
     }
     if (needsFetch && ch) {
-      const current = clipsMode ? (ch.clipPage ?? 1)
+      const current = clipsPayloadMode ? (ch.clipPage ?? 1)
         : streamsMode ? (ch.streamPage ?? 1)
         : (ch.vodPages ?? 1);
       const page = nextChannelPage(true, current) ?? 1;
@@ -5731,6 +5778,7 @@ export default function App() {
     }
   }, [
     clipsMode,
+    clipsPayloadMode,
     streamsMode,
     effectiveKickEnabled,
     effectiveTwitchEnabled,
@@ -5919,7 +5967,11 @@ export default function App() {
       if (typeof s.channel_youtube_enabled === 'boolean') {
         setYoutubeEnabled(s.channel_youtube_enabled);
       }
-      if (s.channel_content_filter === 'clips' || s.channel_content_filter === 'vods' || s.channel_content_filter === 'streams') {
+      // Must accept EVERY ChannelContentFilter value, including `shorts`. This
+      // used to enumerate clips|vods|streams inline, so a persisted `shorts`
+      // was dropped here and the UI silently fell back to `vods` on reload —
+      // the filter set fine and then reverted with no visible cause.
+      if (isChannelContentFilter(s.channel_content_filter)) {
         setChannelContentFilter(s.channel_content_filter);
       }
       // ── i18n: honor a saved UI language; on first run (no saved value)
@@ -7530,6 +7582,17 @@ export default function App() {
                         </button>
                         <button
                           type="button"
+                          onClick={() => setChannelContentFilter('shorts')}
+                          className={`px-2 py-0.5 border font-bold ${
+                            channelContentFilter === 'shorts'
+                              ? 'border-white text-white bg-zinc-900'
+                              : 'border-zinc-700 text-zinc-500 hover:text-white'
+                          }`}
+                        >
+                          {t('Shorts')}
+                        </button>
+                        <button
+                          type="button"
                           onClick={() => setChannelContentFilter('clips')}
                           className={`px-2 py-0.5 border font-bold ${
                             channelContentFilter === 'clips'
@@ -7537,7 +7600,7 @@ export default function App() {
                               : 'border-zinc-700 text-zinc-500 hover:text-white'
                           }`}
                         >
-                          {youtubePlatformOnly ? t('Shorts') : t('Clips')}
+                          {t('Clips')}
                         </button>
                         {youtubePlatformOnly && (
                           <button
@@ -7631,11 +7694,13 @@ export default function App() {
                             </div>
                           )}
                           <p className="text-center text-zinc-600 font-mono text-[10px] py-3">
-                            {channelContentFilter === 'clips'
-                              ? (youtubePlatformOnly ? t('No shorts') : t('No clips'))
-                              : channelContentFilter === 'streams'
-                                ? t('No VODs')
-                                : (youtubePlatformOnly ? t('No videos') : t('No VODs'))}
+                            {channelContentFilter === 'shorts'
+                              ? t('No shorts')
+                              : channelContentFilter === 'clips'
+                                ? t('No clips')
+                                : channelContentFilter === 'streams'
+                                  ? t('No VODs')
+                                  : (youtubePlatformOnly ? t('No videos') : t('No VODs'))}
                           </p>
                         </>
                       ) : (
@@ -7690,8 +7755,8 @@ export default function App() {
                             const fullUrl = buildVodUrl(v);
                             const subline = channelVodSubline(v);
                             const durSec = channelVideoDurationSec(v);
-                            const isClipItem = v.content_kind === 'clip' || channelContentFilter === 'clips';
-                            const isShortItem = (v.url || '').includes('/shorts/');
+                            const isClipItem = v.content_kind === 'clip' || isClipLikeFilter(channelContentFilter);
+                            const isShortItem = isShortsVideo(v);
                             const isMembersOnly = isMembersOnlyVideo(v);
                             const isSyntheticYt = (v.platform || '').toLowerCase() === 'youtube' && isSyntheticArchiveId(v.id);
                             const isActiveVod = url.trim() === fullUrl.trim();

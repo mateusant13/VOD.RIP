@@ -110,7 +110,7 @@ export interface AppSettings {
   channel_kick_enabled?: boolean;
   channel_twitch_enabled?: boolean;
   channel_youtube_enabled?: boolean;
-  channel_content_filter?: 'vods' | 'clips' | 'streams';
+  channel_content_filter?: 'vods' | 'clips' | 'streams' | 'shorts';
   skip_youtube_startup_warm?: boolean;
   /** Run at Windows boot (HKCU Run key -> --autostart): launches
    * hidden-to-tray with quiet pacing for background work. */

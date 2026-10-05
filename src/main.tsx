@@ -2,13 +2,20 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import "./index.css";
 import App from "./App";
+import ErrorBoundary from "./components/ErrorBoundary";
 import { initUiScale } from "./uiScale";
 
 initUiScale();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <App />
+    {/* Mounted at the ROOT, above <App/>: without a boundary at this level a
+        throw during render unmounts the entire tree and the user gets a blank
+        white screen with no error text anywhere. The boundary shows the error
+        and the component stack and offers a reload. */}
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
   </StrictMode>
 );
 

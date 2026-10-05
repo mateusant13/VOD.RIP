@@ -59,6 +59,42 @@ describe('i18n', () => {
     }
   })
 
+  it('every crash-boundary string is translated in pt-BR and es', () => {
+    // The crash panel is the ONLY thing the user sees when the app dies, so a
+    // missing key here means the one diagnostic that exists renders English to
+    // a Brazilian or Spanish user - or, for a key missing everywhere, an empty
+    // label. Asserted non-identity as well as present.
+    const keys = [
+      'crash.title',
+      'crash.body',
+      'crash.reload',
+      'crash.dismiss',
+      'crash.errorLabel',
+      'crash.componentStackLabel',
+      'crash.noComponentStack',
+      'crash.previousLabel',
+      'crash.persistedNote',
+      'crash.unknownError',
+    ];
+    for (const key of keys) {
+      expect(DICTS.en[key], `en is missing "${key}"`).toBeTruthy();
+      for (const lang of ['pt-BR', 'es'] as const) {
+        expect(DICTS[lang][key], `${lang} is missing "${key}"`).toBeTruthy();
+        expect(DICTS[lang][key], `${lang} left "${key}" in English`).not.toBe(key);
+      }
+    }
+  });
+
+  it('the Shorts/Clips filter labels are translated in pt-BR and es', () => {
+    // The new filter reuses existing keys, but only because they were already
+    // translated; a rename would silently drop one locale back to English.
+    for (const key of ['Shorts', 'Clips', 'No shorts', 'No clips']) {
+      for (const lang of ['pt-BR', 'es'] as const) {
+        expect(DICTS[lang][key], `${lang} is missing "${key}"`).toBeTruthy();
+      }
+    }
+  });
+
   it('detectSystemLanguage maps pt→pt-BR, es→es, anything else→en', () => {
     expect(langFamily('pt-BR')).toBe('pt')
     expect(langFamily('es')).toBe('es')
@@ -108,6 +144,7 @@ describe('i18n', () => {
 const PARITY_COVERED_SURFACES = [
   'components/RateGovernorSection.tsx',
   'components/CookieBridgeSection.tsx',
+  'components/ErrorBoundary.tsx',
 ]
 
 /** Every t('...') / t("...") literal in a source file, plus the total number of

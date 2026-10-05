@@ -3,6 +3,7 @@
  */
 
 import { parseVideoTs, parseHmsDurationString, fmtDuration, fmtDaysAgo, fmtViews, fmtDateAndAgo } from './formatters';
+import { isClipLikeFilter, isShortsVideo, normalizeChannelContentFilter, type ChannelContentFilter } from './channelContentFilter';
 import type { ChannelVideo, SavedChannel, VideoInfo } from './types';
 
 export function bestAvailableQuality(info: VideoInfo): string {
@@ -326,10 +327,12 @@ export function effectivePlatformFlags(
 export function hiddenPlatformCounts(
   ch: Pick<SavedChannel, 'vodVideos' | 'clipVideos'> | null | undefined,
   flags: { kick: boolean; twitch: boolean; youtube: boolean },
-  mode: 'vods' | 'clips' | 'streams',
+  mode: ChannelContentFilter,
 ): { platform: 'Kick' | 'Twitch' | 'YouTube'; count: number }[] {
   if (!ch) return [];
-  const list = mode === 'clips' ? (ch.clipVideos ?? []) : (ch.vodVideos ?? []);
+  // `shorts` reads the clips payload too (see channelContentFilter RULE 2), so
+  // it must count rows in the same list the Shorts filter actually shows.
+  const list = isClipLikeFilter(mode) ? (ch.clipVideos ?? []) : (ch.vodVideos ?? []);
   const off: { platform: 'Kick' | 'Twitch' | 'YouTube'; count: number }[] = [];
   for (const [platform, on] of [
     ['Kick', flags.kick],
@@ -341,7 +344,7 @@ export function hiddenPlatformCounts(
       (v) =>
         v.platform === platform &&
         isPublicVideo(v) &&
-        (mode === 'clips'
+        (isClipLikeFilter(mode)
           ? true
           : mode === 'streams'
             ? v.content_kind === 'stream'
@@ -411,11 +414,18 @@ export function channelVodsMissing(
 /** True when the UI can show cached rows for the current platform toggles. */
 export function channelHasCachedContent(
   ch: SavedChannel,
-  mode: 'vods' | 'clips' | 'streams',
+  mode: ChannelContentFilter,
   kickOn: boolean,
   twitchOn: boolean,
   youtubeOn: boolean,
 ): boolean {
+  if (mode === 'shorts') {
+    // Only a YouTube row can be a Short, so a Kick/Twitch channel legitimately
+    // has nothing cached here - reporting the clips cache as a shorts cache
+    // would make the empty Shorts tab look like a failed fetch.
+    const shorts = (ch.clipVideos ?? []).filter(isShortsVideo);
+    return shorts.some((v) => isPublicVideo(v));
+  }
   if (mode === 'clips') {
     const clips = ch.clipVideos ?? [];
     if (kickOn && ch.kickSlug?.trim() && clips.some((v) => v.platform === 'Kick')) return true;
@@ -1110,7 +1120,7 @@ export function loadStoredChannelUi(): {
   kick: boolean;
   twitch: boolean;
   youtube: boolean;
-  content: 'vods' | 'clips' | 'streams';
+  content: ChannelContentFilter;
 } {
   try {
     const raw = localStorage.getItem(CHANNEL_UI_STORAGE_KEY);
@@ -1121,7 +1131,10 @@ export function loadStoredChannelUi(): {
       youtube?: boolean;
       content?: string;
     };
-    const content = p.content === 'clips' ? 'clips' : p.content === 'streams' ? 'streams' : 'vods';
+    // One shared validator: this used to enumerate 'clips'/'streams' inline and
+    // silently coerce anything else to 'vods', so the `shorts` filter reverted
+    // on every reload even though the button set it correctly.
+    const content = normalizeChannelContentFilter(p.content);
     return {
       kick: p.kick !== false,
       twitch: p.twitch !== false,
