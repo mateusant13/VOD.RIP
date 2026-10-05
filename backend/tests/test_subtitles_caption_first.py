@@ -24,6 +24,7 @@ import pytest
 
 from routers import subtitles as subtitles_router
 from services import youtube_innertube
+from services import ytdlp_guard
 
 VTT_PT = """WEBVTT
 Kind: captions
@@ -130,7 +131,7 @@ def _patch_guard_boom(monkeypatch) -> None:
         raise AssertionError("yt-dlp fallback must not run on a caption-first hit")
         yield None  # pragma: no cover
 
-    monkeypatch.setattr(subtitles_router, "guarded_youtube_dl", _never)
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl", _never)
 
 
 def _patch_guard(monkeypatch, fake: _FakeYdl) -> None:
@@ -138,7 +139,7 @@ def _patch_guard(monkeypatch, fake: _FakeYdl) -> None:
     def _guard(opts):
         yield fake
 
-    monkeypatch.setattr(subtitles_router, "guarded_youtube_dl", _guard)
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl", _guard)
 
 
 @pytest.fixture(autouse=True)

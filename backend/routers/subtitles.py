@@ -43,7 +43,15 @@ from fastapi import APIRouter, HTTPException, Query
 
 from services.archive_ytdlp import _parse_caption, _parse_vtt
 from services.ytdlp_ffmpeg import _ytdlp_engine_opts
-from services.ytdlp_guard import guarded_youtube_dl
+# The MODULE, never the name: the call below reads
+# `ytdlp_guard.guarded_youtube_dl(...)`, so the attribute is resolved at call
+# time and `monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl", stub)` —
+# the one process-wide seam — intercepts it. Binding the name here published
+# `subtitles.guarded_youtube_dl`, which is NOT the seam: tests patched that
+# attribute and looked correct while the re-import in any other consumer
+# bypassed it and the real extractor reached the network. See
+# archive_ytdlp.py:41 and backend/tests/test_guard_binding_seam.py.
+from services import ytdlp_guard
 
 logger = logging.getLogger(__name__)
 
@@ -399,7 +407,7 @@ def _fetch_subtitles(url: str, langs: list[str]) -> dict:
     if payload is not None:
         return payload
     try:
-        with guarded_youtube_dl(_subtitles_opts()) as ydl:
+        with ytdlp_guard.guarded_youtube_dl(_subtitles_opts()) as ydl:
             info = ydl.extract_info(url, download=False) or {}
             got = _payload_from_info(url, info, ydl)
             if got is not None:

@@ -17,7 +17,15 @@ import time
 
 import requests
 from services import ytdlp_env  # noqa: F401 — YTDLP_NO_PLUGINS before yt-dlp import
-from services.ytdlp_guard import guarded_youtube_dl
+# The MODULE, never the name: every `ytdlp_guard.guarded_youtube_dl(...)` call
+# below resolves the attribute at call time, so
+# `monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl", stub)` — the one
+# process-wide seam — intercepts all of them. Binding the name here would
+# publish `ytdlp_download.guarded_youtube_dl`, which is NOT the seam: patching
+# it intercepts only module-global lookups, so a function-local re-import
+# bypasses it and the real extractor runs. See archive_ytdlp.py:41 and
+# backend/tests/test_guard_binding_seam.py.
+from services import ytdlp_guard
 import yt_dlp
 from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
 
@@ -183,7 +191,7 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
             **_ytdlp_engine_opts(),
         }
         try:
-            with guarded_youtube_dl(ydl_opts) as ydl:
+            with ytdlp_guard.guarded_youtube_dl(ydl_opts) as ydl:
                 return ydl.extract_info(full_url, download=False)
         except Exception:
             # Twitch sub-only VOD: yt-dlp can't extract (persisted GQL denied)
@@ -1202,7 +1210,7 @@ def _ydl_download(
         watchdog_thread.start()
 
     with _silence_stderr():
-        with guarded_youtube_dl(quiet_opts) as ydl:
+        with ytdlp_guard.guarded_youtube_dl(quiet_opts) as ydl:
             if register_abort:
                 register_abort(lambda: getattr(ydl, "cancel_download", lambda: None)())
             try:
@@ -1361,7 +1369,7 @@ def download_video_sync(
                 expected_duration = info.get("duration")
         else:
             from services.ytdlp_ffmpeg import _ytdlp_engine_opts
-            with guarded_youtube_dl({
+            with ytdlp_guard.guarded_youtube_dl({
                 "format": "bestvideo+bestaudio/best",
                 "quiet": True,
                 "no_warnings": True,
