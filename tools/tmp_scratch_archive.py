@@ -33,6 +33,7 @@ import argparse
 import ctypes
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -311,13 +312,122 @@ def consequence(size, kind):
     return score, band, reclaim
 
 
-def decision_for(ignored):
+def decision_for(ignored, references=0):
     """The choice actually on the table. `unsure` must never mean "unknown"."""
+    if references:
+        return (
+            "referenced by %d tracked file(s) as a path: archiving it breaks live code -- "
+            "keep it, or remove the reference first" % references
+        )
     if ignored is True:
         return "gitignored + untracked: archive it, or keep it because something still uses it"
     if ignored is False:
         return "untracked and NOT ignored: git add it (never committed), or archive it"
     return "git vocabulary unavailable, so tracked/ignored is unknown: archive it, or keep it"
+
+
+# ---------------------------------------------------------------------------
+# Is anything actually reading this file?
+#
+# A leftover is only safe to archive if nothing in the repo still points at it.
+# The counting rule that matters: a match is a PATH FORM -- the name as a path
+# component, i.e. preceded or followed by a separator. Counting bare substrings
+# inflates short names absurdly (measured on this repo: `{}` -> 1,181 hits,
+# `200` -> 727) and every one of those is a non-match, so a substring counter
+# reports a phantom dependency and a classifier built on it is safe by accident
+# rather than by design. Path form is what a real consumer looks like:
+#     __main_launcher__.py:294   base / "icon.ico",
+#     deploy-dist.mjs:74        cpSync(winExe, join(root, 'VOD-RIP.EXE'))
+# ---------------------------------------------------------------------------
+
+# A mention that is not a dependency. Matched on the SAME LINE as the
+# reference, never on the whole file: a file that both copies build outputs
+# AND reads an icon at launch is a real consumer of the icon, and filtering on
+# file-level content threw away backend/__main_launcher__.py -- the single most
+# load-bearing reader of icon.ico in this repo.
+#   .gitignore:16                     VOD-RIP.EXE        <- "do not track this"
+#   scripts/deploy-dist.mjs:74        cpSync(..., 'VOD-RIP.EXE')  <- PRODUCES it
+#   installer/installer.iss:10        #define AppExe      <- names the build output
+PRODUCER_MARKERS = (
+    "cpsync",
+    "copyfile",
+    "copy-item",
+    "#define",
+    "copied at build",
+    "shutil.copy",
+    "shutil.move",
+    "outfile",
+)
+
+
+def _is_producer(path, line):
+    """True when this LINE writes the file, rather than reading it.
+
+    Deliberately a short list. A wider one starts deleting real consumers: a
+    narration filter that dropped `console.log` also dropped the README line
+    that tells a user which file to click, which is a genuine dependency for
+    anyone following the docs.
+    """
+    if os.path.basename(path) in (".gitignore", ".gitattributes"):
+        return True
+    low = line.lower()
+    return any(m in low for m in PRODUCER_MARKERS)
+
+
+def reference_count(rel_path, git=None):
+    """Tracked files that consume `rel_path`, matched in PATH FORM only.
+
+    Returns (count, sample). `git` is injectable so tests can drive the
+    counter from known content with no subprocess.
+
+    Path form is the whole point. A substring counter on short names is
+    nonsense -- measured on this repo, `{}` scores 1,181 hits and `200`
+    scores 727, every one a non-match -- so it invents dependencies and the
+    classifier above it looks careful for the wrong reason. What a real
+    consumer looks like, in this repo:
+        backend/__main_launcher__.py:294   base / "icon.ico",
+    """
+    name = os.path.basename(rel_path)
+    if not name:
+        return 0, []
+    if git is None:
+        git = _git_capture
+    # Character classes, NOT lookbehind: git grep -E is POSIX ERE and rejects
+    # `(?<!...)` outright ("Invalid preceding regular expression"). Measured
+    # cost of getting this wrong: the pattern errors, the exit code is
+    # non-zero, and a caller that treats that as "no matches" reports every
+    # file as unreferenced -- the exact inverse of the truth.
+    pattern = (
+        "(^|[^A-Za-z0-9_.%-])" + re.escape(name) + "([^A-Za-z0-9_]|$)"
+    )
+    hits = []
+    seen = set()
+    for path, line in git(pattern):
+        path = path.replace("\\", "/")
+        if path == "tools/tmp_scratch_archive.py":
+            continue  # the classifier naming a file is not a consumer of it
+        if path.startswith("tools/tests/"):
+            continue  # ditto for the tests that assert on those very names
+        if path in seen:
+            continue  # 5 reads of one file are one consumer, not five
+        seen.add(path)
+        if _is_producer(path, line):
+            continue  # writes the file, or is a rule about the file
+        hits.append(path)
+    return len(hits), hits[:5]
+
+
+def _git_capture(pattern):
+    """Yield (path, matching_line) for tracked lines matching `pattern`."""
+    out = _git(REPO_ROOT, ["grep", "-I", "-n", "-E", pattern, "--", "."], nul=False)
+    for line in out or []:
+        if ":" not in line:
+            continue
+        path, _, text = line.partition(":")
+        path = path.strip()
+        if path:
+            yield path, text
+
 
 
 # ---------------------------------------------------------------------------
@@ -356,11 +466,18 @@ def _listdir(path: str):
         return []
 
 
-def inventory(window: int = 0, vocab=None):
-    """Return one record per candidate file, with liveness evidence attached."""
+def inventory(window: int = 0, vocab=None, refcheck=None):
+    """Return one record per candidate file, with liveness evidence attached.
+
+    `refcheck` is injectable (path -> (count, sample)) so the reference rule
+    can be exercised in tests without shelling out to git. Pass `False` to
+    skip it entirely, which is what a non-git target gets.
+    """
     if vocab is None:
         vocab = git_vocabulary()
     tracked, ignored = vocab
+    if refcheck is None:
+        refcheck = reference_count if tracked is not None else (lambda p: (0, []))
     recs = []
     todo = []
     tmp = os.path.join(REPO_ROOT, "tmp")
@@ -394,6 +511,7 @@ def inventory(window: int = 0, vocab=None):
         is_ignored = (r in ignored) if tracked is not None else None
         kind = artifact_kind(r)
         score, band, _reclaim = consequence(st.st_size, kind)
+        nrefs, sample = 0, []
         if r in PROTECTED:
             cls = "live"
             why = "protected: on the never-move list"
@@ -415,8 +533,18 @@ def inventory(window: int = 0, vocab=None):
             cls = "tracked"
             why = "git-tracked: version history, recoverable by definition, never dead scratch"
         else:
+            # An untracked, idle file is a question. Whether it is a SMALL
+            # question depends on whether live code still points at it: a
+            # 16 KB icon with 23 consumers is not "cheap either way", it is
+            # the app's icon. Counted in path form, never as a substring.
+            nrefs, sample = refcheck(r)
+            if nrefs:
+                score = min(score + 2, 4)
+                band = "p1" if score >= 3 else ("p2" if score == 2 else "p3")
             cls = "unsure"
-            why = "%s [%s %s]" % (decision_for(is_ignored), band, BAND_MEANING[band])
+            why = "%s [%s %s]" % (decision_for(is_ignored, nrefs), band, BAND_MEANING[band])
+            if sample:
+                why += "  <- %s" % ", ".join(sample[:2])
         recs.append(
             {
                 "rel": r,
@@ -431,6 +559,7 @@ def inventory(window: int = 0, vocab=None):
                 "ignored": is_ignored,
                 "kind": kind,
                 "score": score,
+                "nrefs": nrefs,
                 "band": band,
             }
         )
