@@ -191,7 +191,10 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
             **_ytdlp_engine_opts(),
         }
         try:
-            with ytdlp_guard.guarded_youtube_dl(ydl_opts) as ydl:
+            # kind="interactive": get_video_info is the on-demand metadata
+            # resolve behind the preview button — a person is waiting on it. It
+            # takes the next grant ahead of a queued background channel walk.
+            with ytdlp_guard.guarded_youtube_dl(ydl_opts, kind="interactive") as ydl:
                 return ydl.extract_info(full_url, download=False)
         except Exception:
             # Twitch sub-only VOD: yt-dlp can't extract (persisted GQL denied)

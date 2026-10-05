@@ -149,7 +149,22 @@ _BOT_WALL_RE = re.compile(
 # Transient live state. "begin in a few moments" is the scheduled-lobby
 # marker; "offline" alone is anchored so it cannot match a longer sentence
 # that merely contains the word.
-_LIVE_UPCOMING_RE = re.compile(r"this live event will begin in a few moments", re.I)
+#
+# The pt-BR marker was added after MEASUREMENT, not translation for its own
+# sake. On this box YouTube serves the pt-BR locale, and the log line that
+# actually recurs is "Este evento ao vivo começará em breve." — English-matched
+# only, that classified as UNKNOWN and fell through to the REAL-ERROR branch
+# (see _YtdlpConsoleLogger.error), so 32 expected lines in a 4 h window evicted
+# genuine defects from the 500-record error ring. Both the accented and the
+# ASCII spelling are matched: the live log shows the ASCII form once the bytes
+# have been through a non-UTF-8 decode, and a marker that only matches the
+# pretty spelling re-introduces the same defect the moment a codec slips.
+_LIVE_UPCOMING_RE = re.compile(
+    r"this live event will begin in a few moments"
+    r"|est[ea] evento ao vivo com[çc][aá]rar[aá] em breve"
+    r"|come[çc]ar[áa] em breve",
+    re.I,
+)
 _LIVE_OFFLINE_RE = re.compile(r"(?:^|[:\s])offline\.?\s*$", re.I)
 # Per-video expected verdicts, pt-BR and en. Each names a specific known
 # YouTube state, so none can swallow a defect.
