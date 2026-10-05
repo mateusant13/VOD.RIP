@@ -18,6 +18,8 @@ from services.os_services import _NO_WINDOW, _kill_pid, register_child_pid, unre
 from services.http_fingerprint import twitch_http_headers
 from services.youtube_fingerprint import youtube_http_headers
 from services.ytdlp_ffmpeg import _resolve_ffmpeg_exe
+from services import live_upcoming_backoff
+from services import ytdlp_outcomes
 
 logger = logging.getLogger(__name__)
 
@@ -478,6 +480,44 @@ def youtube_live_info(handle: str) -> Optional[dict]:
     vid = vid_match.group(1).decode()
     watch_url = f"https://www.youtube.com/watch?v={vid}"
 
+    # A live that has not started must not be re-probed on the badge cadence.
+    #
+    # MEASURED: `ZvW6Id7tmHs` answered "Este evento ao vivo comecar em breve." 32
+    # times in 4 h, one every ~126 s, and has 0 rows in the live archive
+    # (H:\VOD.RIP-data\archive.db, 13,051 videos, read-only). Each probe was a
+    # real yt-dlp egress charged to the same learned budget the owner's preview
+    # is paced against, and it bought nothing: no video row, no stream.
+    #
+    # The check sits BEFORE both egress legs (InnerTube and yt-dlp), so a
+    # backed-off live spends no budget token and issues no request at all. It
+    # is cleared by note_started() the moment the stream is actually live, so a
+    # live that finally begins is served on the next badge poll.
+    if live_upcoming_backoff.is_backing_off(vid):
+        retry_in = live_upcoming_backoff.retry_in(vid)
+        exhausted = live_upcoming_backoff.is_exhausted(vid)
+        if exhausted:
+            logger.info(
+                "youtube_live_info(%r): live %s has not started after %d probes — "
+                "not polling it again until the channel is re-checked",
+                handle, vid, live_upcoming_backoff.attempts(vid),
+            )
+        else:
+            logger.debug(
+                "youtube_live_info(%r): live %s has not started — next probe in "
+                "%.0fs (attempt %d)",
+                handle, vid, retry_in or 0.0, live_upcoming_backoff.attempts(vid),
+            )
+        return {
+            "reason": (
+                "Live has not started yet"
+                + (" — polling stopped until this channel is re-checked"
+                   if exhausted else "")
+            ),
+            "videoId": vid,
+            "outcome": "live_upcoming",
+            "not_started": True,
+        }
+
     # Primary: app InnerTube — survives bot walls that kill yt-dlp (its
     # multi-client race + POT carries live HLS manifest in streamingData).
     try:
@@ -488,6 +528,8 @@ def youtube_live_info(handle: str) -> Optional[dict]:
         logger.debug("youtube_live_info(%r) innertube failed: %s", handle, exc)
         info = None
     if info and _youtube_info_is_live(info):
+        # The stream is actually up: drop any backoff this id was carrying.
+        live_upcoming_backoff.note_started(vid)
         candidates = [
             f for f in (info.get("formats") or [])
             if f.get("protocol") in ("m3u8", "m3u8_native")
@@ -530,13 +572,40 @@ def youtube_live_info(handle: str) -> Optional[dict]:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(watch_url, download=False)
     except Exception as exc:
+        # Classify FIRST: a live that has simply not started yet is an EXPECTED
+        # condition (ytdlp_outcomes.LIVE_UPCOMING), not a bot wall and not a
+        # defect. Recording it here is what starts the backoff, so the next
+        # badge poll costs no token instead of paying for this answer again.
+        code = ytdlp_outcomes.classify_exception(exc)
+        if code == ytdlp_outcomes.LIVE_UPCOMING:
+            attempts_so_far = live_upcoming_backoff.attempts(vid)
+            live_upcoming_backoff.note_not_started(vid, attempts=attempts_so_far)
+            logger.debug(
+                "youtube_live_info(%r): live %s not started yet (attempt %d)",
+                handle, vid, attempts_so_far + 1,
+            )
+            return {
+                "reason": "Live has not started yet",
+                "videoId": vid,
+                "outcome": code,
+                "not_started": True,
+            }
         low = str(exc).lower()
         if "sign in" in low or "cookie" in low or "bot" in low or "unavailable" in low:
             return {"reason": f"Extraction unavailable (bot wall / auth needed): {exc}"}
         logger.debug("youtube_live_info(%r) extract failed: %s", handle, exc)
         return {"reason": f"Extraction failed: {exc}"}
 
+    # A stream that is genuinely up: clear any backoff, so a live that finally
+    # started is never held back by the ladder it climbed before it went live.
+    live_upcoming_backoff.note_started(vid)
+
     if not info or not info.get("is_live"):
+        # Up but not a live stream (e.g. the /live redirect pointed at a VOD,
+        # or the broadcast already finished). Deliberately NOT a not-started
+        # live: no backoff is started for it, and any stale one was cleared
+        # above. The payload shape is unchanged — test_live_capture asserts it
+        # exactly, and callers branch on "reason".
         return {"reason": "Stream is not live"}
 
     formats = info.get("formats") or []

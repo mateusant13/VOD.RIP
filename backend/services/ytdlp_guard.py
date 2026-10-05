@@ -17,17 +17,111 @@ from services import ytdlp_outcomes
 
 logger = logging.getLogger(__name__)
 
+
+# --- priority gate -----------------------------------------------------------
+#
+# MEASURED DEFECT this addresses: yt-dlp egress had no priority at all. The
+# comment that used to sit here recorded the gap verbatim -- "Why no
+# priority/bounded acquire here: a plain Lock has no priority" -- and the log
+# shows the cost. `rate_budget: pacing yt-dlp yt_channel_list for 21.2s` recurs
+# throughout tmp/vodrip-devall-api.log at the learned 4.04 rpm ceiling, and in
+# the same window a real preview session measured `server_ms=22875`. A
+# background caller that finishes a slice and immediately re-offers work wins
+# every race against a preview that is already waiting, so the preview never
+# gets a turn.
+#
+# WHAT THIS DOES *NOT* DO, deliberately:
+#   * It does NOT time out a holder, and it does NOT preempt one. A 2-hour VOD
+#     legitimately holds yt-dlp for minutes; a bounded acquire that failed it
+#     would break real downloads, and nothing here interrupts a running
+#     holder. Priority applies only at the instant the gate is GRANTED, which
+#     is what makes it safe to let a live download finish in peace. The
+#     pathological holder (a 0 B/s stall) stays DownloadManager's job
+#     (STALL_WATCHDOG_SEC = 90s), which is the right mechanism for that.
+#   * It does NOT starve background work. Arrival order is kept within a
+#     class, so a walk with real work still runs it. The defect is a caller
+#     that re-offers forever and a user who never gets a turn -- not
+#     background work itself.
+#   * It does NOT change the two-lane lock split. YTDLP_EXTRACT_LOCK and
+#     YTDLP_CHANNEL_LOCK stay two distinct real locks, as
+#     backend/tests/test_ytdlp_guard.py and the import-time assert in
+#     ytdlp_hls.py require. This gate is the ADMISSION point in front of
+#     them, not a replacement for them.
+class _PriorityGate:
+    """One-at-a-time admission that grants to the best WAITING caller.
+
+    ``kind`` is ``"interactive"`` (a person is waiting on it: the preview
+    resolve) or anything else -- ``background`` and ``download`` share the low
+    class, because a long VOD download is exactly the holder that must not be
+    cut off by either. FIFO within a class.
+    """
+
+    INTERACTIVE = "interactive"
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition(threading.Lock())
+        self._busy = False
+        self._waiters: list = []  # list[[is_high, seq]] in arrival order
+        self._seq = 0
+
+    def reset(self) -> None:
+        """Test-only: drop waiter bookkeeping. Never releases a live holder."""
+        with self._cond:
+            self._waiters.clear()
+            self._seq = 0
+
+    @contextlib.contextmanager
+    def acquire(self, kind: str = "background"):
+        high = kind == self.INTERACTIVE
+        with self._cond:
+            self._seq += 1
+            ticket = [high, self._seq]
+            self._waiters.append(ticket)
+            try:
+                while True:
+                    # THE RULE, in one place: when the gate is free, it goes to
+                    # the EARLIEST-WAITING interactive caller if any is queued,
+                    # otherwise to the earliest waiter of any class.
+                    #
+                    # Deliberately NOT "an interactive that arrived before me":
+                    # a background walk that was already queued must still yield
+                    # to a preview that arrives while it waits. That re-offering
+                    # walk is the measured defect -- it wins the next grant every
+                    # time otherwise, and the owner's preview never gets a turn.
+                    head_high = next(
+                        (w for w in self._waiters if w[0]), None
+                    )
+                    winner = head_high if head_high is not None else (
+                        self._waiters[0] if self._waiters else None
+                    )
+                    if not self._busy and winner is ticket:
+                        self._waiters.remove(ticket)
+                        self._busy = True
+                        break
+                    self._cond.wait(0.02)
+            except BaseException:
+                if ticket in self._waiters:
+                    self._waiters.remove(ticket)
+                self._cond.notify_all()
+                raise
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._busy = False
+                self._cond.notify_all()
+
+
+#: Shared admission point in front of the two lane locks.
+priority_lock = _PriorityGate()
+
+
+# The two lane locks stay real, distinct threading.Lock objects: the extract
+# lane and the channel-listing lane remain separate mutexes. This change is
+# about WHO GETS THE NEXT TURN, not about merging the lanes.
 _YTDLP_LOCK = threading.Lock()
-# Why no priority/bounded acquire here: a plain Lock has no priority, and a
-# timeout would break legitimate long downloads (a 2-hour VOD legitimately
-# holds this lock for minutes; a bounded acquire would fail preview extracts
-# that merely wait behind it). Priority for live playback is instead handled
-# structurally — live sessions never touch yt-dlp (pure CDN fetches) and run
-# on their own LIVE_EXECUTOR — and the pathological holder (a 0 B/s stalled
-# download) is reaped by DownloadManager's stall watchdog (STALL_WATCHDOG_SEC
-# = 90s), which frees this lock with a clear error instead of holding it
-# forever.
 _YTDLP_CHANNEL_LOCK = threading.Lock()
+
 _FORBIDDEN_PLUGIN_MARKERS = ("getpot_wpc", "getpot-wpc")
 _BLOCKED_YOUTUBE_KEYS = frozenset()
 _YTDLP_FORBIDDEN_PLUGIN_CACHED: bool | None = None
@@ -403,17 +497,22 @@ def ytdlp_js_runtimes() -> dict[str, dict]:
 
 
 @contextlib.contextmanager
-def guarded_youtube_dl(opts: dict[str, Any]) -> Iterator[Any]:
+def guarded_youtube_dl(opts: dict[str, Any], kind: str = "background") -> Iterator[Any]:
     """Only supported way to construct YoutubeDL — one instance at a time.
 
     Instrumentation: this is the single funnel every YouTube metadata /
     download request passes through, so it is where the YouTube request
     count that yt_gate's rate-limit history reports comes from. One
-    in-memory increment per context entry (see services.rl_counter) — the
-    process-wide lock below already serializes construction, so this adds
+    in-memory increment per context entry (see services.rl_counter) —
+    the process-wide gate below already serializes construction, so this adds
     no contention and no DB write. yt-dlp's individual HTTP requests are
     NOT counted separately: they are invisible from here, and pretending
     otherwise would inflate the number a throttle is calibrated on.
+
+    ``kind="interactive"`` marks the request as one a person is waiting on
+    (the preview resolve). It draws from the USER rate-budget reserve and,
+    at the lock, is granted ahead of any background walk that is already
+    QUEUED. It never preempts a holder -- see ``_PriorityGate``.
     """
     import yt_dlp  # lazy: keeps yt-dlp (~0.5s) off the app import path
 
@@ -422,17 +521,28 @@ def guarded_youtube_dl(opts: dict[str, Any]) -> Iterator[Any]:
     safe.setdefault("logger", ytdlp_console_logger())
     safe.setdefault("js_runtimes", ytdlp_js_runtimes())
     rl_counter.count_request("youtube")
-    with _YTDLP_LOCK:
-        with yt_dlp.YoutubeDL(safe) as ydl:
-            yield ydl
+    with priority_lock.acquire(kind=kind):
+        with _YTDLP_LOCK:
+            with yt_dlp.YoutubeDL(safe) as ydl:
+                yield ydl
 
 
 @contextlib.contextmanager
-def guarded_youtube_dl_channel(opts: dict[str, Any]) -> Iterator[Any]:
-    """Flat channel playlists — separate lock so preview segment yt-dlp can't starve lists.
+def guarded_youtube_dl_channel(
+    opts: dict[str, Any], kind: str = "background"
+) -> Iterator[Any]:
+    """Flat channel playlists — the background enumeration path.
 
     Counted like guarded_youtube_dl: one in-memory increment per context
     entry, no DB write.
+
+    It passes through the SAME priority gate as the extract path, while still
+    holding its own distinct lane lock. The separate lane lock alone could
+    never order the two: a walk holding its own lock and re-offering work never
+    contends with a waiting preview at all, which is exactly how the preview
+    ended up waiting on a 21.2 s rate-budget pace instead. A walk that is
+    ALREADY running is still never interrupted, and an interactive request
+    that arrives while it runs takes the very next grant.
     """
     import yt_dlp  # lazy
 
@@ -441,13 +551,17 @@ def guarded_youtube_dl_channel(opts: dict[str, Any]) -> Iterator[Any]:
     safe.setdefault("logger", ytdlp_console_logger())
     safe.setdefault("js_runtimes", ytdlp_js_runtimes())
     rl_counter.count_request("youtube")
-    with _YTDLP_CHANNEL_LOCK:
-        with yt_dlp.YoutubeDL(safe) as ydl:
-            yield ydl
+    with priority_lock.acquire(kind=kind):
+        with _YTDLP_CHANNEL_LOCK:
+            with yt_dlp.YoutubeDL(safe) as ydl:
+                yield ydl
 
 
+#: Unchanged: two distinct real locks, as test_ytdlp_guard.py and the
+#: import-time assert in ytdlp_hls.py both require.
 YTDLP_EXTRACT_LOCK = _YTDLP_LOCK
 YTDLP_CHANNEL_LOCK = _YTDLP_CHANNEL_LOCK
+
 
 assert_ytdlp_safe()
 out_never = sanitize_ytdlp_opts({

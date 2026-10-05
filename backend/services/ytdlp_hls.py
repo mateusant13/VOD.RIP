@@ -1490,7 +1490,11 @@ def _extract_hls_info(url: str, opts: dict) -> dict:
         quiet = not logger.isEnabledFor(logging.DEBUG)
         ctx = _silence_stderr() if quiet else contextlib.nullcontext()
         with ctx:
-            with ytdlp_guard.guarded_youtube_dl(ydl_opts) as ydl:
+            # kind="interactive": this is the preview STREAM resolve, the call
+            # the owner is staring at a spinner for. It takes the next grant
+            # ahead of a queued background walk; it still never preempts one
+            # that is already running.
+            with ytdlp_guard.guarded_youtube_dl(ydl_opts, kind="interactive") as ydl:
                 return ydl.extract_info(url, download=False)
     except Exception as exc:
         # Twitch sub-only VODs: yt-dlp can't extract, but our cloudfront CDN
