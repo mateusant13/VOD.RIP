@@ -459,7 +459,7 @@ def test_sweep_windows_are_charged_once_each_when_allowed(acquires, no_ytdlp, mo
     ydl = _FakeYdl(entries=[
         {"id": f"v{i:011d}", "title": f"t{i}", "duration": 60} for i in range(3)
     ])
-    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel", lambda opts: _ctx(ydl))
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel", lambda opts, **_control: _ctx(ydl))
     acquires.calls.clear()
 
     items, truncated, total = archive_router._deep_enumerate("@chan")

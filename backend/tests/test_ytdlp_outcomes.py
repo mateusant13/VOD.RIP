@@ -242,7 +242,7 @@ def ydl_seam(monkeypatch):
         def _cm(opts):
             yield ydl
 
-        monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel", lambda opts: _cm(opts))
+        monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel", lambda opts, **_control: _cm(opts))
         return ydl
 
     return _install

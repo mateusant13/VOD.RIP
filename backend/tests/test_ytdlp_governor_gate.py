@@ -187,7 +187,7 @@ def test_extract_chokepoint_governed(acquires, monkeypatch):
     backfill_live_chat both go through it) — one token per extract."""
     ydl = _FakeYdl()
     monkeypatch.setattr(archive_ytdlp, "_yt_opts", lambda outdir, video_id=None: {})
-    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl", lambda opts: _ctx(ydl))
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl", lambda opts, **_control: _ctx(ydl))
     with archive_ytdlp._guarded_youtube_dl(Path("."), video_id="VzuPKrGl0z8") as y:
         y.extract_info("https://youtu.be/VzuPKrGl0z8", download=False)
     assert acquires.calls == [("youtube", "auto", "yt_dlp_extract")]
@@ -210,7 +210,7 @@ def test_bestaudio_chokepoint_governed(acquires, monkeypatch, tmp_path):
     ydl = _FakeYdl()
     monkeypatch.setattr(archive_ytdlp, "_audio_resume_dir", lambda vid: tmp_path)
     monkeypatch.setattr(archive_ytdlp, "_apply_youtube_session", lambda *a, **kw: None)
-    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl", lambda opts: _ctx(ydl))
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl", lambda opts, **_control: _ctx(ydl))
     with pytest.raises(Exception):
         # No media file is produced by the stub, so the post-download lookup
         # fails — the point is that the governor ran exactly once first.
@@ -225,7 +225,7 @@ def test_bestaudio_refuses_before_touching_the_network(acquires, monkeypatch, tm
     ydl = _FakeYdl()
     monkeypatch.setattr(archive_ytdlp, "_audio_resume_dir", lambda vid: tmp_path)
     monkeypatch.setattr(archive_ytdlp, "_apply_youtube_session", lambda *a, **kw: None)
-    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl", lambda opts: _ctx(ydl))
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl", lambda opts, **_control: _ctx(ydl))
     monkeypatch.setattr(archive_ytdlp.time, "sleep", lambda s: None)
     acquires.script = [_decision(False, wait_s=1.0)]
 
@@ -236,7 +236,7 @@ def test_bestaudio_refuses_before_touching_the_network(acquires, monkeypatch, tm
 
 def test_channel_list_chokepoint_governed(acquires, monkeypatch):
     ydl = _FakeYdl()
-    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel", lambda opts: _ctx(ydl))
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel", lambda opts, **_control: _ctx(ydl))
     out = archive_ytdlp.list_channel_videos("https://youtube.com/@chan", limit=3)
     assert [e["id"] for e in out] == ["VzuPKrGl0z8"]
     # One token per channel-tab walk — extract_flat makes it ONE listing
@@ -248,7 +248,7 @@ def test_display_name_backfill_governed_per_channel(acquires, monkeypatch):
     """A whole batch of distinct channel ids per run — the highest-frequency
     ungoverned YouTube egress in this module."""
     ydl = _FakeYdl()
-    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel", lambda opts: _ctx(ydl))
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel", lambda opts, **_control: _ctx(ydl))
     monkeypatch.setattr(
         archive_ytdlp.archive_db, "youtube_chat_user_ids_without_display_name",
         lambda limit: ["UCaaa", "UCbbb"],
@@ -263,7 +263,7 @@ def test_display_name_backfill_stops_the_batch_when_the_pool_is_dry(acquires, mo
     would turn a 20-id batch into a 20x stall. It stops, and the unresolved ids
     are picked up on a later run (the existing retry contract)."""
     ydl = _FakeYdl()
-    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel", lambda opts: _ctx(ydl))
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel", lambda opts, **_control: _ctx(ydl))
     monkeypatch.setattr(
         archive_ytdlp.archive_db, "youtube_chat_user_ids_without_display_name",
         lambda limit: ["UCaaa", "UCbbb", "UCccc"],

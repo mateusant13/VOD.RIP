@@ -233,7 +233,7 @@ def _stub_ytdlp(monkeypatch, on_extract):
             on_extract(captured["opts"])
 
     monkeypatch.setattr(
-        "services.ytdlp_guard.guarded_youtube_dl", lambda opts: _FakeYdl(opts)
+        "services.ytdlp_guard.guarded_youtube_dl", lambda opts, **_control: _FakeYdl(opts)
     )
     # The session conditioning and engine opts are irrelevant here.
     monkeypatch.setattr(archive_ytdlp, "_apply_youtube_session", lambda *a, **k: None)

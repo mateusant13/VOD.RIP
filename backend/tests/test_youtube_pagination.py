@@ -59,7 +59,7 @@ def _tab_info(n_entries: int) -> dict:
 
 
 def _stub_session(monkeypatch) -> None:
-    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel", lambda opts: _fake_guard(_tab_info(0)))
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel", lambda opts, **_control: _fake_guard(_tab_info(0)))
     monkeypatch.setattr(youtube_session, "youtube_session_from_settings", lambda: SimpleNamespace())
     monkeypatch.setattr(youtube_session, "ytdlp_extractor_args", lambda s, auto_auth=True: {"youtube": {}})
     monkeypatch.setattr(youtube_session, "apply_ytdlp_cookie_opts", lambda opts, s, auto_auth=True: None)
@@ -69,7 +69,7 @@ def _call(channel_ref, limit, entries, playlist="videos", monkeypatch=None, enri
     assert monkeypatch is not None
     _stub_session(monkeypatch)
     monkeypatch.setattr(
-        ytdlp_guard, "guarded_youtube_dl_channel", lambda opts: _fake_guard(_tab_info(entries))
+        ytdlp_guard, "guarded_youtube_dl_channel", lambda opts, **_control: _fake_guard(_tab_info(entries))
     )
     return ys.list_channel_videos_sync(
         channel_ref, limit, playlist=playlist, enrich=enrich, return_has_more=True
@@ -158,7 +158,7 @@ def test_videos_windowed_pagination_selects_playlist_items(monkeypatch) -> None:
             ],
         }
 
-    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel", lambda opts: _fake_guard(wintab_info(opts)))
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel", lambda opts, **_control: _fake_guard(wintab_info(opts)))
 
     # Window 1: start=0 — NO playlist_items override, first ceiling rows.
     w1, has_more1, sat1 = ys.list_channel_videos_sync(

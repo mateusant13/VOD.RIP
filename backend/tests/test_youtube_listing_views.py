@@ -204,7 +204,7 @@ def test_list_channel_videos_sync_shorts_union_integration(monkeypatch) -> None:
             "newStream": {"content_kind": "stream", "duration": 18922, "availability": None},
         }.get(vid)
 
-    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel", lambda opts: _fake_guard(tab_info))
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel", lambda opts, **_control: _fake_guard(tab_info))
     monkeypatch.setattr(youtube_session, "youtube_session_from_settings", lambda: SimpleNamespace())
     monkeypatch.setattr(youtube_session, "ytdlp_extractor_args", lambda s, auto_auth=True: {"youtube": {}})
     monkeypatch.setattr(youtube_session, "apply_ytdlp_cookie_opts", lambda opts, s, auto_auth=True: None)
