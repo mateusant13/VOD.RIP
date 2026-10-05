@@ -165,6 +165,30 @@ codeintel search "callers of schedule_youtube_window_hls_mux"
 
 This has already caused three wrong reports. An orchestrator read the `%APPDATA%` orphan, found no `rate_limit_events` table, and reported twice — with a formatted table — that rate history was inert in production. It is not: the live archive has that table with 33 rows. A backlog plan was then built on the orphan (1,161 videos / 3,723.6 hours). The live archive holds 12,715 videos / 27,631 hours / 1,216 videos with transcripts. A third agent re-read the orphan and repeated the first error. (Measured read-only on 2026-10-04. The live DB keeps growing — re-measure, do not reuse these totals.)
 
+### ideos.platform is stored LOWERCASE — never hand-type it in a query
+
+youtube, 	witch, kick. NOT YouTube. A filter written as
+`platform = 'YouTube'` returns **0 rows**, and zero rows reads exactly like
+"that platform's backlog is done". It is the same class of error as the
+orphan-DB mistake above: a wrong query is worse than no query, because the
+result looks like a finding. This one was made on 2026-10-05 and briefly
+reported the YouTube backlog as 0; the real figure was 7,119.
+
+**Enumerate the values, never type them.** `SELECT platform, COUNT(*) FROM
+videos GROUP BY platform` — the column also carries no UNNORMALISED
+variants, so a filter that returns nothing is a filter that is wrong.
+
+Re-measured 2026-10-05 07:17, read-only from `H:\VOD.RIP-data\archive.db`
+(7,543.8 MiB, 33 tables, 13,054 videos, 3,104,739 transcripts): backlog =
+videos with NO `transcripts` row, joined `videos.video_id =
+transcripts.video_id`:
+
+| platform | videos | hours |
+|---|---|---|
+| youtube | 7,119 | 9,062.1 |
+| twitch | 4,126 | 17,610.6 |
+| kick | 594 | 1,766.9 |
+| **total** | **11,839** | **28,439.6** |
 ### How the path is resolved
 
 ```text
@@ -333,6 +357,46 @@ against a **sha3-512 hash vendored inside the installed yt-dlp**, which yt-dlp r
 mismatch. So a tampered asset is rejected — but the trust is in the installed package's
 manifest, and the package is part of the trust boundary.
 
+### PROVEN WORKING against a real YouTube URL (2026-10-05)
+
+Not "the knob is set" — an actual extract of `Vja1Z1eoQrM` (a real id from
+the LIVE archive) through the app's own `guarded_youtube_dl` seam, with the
+grant ON:
+
+- 33 formats returned, **6 audio-only**, itags `599 600 249 250 140 251`
+- the app's own selector `bestaudio/best[vcodec=none][acodec!=none]` chose
+  **itag 251, `vcodec=none`, `acodec=opus`, 139.2 kbps** — no video
+- pinned solver v0.8.0, `lib.min.js` sha3-512 `8420c259ad16e99c...`
+
+Before: **0 of 10** real extracts offered any audio-only itag. The gap is
+closed. A googlevideo URL carries the po_token, so a probe must print only
+format_id / vcodec / acodec / tbr — never a URL.
+
+### Why setting the knob to 0 is a REAL revert, not just "stop fetching"
+
+`remote_components=[]` alone stops the FETCH and not the USE. From the
+installed yt-dlp 2026.08.19, `_builtin/ejs.py`:
+
+- `_iter_script_sources` (:259) yields PYPACKAGE -> CACHE -> BUILTIN -> WEB,
+  so a cached entry outranks the vendored one;
+- `_cached_source` (:277) reads the cache and NEVER consults
+  `remote_components` — only `_web_release_source` (:291) checks it.
+
+So a box that solved once would keep EXECUTING the cached script with the
+knob at 0, and "I set it to 0" would be a false claim. That is why
+`sanitize_ytdlp_opts` also PURGES the cache when disabled.
+
+Measured end-to-end, not assumed: a real solve wrote
+`<cachedir>/challenge-solver/lib.json` (157,701 bytes) and the disabled
+path removed it. The path is right because `yt_dlp/cache.py::_get_root_dir`
+returns the `cachedir` param UNCHANGED when the app sets it
+(`ytdlp_hls.py:496`, `ytdlp_download.py:972`) and only appends
+`yt-dlp` on the unset fallback. The purge covers BOTH `core.json` and
+`lib.json`; in practice only `lib.json` is written, because the CORE half
+is vendored locally so `_builtin_source` satisfies it first. The pair is
+defensive against a yt-dlp that changes which half it fetches, and
+`test_remote_challenge_solver.py` pins the list against the installed
+yt-dlp's own `ScriptType` values.
 ### The knob
 
 ```
