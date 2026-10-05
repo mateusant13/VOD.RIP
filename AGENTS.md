@@ -233,6 +233,18 @@ The newest write is the live archive. On 2026-10-04 that was `H:\VOD.RIP-data\ar
 
 Both predecessors are still on disk and still mislead readers. **Deleting them is the owner's decision, not a worker's** — do not clear them as part of "cleanup" or disk-pressure work. Report their existence; let the owner choose.
 
+### Decoys: `vodrip.db` is not the database
+
+The live data dir also holds a **`vodrip.db` that is 0 bytes** and referenced nowhere in the codebase — `grep vodrip.db` across `backend/` returns no matches. It sits *beside* the real archive rather than in a stale directory, which makes it the more dangerous of the four: a glob for `*.db` finds it, and it is the only one obviously empty. It is not a database and holds no rows. It is not an orphan predecessor either — it was never written to.
+
+The live database in the same folder is 7,910,268,928 bytes with a 27 MB `-wal` that moves minute to minute. Never pick a file by name; pick it by size and write time.
+
+```powershell
+Get-ChildItem "H:\VOD.RIP-data\*.db","H:\VOD.RIP-data\*.db-wal","H:\VOD.RIP-data\*.db-shm" -EA SilentlyContinue | Sort-Object Length -Desc | ForEach-Object { "{0,-16} {1,14:0} bytes  {2:yyyy-MM-dd HH:mm}" -f $_.Name, $_.Length, $_.LastWriteTime }
+```
+
+Read-only, and it puts the decoy and the live archive in one view. Substitute the drive the resolver actually returned rather than assuming `H:`.
+
 ### Second disagreement: which drive wins for models
 
 `best_model_cache_drive()` (`backend/services/disk_hygiene.py:286-305`) answers **`H:`** in practice. It is speed-first — fastest bus tier with >= 8 GB free, ties broken by free space — and H: is NVMe with more room than G:. The "Heavy project data lives OFF C:" section below documents **`G:`** for models.
