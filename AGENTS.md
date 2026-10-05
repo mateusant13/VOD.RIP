@@ -233,6 +233,15 @@ The newest write is the live archive. On 2026-10-04 that was `H:\VOD.RIP-data\ar
 
 Both predecessors are still on disk and still mislead readers. **Deleting them is the owner's decision, not a worker's** — do not clear them as part of "cleanup" or disk-pressure work. Report their existence; let the owner choose.
 
+**The two are NOT equally safe to delete — check before recommending either.** Comparing `(platform, video_id)` sets against the live archive on 2026-10-05:
+
+| orphan | videos | rows absent from the live archive | verdict |
+|---|---|---|---|
+| `%APPDATA%\VOD.RIP\archive.db` | 1,161 | **0** | a strict subset — nothing unique is lost |
+| `G:\VOD.RIP-data\archive.db` | 2,309 | **244** | holds 244 videos the live archive does not — deleting it destroys rows unless they are merged first |
+
+The live archive keeps growing, so the 244 is a floor, not a fixed number. Re-measure before acting on either row, and re-derive it the same way: open the live archive and each orphan with `file:<path>?mode=ro` (read-only URI — never a plain `connect()`, and never a `mode=rw` write), read `(platform, video_id)` from `videos` in each, and set-difference. Do not run a merge on the owner's initiative either — that writes to the live database.
+
 ### Decoys: `vodrip.db` is not the database
 
 The live data dir also holds a **`vodrip.db` that is 0 bytes** and referenced nowhere in the codebase — `grep vodrip.db` across `backend/` returns no matches. It sits *beside* the real archive rather than in a stale directory, which makes it the more dangerous of the four: a glob for `*.db` finds it, and it is the only one obviously empty. It is not a database and holds no rows. It is not an orphan predecessor either — it was never written to.
