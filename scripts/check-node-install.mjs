@@ -52,6 +52,9 @@ const REQUIRED_BINS = ["tsc", "vitest", "vite"];
 const problems = [];
 const notes = [];
 
+/** npm in-flight staging leftovers from an interrupted install. Inert. */
+const STAGING = new Set();
+
 function out(...a) {
   if (!AS_JSON) console.log(...a);
 }
@@ -83,12 +86,17 @@ function expectedPackages(lock) {
 
 function actualPackages() {
   const have = new Set();
+  const staging = STAGING;
   for (const name of fs.readdirSync(NM)) {
     if (name.startsWith(".")) continue;
     const p = path.join(NM, name);
     if (!fs.statSync(p).isDirectory()) continue;
     if (name.startsWith("@")) {
       for (const sub of fs.readdirSync(p)) {
+        // A dot-prefixed sibling is npm's in-flight staging dir
+        // (e.g. @rollup/.rollup-win32-x64-msvc-PMEzLQM2), left behind when an
+        // install was interrupted. It is a temp artifact, NOT a package.
+        if (sub.startsWith(".")) { staging.add(`${name}/${sub}`); continue; }
         if (fs.statSync(path.join(p, sub)).isDirectory()) have.add(`${name}/${sub}`);
       }
     } else {
@@ -166,6 +174,14 @@ if (extra.length) {
   // Not fatal — but it is how a half-pruned tree usually announces itself.
   notes.push(`${extra.length} package dir(s) not in the lockfile (leftover from another install): ${extra.slice(0, 8).join(", ")}${extra.length > 8 ? " …" : ""}`);
 }
+if (STAGING.size) {
+  // Inert residue of an interrupted `npm install`. Harmless, and `npm ci`
+  // clears it. Deliberately NOT a failure — it is not a broken package.
+  notes.push(
+    `${STAGING.size} npm staging leftover(s) from an interrupted install (inert, cleared by npm ci): ` +
+      `${[...STAGING].slice(0, 4).join(", ")}${STAGING.size > 4 ? " …" : ""}`
+  );
+}
 
 // 4. Hollow packages: directory survived, contents did not.
 const hollow = [...have].filter(
@@ -188,7 +204,7 @@ if (files < MIN_FILES) {
 if (AS_JSON) {
   console.log(
     JSON.stringify(
-      { ok: problems.length === 0, files, expectedPackages: want.size, actualPackages: have.size, missing, extra, hollow, problems, notes },
+      { ok: problems.length === 0, files, expectedPackages: want.size, actualPackages: have.size, missing, extra, hollow, staging: [...STAGING], problems, notes },
       null,
       2
     )
