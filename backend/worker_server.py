@@ -33,6 +33,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 BACKEND_DIR = Path(__file__).resolve().parent
 LOG_DIR = BACKEND_DIR / "logs"
@@ -143,7 +144,13 @@ def _process_rss_bytes(pid: int) -> int:
             from ctypes import wintypes
 
             PROCESS_QUERY_LIMITED = 0x1000
-            h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED, False, int(pid))
+            # restype MUST be HANDLE: ctypes defaults it to c_int, which
+            # truncates a 64-bit handle to 32 bits and silently probes
+            # garbage (or a reused handle) instead of the real process.
+            _open = ctypes.windll.kernel32.OpenProcess
+            _open.restype = wintypes.HANDLE
+            _open.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            h = _open(PROCESS_QUERY_LIMITED, False, int(pid))
             if h:
                 try:
                     class _PMC(ctypes.Structure):  # PROCESS_MEMORY_COUNTERS_EX
@@ -231,6 +238,416 @@ def _resource_watchdog(
             consecutive_over = 0  # back under cap — reset counter
 
 
+# --- stall watchdog (GIL-held decode deadlock) ----------------------------
+# WHY EXTERNAL, AND WHY HERE
+# The parakeet decode can hard-deadlock inside the native sherpa/onnxruntime
+# call: all chunk lanes stuck in decode_stream on the shared per-device
+# recognizer, MainThread parked in _wait_for_tstate_lock on an unbounded
+# fut.result(). The wedged call HOLDS THE GIL, so nothing inside the child
+# can observe, time out, or recover from it — an in-process heartbeat thread
+# stops ticking, no timeout fires, and KeyboardInterrupt is unreachable.
+# Measured on the wedged child: 0.000 s of CPU across 12 s sampling windows
+# (blocked, not spinning) while its job row sat 'running' with a heartbeat
+# frozen for hours. The ONLY thing that can bound it lives in a different
+# process — this supervisor, which already parents the child and already runs
+# the RSS watchdog above.
+#
+# DETECTING A STALL, NOT A SLOW VIDEO
+# The signals are OBSERVABLE PROGRESS, never "this job is taking long":
+#   * 'progress marks' — timestamps the child itself writes: every completed
+#     60 s chunk stamps archive_jobs.heartbeat (throttled to one UPDATE per
+#     2 s), every yt-dlp byte-progress event does the same, plus the
+#     worker's own worker_heartbeats row. A 13-hour VOD is fine because its
+#     marks keep moving; a wedge moves none of them, because writing them
+#     needs the very GIL the wedge holds.
+#   * child CPU time — consumed while decoding, committing, or unpacking.
+#
+# A stall needs BOTH marks frozen for the full bound AND the child burning no
+# CPU across that same window. The conjunction is the whole trick: CPU
+# consumption counts AS progress, so the clock restarts whenever the child is
+# busy. A throttled worker is slower, never motionless — even at the worst
+# wall multiplier seen in the field (13.6x) it still accumulates ~1.5 s of
+# CPU per poll window, 6x the floor below — so throttling can never trip it.
+# Only a genuinely dead-stuck process reaches zero.
+#
+# THE BOUND (derived, not round)
+# Measured 2026-10-04 on this box through the production _load_parakeet path
+# with real pt-BR/en speech, chunks at the production _MAX_CHUNK_SEC = 60,
+# single lane num_threads=2, at the then-current wall_multiplier of 3.12:
+#     60 s chunk wall: min 8.906  median 9.493  max 10.484  (5.72x realtime)
+# The healthy inter-heartbeat gap is one chunk, so the worst healthy gap at
+# the worst throttle is 10.484 * (13.6/3.12) = 45.7 s. Times a 3x safety
+# factor for descheduling, segment-dense commits and contention with other
+# projects: STALL_BOUND_S below. It also sits deliberately ABOVE the
+# in-process download stall watchdog (STALL_WATCHDOG_SEC = 90 s), so a
+# genuinely stalled download always gets first refusal and fails the job
+# cleanly; this watchdog firing during a fetch means the in-process one could
+# not act either, i.e. the child is wedged.
+_MEASURED_CHUNK_WALL_S = 10.484       # real speech, 60 s chunk, worst of 6
+_BASELINE_WALL_MULTIPLIER = 3.12      # watcher multiplier at measurement time
+_WORST_WALL_MULTIPLIER = 13.6         # worst observed under heavy throttle
+_STALL_SAFETY_FACTOR = 3.0
+STALL_BOUND_S = round(
+    _MEASURED_CHUNK_WALL_S
+    * (_WORST_WALL_MULTIPLIER / _BASELINE_WALL_MULTIPLIER)
+    * _STALL_SAFETY_FACTOR,
+    1,
+)  # == 137.1 s
+_STALL_POLL_S = 15.0
+# END-TO-END bound from "decode wedges" to "job is back in the retry queue".
+# Every term is a constant, so the recovery is a hard bound, not a nominal
+# one: one poll interval to notice + the bound itself + the kill/verify
+# budget (30 s taskkill wait + 15 s TerminateProcess wait) + the retry
+# UPDATE. Under the default bound that is <= 137.1 + 15 + 45 + ~1 ~= 198 s.
+STALL_RECOVERY_BOUND_S = (
+    _STALL_POLL_S + STALL_BOUND_S + 30.0 + 15.0 + 1.0
+)
+# CPU seconds that must be exceeded in one poll window to count as "working".
+# The measured wedge is exactly 0.000; a 13.6x-throttled worker clears ~1.5.
+_STALL_CPU_FLOOR_S = 0.25
+_STILL_ACTIVE = 259  # Windows: GetExitCodeProcess value for a live process
+_STALL_BOUND_ENV = "VODRIP_ASR_STALL_BOUND_S"
+
+# Set by the stall watchdog once it has killed a wedged child AND returned
+# its job to the retry path. main() reads it so a stall we diagnosed and
+# recovered from does not count toward MAX_CONSECUTIVE_CRASHES: the child
+# exiting non-zero is the RECOVERY working, not an unexplained crash, and
+# counting it would park the whole queue in the 15 min give-up cooldown
+# after three wedged videos. Undiagnosed crashes still count as before.
+_STALL_RECOVERED = threading.Event()
+
+
+def _stall_bound_s() -> float:
+    """The derived bound, overridable for the field and for tests.
+
+    The default is STALL_BOUND_S (137.1 s). An operator on a much slower or
+    much faster box can retune it without a code change; the derivation in
+    the comment above says what a sane value looks like."""
+    raw = os.environ.get(_STALL_BOUND_ENV, "").strip()
+    if raw:
+        try:
+            val = float(raw)
+            if val > 0:
+                return val
+        except (ValueError, OverflowError):
+            pass
+    return STALL_BOUND_S
+
+
+def _process_cpu_seconds(pid: int) -> Optional[float]:
+    """Total CPU seconds (user+kernel) consumed by `pid`, or None.
+
+    Windows: GetProcessTimes on an opened handle. POSIX: utime+stime from
+    /proc/[pid]/stat. A dead or unopenable pid is None — the caller must
+    treat a missing reading as 'no evidence', never as 'wedged'."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            class _FT(ctypes.Structure):
+                _fields_ = [("lo", wintypes.DWORD), ("hi", wintypes.DWORD)]
+
+            _open = ctypes.windll.kernel32.OpenProcess
+            _open.restype = wintypes.HANDLE
+            _open.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            # PROCESS_QUERY_LIMITED | PROCESS_VM_READ
+            h = _open(0x1000 | 0x0010, False, int(pid))
+            if not h:
+                return None
+            try:
+                c, e, k, u = _FT(), _FT(), _FT(), _FT()
+                _gpt = ctypes.windll.kernel32.GetProcessTimes
+                _gpt.restype = wintypes.BOOL
+                _gpt.argtypes = [
+                    wintypes.HANDLE,
+                    ctypes.POINTER(_FT), ctypes.POINTER(_FT),
+                    ctypes.POINTER(_FT), ctypes.POINTER(_FT),
+                ]
+                if not _gpt(h, ctypes.byref(c), ctypes.byref(e),
+                            ctypes.byref(k), ctypes.byref(u)):
+                    return None
+                ticks = ((k.hi << 32) | k.lo) + ((u.hi << 32) | u.lo)
+                return ticks / 1e7  # 100 ns FILETIME units -> seconds
+            finally:
+                ctypes.windll.kernel32.CloseHandle(h)
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            parts = f.read().rsplit(b")", 1)[1].split()
+        return (int(parts[11]) + int(parts[12])) / os.sysconf("SC_CLK_TCK")
+    except Exception:
+        return None
+
+
+def _process_exit_code(pid: int) -> Optional[int]:
+    """GetExitCodeProcess(pid), or None if the pid cannot be opened.
+
+    OpenProcess SUCCEEDS on a terminated-but-unreaped pid, so a successful
+    open proves nothing about liveness — only the exit code does. A live
+    process reports STILL_ACTIVE (259); anything else has exited."""
+    try:
+        if os.name != "nt":
+            return None
+        import ctypes
+        from ctypes import wintypes
+
+        _open = ctypes.windll.kernel32.OpenProcess
+        _open.restype = wintypes.HANDLE
+        _open.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        h = _open(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED
+        if not h:
+            return None
+        try:
+            code = wintypes.DWORD(0)
+            _gecp = ctypes.windll.kernel32.GetExitCodeProcess
+            _gecp.restype = wintypes.BOOL
+            _gecp.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            if not _gecp(h, ctypes.byref(code)):
+                return None
+            return int(code.value)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
+    except Exception:
+        return None
+
+
+def _process_is_alive(pid: int) -> bool:
+    """True only if `pid` is a RUNNING process.
+
+    Decided by exit code against STILL_ACTIVE — never by OpenProcess success
+    (a terminated-but-unreaped pid still opens) and never by tasklist (a
+    previous lane's kill path reported killed processes as alive because it
+    trusted one of those). On POSIX, signal 0 is the equivalent probe."""
+    rc = _process_exit_code(pid)
+    if rc is not None:
+        return rc == _STILL_ACTIVE
+    if os.name == "nt":
+        return False  # could not prove liveness -> do not claim alive
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by another user
+    except Exception:
+        return False
+
+
+def _progress_marks() -> str:
+    """A string that changes iff the child made observable progress.
+
+    Reads only the child's own bookkeeping: the heartbeat of every 'running'
+    job row (stamped per completed chunk and per yt-dlp progress event) plus
+    the worker_heartbeats rows. Read-only; returns "" when the DB is
+    unreachable so a DB hiccup can never read as a stall."""
+    try:
+        from services import archive_db
+
+        jobs = archive_db.query(
+            "SELECT id, COALESCE(heartbeat, updated_at) AS hb FROM archive_jobs "
+            "WHERE status = 'running' ORDER BY id"
+        )
+        beats = archive_db.query(
+            "SELECT tag, at FROM worker_heartbeats ORDER BY tag"
+        )
+    except Exception:
+        return ""
+    return "|".join(f"{r['id']}={r['hb']}" for r in jobs) + "#" + "|".join(
+        f"{r['tag']}={r['at']}" for r in beats
+    )
+
+
+def _stall_state(
+    holder: dict,
+    now: float,
+    *,
+    marks: str,
+    cpu_seconds: Optional[float],
+    bound_s: float = STALL_BOUND_S,
+    cpu_floor_s: float = _STALL_CPU_FLOOR_S,
+    active: bool = True,
+) -> Optional[str]:
+    """Pure stall verdict: None = healthy, else the reason string.
+
+    Clock-injected and process-free, exactly like download_manager's
+    _stall_state, so the decision is testable without a database or a
+    clock. See the module comment for why a stall requires frozen marks AND
+    a motionless child."""
+    if not active:
+        return None
+    if holder.get("error"):
+        return holder["error"]  # latched: same verdict until acted on
+    if not holder.get("armed"):
+        holder["armed"] = True
+        holder["last_marks"] = marks
+        holder["last_progress_wall"] = now
+        holder["cpu_baseline"] = cpu_seconds
+        return None
+    if marks != holder["last_marks"]:
+        holder["last_marks"] = marks
+        holder["last_progress_wall"] = now
+        holder["cpu_baseline"] = cpu_seconds
+        return None
+    used = 0.0
+    if cpu_seconds is not None and holder["cpu_baseline"] is not None:
+        used = max(0.0, cpu_seconds - float(holder["cpu_baseline"]))
+    if used > cpu_floor_s:
+        # Burning CPU IS progress: decode, segment commit, ffmpeg unpack.
+        # Restart the clock so only a child that is busy AND silent past the
+        # bound can ever be killed. This is what keeps a throttled worker
+        # safe, and it self-heals a busy-then-wedged child.
+        holder["last_progress_wall"] = now
+        holder["cpu_baseline"] = cpu_seconds
+        return None
+    if now - float(holder["last_progress_wall"]) < bound_s:
+        return None
+    held = now - float(holder["last_progress_wall"])
+    reason = (
+        f"ASR worker wedged: no job progress for {int(held)}s "
+        f"and {used:.2f}s CPU (GIL held in decode)"
+    )
+    holder["error"] = reason  # latched here, as download_manager does, so a
+    return reason               # caller that only re-polls gets one verdict
+
+
+def _running_transcribe_jobs() -> list[dict]:
+    """The 'running' transcribe rows the child owns (read-only)."""
+    try:
+        from services import archive_db
+
+        return [
+            dict(r)
+            for r in archive_db.query(
+                "SELECT id, kind, platform, video_id, status, attempts, max_attempts "
+                "FROM archive_jobs WHERE status = 'running' AND kind = 'transcribe'"
+            )
+        ]
+    except Exception:
+        return []
+
+
+def _mark_stalled_job_failed(reason: str, logf) -> list[str]:
+    """Hand the stall-killed job back to the EXISTING retry path.
+
+    Calls archive_db.update_job(status='failed', ...) — the same helper a
+    crashed job already uses — so the row is requeued with a next_retry_at
+    backoff and attempts+1, and only lands on 'failed' once max_attempts is
+    spent. A job left 'running' with no owner is the one outcome that must
+    never happen. The reason string is deliberately free of the terminal
+    markers update_job matches on ('FileNotFound', 'DownloadError', 'no HLS
+    source', 'ASR unsupported', 'ASR unavailable', ...) so a stall is always
+    retried, never parked as terminal."""
+    marked: list[str] = []
+    for row in _running_transcribe_jobs():
+        job_id = row.get("id")
+        if not job_id:
+            continue
+        try:
+            from services import archive_db
+
+            archive_db.update_job(job_id, status="failed", error=reason[:400])
+            after = archive_db.query(
+                "SELECT status, attempts, next_retry_at FROM archive_jobs WHERE id = ?",
+                (job_id,),
+            )
+            state = dict(after[0]) if after else {}
+            _log(
+                logf,
+                f"stall: job {job_id} released -> status={state.get('status')} "
+                f"attempts {row.get('attempts')}->{state.get('attempts')} "
+                f"next_retry_at={state.get('next_retry_at')}",
+            )
+            marked.append(job_id)
+        except Exception as exc:  # noqa: BLE001 - never mask the kill
+            _log(logf, f"stall: could not release job {job_id}: {exc}")
+    if not marked:
+        _log(logf, "stall: no running transcribe job row to release")
+    return marked
+
+
+def _kill_child_tree(proc: subprocess.Popen, logf) -> Optional[int]:
+    """Kill the child and its tree, then confirm it is really gone.
+
+    PID-REUSE SAFETY: the tree kill is necessarily PID-addressed (taskkill
+    reaches ffmpeg grandchildren), and Windows recycles PIDs freely. So the
+    Popen object — which holds a live OS handle to the process we spawned and
+    reaps it — is the gate: poll() is re-checked immediately before the kill,
+    and a child that has already exited is NEVER killed by PID, because that
+    pid may already belong to someone else. Same reason _process_is_alive
+    decides on the exit code and not on OpenProcess succeeding.
+
+    Returns the observed exit code, or None if the child is still alive."""
+    pid = proc.pid
+    if proc.poll() is not None:
+        # Already gone (and reaped) — a PID kill here could hit a stranger.
+        rc = proc.returncode
+        _log(logf, f"stall: child pid {pid} already exited (rc={rc}) — "
+                   "not killing by pid")
+        return rc
+    try:
+        if os.name == "nt":
+            os.system(f"taskkill /PID {pid} /F /T")
+        else:
+            os.kill(pid, 9)
+    except Exception as exc:  # noqa: BLE001
+        _log(logf, f"stall: kill of pid {pid} raised: {exc}")
+    try:
+        rc = proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        _log(logf, f"stall: pid {pid} survived taskkill — proc.kill()")
+        try:
+            proc.kill()  # handle-based TerminateProcess: no PID lookup
+            rc = proc.wait(timeout=15)
+        except Exception as exc:  # noqa: BLE001
+            _log(logf, f"stall: pid {pid} still alive after proc.kill(): {exc}")
+            return None
+    if _process_is_alive(pid):
+        _log(logf, f"stall: pid {pid} STILL REPORTS ALIVE after kill (rc={rc})")
+        return None
+    _log(logf, f"stall: child pid {pid} confirmed dead (exit code {rc})")
+    return rc
+
+
+def _stall_watchdog(
+    logf, proc: subprocess.Popen, stop_event: threading.Event,
+    bound_s: Optional[float] = None, poll_s: Optional[float] = None,
+) -> None:
+    """Daemon thread: kill a wedged child, hand its job to the retry path.
+
+    `bound_s` / `poll_s` are injectable only so tests can drive the REAL loop
+    at test speed; production takes the derived bound and _STALL_POLL_S."""
+    if bound_s is None:
+        bound_s = _stall_bound_s()
+    if poll_s is None:
+        poll_s = _STALL_POLL_S
+    holder = {
+        "armed": False,
+        "last_marks": None,
+        "last_progress_wall": 0.0,
+        "cpu_baseline": None,
+        "error": None,
+    }
+    while not stop_event.wait(poll_s):
+        if proc.poll() is not None:
+            return  # child already exited on its own
+        marks = _progress_marks()
+        cpu = _process_cpu_seconds(proc.pid)
+        reason = _stall_state(
+            holder, time.monotonic(), marks=marks, cpu_seconds=cpu, bound_s=bound_s,
+        )
+        if reason is None:
+            continue
+        holder["error"] = reason
+        _log(logf, f"stall watchdog: {reason} — killing child pid {proc.pid}")
+        rc = _kill_child_tree(proc, logf)
+        if rc is None:
+            _log(logf, "stall watchdog: kill unconfirmed — leaving job state alone")
+            return
+        _mark_stalled_job_failed(reason, logf)
+        _STALL_RECOVERED.set()
+        return
+
+
 def main() -> int:
     LOG_DIR.mkdir(exist_ok=True)
     if _singleton_mutex_held():
@@ -295,6 +712,20 @@ def main() -> int:
             )
             watchdog.start()
 
+            # Stall watchdog: the in-process watchdog CANNOT do this. A
+            # decode that hard-deadlocks inside the native call holds the
+            # GIL, so the child can neither notice nor time itself out; only
+            # this parent can. It kills the wedged child, hands the job back
+            # to the existing retry path, and the rc!=0 below then respawns
+            # the worker so the next job runs.
+            stall_watchdog = threading.Thread(
+                target=_stall_watchdog,
+                args=(logf, proc, watchdog_stop),
+                daemon=True,
+                name="stall-watchdog",
+            )
+            stall_watchdog.start()
+
             try:
                 rc = proc.wait()
             except KeyboardInterrupt:
@@ -318,6 +749,20 @@ def main() -> int:
             if rc == 0:
                 _log(logf, "worker exited cleanly (queue drained, rc=0) — not restarting")
                 return 0
+
+            if _STALL_RECOVERED.is_set():
+                # A stall we killed and released is a recovery, not a crash:
+                # keep serving the queue instead of walking into the 15 min
+                # give-up cooldown. Per-job max_attempts still bounds a
+                # video that wedges every time.
+                _STALL_RECOVERED.clear()
+                _log(logf, f"worker exited rc={rc} after a recovered stall — "
+                           "not counting it as a crash; respawning for the "
+                           "next job")
+                wait = BACKOFF_SECONDS[0]
+                _log(logf, f"restarting in {wait}s...")
+                time.sleep(wait)
+                continue
 
             crashes += 1
             _log(logf, f"worker exited rc={rc} (consecutive crash #{crashes}/{MAX_CONSECUTIVE_CRASHES})")
