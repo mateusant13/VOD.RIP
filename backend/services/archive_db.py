@@ -548,6 +548,7 @@ def _init_schema() -> None:
         _ensure_jobs_work_heartbeat_column(_conn)
         _ensure_jobs_status_paused(_conn)
         _ensure_rate_limit_events(_conn)
+        _ensure_youtube_channel_outcomes_table(_conn)
         rebuilt = _migrate_fts_contentless(_conn)
         # One-time data migrations on transcripts (entity + lang backfill).
         # Runs after the FTS rebuild so the current trigger set re-indexes.
@@ -1450,6 +1451,99 @@ def _ensure_rate_limit_events(conn: sqlite3.Connection) -> None:
     for name, decl in _RL_EVENT_COLUMNS:
         if name not in cols:
             conn.execute(f"ALTER TABLE rate_limit_events ADD COLUMN {name} {decl}")
+
+
+# --- learned per-channel yt-dlp conditions ----------------------------------
+#
+# A channel with no /streams tab (or one that 404s) answers the same way every
+# cycle, forever: measured over the 500-record error ring (2026-09-15 ->
+# 2026-10-05), 144 records were "does not have a streams tab" and 54 were a
+# 404 on a channel tab, retried every ~12 minutes since 2026-09-04 with no
+# terminal classification and no memory of the failure. Each retry cost a
+# governor token, a yt-dlp spawn and ~8s to learn nothing new.
+#
+# This table is that memory. One row per (platform, channel, tab) PERMANENT
+# condition; the walk skips it instead of re-proving it. Keyed by the TAB as
+# well as the channel, because "no /streams" says nothing about /videos -- a
+# channel that never livestreams still has an ordinary videos tab, and parking
+# the whole channel on its streams verdict would be a false, irreversible
+# claim.
+#
+# outcome_code is the vocabulary CODE from services.ytdlp_outcomes, not prose:
+# a code is a contract, the human phrase is derived at read time, and a
+# wording edit cannot break a stored row. Same discipline as
+# videos.captions_unavailable_kind.
+#
+# RELEASABLE, deliberately. A channel can gain a streams tab later, and a park
+# that cannot be released is worse than the bug it fixes -- so release is a
+# COLUMN UPDATE (released_at), it is in the same transaction family as the
+# park, and it survives a restart for the same reason the park does. `skipped`
+# counts how many times the condition was seen (so a skip is observable and
+# not a silent zero); it is never reset by a park, only by a release.
+_CHANNEL_OUTCOME_DDL = """
+CREATE TABLE IF NOT EXISTS youtube_channel_outcomes (
+  channel_norm TEXT NOT NULL,
+  tab          TEXT NOT NULL,
+  platform     TEXT NOT NULL DEFAULT 'youtube',
+  outcome_code TEXT NOT NULL,
+  first_seen   TEXT NOT NULL,
+  last_seen    TEXT NOT NULL,
+  released_at  TEXT,
+  skipped      INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (platform, channel_norm, tab)
+)
+"""
+_CHANNEL_OUTCOME_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("platform", "TEXT NOT NULL DEFAULT 'youtube'"),
+    ("channel_norm", "TEXT NOT NULL"),
+    ("tab", "TEXT NOT NULL"),
+    ("outcome_code", "TEXT NOT NULL"),
+    ("first_seen", "TEXT NOT NULL"),
+    ("last_seen", "TEXT NOT NULL"),
+    ("released_at", "TEXT"),
+    ("skipped", "INTEGER NOT NULL DEFAULT 0"),
+)
+# An index is unnecessary: the primary key already covers every read (the walk
+# probes one (platform, channel, tab) triple per request) and the only scan is
+# the full release sweep, which is bounded by the row count.
+
+
+def _ensure_youtube_channel_outcomes_table(conn: sqlite3.Connection) -> None:
+    """Idempotent migration: the learned per-channel yt-dlp condition table.
+
+    Self-sufficient in the same shape as _ensure_rate_limit_events: when the
+    table is ABSENT this creates it from the one shared DDL, and when it is
+    PRESENT it backfills any column a later lane appended. Both halves are
+    guarded, so repeated calls are no-ops and two processes racing on the same
+    archive both succeed (CREATE TABLE IF NOT EXISTS and the PRAGMA
+    table_info check are both race-safe; ALTER ADD COLUMN is additive and
+    instant, which is what a multi-GB archive can afford).
+
+    A failure here is debug-level and non-fatal on purpose, exactly like the
+    rate-limit history create: the callers degrade to "no memory, try the
+    channel" -- i.e. back to today's behaviour -- and a learning table must
+    never become a new failure mode for the walk.
+    """
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(youtube_channel_outcomes)")}
+    except sqlite3.Error:
+        return
+    if not cols:
+        try:
+            for stmt in _split_ddl(_CHANNEL_OUTCOME_DDL):
+                conn.execute(stmt)
+        except sqlite3.Error:
+            logger.debug("youtube_channel_outcomes: create failed", exc_info=True)
+            return
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(youtube_channel_outcomes)")}
+        if not cols:
+            return
+    for name, decl in _CHANNEL_OUTCOME_COLUMNS:
+        if name not in cols:
+            try:
+                conn.execute(f"ALTER TABLE youtube_channel_outcomes ADD COLUMN {name} {decl}")
+            except sqlite3.Error:
+                logger.debug("youtube_channel_outcomes: add %s failed", name, exc_info=True)
 
 
 # (fts_table, content_table) pairs kept in sync by FTS triggers.
@@ -4070,6 +4164,188 @@ def age_gate_parked_videos(
             }
         )
     return out
+
+
+# --- learned per-channel yt-dlp conditions (see _CHANNEL_OUTCOME_DDL) --------
+
+
+def _norm_channel_ref(channel_ref: str) -> str:
+    """Canonical key for a channel handle.
+
+    Lowercased with a leading '@' stripped, so '@SeeelBR' and 'seeelbr' are one
+    channel. That matters because the key is the primary key of the learning
+    table: a walk that spelled the same channel two ways would park it twice
+    and skip neither consistently.
+    """
+    return str(channel_ref or "").strip().lstrip("@").lower()
+
+
+def channel_outcome_parked(
+    channel_ref: str, tab: str, platform: str = "youtube"
+) -> Optional[dict]:
+    """The learned PERMANENT condition for (channel, tab), or None.
+
+    None means "no memory" -- which is the honest answer for a channel that
+    has never been asked, and for a channel whose park was released. A caller
+    must not read None as "this channel has no videos": that is the whole
+    distinction this table exists to keep, and collapsing it is how an earlier
+    version of the age-gate park reported a plausible-looking empty channel.
+
+    Only rows with released_at IS NULL count. A released row is inert and must
+    never be re-applied by a later cycle.
+    """
+    try:
+        rows = query(
+            "SELECT outcome_code, first_seen, last_seen, skipped "
+            "FROM youtube_channel_outcomes "
+            "WHERE platform=? AND channel_norm=? AND tab=? AND released_at IS NULL",
+            (platform, _norm_channel_ref(channel_ref), str(tab or "").lower()),
+        )
+    except sqlite3.Error:
+        # A missing/broken learning table must degrade to "no memory", never to
+        # an exception in the walk's hot path.
+        return None
+    if not rows:
+        return None
+    r = rows[0]
+    return {
+        "outcome_code": str(r["outcome_code"]),
+        "first_seen": str(r["first_seen"]),
+        "last_seen": str(r["last_seen"]),
+        "skipped": int(r["skipped"] or 0),
+    }
+
+
+def learn_channel_outcome(
+    channel_ref: str, tab: str, outcome_code: str, platform: str = "youtube"
+) -> None:
+    """Record (or refresh) a learned permanent condition for (channel, tab).
+
+    Upsert, so re-seeing the condition refreshes last_seen instead of failing
+    on the primary key. A park RE-ARMS a previously released row (released_at
+    back to NULL) because the channel is answering the same way again -- the
+    condition is current, not historical.
+
+    Best-effort: a write failure is debug-level, and the walk then behaves
+    exactly as it does today (retry, learn nothing). Learning must never be a
+    new failure mode.
+    """
+    now = _now_iso()
+    try:
+        execute(
+            """INSERT INTO youtube_channel_outcomes
+                 (platform, channel_norm, tab, outcome_code, first_seen,
+                  last_seen, released_at, skipped)
+               VALUES (?, ?, ?, ?, ?, ?, NULL, 0)
+               ON CONFLICT(platform, channel_norm, tab) DO UPDATE SET
+                 outcome_code=excluded.outcome_code,
+                 last_seen=excluded.last_seen,
+                 released_at=NULL""",
+            (platform, _norm_channel_ref(channel_ref), str(tab or "").lower(),
+             str(outcome_code), now, now),
+        )
+    except sqlite3.Error:
+        logger.debug("learn_channel_outcome failed for %s/%s", channel_ref, tab, exc_info=True)
+
+
+def note_channel_outcome_skipped(
+    channel_ref: str, tab: str, platform: str = "youtube"
+) -> int:
+    """Count one skip served from memory; returns the new count.
+
+    A skip that is never counted is a silent zero -- indistinguishable from
+    "this channel was never parked", which is the same NULL!=0 hole the
+    /api/asr/runtime fix closed. The counter is what makes the saving
+    observable, and it is only ever incremented (a release resets it, because
+    after a release the memory is gone and the count no longer describes
+    anything).
+    """
+    try:
+        execute(
+            "UPDATE youtube_channel_outcomes SET skipped = skipped + 1 "
+            "WHERE platform=? AND channel_norm=? AND tab=? AND released_at IS NULL",
+            (platform, _norm_channel_ref(channel_ref), str(tab or "").lower()),
+        )
+        rows = query(
+            "SELECT skipped FROM youtube_channel_outcomes "
+            "WHERE platform=? AND channel_norm=? AND tab=? AND released_at IS NULL",
+            (platform, _norm_channel_ref(channel_ref), str(tab or "").lower()),
+        )
+        return int(rows[0]["skipped"] or 0) if rows else 0
+    except sqlite3.Error:
+        logger.debug("note_channel_outcome_skipped failed for %s/%s", channel_ref, tab, exc_info=True)
+        return 0
+
+
+def release_channel_outcome(
+    channel_ref: str, tab: str | None = None, platform: str = "youtube"
+) -> int:
+    """Release learned conditions for a channel (all tabs, or one tab).
+
+    tab=None releases every tab for the channel; a specific tab releases only
+    that one. Returns how many rows were released.
+
+    This is the path that makes the park safe to have at all. A channel can
+    gain a /streams tab later, and a park that cannot be released would hide
+    live content FOREVER -- strictly worse than the retry it prevents. The
+    release is a column update on the same durable row, so it survives a
+    restart exactly as the park does; a release that died with the process
+    would be the same class of bug as the in-memory park this table replaced.
+    """
+    released = 0
+    try:
+        if tab:
+            execute(
+                "UPDATE youtube_channel_outcomes SET released_at=? "
+                "WHERE platform=? AND channel_norm=? AND tab=? AND released_at IS NULL",
+                (_now_iso(), platform, _norm_channel_ref(channel_ref), str(tab).lower()),
+            )
+        else:
+            execute(
+                "UPDATE youtube_channel_outcomes SET released_at=? "
+                "WHERE platform=? AND channel_norm=? AND released_at IS NULL",
+                (_now_iso(), platform, _norm_channel_ref(channel_ref)),
+            )
+        rows = query(
+            "SELECT released_at FROM youtube_channel_outcomes "
+            "WHERE platform=? AND channel_norm=? AND released_at IS NOT NULL"
+            + (" AND tab=?" if tab else ""),
+            (platform, _norm_channel_ref(channel_ref)) + ((str(tab).lower(),) if tab else ()),
+        )
+        released = len(rows)
+    except sqlite3.Error:
+        logger.debug("release_channel_outcome failed for %s/%s", channel_ref, tab, exc_info=True)
+    return released
+
+
+def channel_outcome_snapshot(platform: str = "youtube") -> list[dict]:
+    """Every currently-parked condition, for diagnostics and the API.
+
+    Reads the PERSISTED rows, so a caller that renders this after a restart
+    sees the same thing a live process does. The human phrase is derived at
+    read time from the stored code (never stored), which is why this returns
+    codes and lets the caller render.
+    """
+    try:
+        rows = query(
+            "SELECT channel_norm, tab, outcome_code, first_seen, last_seen, skipped "
+            "FROM youtube_channel_outcomes "
+            "WHERE platform=? AND released_at IS NULL ORDER BY channel_norm, tab",
+            (platform,),
+        )
+    except sqlite3.Error:
+        return []
+    return [
+        {
+            "channel": str(r["channel_norm"]),
+            "tab": str(r["tab"]),
+            "outcome_code": str(r["outcome_code"]),
+            "first_seen": str(r["first_seen"]),
+            "last_seen": str(r["last_seen"]),
+            "skipped": int(r["skipped"] or 0),
+        }
+        for r in rows
+    ]
 
 
 def mark_video_transcript_kind(platform: str, video_id: str, kind: str) -> None:

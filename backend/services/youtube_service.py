@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
 from services import ytdlp_guard
+from services import ytdlp_outcomes
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +120,106 @@ def channel_playlist_url(channel_ref: str, kind: PlaylistKind = "videos") -> str
     else:
         base = f"https://www.youtube.com/@{ref}"
     return f"{base}{suffix}"
+
+
+# --- learned per-channel yt-dlp conditions ----------------------------------
+#
+# Thin seam over archive_db's durable youtube_channel_outcomes table. The
+# vocabulary and the permanence decision live in services.ytdlp_outcomes; the
+# persistence lives in archive_db; this is only the walk's use of both.
+#
+# Every function here is BEST-EFFORT. A learning table that raises inside the
+# walk's hot path would be a new failure mode for the thing it is meant to
+# improve, so a DB error degrades to "no memory" (behave exactly as before).
+
+
+def _channel_outcome_parked(channel_ref: str, tab: str) -> Optional[dict]:
+    """The learned permanent condition for (channel, tab), or None.
+
+    None is the honest "we have no memory" answer -- NOT "this channel has no
+    videos". A caller that conflates the two is exactly how an empty listing
+    gets cached and the caption sweep concludes a live channel is empty, so
+    the skip below returns an empty listing that is explicitly marked as
+    un-saturated, never as a verified-empty channel.
+    """
+    try:
+        from services import archive_db
+
+        return archive_db.channel_outcome_parked(channel_ref, tab)
+    except Exception:
+        logger.debug("channel outcome lookup failed for %s/%s", channel_ref, tab, exc_info=True)
+        return None
+
+
+def _learn_channel_outcome_from_exc(channel_ref: str, tab: str, exc: BaseException) -> Optional[str]:
+    """Record a PERMANENT, channel-attributable outcome. Returns the code.
+
+    Two guards, both load-bearing:
+
+      * only PERMANENT_CODES are learned. A bot wall is IP state, not a
+        verdict about this channel (the distinction dc01ea3 had to make for
+        the age gate), and "Offline" resolves on its own -- parking either
+        would hide a channel that recovers.
+      * the message must actually NAME this channel (yt-dlp renders these as
+        "[youtube:tab] @handle/tab: ..."). Without that check a failure
+        unrelated to the channel would be attributed to it, and the skip path
+        would act on a verdict nobody made.
+    """
+    try:
+        from services import archive_db
+
+        text = f"{type(exc).__name__}: {exc}"
+        code = ytdlp_outcomes.classify(text)
+        if not ytdlp_outcomes.is_permanent(code):
+            return None
+        if ytdlp_outcomes.channel_from_message(text) is None:
+            return None
+        archive_db.learn_channel_outcome(channel_ref, tab, code)
+        logger.info(
+            "youtube channel %s tab %s learned a permanent condition (%s) — "
+            "future cycles skip it; releasable via release_channel_outcome",
+            channel_ref, tab, code,
+        )
+        return code
+    except Exception:
+        logger.debug("channel outcome learn failed for %s/%s", channel_ref, tab, exc_info=True)
+        return None
+
+
+def release_learned_channel_outcome(channel_ref: str, tab: str | None = None) -> int:
+    """Release learned (channel, tab) conditions. All tabs when tab is None.
+
+    The escape hatch that makes the park safe to have: a channel can gain a
+    /streams tab later, and a park that could not be released would hide live
+    content forever. Durable, so it works across a restart for a park written
+    before it.
+    """
+    try:
+        from services import archive_db
+
+        return archive_db.release_channel_outcome(channel_ref, tab)
+    except Exception:
+        logger.debug("channel outcome release failed for %s", channel_ref, exc_info=True)
+        return 0
+
+
+def _empty_listing(
+    playlist: str,
+    return_has_more: bool,
+    return_crawl_saturation: bool,
+) -> Any:
+    """The listing shape a remembered skip returns.
+
+    Deliberately reports crawl_saturated=True: the walk made NO request, so
+    coverage is UNKNOWN, and a caller that consumed this as a verified-empty
+    channel would cache "this channel has no streams" off a value we never
+    measured. has_more is False because there is nothing more to page to.
+    """
+    if return_crawl_saturation:
+        return [], False, True
+    if return_has_more:
+        return [], False
+    return []
 
 
 def _content_kind_for_playlist(kind: PlaylistKind) -> str:
@@ -662,6 +763,26 @@ def list_channel_videos_sync(
     pl = playlist if playlist in ("videos", "shorts", "streams") else "videos"
     pl_url = channel_playlist_url(channel_ref, pl)
     fetch_failed = False
+
+    # LEARNED SKIP (before the governor, on purpose). A channel with no
+    # /streams tab — or one that 404s — answers identically every cycle. The
+    # live error ring carried 144 "does not have a streams tab" + 54 channel
+    # 404s, retried every ~12 min since 2026-09-04, each costing a governor
+    # token, a yt-dlp spawn and ~8s to re-learn nothing.
+    #
+    # The check sits ABOVE the token draw, not below it: a remembered skip
+    # makes no request, so charging it a rate-governor token would tax the
+    # budget for work never done, and it would make the token count lie about
+    # real egress. The learned state is durable (archive_db's
+    # youtube_channel_outcomes) and RELEASABLE, because a channel can gain a
+    # streams tab later — see archive_db.release_channel_outcome.
+    #
+    # Only PERMANENT_CODES are learned or skipped. A bot wall or a live
+    # "Offline" is transient and would hide a channel that recovers, so those
+    # stay out of this table by construction (ytdlp_outcomes.PERMANENT_CODES).
+    if _channel_outcome_parked(channel_ref, pl):
+        return _empty_listing(playlist, return_has_more, return_crawl_saturation)
+
     # Governor entry point: one token per channel-tab walk. extract_flat makes
     # this ONE listing request, not one per entry, and the inner pageToken
     # fan-out is not observable from here — so the token is drawn here, once,
@@ -682,6 +803,11 @@ def list_channel_videos_sync(
         logger.debug("youtube playlist %s failed: %s", pl, exc)
         info = None
         fetch_failed = True
+        # Learn only what is permanent AND channel-attributable. A bot wall
+        # names no channel (it is IP state) and a live state is transient, so
+        # neither can be parked on this channel without inventing a verdict
+        # about a video instead.
+        _learn_channel_outcome_from_exc(channel_ref, pl, exc)
 
     entries = (info or {}).get("entries") or []
     for e in entries:
