@@ -60,14 +60,18 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $env:GIT_OPTIONAL_LOCKS = '0'
+# Same reason as the report: "0,1h" beside "18 lanes" is unreadable.
+[System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::InvariantCulture
 
+# $here is the directory this script lives in, which is scripts/. The report it
+# reuses is a sibling, not its parent.
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$scriptDir = Split-Path -Parent $here
+$repoRoot = Split-Path -Parent $here
 
-. (Join-Path $scriptDir 'workspace-status.ps1')
+. (Join-Path $here 'workspace-status.ps1')
 
 if (-not $Repo) {
-  $Repo = (git -C $scriptDir rev-parse --show-toplevel 2> $null | Select-Object -First 1)
+  $Repo = (git -C $here rev-parse --show-toplevel 2> $null | Select-Object -First 1)
   if ($Repo) { $Repo = "$Repo".Trim() }
 }
 if (-not $Repo) { Write-Error 'cannot resolve a repository (pass -Repo <path>)'; exit 1 }
@@ -230,9 +234,13 @@ switch ($Action) {
     $coll = @(Get-LaneCollisions -Lanes $parsed.lanes)
     if ($coll.Count -gt 0) {
       Write-Output ("COLLISIONS n={0}" -f $coll.Count)
-      foreach ($c in $coll) { Write-Output ("  {0} {1} <-> {2} {3}  [{4}]" -f $c.lane_a, $c.glob_a, $c.lane_b, $c.glob_b, $c.kind) }
+      foreach ($c in $coll) {
+        Write-Output ("  {0} {1} <-> {2} {3}  [{4}]" -f $c.lane_a, $c.glob_a, $c.lane_b, $c.glob_b, $c.kind)
+        Write-Output ("     two lanes hold the same repo-relative path uncommitted; separate worktrees today, but a merge conflict the moment both commit it")
+      }
     }
-    if ($quiet.Count -gt 0) { exit 2 }
+    # A collision is as actionable as a quiet lane, so it must not exit 0.
+    if ($quiet.Count -gt 0 -or $coll.Count -gt 0) { exit 2 }
     exit 0
   }
 }
