@@ -153,18 +153,76 @@ codeintel search "callers of schedule_youtube_window_hls_mux"
 - The error log retains the latest 500 sanitized error records; the running API exposes them at `GET /api/errors/latest?limit=500`.
 - Dev supervisor stdout/stderr logs: `tmp\vodrip-devall-api.log` and `tmp\vodrip-devall-web.log`.
 
+## The live archive.db lives on H: (learned 2026-10-04)
+
+**There are three `archive.db` files on this machine and the app opens exactly one: `H:\VOD.RIP-data\archive.db`.** The other two are orphaned predecessors. Every count read from either of them is wrong.
+
+| path | size | last write | status |
+|---|---|---|---|
+| `H:\VOD.RIP-data\archive.db` | 7.5 GB | written continuously | **LIVE — the one the app opens** |
+| `G:\VOD.RIP-data\archive.db` | 486 MB | 2026-09-17 | orphan (migrated away) |
+| `%APPDATA%\VOD.RIP\archive.db` | 139 MB | 2026-09-16 | orphan (migrated away) |
+
+This has already caused three wrong reports. An orchestrator read the `%APPDATA%` orphan, found no `rate_limit_events` table, and reported twice — with a formatted table — that rate history was inert in production. It is not: the live archive has that table with 33 rows. A backlog plan was then built on the orphan (1,161 videos / 3,723.6 hours). The live archive holds 12,715 videos / 27,631 hours / 1,216 videos with transcripts. A third agent re-read the orphan and repeated the first error. (Measured read-only on 2026-10-04. The live DB keeps growing — re-measure, do not reuse these totals.)
+
+### How the path is resolved
+
+```text
+_db_path()                            archive_db.py:340
+├─ VODRIP_ARCHIVE_DB (env)            archive_db.py:341   — unset
+└─ data_dir() / "archive.db"          archive_db.py:356
+   ├─ VODRIP_DATA_DIR (env)           disk_hygiene.py:169 — unset
+   ├─ settings.data_dir               disk_hygiene.py:174 — "" in the live settings.json
+   └─ auto tier (speed-first)         disk_hygiene.py:180-183
+      fastest_disk()                  disk_detect.py:131  — answers "H:"
+      → <drive>\VOD.RIP-data
+```
+
+Every override is unset and `settings.data_dir` is empty on this box, so the answer falls all the way through to the auto tier: `H:\VOD.RIP-data\archive.db`.
+
+`_migrate_db_to_data_dir()` (`archive_db.py:374`) is what walked the database along that chain — `%APPDATA%` → `G:` on 2026-09-17, then `G:` → `H:` later — **copying** at each step and leaving every predecessor behind.
+
+### The rule
+
+**The log directory and the database directory are resolved by different code and can disagree.** Logs go to `%APPDATA%\VOD.RIP\logs\errors.jsonl` (`backend/services/error_log.py:62` — anchored to appdata, not to the data disk); the database goes through `disk_hygiene.data_dir()`. `errors.jsonl` is written there daily, which is exactly what keeps the stale `%APPDATA%` archive looking like the production one.
+
+- **Logs in `%APPDATA%` do NOT mean the database is in `%APPDATA%`.**
+- **Before quoting any count, name the exact file you read** — full path, in the same breath as the number.
+- When in doubt, re-run the check below. Do not reason from log freshness.
+
+### Verify which file is live (read-only)
+
+```powershell
+Get-ChildItem "$env:APPDATA\VOD.RIP\archive.db","G:\VOD.RIP-data\archive.db","H:\VOD.RIP-data\archive.db" -EA SilentlyContinue | Sort-Object LastWriteTime -Desc | ForEach-Object { "{0,-46} {1,6:0} MB  {2:yyyy-MM-dd HH:mm}" -f $_.FullName, ($_.Length/1MB), $_.LastWriteTime }
+```
+
+The newest write is the live archive. On 2026-10-04 that was `H:\VOD.RIP-data\archive.db`, 7,537 MB, 2026-10-04 22:25 — the two orphans were 17 days and 18 days stale respectively. This command only stats files; it opens nothing and writes nothing.
+
+### The orphans
+
+Both predecessors are still on disk and still mislead readers. **Deleting them is the owner's decision, not a worker's** — do not clear them as part of "cleanup" or disk-pressure work. Report their existence; let the owner choose.
+
+### Second disagreement: which drive wins for models
+
+`best_model_cache_drive()` (`backend/services/disk_hygiene.py:286-305`) answers **`H:`** in practice. It is speed-first — fastest bus tier with >= 8 GB free, ties broken by free space — and H: is NVMe with more room than G:. The "Heavy project data lives OFF C:" section below documents **`G:`** for models.
+
+**The code and that section currently disagree, and that section is not authoritative for which drive wins** — read the function, not the prose. Not resolved here: which drive should own model weights is a separate decision for the owner, not a documentation fix.
+
 ## Heavy project data lives OFF C: (learned 2026-08-15)
 
-**C: is the system NVMe — never put heavy project artifacts there.** It has ~15GB free and the repo bloated to 18.7GB on C: (9GB `dist` + 9GB `_internal` + `build` + a stray CUDA-13 stack). Disk map:
+**C: is the system NVMe — never put heavy project artifacts there.** It had **13.2 GB free** when measured on 2026-10-04 (this number drifts; re-measure rather than quoting it) and the repo bloated to 18.7GB on C: (9GB `dist` + 9GB `_internal` + `build` + a stray CUDA-13 stack). Disk map:
 
-- **G:** (NVMe) — models `G:\VOD.RIP-models`, data `G:\VOD.RIP-data`, benchmarks `G:\vodrip-bench`, downloads
-- **H:** (NVMe) — frozen bundle installs `H:\VOD.RIP-build\dist\VOD-RIP` (build-install.ps1 default)
+- **G:** (NVMe, ~10 GB free on 2026-10-04) — `G:\VOD.RIP-models`, `G:\VOD.RIP-data`, `G:\vodrip-bench`, downloads
+- **H:** (NVMe, ~109 GB free on 2026-10-04) — **the live `archive.db` is here**, plus frozen bundle installs `H:\VOD.RIP-build\dist\VOD-RIP` (build-install.ps1 default)
 - **I:** (HDD, 4TB) — bulk/long-term storage
+
+**Which drive a given artifact lands on is decided by code, not by this map.** `disk_hygiene.best_model_cache_drive()` and the auto tier inside `data_dir()` pick the fastest bus tier with enough free space, ties broken by free space — so with G: at ~10 GB and H: at ~109 GB, both answers land on **`H:`**. Models and the live database currently sit on `H:`; G: retains older copies (including the orphaned predecessors listed above). Do not hand-place a model or database on G: expecting the app to find it there, and do not read this map as authoritative for which drive wins — read the resolver.
 
 Rules:
 
 - Build outputs (`dist\`, `_internal\`, `build\`) are gitignored and regenerable — **delete them from the repo after `scripts/build-install.ps1` installs to H:**; do not leave ~18GB of build trees on C:.
-- Model caches, ASR scratch, benchmark audio, VOD archives, DBs → **G:** stable roots (NOT `G:\Temp` — pytest's session-end wipe deletes `vodrip-*` there; `tempfile.gettempdir()` = `G:\Temp` on this box).
+- Model caches, ASR scratch, benchmark audio → the models root chosen by `disk_hygiene.best_model_cache_drive()` (currently `H:\VOD.RIP-models`); NOT `G:\Temp`, where pytest's session-end wipe deletes `vodrip-*` (`tempfile.gettempdir()` = `G:\Temp` on this box).
+- **VOD archives and DBs → the live `archive.db` is on `H:`** (`H:\VOD.RIP-data`), resolved by the auto tier in `disk_hygiene.data_dir()`. The two files on `%APPDATA%` and `G:` are **orphaned predecessors** — see "The live archive.db lives on H:" above. Do not treat them as the archive.
 - `vod-rip.spec` skips `cu13`/`*-cu13` nvidia packages (stack pinned to cu12) — keep it; a cu13 tree adds ~850MB to every bundle.
 - Pagefile: `H:\pagefile.sys` 16GB fixed (same NVMe as C: so it mounts at boot).
 
@@ -197,7 +255,7 @@ Ship the frozen app as a **small CPU-only base** plus a **separate, versioned GP
 - **CPU ASR stays** — the base is "CPU-only" w.r.t. NVIDIA/GPU only; it still ships CPU parakeet (sherpa-onnx CPU wheel). Do NOT claim "no ASR on CPU."
 
 #### Current primitives in-tree (reuse these)
-- ASR engine: **Parakeet** (sherpa-onnx `nemo_transducer`, TDT v3, `int8`) — the ONLY engine; faster-whisper was removed (`backend/services/archive_transcribe.py`, `backend/requirements.txt`).
+- ASR engine: **Parakeet Redux** (sherpa-onnx `nemo_transducer`; `Codyfederer/sherpa-onnx-nemo-parakeet-redux`, `archive_transcribe.py:1645`) — the ONLY engine; faster-whisper was removed (`backend/services/archive_transcribe.py`, `backend/requirements.txt`). **Swapped in 2026-10-04:** Redux is the 1.58-bit ternary re-quantisation of NVIDIA's `parakeet-tdt-0.6b-v3` — same architecture, same tokenizer, same 25 European languages, ~178 MB of weights instead of ~1.2 GB. It beats the int8 original on the 25-language FLEURS aggregate (WER 10.56 vs 11.62) and on long-form TEDLIUM (2.51 vs 2.71), is slightly worse on English (6.55 vs 6.26), and is notably worse in background noise (9.04 vs 6.72) — the real cost of the swap on noisy Twitch/Kick VODs, accepted for the size and RSS win. Redis weights live inside `encoder.onnx` as `MatMulNBits` 4-bit blocks (no separate `.int8.onnx` file — that name means the model never resolves and every ASR job fails as "no model"). **The int8 model is deliberately KEPT on disk** (`H:\VOD.RIP-models\parakeet-models\sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8`, ~639 MB) so a revert is a constant change rather than a re-download — **do not delete it until the Photon path is proven in the field.**
 - CPU: `sherpa-onnx>=1.13.0` (base). GPU: `backend/requirements-gpu.txt` → `sherpa-onnx==1.13.4+cuda12.cudnn9` + `nvidia-{cublas,cuda-runtime,cufft,curand,cudnn}-cu12`; `archive_transcribe._ensure_cuda_libs` exposes the DLL dirs.
 - Existing release scripts: `scripts/sign-release.ps1` (Authenticode) and `scripts/build-install.ps1` (build+install to H:). A runtime-archive builder and a sha256-hashing step do NOT exist yet — entries below marked `[FUTURE]` are proposed, not yet written.
 
