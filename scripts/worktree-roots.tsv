@@ -1,0 +1,61 @@
+# worktree-roots.tsv — VOD.RIP worktree PLACEMENT source of truth (project-scoped).
+#
+# WHY THIS FILE IS A SEPARATE COPY AND NOT A ROW IN THE SHARED PORTFOLIO MANIFEST
+#   The shared manifest lives at I:\!manager\worktree-roots.tsv and is owned by
+#   the `manager` repo. It ALREADY carries a VOD.RIP row (`vod-rip`), but:
+#     * it is another repo's file, and this task did not establish ownership of it;
+#     * its ceiling for vod-rip is 1, MEASURED 2026-09-25 against 1 stray, and that
+#       ceiling is documented as a RATCHET that "must only ever be LOWERED" — it is
+#       long stale against the 42 registered worktrees measured 2026-10-05, so
+#       editing it from here would mean silently rewriting another repo's number;
+#     * a tool that resolves its truth from a path OUTSIDE this repo breaks when
+#       that path moves, and makes this project's topology unauditable from the repo.
+#   => A repo-scoped manifest is used and the shared file is left UNTOUCHED.
+#      The shared row still says `G:/vod-rip-wt`; THIS file says `I:/vod-rip-wt`.
+#      Anyone using the shared manifest (WORKTREE_ROOTS=I:/!manager/...) gets G: —
+#      which is NOT where this project's lanes live. The divergence is recorded in
+#      the shared manifest's successor, not by rewriting the shared file.
+#      Reconciling the two is an owner decision, named in docs/worktree-topology.md.
+#
+# SHAPE (TSV, tab-separated, `#` comments; same six fields as upstream so this file
+# is a DROP-IN for I:\!manager\worktree-roots.tsv and WORKTREE_ROOTS can point here)
+#   project <TAB> repo_root <TAB> worktree_root <TAB> ceiling <TAB> ceiling_note <TAB> superseded_roots
+#
+#   project           id used by scripts/wt-new.sh --project
+#   repo_root         `git -C <repo_root> rev-parse --show-toplevel`, MEASURED
+#   worktree_root     the ONLY place this project's worktrees may be created.
+#                     MUST be absolute X:/..., basename ending in `-wt`, no `.`/`..`
+#                     (scripts/lib/worktree-roots.sh:wtroot_validate_root).
+#   ceiling           maximum STRAYS: registered worktrees OUTSIDE worktree_root,
+#                     EXCLUDING this project's own primary checkout (which is outside
+#                     every `<project>-wt` root by construction, so it can never be
+#                     driven to 0). Ratchet, never a hiding place: only ever LOWERED.
+#   ceiling_note      free text, no tabs.
+#   superseded_roots  `;`-separated roots the owner has explicitly RETIRED. A retired
+#                     root may still HOLD worktrees; it is excluded from the
+#                     ambiguity wall in wt-new.sh. A declared, revertible act.
+#
+# DRIVE RULE — WHY I: AND NOT G: OR H:  (this is the one number that matters here)
+#   1. `git worktree move` is SAME-DRIVE-ONLY. All 42 registered VOD.RIP worktrees
+#      are on I: (`I:/TEMP/wt-*`), MEASURED 2026-10-05. A root on G: or H: would
+#      make the ENTIRE migration impossible — not slow, IMPOSSIBLE — because git
+#      refuses a cross-drive move outright. So the root MUST share I:.
+#   2. `archive/` is a SIBLING of wip/unsure/done under this same root, so it is on
+#      the same drive as the root for free and a later `git worktree move` into
+#      `archive/` works. That is the whole reason for the `archive/` state existing.
+#   3. Free space, MEASURED 2026-10-05: C: 13.1 GB · G: 7.4 GB · H: 102.1 GB ·
+#      I: 49.0 GB. I: has room; G: does not have room for a 1.29 GiB tree set plus
+#      growth, and H: would break rule 1.
+#   HONESTY NOTE: this is a REORGANISATION, not a storage move. Moving worktrees
+#   within I: reclaims ZERO bytes. The 1.29 GiB measured across the 42 worktrees
+#   stays exactly where it was. See docs/worktree-topology.md for the real numbers.
+#
+# STATES (verified by reading wtroot_states, not assumed — 2026-10-05)
+#   wip  unsure  done  archive
+#   wip     = unmerged branch with real work
+#   unsure  = merged-or-not but DIRTY, or state that cannot be established
+#   done    = proven merged into main AND a clean tree
+#   archive = genuinely abandoned, reason recorded
+#
+# project  |  repo_root  |  worktree_root  |  ceiling  |  ceiling_note  |  superseded_roots
+vod-rip	C:/Users/Administrador/Desktop/Nova pasta (3)/TESTE/VOD.RIP	I:/vod-rip-wt	10	POST-MIGRATION, measured 2026-10-05. Before the migration: 43 registered rows = 42 strays + primary, and ALL 42 under I:/TEMP. After: 32 moved into I:/vod-rip-wt/{wip,unsure,done}, 10 left in place because they carry a node_modules JUNCTION (git worktree remove destroyed a dependency tree through one, so they are not moved either), + primary = 11 outside. STRAYS therefore settle at 10, and that is this ceiling. ratchet target 0 once the junctioned lanes are retired by the owner, which no script here may do.	I:/TEMP

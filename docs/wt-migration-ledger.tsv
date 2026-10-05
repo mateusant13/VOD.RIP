@@ -1,0 +1,9 @@
+# wt-migration-ledger.tsv — one row per `git worktree move`, the record that makes the
+# worktree-topology migration reversible. Read docs/worktree-topology.md for the procedure.
+#
+# NOTHING IN THIS FILE IS A DELETION RECORD. Every row describes a MOVE. To undo one row,
+# run:  scripts/wt-restore.sh --lane <lane>      (moves it back to <original_path>)
+# To undo the whole migration:  scripts/wt-restore.sh --all
+#
+# lane<TAB>original_path<TAB>state<TAB>new_path<TAB>sha<TAB>moved_utc
+wt-ytgate	I:/TEMP/wt-ytgate	done	I:/vod-rip-wt/done/wt-ytgate	dbc6513527fb44386408b7877b2dd28df8a5f462	2026-10-05T06:34:49Z
