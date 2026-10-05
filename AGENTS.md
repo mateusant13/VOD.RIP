@@ -242,6 +242,8 @@ Both predecessors are still on disk and still mislead readers. **Deleting them i
 
 The live archive keeps growing, so the 244 is a floor, not a fixed number. Re-measure before acting on either row, and re-derive it the same way: open the live archive and each orphan with `file:<path>?mode=ro` (read-only URI — never a plain `connect()`, and never a `mode=rw` write), read `(platform, video_id)` from `videos` in each, and set-difference. Do not run a merge on the owner's initiative either — that writes to the live database.
 
+**A fresh `-shm` mtime is the "someone just read the wrong file" signal.** A WAL database's `-shm` is touched when a connection opens it, so it moves even for a read-only open, while `archive.db` and `-wal` stay put. Measured 2026-10-05 07:11: `G:\VOD.RIP-data\archive.db-shm` had been written 06:39 that morning while its `archive.db` and `-wal` were frozen at 2026-09-17 — a process had the **wrong archive** open half an hour earlier. The trap is not historical. Check that mtime before recommending a delete, and read a fresh one as an active reader rather than a stale file.
+
 ### Decoys: `vodrip.db` is not the database
 
 The live data dir also holds a **`vodrip.db` that is 0 bytes** and referenced nowhere in the codebase — `grep vodrip.db` across `backend/` returns no matches. It sits *beside* the real archive rather than in a stale directory, which makes it the more dangerous of the four: a glob for `*.db` finds it, and it is the only one obviously empty. It is not a database and holds no rows. It is not an orphan predecessor either — it was never written to.
