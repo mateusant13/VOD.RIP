@@ -69,19 +69,31 @@ def fast_pace(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def isolate_deep_jobs():
-    """Deep jobs and the age-park registry are module-global; the no-captions
-    marker is PERSISTED per video. Clear all three, or one test's park
-    pre-skips the next test's video (they share a video id) and the whole
-    suite silently measures the wrong thing.
+    """Deep jobs are module-global; the age-park is PERSISTED (it is the video
+    row's no-captions marker + its age-gate kind, read back through
+    _age_parked_map). Clear all three, or one test's park pre-skips the next
+    test's video (they share a video id) and the whole suite silently measures
+    the wrong thing.
+
+    The park is no longer a process-lifetime dict, so "clearing" it means
+    clearing the persisted marker — which is exactly why the restart tests work.
+    A legacy in-process park dict is still cleared when this build has one, so
+    the isolation this fixture exists for does not depend on which build runs.
     """
     def _clear() -> None:
         with archive._deep_jobs_lock:
             archive._deep_jobs.clear()
-        with archive._age_park_lock:
-            archive._age_parked.clear()
+        legacy_park = getattr(archive, "_age_parked", None)
+        if isinstance(legacy_park, dict):
+            with archive._age_park_lock:  # pre-fix builds only
+                legacy_park.clear()
         try:
             archive_db.execute(
                 "UPDATE videos SET captions_unavailable_at = NULL "
+                "WHERE platform = 'youtube'"
+            )
+            archive_db.execute(
+                "UPDATE videos SET captions_unavailable_kind = NULL "
                 "WHERE platform = 'youtube'"
             )
         except Exception:  # noqa: BLE001 — schema/DB probe, never a test failure

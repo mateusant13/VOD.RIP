@@ -651,13 +651,16 @@ async def archive_videos(platform: str | None = None, channel: str | None = None
     # Age-gated videos show WHY they have no captions and what would fix it.
     # The marker alone (captions_unavailable_at) is indistinguishable from an
     # ordinary "no captions" verdict, which is what made the age-gate loop
-    # invisible to the user.
-    parked = _age_parked_snapshot()
+    # invisible to the user — the stored kind is what separates them, and it
+    # lives on the row, so this still answers after a restart. `code` is the
+    # stable contract; `reason` is the sentence derived from it.
+    parked = _age_parked_map()
     if parked:
         for v in videos:
-            reason = parked.get(str(v.get("video_id") or ""))
-            if reason:
-                v["captions_parked_reason"] = reason
+            code = parked.get(str(v.get("video_id") or ""))
+            if code:
+                v["captions_parked_reason_code"] = code
+                v["captions_parked_reason"] = _age_gate_park_text(code)
     return {"videos": videos}
 
 
@@ -1804,6 +1807,7 @@ CREATE TABLE IF NOT EXISTS deep_jobs (
     truncated INTEGER NOT NULL DEFAULT 0,
     no_transcript INTEGER NOT NULL DEFAULT 0,
     error TEXT,
+    age_parked INTEGER NOT NULL DEFAULT 0,
     started_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 )
@@ -1813,11 +1817,27 @@ CREATE TABLE IF NOT EXISTS deep_jobs (
 def _ensure_deep_jobs_table() -> None:
     """Lazy-create deep_jobs on the resolved DB path. Keyed per DB path so a
     test that rebinds VODRIP_ARCHIVE_DB to a fresh scratch DB still gets the
-    table (an unconditional module-global cache would skip it)."""
+    table (an unconditional module-global cache would skip it).
+
+    age_parked is added ADDITIVELY for a deep_jobs table created before this
+    column existed (CREATE TABLE IF NOT EXISTS is a no-op on it): a sweep
+    parked its videos into the video rows regardless, so the count has to land
+    somewhere durable too, or a recovered job reports 0 — the exact hole this
+    column closes. Pre-existing rows default to 0 (that run's per-run count was
+    never persisted; the per-video parks themselves are intact and reported
+    through /api/archive/videos)."""
     path = str(archive_db._db_path())
     if path in _deep_jobs_tables_ok:
         return
     archive_db.execute(_DEEP_JOBS_DDL)
+    try:
+        cols = {str(r["name"]) for r in archive_db.query("PRAGMA table_info(deep_jobs)")}
+        if "age_parked" not in cols:
+            archive_db.execute(
+                "ALTER TABLE deep_jobs ADD COLUMN age_parked INTEGER NOT NULL DEFAULT 0"
+            )
+    except sqlite3.Error as exc:
+        logger.debug("deep_jobs age_parked migration failed: %s", exc)
     _deep_jobs_tables_ok.add(path)
 
 
@@ -1827,15 +1847,16 @@ def _deep_jobs_put(row: dict) -> None:
     archive_db.execute(
         """INSERT INTO deep_jobs
              (id, kind, handle, handle_norm, query, status, scanned, total,
-              cursor, truncated, no_transcript, error, started_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              cursor, truncated, no_transcript, error, age_parked, started_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
              kind=excluded.kind, handle=excluded.handle,
              handle_norm=excluded.handle_norm, query=excluded.query,
              status=excluded.status, scanned=excluded.scanned,
              total=excluded.total, cursor=excluded.cursor,
              truncated=excluded.truncated, no_transcript=excluded.no_transcript,
-             error=excluded.error, updated_at=excluded.updated_at""",
+             error=excluded.error, age_parked=excluded.age_parked,
+             updated_at=excluded.updated_at""",
         (
             row.get("id", ""), row.get("kind", "deep"),
             row.get("handle", ""), row.get("handle_norm", ""),
@@ -1843,6 +1864,7 @@ def _deep_jobs_put(row: dict) -> None:
             int(row.get("scanned", 0)), int(row.get("total", 0)),
             row.get("cursor"), int(row.get("truncated", 0)),
             int(row.get("no_transcript", 0)), row.get("error"),
+            int(row.get("age_parked", 0)),
             row.get("started_at", datetime.now(timezone.utc).isoformat(timespec="seconds")),
             datetime.now(timezone.utc).isoformat(timespec="seconds"),
         ),
@@ -2035,22 +2057,28 @@ def _yt_default_budget() -> int:
 # ingest, and _unpark_age_gated_if_authenticated() clears it the moment an
 # authenticated YouTube session exists (the same predicate the sibling fix and
 # the cookie-bridge `youtube_authenticated` signal use).
-_age_park_lock = threading.Lock()
-_age_parked: dict[str, str] = {}  # video_id -> user-facing park reason
+#
+# The park is read from the video row, never from a process-lifetime set: an
+# earlier version kept {video_id: reason} in a module dict, so the UI rendered
+# the parked state until the app restarted and then silently forgot it (and
+# reported age_parked 0 for every DB-recovered job). The marker row is the only
+# state; the sentence the UI shows is derived from the stored code below.
 
 
-def _age_gate_park_reason() -> str:
-    """Why this video has no captions, and what would fix it.
+def _age_gate_park_code() -> str:
+    """WHICH age-gate park this is, as a persisted code.
 
     Deliberately the same two states the age gate already reports elsewhere
     (youtube_diag.age_gate_actionable_message on the download/transcribe job
     error, and the cookie-bridge `youtube_authenticated` signal): no session
     configured vs a session that was rejected. They need different user
     actions, and the caption sweep is the path that actually hit the gate, so
-    the reason has to name the remedy here too. Wording is caption-specific —
-    the download path's "cannot be downloaded/watched" verb is wrong for a
-    video that simply has no captions.
-    """
+    the classification has to name the remedy here too.
+
+    A CODE, not a sentence: this value is what lands in
+    videos.captions_unavailable_kind, and the sentence the UI renders is
+    derived from it at read time (_age_gate_park_text). A client can then
+    branch on the state without matching English prose."""
     try:
         from services.youtube_session import youtube_session_configured
 
@@ -2059,38 +2087,71 @@ def _age_gate_park_reason() -> str:
         # A failed probe must never claim "you are signed in".
         configured = False
     if not configured:
+        return archive_db.CAPTIONS_PARK_AGE_GATE_NO_SESSION
+    return archive_db.CAPTIONS_PARK_AGE_GATE_SESSION_REJECTED
+
+
+def _age_gate_park_text(code: str) -> str:
+    """The user-facing reason for a persisted park code.
+
+    Wording is caption-specific — the download path's "cannot be
+    downloaded/watched" verb is wrong for a video that simply has no captions.
+    Derived from the STORED code, never from a fresh probe: the park records
+    what was true when the video was gated, and the text must match that code
+    or the UI would describe a state the row does not hold."""
+    if code == archive_db.CAPTIONS_PARK_AGE_GATE_SESSION_REJECTED:
         return (
-            "Age-restricted video — YouTube serves no captions to an "
-            "anonymous request, and no signed-in YouTube session is "
-            "configured. Open Settings > Cookie Bridge, sign in to YouTube, "
-            "then re-run the caption sweep."
+            "Age-restricted video — the configured YouTube session was rejected "
+            "(YouTube rotates account cookies while a YouTube tab is open), so no "
+            "captions could be read. Sign in again from a private window via "
+            "Settings > Cookie Bridge, then re-run the caption sweep."
         )
     return (
-        "Age-restricted video — the configured YouTube session was rejected "
-        "(YouTube rotates account cookies while a YouTube tab is open), so no "
-        "captions could be read. Sign in again from a private window via "
-        "Settings > Cookie Bridge, then re-run the caption sweep."
+        "Age-restricted video — YouTube serves no captions to an "
+        "anonymous request, and no signed-in YouTube session is "
+        "configured. Open Settings > Cookie Bridge, sign in to YouTube, "
+        "then re-run the caption sweep."
     )
 
 
 def _park_age_gated(video_id: str) -> str:
     """Park one age-gated video: per-video marker + the user-facing reason.
 
-    Stamping captions_unavailable_at is what terminates the retry: the sweep's
+    The marker (captions_unavailable_at) plus its age-gate classification is
+    what terminates the retry AND what makes the park durable: the sweep's
     covered/marked probe (_deep_covered_ids) and the scheduler's
     _youtube_covered both pre-skip a fresh marker, so the video is attempted
-    once and then left alone. Returns the reason for the caller to surface.
-    """
-    reason = _age_gate_park_reason()
+    once and then left alone — and the UI can still say WHY after a restart,
+    because the state it reads is the row, not a process-lifetime set. Returns
+    the reason for the caller to surface."""
+    code = _age_gate_park_code()
     vid = str(video_id or "")
-    with _age_park_lock:
-        _age_parked[vid] = reason
     try:
-        archive_db.mark_captions_unavailable("youtube", vid)
+        archive_db.mark_captions_unavailable("youtube", vid, kind=code)
     except Exception:
         logger.debug("age-gate park marker failed for %s", vid, exc_info=True)
     logger.info("youtube %s age-gated — parked (no captions without a signed-in session)", vid)
-    return reason
+    return _age_gate_park_text(code)
+
+
+def _age_parked_map(*, fresh_only: bool = True) -> dict[str, str]:
+    """{video_id: park code} straight from the video rows.
+
+    The park is PERSISTED, so this is the same set before and after a restart
+    and for a job recovered from the database. fresh_only honours the same
+    cooldown the sweep does: a stamp older than the no-captions freshness
+    window is a re-attempt candidate, not a park, so it must not be reported to
+    the user as one (it would claim a sign-in is still pending when the next
+    sweep is already retrying the video on its own)."""
+    try:
+        rows = archive_db.age_gate_parked_videos(
+            "youtube",
+            fresh_seconds=_deep_marker_fresh_s() if fresh_only else None,
+        )
+    except Exception:
+        logger.debug("age-parked read failed", exc_info=True)
+        return {}
+    return {r["video_id"]: r["kind"] for r in rows}
 
 
 def _unpark_age_gated_if_authenticated() -> int:
@@ -2101,11 +2162,11 @@ def _unpark_age_gated_if_authenticated() -> int:
     session appears. Clearing the marker makes the video a caption-sweep
     candidate again — that is the difference between "sign in and it works"
     and a video that never processes. Returns how many were released.
-    """
-    with _age_park_lock:
-        parked = list(_age_parked)
-    if not parked:
-        return 0
+
+    Reads the PERSISTED park list, not an in-process set: the release has to
+    work for a park written before the restart, or the promise the park text
+    makes ("sign in and re-run the sweep") would be a lie across exactly the
+    restart the park now survives."""
     try:
         from services.youtube_session import youtube_session_configured
 
@@ -2114,14 +2175,13 @@ def _unpark_age_gated_if_authenticated() -> int:
     except Exception:
         return 0  # probe failed — stay parked rather than hammer
     released = 0
-    for vid in parked:
+    for row in archive_db.age_gate_parked_videos("youtube"):
+        vid = row["video_id"]
         try:
             archive_db.clear_captions_unavailable("youtube", vid)
         except Exception:
             logger.debug("age-gate un-park failed for %s", vid, exc_info=True)
             continue
-        with _age_park_lock:
-            _age_parked.pop(vid, None)
         released += 1
     if released:
         logger.info(
@@ -2132,9 +2192,14 @@ def _unpark_age_gated_if_authenticated() -> int:
 
 
 def _age_parked_snapshot() -> dict[str, str]:
-    """{video_id: reason} for the parked age gates, for the API surface."""
-    with _age_park_lock:
-        return dict(_age_parked)
+    """{video_id: reason} for the parked age gates, for the API surface.
+
+    Derived from the persisted marker rows, so it survives a restart: the old
+    process-lifetime set made the UI forget the park (and the count) the moment
+    the app restarted. Reason text is derived from the stored code."""
+    return {
+        vid: _age_gate_park_text(code) for vid, code in _age_parked_map().items()
+    }
 
 
 def _paced_caption_fetch(video_id: str, handle: str) -> bool:
@@ -2279,6 +2344,7 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
         try:
             with _deep_jobs_lock:
                 _scanned, _no_transcript = counters["scanned"], counters["no_transcript"]
+                _age_parked_n = counters["age_parked"]
                 _total = job.get("total", 0)
                 _trunc = int(bool(job.get("truncated", False)))
                 _status = job.get("status", "running")
@@ -2289,6 +2355,13 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
                 "query": query, "status": _status,
                 "scanned": _scanned, "total": _total, "cursor": _scanned,
                 "truncated": _trunc, "no_transcript": _no_transcript,
+                # Persisted next to its sibling per-run counters: the parks
+                # themselves are on the video rows, but a per-RUN count is not
+                # reconstructible from them (they outlive the run, are shared
+                # with other sweeps, and are cleared on release) — so it is
+                # stored where no_transcript already lives, not in a
+                # process-lifetime set.
+                "age_parked": _age_parked_n,
                 "error": _err,
             })
         except Exception as exc:
@@ -2638,7 +2711,7 @@ def _deep_status_from_db(job_id: str) -> list:
     _ensure_deep_jobs_table()
     return archive_db.query(
         """SELECT id, status, scanned, total, cursor, truncated,
-                  no_transcript, error
+                  no_transcript, error, age_parked
            FROM deep_jobs WHERE id=? LIMIT 1""",
         (job_id,),
     )
@@ -2715,6 +2788,7 @@ async def archive_search_deep_start(body: DeepSearchRequest):
         "scanned": resume_scanned,
         "total": resume_total,
         "no_transcript": resume_no_transcript,
+        "age_parked": 0,
         "truncated": False,
         "truncated_results": False,
         "results": [],
@@ -2782,9 +2856,12 @@ async def archive_search_deep_status(job_id: str):
         "scanned": int(r["scanned"] or 0),
         "total": int(r["total"] or 0),
         "no_transcript": int(r["no_transcript"] or 0),
-        # Not persisted in deep_jobs (the counter is per-run in-memory state),
-        # so a DB-recovered job reports 0 rather than inventing a number.
-        "age_parked": 0,
+        # Persisted beside no_transcript (see _persist), so a job recovered
+        # from the DB reports what the run actually parked. This used to be a
+        # hardcoded 0 with a comment claiming the number was unknowable: it is
+        # knowable, and the UI showed a live sweep's parked state and then
+        # forgot it across the restart.
+        "age_parked": int(r["age_parked"] or 0),
         "truncated": bool(int(r["truncated"] or 0)),
         "truncated_results": False,
         "results": [],
