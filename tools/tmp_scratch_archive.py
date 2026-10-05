@@ -9,6 +9,18 @@ Liveness is *measured*, never asserted:
   * a Windows Restart Manager handle query (a file held open by a process)
   * a hard protected-name list that can never be moved
 
+And non-candidacy is read from the repo's own vocabulary, not guessed:
+  * a path in `git ls-files` has version history, so it is recoverable by
+    definition and is *not* dead scratch. That is a fact, not a heuristic.
+
+`classify` prints four labels, each a positive statement:
+
+  live         demonstrably in use right now: protected, growing, or held open
+  tracked      versioned by git -- never dead scratch, whatever its mtime
+  dead-scratch declared dead AND measured idle -- the only thing archive moves
+  unsure       NOT a synonym for "not scratch": an untracked, idle file that
+               only an owner can adjudicate. Each entry names the decision.
+
 Subcommands:
   classify   read-only inventory + classification of tmp/ and loose root files
   archive    move dead-scratch into tmp/_archive/<date>/ and write MANIFEST.tsv
@@ -22,6 +34,7 @@ import ctypes
 import hashlib
 import os
 import shutil
+import subprocess
 import sys
 import time
 from ctypes import wintypes
@@ -192,6 +205,122 @@ def open_handlers(path: str):
 
 
 # ---------------------------------------------------------------------------
+# The repo's own vocabulary: what git already knows.
+#
+# "provenance not established" is not a useful verdict on AGENTS.md. A path in
+# `git ls-files` has version history, so it is recoverable by definition and is
+# not dead scratch. That is a fact about the repo, not a guess about intent.
+# Only what git does NOT track, is not declared dead, and is not in use is a
+# genuine open question -- and that is the sole meaning of `unsure`.
+# ---------------------------------------------------------------------------
+
+GIT_TIMEOUT = 30
+_git_cache = {}
+
+
+def _git(root, args, nul):
+    """One read-only git call. Returns paths, or None on any failure at all.
+
+    Every failure mode is a None, never an exception: this tool is read-only
+    reporting for a live working tree, and a missing git must not take it down.
+    """
+    cmd = ["git", "-C", root] + list(args) + (["-z"] if nul else [])
+    try:
+        out = subprocess.run(
+            cmd, capture_output=True, timeout=GIT_TIMEOUT, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    text = out.stdout.decode("utf-8", "replace")
+    if nul:
+        return [p for p in text.split("\0") if p]
+    return [p.strip() for p in text.splitlines() if p.strip()]
+
+
+def git_vocabulary(root=None):
+    """(tracked, ignored_untracked) as sets of repo-relative POSIX paths.
+
+    Returns (None, None) when `root` is not a git work tree or git is missing.
+    Callers then degrade to "every untracked idle file is an open question",
+    which is the old behaviour -- correct, and noisy. The toplevel check keeps
+    a sandbox under some other repo's tree from inheriting that repo's answers.
+    """
+    root = os.path.normpath(root or REPO_ROOT)
+    if root in _git_cache:
+        return _git_cache[root]
+    result = (None, None)
+    top = _git(root, ["rev-parse", "--show-toplevel"], nul=False)
+    if top and len(top) == 1 and os.path.normpath(top[0]).lower() == root.lower():
+        tracked = _git(root, ["ls-files"], nul=True)
+        ignored = _git(
+            root, ["ls-files", "--others", "--ignored", "--exclude-standard"], nul=True
+        )
+        if tracked is not None and ignored is not None:
+            result = (set(tracked), set(ignored))
+    _git_cache[root] = result
+    return result
+
+
+# ---------------------------------------------------------------------------
+# classification vocabulary
+# ---------------------------------------------------------------------------
+
+# How much breaks if you archive the wrong file, by what the file IS.
+KIND_LOSS = {"record": 2, "script": 1, "log": 0, "other": 1}
+KIND_BY_EXT = {
+    ".json": "record",
+    ".md": "record",
+    ".csv": "record",
+    ".log": "log",
+    ".py": "script",
+    ".mjs": "script",
+    ".js": "script",
+    ".ps1": "script",
+    ".ts": "script",
+}
+BAND_MEANING = {
+    "p1": "act first",
+    "p2": "worth an answer",
+    "p3": "cheap either way",
+}
+
+
+def artifact_kind(rel_path):
+    """`record` (a unique account of something that happened), `log`, `script`,
+    `other`. Deliberately coarse: this orders questions, it does not judge."""
+    return KIND_BY_EXT.get(os.path.splitext(os.path.basename(rel_path))[1].lower(), "other")
+
+
+def consequence(size, kind):
+    """Rank one open question: (score 0..4, band, reclaim_component).
+
+    Two independent factors, because size alone ranks the wrong things. A
+    350 KB superseded supervisor log deserves an owner's attention (bytes) but
+    archiving it costs nothing, because it is regenerable. A 4 KB audit receipt
+    is not worth the bytes, but archiving it destroys the only copy of a
+    record. Summing them puts the expensive decision at the top instead of
+    merely the biggest file, and still separates a 350 KB log from a 731 B
+    utility script.
+    """
+    kb = size / 1024.0
+    reclaim = 0 if kb < 16 else (1 if kb < 256 else 2)
+    score = min(reclaim + KIND_LOSS.get(kind, 1), 4)
+    band = "p1" if score >= 3 else ("p2" if score == 2 else "p3")
+    return score, band, reclaim
+
+
+def decision_for(ignored):
+    """The choice actually on the table. `unsure` must never mean "unknown"."""
+    if ignored is True:
+        return "gitignored + untracked: archive it, or keep it because something still uses it"
+    if ignored is False:
+        return "untracked and NOT ignored: git add it (never committed), or archive it"
+    return "git vocabulary unavailable, so tracked/ignored is unknown: archive it, or keep it"
+
+
+# ---------------------------------------------------------------------------
 # inventory
 # ---------------------------------------------------------------------------
 
@@ -227,8 +356,11 @@ def _listdir(path: str):
         return []
 
 
-def inventory(window: int = 0):
+def inventory(window: int = 0, vocab=None):
     """Return one record per candidate file, with liveness evidence attached."""
+    if vocab is None:
+        vocab = git_vocabulary()
+    tracked, ignored = vocab
     recs = []
     todo = []
     tmp = os.path.join(REPO_ROOT, "tmp")
@@ -258,6 +390,10 @@ def inventory(window: int = 0):
             growing = before[p] != (st.st_size, st.st_mtime)
         handles = open_handlers(p)
         held = bool(handles) if handles is not None else None
+        is_tracked = (r in tracked) if tracked is not None else None
+        is_ignored = (r in ignored) if tracked is not None else None
+        kind = artifact_kind(r)
+        score, band, _reclaim = consequence(st.st_size, kind)
         if r in PROTECTED:
             cls = "live"
             why = "protected: on the never-move list"
@@ -272,9 +408,15 @@ def inventory(window: int = 0):
         elif growing or held:
             cls = "live"
             why = "growing=%s held=%s" % (growing, held)
+        elif is_tracked:
+            # Authoritative, and it outranks staleness: a tracked path has
+            # version history, so moving it out of the tree is a working-tree
+            # change nobody asked for, and `git checkout` brings it back.
+            cls = "tracked"
+            why = "git-tracked: version history, recoverable by definition, never dead scratch"
         else:
             cls = "unsure"
-            why = "provenance not established; left in place"
+            why = "%s [%s %s]" % (decision_for(is_ignored), band, BAND_MEANING[band])
         recs.append(
             {
                 "rel": r,
@@ -285,6 +427,11 @@ def inventory(window: int = 0):
                 "why": why,
                 "growing": growing,
                 "handles": handles,
+                "tracked": is_tracked,
+                "ignored": is_ignored,
+                "kind": kind,
+                "score": score,
+                "band": band,
             }
         )
     return recs
@@ -373,26 +520,90 @@ def write_manifest(date: str, rows, archive_root: str, created: str):
 # ---------------------------------------------------------------------------
 
 
+CLASS_BLURB = (
+    ("live", "in use right now: protected, growing, or held open"),
+    ("tracked", "versioned by git - never dead scratch, whatever its mtime"),
+    ("dead-scratch", "declared dead and measured idle - the only thing archive moves"),
+    ("unsure", "NEEDS A DECISION: untracked, idle, owner must choose"),
+)
+
+
 def cmd_classify(args):
     recs = inventory(window=args.window)
+    tracked, _ignored = git_vocabulary()
     counts = {}
     for r in recs:
         counts[r["class"]] = counts.get(r["class"], 0) + 1
+    unsure = [r for r in recs if r["class"] == "unsure"]
+    unsure.sort(key=lambda x: (-x["score"], -x["size"], x["rel"]))
+
     print("repo_root: %s" % REPO_ROOT)
     if args.window:
-        print("liveness window: %ds" % args.window)
-    print("")
-    print("%-36s %-13s %10s  %s" % ("PATH", "CLASS", "BYTES", "EVIDENCE"))
-    print("-" * 118)
-    for r in sorted(recs, key=lambda x: (x["class"], x["rel"])):
-        h = r["handles"]
-        hs = "n/a" if h is None else (", ".join("pid=%s" % k for k in h) or "-")
         print(
-            "%-36s %-13s %10d  growing=%-5s held=%-12s %s"
-            % (r["rel"], r["class"], r["size"], r["growing"], hs, r["why"])
+            "liveness: %ds mtime-delta window + Restart Manager open handles"
+            % args.window
         )
+    if tracked is None:
+        print("git vocabulary: UNAVAILABLE (not a git work tree?) - cannot rule anything out")
+    else:
+        print("git vocabulary: %d tracked path(s) from `git ls-files`" % len(tracked))
+
+    print("")
+    print("HEADLINE")
+    for cls, blurb in CLASS_BLURB:
+        print("  %-13s %4d  %s" % (cls, counts.get(cls, 0), blurb))
+
+    if unsure:
+        bands = {}
+        for r in unsure:
+            bands[r["band"]] = bands.get(r["band"], 0) + 1
+        print(
+            "  %-13s      %s"
+            % (
+                "",
+                "  ".join(
+                    "%s=%d(%s)" % (b, bands.get(b, 0), BAND_MEANING[b]) for b in ("p1", "p2", "p3")
+                ),
+            )
+        )
+
+    if unsure:
+        print("")
+        top = len(unsure) if args.top <= 0 else min(args.top, len(unsure))
+        print("DECISIONS (%d) ranked by consequence, not by size alone:" % len(unsure))
+        for r in unsure[:top]:
+            print(
+                "  %-3s %-40s %9d  %6.1fK  %-6s %s"
+                % (
+                    r["band"],
+                    r["rel"],
+                    r["size"],
+                    r["size"] / 1024.0,
+                    r["kind"],
+                    r["why"],
+                )
+            )
+        if top < len(unsure):
+            print("  ... and %d more (--top 0 lists all, --detail lists every file)" % (
+                len(unsure) - top
+            ))
+
     print("")
     print("counts: " + ", ".join("%s=%d" % (k, counts[k]) for k in sorted(counts)))
+
+    if args.detail:
+        print("")
+        print("DETAIL")
+        print("%-36s %-13s %10s  %s" % ("PATH", "CLASS", "BYTES", "EVIDENCE"))
+        print("-" * 118)
+        for r in sorted(recs, key=lambda x: (x["class"], x["rel"])):
+            h = r["handles"]
+            hs = "n/a" if h is None else (", ".join("pid=%s" % k for k in h) or "-")
+            print(
+                "%-36s %-13s %10d  growing=%-5s held=%-12s %s"
+                % (r["rel"], r["class"], r["size"], r["growing"], hs, r["why"])
+            )
+
     missing = missing_candidates(recs)
     if missing:
         print("")
@@ -691,6 +902,12 @@ def main(argv=None):
 
     p = sub.add_parser("classify")
     p.add_argument("--window", type=int, default=30, help="mtime-delta seconds (0=skip)")
+    p.add_argument(
+        "--detail", action="store_true", help="also print every file, not just the decisions"
+    )
+    p.add_argument(
+        "--top", type=int, default=12, help="max decisions to print (0 = all)"
+    )
     p.set_defaults(fn=cmd_classify)
 
     p = sub.add_parser("archive")
