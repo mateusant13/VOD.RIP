@@ -651,6 +651,40 @@ const ptBR: Record<string, string> = {
   'cookieAuto.toggleInfo': 'Mostra a oferta de instalação com um clique quando os cookies ainda não estão pareados. Desligue para instalar apenas manualmente.',
   'cookieBridge.silentHint': 'Instalação automática em segundo plano — sem abrir chrome://extensions nem pastas na frente de você. Fallback manual: abra extensões, modo desenvolvedor ON, arraste VOD.RIP-cookies.',
   'cookieBridge.manualOpen': 'Instalar manualmente (abrir extensões)',
+  // ── Cookie Bridge panel: pairing, consent, age-gate capture ────────
+  // The age-gate capture recipe below is the instruction the owner follows to
+  // release a parked video, so the two invariants in it must survive every
+  // translation: a private window is never cookie-rotated, and the Cookie
+  // Bridge must stay enabled or the exported session never reaches the app.
+  'Delete all stored bridge cookies from this machine?':
+    'Excluir todos os cookies do bridge armazenados nesta máquina?',
+  'Could not clear stored cookies — backend unreachable?':
+    'Não foi possível limpar os cookies armazenados — o backend está inacessível?',
+  'Could not reach the backend to start install.':
+    'Não foi possível contatar o backend para iniciar a instalação.',
+  // Pre-existing: this button's key is a Portuguese literal in the source, not
+  // an English one. pt-BR is therefore the identity mapping and only `es` gains
+  // a real translation. Correcting the source string would change the `en`
+  // render, which this dictionary-only change must not do.
+  'Apagar cookies armazenados': 'Apagar cookies armazenados',
+  'YouTube sign-in:': 'Login do YouTube:',
+  'session connected — age-restricted videos will work.':
+    'sessão conectada — vídeos com restrição de idade vão funcionar.',
+  'not connected — age-restricted videos cannot be downloaded. Sign in below.':
+    'não conectado — vídeos com restrição de idade não podem ser baixados. Entre no YouTube abaixo.',
+  'unknown': 'desconhecido',
+  'Age-restricted video? Capture the YouTube session so it lasts':
+    'Vídeo com restrição de idade? Capture a sessão do YouTube para que ela dure',
+  'Open a private/incognito window and sign in to YouTube. Use a throwaway account if you can — a personal account risks a YouTube ban.':
+    'Abra uma janela privada/incógnita e entre no YouTube. Use uma conta descartável, se puder — uma conta pessoal corre o risco de ser banida do YouTube.',
+  'In that same window, go to https://www.youtube.com/robots.txt':
+    'Nessa mesma janela, acesse https://www.youtube.com/robots.txt',
+  'Export the youtube.com cookies from this window, then close the window immediately — a closed window is never rotated.':
+    'Exporte os cookies de youtube.com desta janela e feche-a imediatamente — uma janela fechada nunca sofre rotação de cookies.',
+  'Keep the Cookie Bridge enabled so the session reaches this app. Do NOT point an exporter at a normal tab: those cookies rotate within hours.':
+    'Mantenha o Cookie Bridge ativado para que a sessão chegue a este app. NÃO aponte um exportador para uma aba normal: esses cookies são rotacionados em poucas horas.',
+  'Then retry the failed job — it picks up on its own.':
+    'Depois repita o trabalho que falhou — ele retoma sozinho.',
   // ── Age-gated caption park (captionsPark.*) ───────────────────────
   'captionsPark.title': 'Legendas pausadas',
   'captionsPark.noSession':
@@ -1403,6 +1437,36 @@ const es: Record<string, string> = {
   'cookieAuto.toggleInfo': 'Ofrece la instalación con un clic cuando las cookies aún no están vinculadas. Desactívalo para instalar solo manualmente.',
   'cookieBridge.silentHint': 'Instalación automática en segundo plano — sin abrir chrome://extensions ni ventanas de carpetas delante de ti. Fallback manual: abre extensiones, modo desarrollador ON, arrastra VOD.RIP-cookies.',
   'cookieBridge.manualOpen': 'Instalar manualmente (abrir extensiones)',
+  // ── Cookie Bridge panel: pairing, consent, age-gate capture ────────
+  // The age-gate capture recipe below is the instruction the owner follows to
+  // release a parked video, so the two invariants in it must survive every
+  // translation: a private window is never cookie-rotated, and the Cookie
+  // Bridge must stay enabled or the exported session never reaches the app.
+  'Delete all stored bridge cookies from this machine?':
+    '¿Eliminar todas las cookies del bridge guardadas en este equipo?',
+  'Could not clear stored cookies — backend unreachable?':
+    '¿No se pudieron limpiar las cookies guardadas: backend inaccesible?',
+  'Could not reach the backend to start install.':
+    'No se pudo contactar con el backend para iniciar la instalación.',
+  'Apagar cookies armazenados': 'Eliminar cookies guardadas',
+  'YouTube sign-in:': 'Inicio de sesión de YouTube:',
+  'session connected — age-restricted videos will work.':
+    'sesión conectada: los vídeos con restricción de edad funcionarán.',
+  'not connected — age-restricted videos cannot be downloaded. Sign in below.':
+    'no conectada: los vídeos con restricción de edad no se pueden descargar. Inicia sesión abajo.',
+  'unknown': 'desconocido',
+  'Age-restricted video? Capture the YouTube session so it lasts':
+    '¿Vídeo con restricción de edad? Captura la sesión de YouTube para que dure',
+  'Open a private/incognito window and sign in to YouTube. Use a throwaway account if you can — a personal account risks a YouTube ban.':
+    'Abre una ventana privada/incógnito e inicia sesión en YouTube. Usa una cuenta desechable si puedes: una cuenta personal arriesga un baneo de YouTube.',
+  'In that same window, go to https://www.youtube.com/robots.txt':
+    'En esa misma ventana, ve a https://www.youtube.com/robots.txt',
+  'Export the youtube.com cookies from this window, then close the window immediately — a closed window is never rotated.':
+    'Exporta las cookies de youtube.com desde esa ventana y ciérrala de inmediato: una ventana cerrada nunca ve sus cookies rotadas.',
+  'Keep the Cookie Bridge enabled so the session reaches this app. Do NOT point an exporter at a normal tab: those cookies rotate within hours.':
+    'Mantén el Cookie Bridge activado para que la sesión llegue a esta app. NO apuntes un exportador a una pestaña normal: esas cookies rotan en pocas horas.',
+  'Then retry the failed job — it picks up on its own.':
+    'Luego reintenta el trabajo que falló: lo retoma por sí solo.',
   // ── Age-gated caption park (captionsPark.*) ───────────────────────
   'captionsPark.title': 'Subtítulos pausados',
   'captionsPark.noSession':
@@ -1513,7 +1577,10 @@ const es: Record<string, string> = {
 // botGate.* and progress.* keys are namespaced (not English sentences), so
 // they need explicit English entries — every other key falls back to the key itself.
 
-const DICTS: Record<Lang, Record<string, string>> = { en, 'pt-BR': ptBR, es }
+// Exported so src/i18n.test.ts can assert real locale parity over the key
+// sets. Read-only for every caller; t() is the only supported way to look a
+// string up.
+export const DICTS: Record<Lang, Record<string, string>> = { en, 'pt-BR': ptBR, es }
 
 let currentLang: Lang = 'en'
 const listeners = new Set<() => void>()
