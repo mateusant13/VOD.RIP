@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState } from 'react';
+import { useCallback, useLayoutEffect, useRef, useState } from 'react';
 import type { CSSProperties, Dispatch, MutableRefObject, PointerEvent as ReactPointerEvent, SetStateAction } from 'react';
 
 export type PanelPos = { x: number; y: number };
@@ -283,7 +283,16 @@ export function PanelResizeHandles({
 }) {
   // Hosts with overflow hidden/clip can't paint handles outside their padding
   // box — detect that and hug the inner edge instead of straddling the border.
-  const hostRef = useRef<HTMLDivElement>(null);
+  // The containing block (offsetParent) is the panel the handles are positioned
+  // against — the DOM parent may be an inner scroll container. It is read into
+  // STATE through a STABLE callback ref rather than left in a plain ref: an
+  // effect can only re-run on something it declares, and a ref mutation is not
+  // a render. An unstable callback ref would re-attach every render, re-set the
+  // host, re-run the effect — the very loop this shape removes.
+  const [host, setHost] = useState<HTMLElement | null>(null);
+  const attachHost = useCallback((el: HTMLDivElement | null) => {
+    setHost((el ? (el.offsetParent as HTMLElement | null) : null) ?? null);
+  }, []);
   const [clipsOverflow, setClipsOverflow] = useState(false);
   // The colored band is the host's box-shadow offset — measure the REAL
   // rendered shadow (platformCardShadow: 4/6px per platform, up to 8/18px for
@@ -294,26 +303,45 @@ export function PanelResizeHandles({
   // four corners (nw/ne the top edge, ne/se the right…), so the tightest edge
   // is the one that constrains them.
   const [gutterPx, setGutterPx] = useState(RESIZE_CORNER_PX);
+  // Last measurement actually committed. Two properties make this effect safe:
+  //
+  //  1. It depends on [host], so it runs once per containing block instead of
+  //     after every render. It previously had NO dependency array at all.
+  //  2. A measurement that did not change commits nothing.
+  //
+  // Together they are what stops the loop that crashed the app. This file
+  // ships a transition system (disablePanelTransitions/restorePanelTransitions),
+  // and `getComputedStyle` on a TRANSITIONED box-shadow returns a different
+  // interpolated value on every frame. Measure-then-setState, unconditionally,
+  // after every render, against a value that changes every frame, is unbounded:
+  // React reports "Maximum update depth exceeded" and unmounts the tree, which
+  // is exactly what ChannelExplorePopup did.
+  const measuredRef = useRef<{ clips: boolean; band: number; gutter: number } | null>(null);
   useLayoutEffect(() => {
-    // The containing block (offsetParent) is the panel the handles are
-    // positioned against — the DOM parent may be an inner scroll container.
+    if (!host) return;
     // overflow: clip hosts can still paint outside their padding box as long
     // as the clip margin covers the strip overhang; anything less clips.
-    const host = hostRef.current?.offsetParent as HTMLElement | null;
-    if (!host) return;
     const cs = getComputedStyle(host);
     const margin = parseFloat(cs.overflowClipMargin) || 0;
-    setClipsOverflow(cs.overflow === 'hidden' || (cs.overflow === 'clip' && margin < CARD_BORDER_PX));
-    setBandPx(maxBoxShadowBandPx(cs.boxShadow));
-    setGutterPx(
-      Math.min(
+    const next = {
+      clips: cs.overflow === 'hidden' || (cs.overflow === 'clip' && margin < CARD_BORDER_PX),
+      band: maxBoxShadowBandPx(cs.boxShadow),
+      gutter: Math.min(
         parseFloat(cs.paddingTop) || 0,
         parseFloat(cs.paddingRight) || 0,
         parseFloat(cs.paddingBottom) || 0,
         parseFloat(cs.paddingLeft) || 0,
       ),
-    );
-  });
+    };
+    const prev = measuredRef.current;
+    if (prev && prev.clips === next.clips && prev.band === next.band && prev.gutter === next.gutter) {
+      return;
+    }
+    measuredRef.current = next;
+    setClipsOverflow(next.clips);
+    setBandPx(next.band);
+    setGutterPx(next.gutter);
+  }, [host]);
 
   // Cursor is applied directly per edge (not group-hover): the handle is always
   // inside its own panel, so no .group ancestor is required — fixes main panel.
@@ -348,7 +376,7 @@ export function PanelResizeHandles({
   });
 
   return (
-    <div ref={hostRef} className="absolute inset-0 z-50 pointer-events-none" aria-hidden="true">
+    <div ref={attachHost} className="absolute inset-0 z-50 pointer-events-none" aria-hidden="true">
       <div {...edgeProps('n', { top: -edgeOff, left: edgePad, right: edgePad, height: 6 }, 'cursor-ns-resize')} />
       <div {...edgeProps('s', { bottom: -bandOff, left: -bandOff, right: -bandOff, height: bandW }, 'cursor-ns-resize')} />
       <div {...edgeProps('e', { right: -bandOff, top: -bandOff, bottom: -bandOff, width: bandW }, 'cursor-ew-resize')} />
