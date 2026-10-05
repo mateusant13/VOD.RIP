@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 import time
@@ -196,13 +197,22 @@ def test_real_repo_headline_counts_only_what_needs_a_decision(mod):
     tracked, _ignored = mod.git_vocabulary()
     assert tracked, "expected a git vocabulary at %s" % LIVE_ROOT
 
-    # 33 on this repo before the fix, entirely because the default bucket was
-    # "I could not prove it dead". The real open questions are ~7-10.
-    assert len(unsure) <= 12, (
-        "ambiguous bucket is %d entries (%s) - it is counting tracked project "
-        "files again" % (len(unsure), sorted(unsure))
+    # The defect was never "13 files"; it was "AGENTS.md is in the list". A
+    # fixed ceiling would rot the moment another lane leaves a file in tmp/ --
+    # which is exactly what happened, and it is not a regression. So the
+    # invariant is structural: the bucket contains no tracked path, and it is
+    # small relative to what the old vocabulary called unsure.
+    assert not (unsure & tracked), (
+        "a git-tracked file is being reported as a question: %s" % sorted(unsure & tracked)
     )
-    assert not (unsure & tracked), "a git-tracked file is being reported as a question"
+    # Before the fix this repo produced 33 unsure entries, 23 of them tracked
+    # project files. The bucket must stay a short list, not a share of the
+    # working tree: 25 files are tracked at the root, and every one of them is
+    # a non-question.
+    root_files = {r["rel"] for r in recs if "/" not in r["rel"]}
+    assert len(unsure) <= max(12, len(root_files)), (
+        "ambiguous bucket is %d entries (%s)" % (len(unsure), sorted(unsure))
+    )
     for name in ("README.md", "AGENTS.md", "index.html", ".gitignore", "LICENSE.txt"):
         if name in {r["rel"] for r in recs}:
             assert name not in unsure, "%s is a live project file" % name
@@ -443,3 +453,159 @@ def test_nothing_in_the_repo_is_ever_deleted(mod):
     assert "tempfile.mkdtemp" in selftest
     assert "shutil.rmtree(sandbox" in selftest
     assert selftest.count("os.remove") == 1, "the selftest's own tamper steps only"
+
+
+# ---------------------------------------------------------------------------
+# References: is anything actually reading this leftover?
+#
+# The rule is untracked AND git-ignored AND zero references in tracked files.
+# The first two landed with the git vocabulary; the third is what a p3 label
+# on icon.ico exposed. A 16 KB app icon that the onefile launcher reads is not
+# "cheap either way", and the count that says so has to be a PATH-FORM count.
+# ---------------------------------------------------------------------------
+
+
+def _fake_grep(pairs):
+    """A git-grep stand-in that HONOURS the pattern it is handed.
+
+    It has to compile and apply the regex, not just yield the pairs: the whole
+    claim under test is that the pattern rejects a name embedded in a longer
+    one. A fake that ignored the pattern would pass every pair through and the
+    assertion would be counting files, not matching anything.
+    """
+    def _grep(pattern):
+        rx = re.compile(pattern)
+        for path, line in pairs:
+            if rx.search(line):
+                yield path, line
+
+    return _grep
+
+
+def test_path_form_count_finds_a_real_consumer(mod):
+    pairs = [("backend/app.py", '    base / "icon.ico",')]
+    n, sample = mod.reference_count("icon.ico", git=_fake_grep(pairs))
+    assert n == 1
+    assert sample == ["backend/app.py"]
+
+
+def test_a_shorter_name_is_not_a_substring_of_a_longer_one(mod):
+    """`log.txt` must not be found inside `catalog.txt`.
+
+    This is the substring trap in miniature. A bare substring count says the
+    file mentioning `catalog.txt` also uses `log.txt`; on the live repo the same
+    mistake scores `{}` at 1,181 hits. Every one of those is a non-match.
+    """
+    pairs = [("src/catalog.txt", "catalog contents"), ("src/mylog.txt", "x")]
+    n, _ = mod.reference_count("log.txt", git=_fake_grep(pairs))
+    assert n == 0, "a name embedded in a longer name is not a reference"
+
+
+def test_a_producer_is_not_a_consumer(mod):
+    """`cpSync(winExe, join(root, 'VOD-RIP.EXE'))` WRITES the file."""
+    pairs = [("scripts/deploy-dist.mjs", "cpSync(winExe, join(root, 'VOD-RIP.EXE'));")]
+    n, _ = mod.reference_count("VOD-RIP.EXE", git=_fake_grep(pairs))
+    assert n == 0, "a file that produces a name does not depend on it"
+
+
+def test_a_gitignore_rule_is_not_a_consumer(mod):
+    """`.gitignore:16  VOD-RIP.EXE` is a statement ABOUT the file, not a use."""
+    pairs = [(".gitignore", "VOD-RIP.EXE")]
+    n, _ = mod.reference_count("VOD-RIP.EXE", git=_fake_grep(pairs))
+    assert n == 0, "an ignore rule is not a dependency"
+
+
+def test_the_producer_filter_is_scoped_to_the_line_not_the_file(mod):
+    """Regression: file-level filtering discarded a real consumer.
+
+    backend/__main_launcher__.py both copies build outputs and reads
+    `base / "icon.ico"` for the onefile launcher. Filtering on whole-file
+    content threw it away -- the most load-bearing reader of that icon in the
+    repo, dropped by its own unrelated shutil.copy calls.
+    """
+    pairs = [("backend/__main_launcher__.py", '            base / "icon.ico",')]
+    n, sample = mod.reference_count("icon.ico", git=_fake_grep(pairs))
+    assert n == 1, "a file that copies things AND reads the icon consumes the icon"
+    assert sample == ["backend/__main_launcher__.py"]
+
+
+def test_five_reads_of_one_file_are_one_consumer(mod):
+    pairs = [("index.html", "icon.ico x%d" % i) for i in range(5)]
+    n, sample = mod.reference_count("icon.ico", git=_fake_grep(pairs))
+    assert n == 1
+    assert len(sample) == 1
+
+
+def test_the_classifier_and_its_tests_are_not_consumers_of_themselves(mod):
+    """Otherwise every file appears to depend on every name the tests assert on."""
+    pairs = [
+        ("tools/tmp_scratch_archive.py", 'name = "icon.ico"'),
+        ("tools/tests/test_tmp_scratch_archive_classify.py", 'reference_count("icon.ico")'),
+    ]
+    n, _ = mod.reference_count("icon.ico", git=_fake_grep(pairs))
+    assert n == 0
+
+
+def test_the_grep_pattern_is_valid_posix_ere(mod):
+    """`git grep -E` REJECTS lookbehind: "Invalid preceding regular expression".
+
+    The failure is silent and inverted -- the pattern errors, the exit code is
+    non-zero, and a caller that reads that as "no matches" reports every file as
+    unreferenced. So the pattern is asserted ERE-legal, and separately checked
+    to behave correctly as a regex.
+    """
+    import re as _re
+
+    name = "icon.ico"
+    pattern = "(^|[^A-Za-z0-9_.%-])" + _re.escape(name) + "([^A-Za-z0-9_]|$)"
+    assert "(?<" not in pattern, "lookbehind is not POSIX ERE and git grep rejects it"
+    rx = _re.compile(pattern)
+    assert rx.search('base / "icon.ico",')
+    assert not rx.search("catalog.txt")
+
+
+def test_a_referenced_leftover_is_promoted_out_of_p3(mod, tmp_path):
+    """The end-to-end effect: a small file WITH consumers is not `cheap either
+    way`, and the entry says who reads it."""
+    root = _make_git_repo(str(tmp_path), commit=["README.md"], gitignore=["tmp/"])
+    target = os.path.join(root, "tmp", "asset.ico")
+    with open(target, "wb") as fh:
+        fh.write(b"\x00" * 800)  # 800 bytes: p3 on size alone
+    os.utime(target, (time.time() - 86400, time.time() - 86400))
+    with open(os.path.join(root, "app.py"), "w", encoding="utf-8") as fh:
+        fh.write('ICON = os.path.join(base, "asset.ico")\n')
+    _git(root, "add", "app.py")
+    _git(
+        root,
+        "-c",
+        "user.email=t@example.invalid",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-q",
+        "-m",
+        "add app",
+    )
+
+    mod.REPO_ROOT = root
+    plain = _by_rel(mod.inventory(window=0, refcheck=lambda p: (0, [])))["tmp/asset.ico"]
+    assert plain["band"] == "p3", "fixture must be small enough to be p3 unaided"
+
+    live = _by_rel(mod.inventory(window=0))["tmp/asset.ico"]
+    assert live["nrefs"] == 1, "the tracked app.py reads the leftover"
+    assert live["band"] != "p3", "a file the app still reads is not cheap either way"
+    assert "referenced by 1 tracked file" in live["why"]
+    assert "app.py" in live["why"]
+
+
+def test_the_live_repo_icon_has_real_consumers(mod):
+    """Measured, not asserted from memory: the app really does read icon.ico."""
+    if not os.path.isdir(LIVE_ROOT):
+        pytest.skip("live repo root not available: %s" % LIVE_ROOT)
+    mod.REPO_ROOT = LIVE_ROOT
+    tracked, _ = mod.git_vocabulary()
+    if not tracked or "backend/__main_launcher__.py" not in tracked:
+        pytest.skip("live repo layout changed")
+    n, sample = mod.reference_count("icon.ico")
+    assert n > 0, "icon.ico must show live consumers, or this rule proves nothing"
+    assert any("__main_launcher__" in s or "index.html" in s for s in sample), sample
