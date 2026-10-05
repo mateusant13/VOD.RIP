@@ -565,6 +565,243 @@ def _mark_stalled_job_failed(reason: str, logf) -> list[str]:
     return marked
 
 
+def _running_job_heartbeats() -> dict[str, str]:
+    """COALESCE(heartbeat, updated_at) per 'running' job — the SCHEDULING
+    signal, kept separate from the work marks on purpose (read-only)."""
+    try:
+        from services import archive_db
+
+        return {
+            str(r["id"]): str(r["hb"])
+            for r in archive_db.query(
+                "SELECT id, COALESCE(heartbeat, updated_at) AS hb "
+                "FROM archive_jobs WHERE status = 'running'"
+            )
+        }
+    except Exception:
+        return {}
+
+
+# --- job-liveness reaper: a heartbeat is not work -------------------------
+# WHY THIS EXISTS
+# update_job stamps archive_jobs.heartbeat on EVERY call, progress or not
+# (archive_db.update_job). The claim path re-stamps it too, and the download
+# watchdog's bare `update_job(job_id)` touch stamps it every 5 min with no
+# work at all. So the heartbeat says "a thread was scheduled", never "a
+# result was produced". _claim_next_job then decides staleness from that
+# column alone (COALESCE(heartbeat, updated_at) < cutoff).
+#
+# The production shape that leaks: a 'chat' row whose executor wedged. Its
+# heartbeat still advances — because the reclaim itself re-stamps it — so it
+# never ages out, and the reclaim's CAS flips running->running without
+# touching attempts or next_retry_at. attempts stays 0 forever, max_attempts
+# is never reached, and the row is relaunched every 2 h for as long as the DB
+# lives. The observed job was two months old with a same-day heartbeat.
+#
+# THE PREDICATE
+# A 'running' row is released only when ALL of these hold:
+#   1. its WORK marks (progress+status, never the heartbeat — see
+#      archive_db.running_job_work_marks) have not changed for the whole
+#      bound, AND
+#   2. the owning worker has burned less than the CPU floor over that same
+#      window, AND
+#   3. the row's heartbeat ADVANCED while the work marks were frozen — i.e.
+#      something is actively refreshing a job that is producing nothing.
+#
+# Clause 3 is what makes this catch an immortal row instead of racing the
+# existing reclaim for it: the re-stamp that keeps the job alive is the very
+# evidence that it is dead. It also means a row nobody touches is left to the
+# existing reclaim, which is the correct owner for that case.
+#
+# WHAT MAKES IT CONSERVATIVE
+#   * Both work AND CPU must be flat. This is the same conjunction as
+#     _stall_state: burning CPU counts as progress and restarts the clock, so
+#     the 7-14% CPU throttle (13.6x wall) cannot trip it — a throttled worker
+#     is slower, never motionless, and clears ~1.5 s CPU per window against a
+#     0.25 s floor.
+#   * The bound is derived from the longest HEALTHY gap between work marks
+#     (~300 s: an ASR chunk is 45.7 s worst-case wall, a twitch chat page
+#     under 429 backoff is 4-5 min) times a 4.5x safety factor. A working
+#     job re-marks orders of magnitude inside that.
+#   * Only status='running' rows are ever considered. A queued row is a
+#     queue, not a fault: the healthy backlog is untouchable by construction.
+#   * The release is a compare-and-set on status='running', so a job that
+#     moved between the read and the write is never clobbered.
+#   * The release goes through update_job(status='failed'), the EXISTING
+#     retry machinery, so the row gets attempts+1 and a next_retry_at
+#     backoff and lands terminal at max_attempts. Nothing is left running
+#     with no owner, and this reaper cannot invent a second retry vocabulary.
+_HEALTHY_MARK_GAP_S = 300.0
+_JOB_LIVENESS_SAFETY_FACTOR = 4.5
+JOB_LIVENESS_BOUND_S = round(
+    _HEALTHY_MARK_GAP_S * _JOB_LIVENESS_SAFETY_FACTOR, 1
+)  # == 1350.0 s
+JOB_LIVENESS_POLL_S = 60.0
+_JOB_LIVENESS_CPU_FLOOR_S = _STALL_CPU_FLOOR_S
+_JOB_LIVENESS_BOUND_ENV = "VODRIP_JOB_LIVENESS_BOUND_S"
+
+
+def _job_liveness_bound_s() -> float:
+    """The derived bound, overridable for the field and for tests (same
+    contract as _stall_bound_s)."""
+    raw = os.environ.get(_JOB_LIVENESS_BOUND_ENV, "").strip()
+    if raw:
+        try:
+            val = float(raw)
+            if val > 0:
+                return val
+        except (ValueError, OverflowError):
+            pass
+    return JOB_LIVENESS_BOUND_S
+
+
+def _job_liveness_state(
+    holder: dict,
+    now: float,
+    *,
+    work: str,
+    beat: str,
+    cpu_seconds: Optional[float],
+    bound_s: float = JOB_LIVENESS_BOUND_S,
+    cpu_floor_s: float = _JOB_LIVENESS_CPU_FLOOR_S,
+) -> Optional[str]:
+    """Pure per-job liveness verdict: None = healthy, else the reason.
+
+    Clock-injected and process-free, exactly like _stall_state, so the
+    decision is testable with no database and no clock. `holder` is the
+    per-job state dict the reaper keeps between ticks.
+    """
+    if holder.get("error"):
+        return holder["error"]  # latched: same verdict until acted on
+    if not holder.get("armed"):
+        holder["armed"] = True
+        holder["last_work"] = work
+        holder["last_beat"] = beat
+        holder["work_frozen_since"] = now
+        holder["cpu_baseline"] = cpu_seconds
+        return None
+    if work != holder["last_work"]:
+        # The job produced something. This is the ONLY unconditional reset.
+        holder["last_work"] = work
+        holder["last_beat"] = beat
+        holder["work_frozen_since"] = now
+        holder["cpu_baseline"] = cpu_seconds
+        return None
+    used = 0.0
+    if cpu_seconds is not None and holder["cpu_baseline"] is not None:
+        used = max(0.0, cpu_seconds - float(holder["cpu_baseline"]))
+    if used > cpu_floor_s:
+        # Burning CPU IS work: a throttled worker looks slow here, never
+        # motionless. Restart the clock for every row so the throttle can
+        # never be mistaken for a stall.
+        holder["work_frozen_since"] = now
+        holder["cpu_baseline"] = cpu_seconds
+        return None
+    if beat == holder["last_beat"]:
+        # Silent AND frozen: nobody is even pretending to work on it. Not
+        # this reaper's case — the existing stale-window reclaim owns it.
+        return None
+    if now - float(holder["work_frozen_since"]) < bound_s:
+        return None
+    # Frozen work past the bound AND a re-stamp landed in that window: a
+    # timestamp is being refreshed to keep a job that computes nothing.
+    held = now - float(holder["work_frozen_since"])
+    reason = (
+        f"job alive but not working: no progress for {int(held)}s and "
+        f"{used:.2f}s CPU while the heartbeat kept advancing"
+    )
+    holder["error"] = reason
+    return reason
+
+
+def _reclaim_lifeless_jobs(
+    logf, holders: dict, proc, *, bound_s: Optional[float] = None,
+) -> list[str]:
+    """One reaper tick: release every 'running' row the predicate condemns.
+
+    `holders` is the per-job state dict, persisted across ticks by the
+    caller. `proc` is the supervised child, whose CPU time is the
+    'is the worker doing anything at all' signal — the same reading the
+    stall watchdog takes. Read-only apart from the release itself.
+    """
+    from services import archive_db
+
+    if bound_s is None:
+        bound_s = _job_liveness_bound_s()
+    work_marks = archive_db.running_job_work_marks()
+    beats = _running_job_heartbeats()
+    cpu = _process_cpu_seconds(proc.pid)
+    now = time.monotonic()
+
+    # Drop holders for rows that are no longer running so the dict cannot
+    # grow without bound across a long-lived supervisor.
+    for job_id in list(holders):
+        if job_id not in work_marks:
+            holders.pop(job_id, None)
+
+    reclaimed: list[str] = []
+    for job_id, work in work_marks.items():
+        holder = holders.setdefault(job_id, {})
+        reason = _job_liveness_state(
+            holder, now, work=work, beat=beats.get(job_id, ""),
+            cpu_seconds=cpu, bound_s=bound_s,
+        )
+        if reason is None:
+            continue
+        holders.pop(job_id, None)
+        try:
+            # expect_status makes this a compare-and-set: if an executor
+            # moved the row since the read above, the update matches nothing
+            # and we leave it alone instead of clobbering real work.
+            ok = archive_db.update_job(
+                job_id, status="failed", error=reason[:400],
+                expect_status="running",
+            )
+        except Exception as exc:  # noqa: BLE001 - never kill the reaper
+            _log(logf, f"liveness: could not release job {job_id}: {exc}")
+            continue
+        if not ok:
+            _log(logf, f"liveness: job {job_id} moved on before release — left alone")
+            continue
+        after = archive_db.query(
+            "SELECT status, attempts, next_retry_at FROM archive_jobs WHERE id = ?",
+            (job_id,),
+        )
+        state = dict(after[0]) if after else {}
+        _log(
+            logf,
+            f"liveness: job {job_id} released -> status={state.get('status')} "
+            f"attempts={state.get('attempts')} "
+            f"next_retry_at={state.get('next_retry_at')}",
+        )
+        reclaimed.append(job_id)
+    return reclaimed
+
+
+def _job_liveness_reaper(
+    logf, proc: subprocess.Popen, stop_event: threading.Event,
+    bound_s: Optional[float] = None, poll_s: Optional[float] = None,
+) -> None:
+    """Daemon thread: release 'running' rows that are alive but not working.
+
+    Runs beside the stall watchdog and never kills anything — the row is
+    handed to the existing retry path, and the worker is left to pick it up
+    after the backoff. `bound_s` / `poll_s` are injectable only so tests can
+    drive the REAL loop at test speed."""
+    if bound_s is None:
+        bound_s = _job_liveness_bound_s()
+    if poll_s is None:
+        poll_s = JOB_LIVENESS_POLL_S
+    holders: dict = {}
+    while not stop_event.wait(poll_s):
+        if proc.poll() is not None:
+            return  # child exited; nothing left to judge
+        try:
+            _reclaim_lifeless_jobs(logf, holders, proc, bound_s=bound_s)
+        except Exception as exc:  # noqa: BLE001 - a reaper must never die
+            _log(logf, f"liveness: tick failed: {exc}")
+
+
 def _kill_child_tree(proc: subprocess.Popen, logf) -> Optional[int]:
     """Kill the child and its tree, then confirm it is really gone.
 
@@ -725,6 +962,21 @@ def main() -> int:
                 name="stall-watchdog",
             )
             stall_watchdog.start()
+
+            # Job-liveness reaper: the stall watchdog can only judge a child
+            # it KILLS, and only for 'transcribe'. A 'chat' row that wedges
+            # keeps a fresh heartbeat forever and is relaunched every 2 h
+            # with attempts pinned at 0, so it never reaches max_attempts.
+            # This thread judges the ROW — work marks + the child's CPU, the
+            # same vocabulary the stall watchdog uses — and hands a condemned
+            # row to the existing retry path. It never kills anything.
+            liveness_reaper = threading.Thread(
+                target=_job_liveness_reaper,
+                args=(logf, proc, watchdog_stop),
+                daemon=True,
+                name="job-liveness-reaper",
+            )
+            liveness_reaper.start()
 
             try:
                 rc = proc.wait()

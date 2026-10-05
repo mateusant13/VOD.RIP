@@ -2910,7 +2910,18 @@ def enqueue_job(job_id: str, kind: str, platform: str, video_id: str, *, priorit
 
 
 def update_job(job_id: str, *, status: Optional[str] = None,
-               progress: Optional[float] = None, error: Optional[str] = None) -> None:
+               progress: Optional[float] = None, error: Optional[str] = None,
+               expect_status: Optional[str] = None) -> bool:
+    """Apply a job update. Returns True when the row was really updated.
+
+    expect_status is an optional compare-and-set guard: the UPDATE only
+    matches while the row is still in that status, so a caller that decided
+    a row was wedged (and wants to release it) cannot clobber a row an
+    executor has already moved on since that decision was taken. It returns
+    False instead of silently writing — the caller then knows it lost the
+    race and must not assume the row moved. Purely additive: every existing
+    caller omits it and gets the previous unconditional UPDATE.
+    """
     sets = ["updated_at = ?", "heartbeat = ?"]
     params: list[Any] = [_now_iso(), _now_iso()]
     if status == "failed":
@@ -2997,7 +3008,57 @@ def update_job(job_id: str, *, status: Optional[str] = None,
         sets.append("error = ?")
         params.append(error)
     params.append(job_id)
-    execute(f"UPDATE archive_jobs SET {', '.join(sets)} WHERE id = ?", params)
+    where = "id = ?"
+    if expect_status is not None:
+        where += " AND status = ?"
+        params.append(expect_status)
+    cur = execute(f"UPDATE archive_jobs SET {', '.join(sets)} WHERE {where}", params)
+    return bool(getattr(cur, "rowcount", 1))
+
+
+def running_job_work_marks() -> dict[str, str]:
+    """Per-'running'-job fingerprint of WORK, keyed by job id.
+
+    This is the job-status liveness read that deliberately EXCLUDES
+    archive_jobs.heartbeat and updated_at. Those two columns are stamped by
+    `update_job` on *every* call, including calls that carry no progress at
+    all — the download watchdog's bare `update_job(job_id)` touch
+    (archive_transcribe._fetch_heartbeat) and the claim-time re-stamp are
+    both progress-free. So a row whose heartbeat advances while nothing is
+    computed is indistinguishable from a row being worked on, and a
+    heartbeat-only liveness test cannot see a wedged job at all: it stays
+    'running' forever.
+
+    What is left is what only changes when the job actually advances:
+      * progress  — the work counter the processors advance per chunk, per
+        stored chat page, per segment commit. Quantised to 4dp so float
+        noise cannot read as work.
+      * status    — a row that changed state is not the same row any more.
+
+    A healthy job that reports no progress (a YouTube live-chat replay
+    download carries no progress callback, so its progress legitimately
+    sits at 0.0 for the whole run) is NOT caught by this alone — callers
+    must conjoin it with a CPU delta, exactly like the stall watchdog's
+    _stall_state does. Read-only; an unreachable DB yields {}.
+    """
+    try:
+        rows = query(
+            "SELECT id, kind, platform, video_id, status, progress "
+            "FROM archive_jobs WHERE status = 'running' ORDER BY id"
+        )
+    except Exception:
+        return {}
+    marks: dict[str, str] = {}
+    for r in rows:
+        try:
+            prog = float(r["progress"] or 0.0)
+        except (TypeError, ValueError):
+            prog = 0.0
+        marks[str(r["id"])] = (
+            f"{r['kind']}/{r['platform']}/{r['video_id']}"
+            f":{r['status']}:{prog:.4f}"
+        )
+    return marks
 
 
 def _retry_delay_sec(attempts: int, rate: bool) -> float:
