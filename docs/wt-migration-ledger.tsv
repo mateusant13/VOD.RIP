@@ -39,3 +39,11 @@ wtapi	I:/TEMP/wtapi	done	I:/vod-rip-wt/done/wtapi	51fea26dd97fddc83f4d61305d44e3
 wti18n	I:/TEMP/wti18n	done	I:/vod-rip-wt/done/wti18n	847af0c63856cc5584d54b89df5b4df7d7734dec	2026-10-05T09:58:33Z
 wtsig	I:/TEMP/wtsig	done	I:/vod-rip-wt/done/wtsig	d770bb3dd5c924f778f960110164034ac1e74912	2026-10-05T09:58:48Z
 wtsrt	I:/TEMP/wtsrt	done	I:/vod-rip-wt/done/wtsrt	ddf38515a3c470f2111b064331f0411dc4d4c498	2026-10-05T09:59:04Z
+#
+# ARCHIVED BY THE SELFTEST, NOT BY A MIGRATION - keep this row out of any
+# 'migrate' count. The wt-new.sh selftest arm 2 created this worktree at
+# wip/wt-asrsup on branch lane/vod-rip/wt-asrsup because the test re-ran the
+# creation with the default state (wip) against a lane that actually lived in
+# done/. The arm now derives the lane's real state and asserts the registry is
+# unchanged. The worktree was MOVED to archive/, never deleted.
+wt-asrsup-selftest-leftover	i:/vod-rip-wt/wip/wt-asrsup	archive	i:/vod-rip-wt/archive/wt-asrsup-selftest-leftover	54477f21ba025f6c4d5574822180a1a1ffdc9180	2026-10-05T11:59:29Z

@@ -410,17 +410,56 @@ selftest() {
   _chk "real-manifest bad state rc 1" "1" "$rc"
 
   # A real, registered lane must refuse re-creation at its REAL location.
-  local real_lane real_dest
+  #
+  # BUG FOUND BY RUNNING THIS, 2026-10-05 — the first version took only the lane's
+  # BASENAME and re-ran the creation with the DEFAULT state (wip). Before the
+  # migration every lane under the root happened to be in wip/, so the destination it
+  # computed was the lane's own occupied directory, the tool correctly refused, and
+  # the test passed. After the migration the first lane under the root is usually in
+  # done/ or unsure/, so the same command computed an EMPTY wip/ destination — and
+  # CREATED A REAL WORKTREE, on branch lane/vod-rip/wt-asrsup. A selftest arm that
+  # documents itself as read-only was writing to the repository.
+  #
+  # Fixed by deriving the lane's ACTUAL state from its registered path, so the
+  # destination the tool resolves IS the lane's own directory, which is occupied and
+  # must be refused. The registry's size is now also compared before and after, so a
+  # side effect of this kind fails loudly instead of passing quietly.
+  # NOTE: the relative path is `${w#"$root"/}`, i.e. strip the ROOT PREFIX. The first
+  # version used `${w##*/}` (strip up to the LAST slash), which yields only the lane
+  # name and left <state> empty — so the guard below never matched and the check
+  # silently SKIPPED instead of testing anything. A guard that quietly stops testing
+  # is reported as a pass-count that still looks healthy, which is how this got
+  # through a first "27 passed" run.
+  local rows_before rows_after
+  rows_before="$(wtroot_scan "$repo" "$root" 2>/dev/null | cut -f3)"
+  local real_lane real_state
   real_lane="$(wtroot_worktrees "$repo" 2>/dev/null | while IFS= read -r w; do
+    local rel st ln
     wtroot_inside "$w" "$root" || continue
-    printf '%s\n' "$w" | sed 's#.*/##'
+    rel="${w#"$root"/}"
+    st="${rel%%/*}"; ln="${rel#*/}"; ln="${ln%%/*}"
+    case "$st" in wip|unsure|done|archive) ;; *) continue ;; esac
+    [ -n "$ln" ] || continue
+    printf '%s|%s\n' "$ln" "$st"
+    break
   done | head -n1)"
   if [ -n "$real_lane" ]; then
-    out="$(bash "$SELF" --project "$proj" --lane "$real_lane" 2>&1)"; rc=$?
-    [ "$rc" != 0 ] && _chk "existing registered lane refuses re-creation" "yes" "yes" || _chk "existing registered lane refuses re-creation" "yes" "no"
+    # ORDER MATTERS: real_state must be taken BEFORE real_lane is truncated, or the
+    # `|` is already gone and the state comes out equal to the lane name (which then
+    # silently computes a wip/ destination and defeats the whole point of the check).
+    real_state="${real_lane#*|}"
+    real_lane="${real_lane%%|*}"
+    out="$(bash "$SELF" --project "$proj" --lane "$real_lane" --state "$real_state" 2>&1)"; rc=$?
+    [ "$rc" != 0 ] && _chk "existing registered lane ($real_lane/$real_state) refuses re-creation" "yes" "yes" \
+                   || _chk "existing registered lane ($real_lane/$real_state) refuses re-creation" "yes" "no"
+    printf '%s' "$out" | grep -q "already exists and IS a git worktree" \
+      && _chk "refusal names the occupied-destination reason" "yes" "yes" \
+      || _chk "refusal names the occupied-destination reason" "yes" "no"
   else
     printf '  SKIP: no registered lane under the root yet (nothing to collide with)\n'
   fi
+  rows_after="$(wtroot_scan "$repo" "$root" 2>/dev/null | cut -f3)"
+  _chk "arm 2 changed no worktree rows (read-only)" "$rows_before" "$rows_after"
 
   # REGRESSION GUARD for the upstream 2026-10-02 fix: the ambiguity wall must NOT
   # fire merely because a sibling `<project>-wt` directory exists. VOD.RIP has a live
