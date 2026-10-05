@@ -26,6 +26,7 @@ from urllib.parse import urljoin
 import requests
 from services import rl_counter
 from services import ytdlp_env  # noqa: F401 ÔÇö YTDLP_NO_PLUGINS before yt-dlp import
+from services import ytdlp_guard
 from services.os_services import _NO_WINDOW
 from services.ytdlp_ffmpeg import (
     MIN_VALID_OUTPUT_BYTES,
@@ -49,9 +50,6 @@ from services.ytdlp_ffmpeg import (
 )
 from services.ytdlp_guard import (
     YTDLP_EXTRACT_LOCK as _YTDLP_EXTRACT_LOCK,
-)
-from services.ytdlp_guard import (
-    guarded_youtube_dl,
 )
 from services.ytdlp_guard import ytdlp_console_logger, ytdlp_js_runtimes
 
@@ -1492,7 +1490,7 @@ def _extract_hls_info(url: str, opts: dict) -> dict:
         quiet = not logger.isEnabledFor(logging.DEBUG)
         ctx = _silence_stderr() if quiet else contextlib.nullcontext()
         with ctx:
-            with guarded_youtube_dl(ydl_opts) as ydl:
+            with ytdlp_guard.guarded_youtube_dl(ydl_opts) as ydl:
                 return ydl.extract_info(url, download=False)
     except Exception as exc:
         # Twitch sub-only VODs: yt-dlp can't extract, but our cloudfront CDN
@@ -4086,7 +4084,7 @@ def _ytdlp_audio_section_download(
         )
         if progress_hook:
             ydl_opts["progress_hooks"] = [progress_hook]
-        with guarded_youtube_dl(ydl_opts) as ydl:
+        with ytdlp_guard.guarded_youtube_dl(ydl_opts) as ydl:
             if register_abort:
                 register_abort(lambda: getattr(ydl, "cancel_download", lambda: None)())
             _check_pause_cancel(cancel_event, pause_event)

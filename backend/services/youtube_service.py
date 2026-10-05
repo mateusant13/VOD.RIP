@@ -7,6 +7,8 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
+from services import ytdlp_guard
+
 logger = logging.getLogger(__name__)
 
 PlaylistKind = Literal["videos", "shorts", "streams"]
@@ -42,7 +44,7 @@ YOUTUBE_PLAYLIST_CEILING = 1000
 # ENTRY POINT, NOT PER INNER REQUEST — for the reason documented in
 # archive_ytdlp.py:47-67: extract_info fans out internally and is not
 # observable from here, so the token is drawn ONCE per egress operation, before
-# the `with guarded_youtube_dl_channel(...)` block. Pacing inside a request
+# the `with ytdlp_guard.guarded_youtube_dl_channel(...)` block. Pacing inside a request
 # would be wrong: a profile race holds a wall of 2.5s, and a sleep inside it
 # blows that race (see youtube_innertube.py:47-60).
 #
@@ -292,7 +294,6 @@ def _make_rss_probe():
     def probe(vid: str) -> Optional[dict[str, Any]]:
         if vid in _RSS_SHORT_PROBE_CACHE:
             return _RSS_SHORT_PROBE_CACHE[vid]
-        from services.ytdlp_guard import guarded_youtube_dl_channel
         from services.youtube_session import (
             apply_ytdlp_cookie_opts,
             youtube_session_from_settings,
@@ -326,7 +327,7 @@ def _make_rss_probe():
                 "extractor_args": ytdlp_extractor_args(session, auto_auth=auto_auth),
             }
             apply_ytdlp_cookie_opts(probe_opts, session, auto_auth=auto_auth)
-            with guarded_youtube_dl_channel(probe_opts) as ydl:
+            with ytdlp_guard.guarded_youtube_dl_channel(probe_opts) as ydl:
                 info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
             dur = info.get("duration")
             duration_sec = int(float(dur)) if dur is not None else None
@@ -606,7 +607,6 @@ def list_channel_videos_sync(
     """
     import yt_dlp
 
-    from services.ytdlp_guard import guarded_youtube_dl_channel
     from services.youtube_session import (
         resolve_ytdlp_cookiefile,
         youtube_session_from_settings,
@@ -675,7 +675,7 @@ def list_channel_videos_sync(
     # propagate to the caller, which reports it as a rate limit.
     _governor_admit_channel_walk(source, "yt_channel_list")
     try:
-        with guarded_youtube_dl_channel(base_opts) as ydl:
+        with ytdlp_guard.guarded_youtube_dl_channel(base_opts) as ydl:
             info = ydl.extract_info(pl_url, download=False)
         channel_id = (info or {}).get("channel_id") or (info or {}).get("uploader_id")
     except Exception as exc:
@@ -801,7 +801,6 @@ def search_channel_videos_sync(handle: str, query: str, limit: int = 20) -> list
     guarded yt-dlp + cookie machinery as list_channel_videos_sync; returns
     [] on any fetch failure (the router surfaces the error).
     """
-    from services.ytdlp_guard import guarded_youtube_dl_channel
     from services.youtube_session import (
         apply_ytdlp_cookie_opts,
         youtube_session_from_settings,
@@ -842,7 +841,7 @@ def search_channel_videos_sync(handle: str, query: str, limit: int = 20) -> list
     # user a silent empty hit list from the `except` below.
     _governor_admit_channel_walk("user", "yt_channel_search")
     try:
-        with guarded_youtube_dl_channel(base_opts) as ydl:
+        with ytdlp_guard.guarded_youtube_dl_channel(base_opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:
         logger.debug("youtube channel search %s failed: %s", url, exc)

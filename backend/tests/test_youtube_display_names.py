@@ -22,6 +22,7 @@ os.environ["VODRIP_ARCHIVE_DB"] = str(_DB)
 
 from services import archive_db  # noqa: E402  (env must be set before import)
 from services import archive_ytdlp  # noqa: E402
+from services import ytdlp_guard  # noqa: E402
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -70,7 +71,7 @@ def test_resolver_populates_display_name_and_is_idempotent(monkeypatch):
     _seed_youtube_chat("UCdyk2210", "@dyk2210")
     _seed_youtube_chat("UCScriptingkata", "@Scriptingkata")
     fake = _FakeYdl({"UCdyk2210": "dyk2210", "UCScriptingkata": "Scripting Kata"})
-    monkeypatch.setattr(archive_ytdlp, "guarded_youtube_dl_channel",
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel",
                         lambda opts: _fake_guard(fake))
 
     n = archive_ytdlp.resolve_youtube_display_names(10)
@@ -90,7 +91,7 @@ def test_resolver_populates_display_name_and_is_idempotent(monkeypatch):
 def test_resolver_bot_wall_leaves_null(monkeypatch):
     _seed_youtube_chat("UCblocked", "@blocked")
     fake = _FakeYdl({"UCblocked": None})  # extract raises
-    monkeypatch.setattr(archive_ytdlp, "guarded_youtube_dl_channel",
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel",
                         lambda opts: _fake_guard(fake))
 
     assert archive_ytdlp.resolve_youtube_display_names(10) == 0
@@ -101,6 +102,6 @@ def test_resolver_bot_wall_leaves_null(monkeypatch):
 
 
 def test_resolver_no_candidates_is_noop(monkeypatch):
-    monkeypatch.setattr(archive_ytdlp, "guarded_youtube_dl_channel",
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel",
                         lambda opts: (_ for _ in ()).throw(AssertionError("no ydl")))
     assert archive_ytdlp.resolve_youtube_display_names(10) == 0
