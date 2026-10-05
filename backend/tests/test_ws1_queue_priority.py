@@ -149,15 +149,16 @@ def test_legacy_db_migration_adds_priority():
         )
     archive_db._ensure_jobs_priority(conn)
     archive_db._ensure_jobs_retry_columns(conn)
+    archive_db._ensure_jobs_work_heartbeat_column(conn)
     conn.commit()
 
     rows = archive_db.query("PRAGMA table_info(archive_jobs)")
     cols = {r["name"]: r for r in rows}
     assert "priority" in cols, "migration must add archive_jobs.priority"
-    for retry_col in ("attempts", "max_attempts", "next_retry_at"):
+    for retry_col in ("attempts", "max_attempts", "next_retry_at", "work_heartbeat"):
         assert retry_col in cols, (
-            f"the retry rebuild must not drop {retry_col} — _claim_next_job's "
-            "WHERE references it"
+            f"the rebuilds must not drop {retry_col} — _claim_next_job's WHERE "
+            "and update_job's SET both reference it"
         )
     assert cols["priority"]["notnull"] == 1 and cols["priority"]["dflt_value"] == "0"
     legacy = archive_db.query("SELECT * FROM archive_jobs WHERE id = 'legacy-1'")[0]
@@ -210,6 +211,7 @@ def test_ancient_legacy_db_survives_both_rebuilds():
     archive_db._ensure_jobs_kind_events(conn)
     archive_db._ensure_jobs_priority(conn)
     archive_db._ensure_jobs_retry_columns(conn)
+    archive_db._ensure_jobs_work_heartbeat_column(conn)
     conn.commit()
 
     rows = archive_db.query("PRAGMA table_info(archive_jobs)")

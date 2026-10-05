@@ -4806,6 +4806,23 @@ _CHAT_STALE_TIMEDELTA = timedelta(hours=2)
 # download (heartbeat stays NULL) and keeps the 2h window.
 _CHAT_HEARTBEAT_STALE = timedelta(minutes=20)
 
+# Why a row is PARKED rather than relaunched once its reclaim budget is spent.
+# Deliberately descriptive and blame-free: it reports what the reclaim saw (a
+# stale liveness window, and no work recorded across every relaunch), not a
+# cause. It never claims a download/ASR/gate verdict — those belong to
+# update_job's failure classifiers, which a reclaim must not borrow, because a
+# reclaim is not a failure of the job's own making. The user is not told to do
+# anything: the honest remedy (an authenticated session, an engine install) is
+# whatever the underlying job would have said had it ever got far enough to
+# fail. %-formatted (mapping placeholders, NOT f-string braces — the same
+# string with {attempts} passes through % untouched) and truncated to 400
+# chars at the call site, matching every other archive_jobs.error write.
+_RECLAIM_EXHAUSTED_ERROR = (
+    "reclaimed %(attempts)s/%(max_attempts)s times: the job's liveness stamp "
+    "went stale with no recorded work each time, so it was parked instead of "
+    "relaunched again"
+)
+
 # YouTube chat-backfill pacing: min gap between chat video STARTS. The
 # intervals below are the current production values (active 30 s = 2 starts/
 # min, quiet 60 s = 1/min; the 3-thread pool can overlap them, and each start
@@ -4904,6 +4921,15 @@ def _claim_next_job() -> Optional[dict]:
     reclaimed long before the flat 2h window; NULL heartbeats
     (pre-heartbeat rows, YouTube) fall back to updated_at.
 
+    A reclaim COSTS AN ATTEMPT. Relaunching is an attempt, so the reclaim's
+    CAS charges the job's budget (attempts+1, a _retry_delay_sec backoff on
+    next_retry_at) and parks the row as 'failed' once max_attempts is spent.
+    Without that charge a re-stamp cost nothing, attempts never left 0,
+    max_attempts was unreachable, and a wedged row could be relaunched on
+    every window forever. The reclaim's own trigger is unchanged — same
+    predicate, same three cutoffs — so this bounds the loop without making
+    the reclaim any keener to fire.
+
     Three claim-time gates, in this order:
 
     * 'paused' rows are NEVER claimed. The status predicate below only
@@ -4979,29 +5005,83 @@ def _claim_next_job() -> Optional[dict]:
         # The claim refreshes the heartbeat too: a re-claimed row must not
         # match the stale predicate again before the new executor's first
         # progress touch (that would let a third worker steal it mid-claim).
+        # A CLAIM is the executor taking the job, so it also stamps
+        # work_heartbeat — the signal a progress-free watchdog touch cannot
+        # fake (archive_db._ensure_jobs_work_heartbeat_column).
         if row["status"] == "queued":
             cur = archive_db.execute(
-                "UPDATE archive_jobs SET status = 'running', updated_at = ?, heartbeat = ? "
+                "UPDATE archive_jobs SET status = 'running', updated_at = ?, heartbeat = ?, "
+                "work_heartbeat = ? "
                 "WHERE id = ? AND status = 'queued' "
                 "AND (next_retry_at IS NULL OR next_retry_at <= ?)",
-                (_now_iso(), _now_iso(), row["id"], now_iso),
+                (_now_iso(), _now_iso(), _now_iso(), row["id"], now_iso),
             )
-        else:
-            # Stale-reclaim CAS: the UPDATE re-checks the same stale-window
-            # condition the SELECT used, so two workers that both read the
-            # same stale 'running' row cannot both claim it — the first
-            # claim refreshes heartbeat/updated_at and the second's WHERE
-            # matches zero rows (rowcount 0 -> skip). Without the condition
-            # both UPDATEs would hit (status stays 'running' either way) and
-            # two workers would transcribe the same video.
+            if cur.rowcount == 1:
+                return dict(row)
+            continue
+        # Stale-reclaim CAS: the UPDATE re-checks the same stale-window
+        # condition the SELECT used, so two workers that both read the
+        # same stale 'running' row cannot both claim it — the first
+        # claim refreshes heartbeat/updated_at and the second's WHERE
+        # matches zero rows (rowcount 0 -> skip). Without the condition
+        # both UPDATEs would hit (status stays 'running' either way) and
+        # two workers would transcribe the same video.
+        #
+        # A RECLAIM IS A RELAUNCH, SO IT COSTS AN ATTEMPT. This CAS used to
+        # flip running -> running and re-stamp the heartbeat WITHOUT
+        # touching attempts or next_retry_at, so attempts stayed 0,
+        # max_attempts was unreachable, and the row was relaunched every
+        # window, forever. Live evidence: chat-youtube-0FH0wZfZ82Q sat
+        # 'running' from 2026-08-07 to 2026-10-04 with attempts 0,
+        # progress 0.0, and a heartbeat that advanced only because each
+        # cycle re-stamped it. A heartbeat refresh costs nothing, so a job
+        # that computes nothing could hold a row indefinitely. Charging the
+        # budget bounds the loop: 0 -> 1 -> 2 -> failed at max_attempts.
+        #
+        # It does NOT make the reclaim more aggressive: the stale predicate
+        # and all three cutoffs are untouched, so a reclaim fires on exactly
+        # the same schedule it always did. What changes is the PRICE.
+        prior_attempts = int(row["attempts"] or 0)
+        max_attempts = int(row["max_attempts"] or 0) or 3
+        plan = archive_db.reclaim_relaunch_plan(prior_attempts, max_attempts)
+        if plan["exhausted"]:
+            # Budget spent. Park the row instead of relaunching a 4th time —
+            # the only way the loop can end. The message reports what the
+            # reclaim SAW (a stale window, no recorded work), never a cause
+            # the user did not produce, and the row carries no terminal-error
+            # classification: the verdict is the budget, not a string.
+            reason = (_RECLAIM_EXHAUSTED_ERROR % {
+                "attempts": plan["attempts"], "max_attempts": max_attempts,
+            })[:400]
             cur = archive_db.execute(
-                "UPDATE archive_jobs SET status = 'running', updated_at = ?, heartbeat = ? "
-                "WHERE id = ? AND status = 'running' "
+                "UPDATE archive_jobs SET status = 'failed', updated_at = ?, "
+                "attempts = ?, next_retry_at = NULL, error = ? "
+                "WHERE id = ? AND status = 'running' AND COALESCE(attempts, 0) = ? "
                 "AND COALESCE(heartbeat, updated_at) < "
                 "CASE WHEN kind = 'chat' AND platform = 'twitch' THEN ? "
                 "WHEN kind = 'chat' THEN ? ELSE ? END",
-                (_now_iso(), _now_iso(), row["id"], twitch_chat_cutoff, yt_chat_cutoff, transcribe_cutoff),
+                (_now_iso(), plan["attempts"], reason, row["id"], prior_attempts,
+                 twitch_chat_cutoff, yt_chat_cutoff, transcribe_cutoff),
             )
+            if cur.rowcount == 1:
+                logger.warning(
+                    "job %s parked: %d/%d stale reclaims with no recorded work",
+                    row["id"], plan["attempts"], max_attempts)
+            # Parked, or lost the race to another reclaim: either way the row
+            # is NOT handed to an executor. Keep scanning the remaining
+            # candidates so a park never idles the worker.
+            continue
+        cur = archive_db.execute(
+            "UPDATE archive_jobs SET status = 'running', updated_at = ?, heartbeat = ?, "
+            "work_heartbeat = ?, attempts = ?, next_retry_at = ? "
+            "WHERE id = ? AND status = 'running' AND COALESCE(attempts, 0) = ? "
+            "AND COALESCE(heartbeat, updated_at) < "
+            "CASE WHEN kind = 'chat' AND platform = 'twitch' THEN ? "
+            "WHEN kind = 'chat' THEN ? ELSE ? END",
+            (_now_iso(), _now_iso(), _now_iso(), plan["attempts"],
+             archive_db._now_iso_plus(plan["backoff_s"]), row["id"],
+             prior_attempts, twitch_chat_cutoff, yt_chat_cutoff, transcribe_cutoff),
+        )
         if cur.rowcount == 1:
             return dict(row)
     return None

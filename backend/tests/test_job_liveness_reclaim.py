@@ -1,4 +1,5 @@
-"""Job-liveness reaper: a heartbeat that advances is not a job that works.
+"""Job-liveness: a heartbeat that advances is not a job that works, and a
+reclaim that costs nothing never ends.
 
 Production evidence this exists for (live H:\\VOD.RIP-data\\archive.db, read-only):
 
@@ -8,21 +9,40 @@ Production evidence this exists for (live H:\\VOD.RIP-data\\archive.db, read-onl
 
 A two-month-old job with a same-day heartbeat and a zero attempt count.
 
-The failure is NOT that the old rule cannot see the row — at read time the
+The failure is NOT that the old rule cannot see the row: at read time the
 heartbeat was 12.8 h old, well past the 2 h chat window, so _claim_next_job
-reclaims it on schedule. The failure is that reclaiming is FREE: its
+reclaims it on schedule. The failure was that reclaiming was FREE: its
 compare-and-set flips running -> running, re-stamps the heartbeat, and never
 touches attempts or next_retry_at. So attempts stays 0, max_attempts (3) is
-unreachable, and the row is relaunched every 2 h indefinitely. Today's
-heartbeat is the previous cycle's re-stamp, not a live executor — and because
+unreachable, and the row is relaunched every 2 h indefinitely. The advancing
+heartbeat is the previous cycle's re-stamp, not a live executor, and because
 a heartbeat refresh costs nothing, a job can be kept 'running' indefinitely
 by something that computes nothing.
+
+Two fixes, and they are not the same fix.
+
+THE RECLAIM COSTS AN ATTEMPT (archive_transcribe._claim_next_job). A relaunch is
+an attempt, so the reclaim's CAS charges the budget, sets a _retry_delay_sec
+backoff, and parks the row at max_attempts. This is what bounds the loop, and
+it is the load-bearing half: without it the loop is unbounded however good the
+detection is. Its trigger is unchanged, so the reclaim is no keener to fire
+than it was.
+
+A LIVENESS TOUCH IS NOT WORK (archive_db.work_heartbeat). The reclaim only ever
+saw the coarse heartbeat, which every bare `update_job(job_id)` watchdog
+refreshes for free, so a stuck download could hold its row open indefinitely
+and "no work happened" had to be inferred from a timestamp anyone can stamp.
+work_heartbeat advances only on a work-bearing update or a real claim, so the
+two are distinguishable. This is the deeper root cause, but it is deliberately
+NOT wired into the reclaim's trigger: firing on the work signal would reclaim
+a legitimately slow fetch, which is worse than the bug.
 
 The predicate under test (worker_server._job_liveness_state, driven through
 the real _reclaim_lifeless_jobs tick) condemns a 'running' row only when its
 WORK marks are frozen past the bound AND the owning worker burned no CPU AND
 the heartbeat advanced in that window — the re-stamp that keeps the row alive
-is the evidence that it is dead.
+is the evidence that it is dead. That reaper is unchanged by the fix above; it
+is the other route to the same budget.
 
 No network, no real worker: a fresh scratch DB per module, a stub `proc`, and
 an injected CPU reading. Mirrors test_asr_stall_supervisor's fixture.
@@ -126,6 +146,17 @@ def _stale_running_chat_job(job_id: str, platform: str = "twitch") -> tuple[str,
 def _row(job_id: str) -> dict:
     rows = archive_db.query("SELECT * FROM archive_jobs WHERE id = ?", (job_id,))
     return dict(rows[0]) if rows else {}
+
+
+def _age_the_heartbeat(job_id: str, hours: int = 3) -> None:
+    """Backdate a row's liveness stamps past every reclaim window, so the
+    next _claim_next_job() sees the same 'wedged executor' state a reclaim
+    cycle would."""
+    old = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(
+        timespec="seconds")
+    archive_db.execute(
+        "UPDATE archive_jobs SET heartbeat = ?, updated_at = ? WHERE id = ?",
+        (old, old, job_id))
 
 
 def _reclaim(holder_map, *, bound_s=1.0, proc=None):
@@ -331,32 +362,34 @@ def test_work_marks_exclude_the_heartbeat_column():
         "real progress must move the work marks")
 
 
-# --- 4. the pre-fix rule, pinned so the regression cannot come back --------
+# --- 4. the reclaim itself charges the relaunch ---------------------------
 
-def test_pre_fix_reclaim_relaunches_the_row_without_counting_an_attempt():
-    """The actual pre-fix failure, executed against the REAL, unmodified
-    reclaim path (services.archive_transcribe._claim_next_job).
+def test_reclaim_costs_an_attempt_and_sets_a_retry_backoff():
+    """THE CONTRACT CHANGE. This test used to be
+    `test_pre_fix_reclaim_relaunches_the_row_without_counting_an_attempt` and
+    it asserted the BUG:
 
-    The two-month-old production row is NOT invisible to the old rule: at
-    2026-10-04T22:30Z its 09:41Z heartbeat is 12.8 h old, well past the 2 h
-    chat window, so _claim_next_job does reclaim it. That is the problem. The
-    reclaim's CAS flips running -> running and stamps a fresh heartbeat
-    WITHOUT touching attempts or next_retry_at, so:
+        assert row["attempts"] == 0, "... if this ever becomes true the loop
+        terminates on its own and this fix is redundant"
+        assert row["next_retry_at"] is None
 
-      * the heartbeat observed today at 09:41 is not evidence of a live
-        executor — it is the previous cycle's re-stamp, and
-      * attempts stays 0 forever, so max_attempts (3) is unreachable and the
-        row is relaunched every 2 h for as long as the DB lives.
+    That assertion is the defect, so it was deliberately inverted rather than
+    deleted. It runs the real, unmodified reclaim
+    (services.archive_transcribe._claim_next_job) against a stale twitch chat
+    row — the CAS is platform-independent; twitch avoids the YouTube bot gate
+    — so the fix is demonstrated, not merely described.
 
-    So the fix is not "make the reclaim see it" — it is "make the relaunch
-    cost an attempt". Asserted here on a stale twitch chat row (the CAS is
-    platform-independent; twitch avoids the YouTube bot gate) so the failure
-    is demonstrated, not merely described."""
+    The production row is NOT invisible to the old rule: at 2026-10-04T22:30Z
+    its 09:41Z heartbeat is 12.8 h old, well past the 2 h chat window, so
+    _claim_next_job DID reclaim it, on schedule, every 2 h. The relaunched
+    row re-stamped its own heartbeat, which is what made the advancing
+    heartbeat look like liveness. Now the relaunch spends an attempt and sets
+    a backoff, so max_attempts is reachable and the loop is bounded."""
     from services.archive_transcribe import _claim_next_job
 
     job, old = _stale_running_chat_job("chat-test-prefix-loop")
 
-    assert _row(job)["attempts"] == 0
+    assert _row(job)["attempts"] == 0, "precondition: a fresh row has no budget spent"
     reclaimed = _claim_next_job()
     assert reclaimed and reclaimed["id"] == job, (
         "precondition: the stale-window reclaim owns this row")
@@ -364,18 +397,231 @@ def test_pre_fix_reclaim_relaunches_the_row_without_counting_an_attempt():
     row = _row(job)
     assert row["status"] == "running", "expected the running->running relaunch"
     assert row["heartbeat"] != old, "the relaunch re-stamped the heartbeat"
-    assert row["attempts"] == 0, (
-        f"the pre-fix reclaim counted an attempt (got {row['attempts']}) — if "
-        "this ever becomes true the loop terminates on its own and this fix "
-        "is redundant; re-check before changing anything")
-    assert row["next_retry_at"] is None, (
-        "the pre-fix reclaim set a retry deadline")
+    # --- the inverted assertions -------------------------------------------
+    assert row["attempts"] == 1, (
+        f"a reclaim is a relaunch and must cost an attempt, got "
+        f"{row['attempts']}")
+    assert row["next_retry_at"], (
+        "a reclaim must leave a retry deadline; NULL means the next claim is "
+        "unguarded")
+    # The deadline is in the FUTURE: the row is already claimed, so this only
+    # bounds the NEXT claim if the row falls back to 'queued'.
+    assert row["next_retry_at"] > row["heartbeat"], (
+        f"backoff {row['next_retry_at']} is not after the claim "
+        f"{row['heartbeat']}")
 
 
-def test_reaper_is_what_makes_the_relaunch_cost_an_attempt(logf, cpu):
-    """The same row, released by the reaper instead: attempts increments, a
-    next_retry_at backoff appears, and repeated relaunches terminate at
-    max_attempts. This is the whole fix, end to end."""
+def test_reclaim_is_terminal_at_max_attempts():
+    """The immortality breaker, on the reclaim path itself. The two-month-old
+    row would have gone attempts 0 -> 1 on its first cycle, 1 -> 2 on its
+    second, and been PARKED on the third instead of relaunched a fourth."""
+    from services.archive_transcribe import _claim_next_job
+
+    job, _old = _stale_running_chat_job("chat-test-reclaim-exhaust")
+    max_attempts = _row(job)["max_attempts"]
+    assert max_attempts == 3
+
+    statuses = []
+    # The max_attempts-th reclaim is the one that exhausts the budget, and it
+    # PARKS instead of relaunching — so the row is handed out
+    # max_attempts-1 times, never max_attempts times.
+    for cycle in range(1, max_attempts):
+        claimed = _claim_next_job()
+        assert claimed and claimed["id"] == job, (
+            f"cycle {cycle}: the stale row stopped being claimable")
+        assert _row(job)["attempts"] == cycle, (
+            f"cycle {cycle} charged {_row(job)['attempts']} attempts")
+        statuses.append(_row(job)["status"])
+        _age_the_heartbeat(job)
+
+    # The reclaim that spends the last attempt parks the row and hands it to
+    # nobody. This is the assertion that was impossible pre-fix: with attempts
+    # frozen at 0 this call returned the row again, forever.
+    assert _claim_next_job() is None, (
+        "an exhausted row was relaunched again — the loop is not bounded")
+    row = _row(job)
+    assert row["status"] == "failed", f"expected a parked row, got {row['status']}"
+    assert row["attempts"] == max_attempts, (
+        f"attempts must reach max_attempts exactly, got {row['attempts']}")
+    assert row["next_retry_at"] is None, "a parked row keeps no retry deadline"
+    assert statuses == ["running"] * (max_attempts - 1)
+
+
+def test_parked_reclaim_reports_no_work_not_a_user_cause():
+    """A reclaim is NOT a crash. Parking must not borrow update_job's
+    error-string classifiers (DownloadError / bot-gate / age gate / '429'),
+    which would blame a cause the user never produced, and it must not demand
+    any action. The verdict is the budget plus what the reclaim observed."""
+    from services.archive_transcribe import _claim_next_job
+
+    job, _old = _stale_running_chat_job("chat-test-park-reason")
+    for _ in range(_row(job)["max_attempts"]):
+        _age_the_heartbeat(job)
+        _claim_next_job()          # the last one parks instead of returning
+    row = _row(job)
+    assert row["status"] == "failed", f"precondition: the row parks ({row['status']})"
+    err = row["error"] or ""
+    assert "no recorded work" in err, err
+    assert "3/3" in err, f"the message must state the budget it spent: {err}"
+    for marker in ("429", "rate limit", "bot-gate", "DownloadError",
+                   "age gate", "sign in", "log in", "credentials"):
+        assert marker not in err, (
+            f"a reclaim borrowed the failure path's blame: {marker!r} in {err!r}")
+
+
+def test_ordinary_claim_of_a_queued_row_is_free():
+    """Only a RECLAIM costs an attempt. A normal queued -> running claim must
+    not spend budget, or an ordinary retried job would exhaust max_attempts
+    without ever failing — and the crash path's arithmetic would silently
+    change underneath it."""
+    from services.archive_transcribe import _claim_next_job
+
+    archive_db.enqueue_job("chat-test-free-claim", "chat", "twitch", "vfree")
+    for i in range(5):
+        archive_db.update_job("chat-test-free-claim", status="running", progress=0.0)
+        archive_db.execute(
+            "UPDATE archive_jobs SET status = 'queued' WHERE id = ?",
+            ("chat-test-free-claim",))
+        claimed = _claim_next_job()
+        assert claimed and claimed["id"] == "chat-test-free-claim", i
+        assert _row("chat-test-free-claim")["attempts"] == 0, (
+            "an ordinary claim must not spend the reclaim budget")
+
+
+def test_a_working_job_is_not_reclaimed():
+    """Nothing about the fix may cost a healthy job anything. A row whose
+    executor is touching it (fresh coarse heartbeat) is invisible to the
+    reclaim, so it is neither charged nor parked."""
+    from services.archive_transcribe import _claim_next_job
+
+    job = _running_chat_job("chat-test-working")
+    for _ in range(3):
+        time.sleep(1.05)
+        archive_db.update_job(job, progress=0.25)   # real work
+        assert _claim_next_job() is None, "a working job was reclaimed"
+    row = _row(job)
+    assert row["status"] == "running"
+    assert row["attempts"] == 0, "a working job was charged an attempt"
+
+
+def test_a_throttled_but_working_job_is_not_reclaimed():
+    """Steady Watcher holds this box to 7-14% CPU with a ~13.6x wall
+    multiplier, so a working job can legitimately be quiet for a long time.
+    Its only defence is that it keeps touching the row — which must stay free,
+    since a throttle must never be what drains a job's budget."""
+    from services.archive_transcribe import _claim_next_job
+
+    job = _running_chat_job("chat-test-throttled")
+    for _ in range(3):
+        time.sleep(1.05)
+        archive_db.update_job(job)   # liveness touch only, like a watchdog
+        assert _claim_next_job() is None, (
+            "a throttled-but-working job was reclaimed")
+    assert _row(job)["status"] == "running"
+    assert _row(job)["attempts"] == 0, "a working job was charged an attempt"
+
+
+# --- 5. the watchdog's liveness touch is no longer work -------------------
+
+def test_watchdog_liveness_touch_does_not_reset_the_staleness_window():
+    """The deeper half. `update_job` stamps heartbeat+updated_at on EVERY
+    call, and every bare `update_job(job_id)` in the backend is a watchdog
+    refreshing the row so the coarse stale window does not fire mid-download
+    (archive_transcribe._dl_progress, _fetch_heartbeat, archive_twitch's page
+    heartbeat). Because a refresh costs nothing, a STUCK download kept its
+    row alive forever on that signal alone.
+
+    work_heartbeat is the second stamp: it advances only on a work-bearing
+    update (progress and/or status) or a real claim, so a progress-free touch
+    cannot move it. That is the discriminator — 'no work happened' is a stored
+    fact, not something a reaper has to infer from a timestamp anyone can
+    refresh for free."""
+    job = _running_chat_job("chat-test-watchdog")
+    claimed = _row(job)
+    assert claimed["work_heartbeat"], "precondition: a claimed row has the stamp"
+
+    before_beat = _row(job)["heartbeat"]
+    before_work = _row(job)["work_heartbeat"]
+    time.sleep(1.05)
+
+    # Exactly what the download watchdog issues every 5 min: no work.
+    archive_db.update_job(job)
+
+    row = _row(job)
+    assert row["heartbeat"] != before_beat, (
+        "sanity: the coarse liveness heartbeat must still advance — the fetch "
+        "watchdog's job is to hold the coarse window open")
+    assert row["work_heartbeat"] == before_work, (
+        "a progress-free liveness touch reset the staleness window — a stuck "
+        "download can never age out while a watchdog refreshes it")
+
+    # Real work DOES move it, so the window is not merely frozen.
+    time.sleep(1.05)
+    archive_db.update_job(job, progress=0.3)
+    assert _row(job)["work_heartbeat"] != before_work, (
+        "real work must advance the staleness window")
+
+
+def test_a_stuck_download_ages_out_on_the_work_signal_while_the_watchdog_runs():
+    """The scenario the second stamp exists for, end to end. The coarse
+    heartbeat is refreshed every tick (a healthy, non-suspending download);
+    the work signal is never touched, because nothing is being computed. Only
+    the second one freezes, so a watchdog cannot make a wedged download look
+    alive indefinitely."""
+    job = _running_chat_job("chat-test-stuck-download")
+    work = _row(job)["work_heartbeat"]
+    for _ in range(3):
+        time.sleep(1.05)
+        archive_db.update_job(job)  # the watchdog, forever
+    row = _row(job)
+    assert row["status"] == "running", "precondition: the watchdog holds it"
+    assert row["heartbeat"], "the coarse heartbeat was refreshed"
+    assert row["work_heartbeat"] == work, (
+        "the stuck download's staleness window was reset by its own watchdog")
+
+    # The reclaim is deliberately NOT built on this signal — that would fire
+    # on a legitimately slow fetch, which the brief forbids — so the coarse
+    # stale window is what governs it, unchanged. Assert the separation that
+    # makes the distinction available at all.
+    assert row["work_heartbeat"] < row["heartbeat"], (
+        "precondition: the two signals are actually distinguishable")
+
+
+def test_a_claim_stamps_the_work_signal_even_though_a_watchdog_touch_does_not():
+    """An executor CLAIMING the job is the event the stamp means, and it is
+    distinguishable from the watchdog that later refreshes the same row."""
+    from services.archive_transcribe import _claim_next_job
+
+    job = _running_chat_job("chat-test-claim-stamp")
+    before = _row(job)["work_heartbeat"]
+    time.sleep(1.05)
+    archive_db.update_job(job)          # watchdog touch: must not move it
+    assert _row(job)["work_heartbeat"] == before
+    # Re-arm as claimable so the real claim path runs.
+    archive_db.execute(
+        "UPDATE archive_jobs SET status = 'queued', heartbeat = NULL, "
+        "work_heartbeat = NULL, next_retry_at = NULL WHERE id = ?", (job,))
+    claimed = _claim_next_job()
+    assert claimed and claimed["id"] == job
+    assert _row(job)["work_heartbeat"], "the claim did not stamp the work signal"
+
+
+def test_reaper_release_and_reclaim_release_both_cost_exactly_one_attempt(
+        logf, cpu):
+    """The reaper's release is the OTHER route to the same budget, and it is
+    unaffected by the reclaim fix. It still goes through the real
+    update_job(status='failed') retry machinery, so attempts increments and a
+    next_retry_at backoff appears.
+
+    Renamed from `test_reaper_is_what_makes_the_relaunch_cost_an_attempt`:
+    the reclaim now costs an attempt itself, so the reaper is no longer the
+    only thing that charges one. Assertion values are unchanged — this is a
+    rationale fix, not a contract relaxation.
+
+    The final assertion is the one that keeps the two routes honest: the
+    relaunch here is an ordinary queued -> running claim, NOT a reclaim, so
+    it is free. If a future edit makes every claim charge the budget, an
+    ordinary retried job would exhaust max_attempts without ever failing."""
     from services.archive_transcribe import _claim_next_job
 
     job, old = _stale_running_chat_job("chat-test-prefix-loop")
@@ -388,13 +634,15 @@ def test_reaper_is_what_makes_the_relaunch_cost_an_attempt(logf, cpu):
     row = _row(job)
     assert row["attempts"] == 1, f"attempt not counted: {row['attempts']}"
     assert row["next_retry_at"], "no retry deadline"
-    # The relaunch path still works — and now it costs an attempt each time.
+    # The relaunch path still works, and does not double-charge: the reaper
+    # left the row 'queued', so this is a plain claim.
     archive_db.execute(
         "UPDATE archive_jobs SET next_retry_at = ? WHERE id = ?",
         ("2000-01-01T00:00:00+00:00", job))
     relaunched = _claim_next_job()
     assert relaunched and relaunched["id"] == job
-    assert _row(job)["attempts"] == 1, "the relaunch consumed the attempt"
+    assert _row(job)["attempts"] == 1, (
+        "an ordinary claim of a requeued row must not spend a second attempt")
 
 
 def test_bound_is_derived_and_far_above_a_healthy_gap():
