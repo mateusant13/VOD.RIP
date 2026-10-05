@@ -26,7 +26,11 @@ from deps import (
     YOUTUBE_CHANNEL_FETCH_TIMEOUT_SEC,
     YOUTUBE_CHANNEL_FRESH_SEC,
 )
+from models.schemas import ChannelOutcomeReleaseRequest
+from services import youtube_service
+from services import ytdlp_outcomes
 from services.archive_db import (
+    channel_outcome_snapshot,
     channel_snapshot_age_sec,
     list_videos,
     mark_channel_priority,
@@ -1191,3 +1195,267 @@ async def _run_original_backfill(channel: str) -> None:
     finally:
         async with _original_backfill_lock:
             _original_backfill_inflight.discard(channel)
+
+
+# ─── LEARNED PER-CHANNEL yt-dlp PARKS (the visible half) ────────────────────
+#
+# The walk already LEARNS a permanent, per-(channel, tab) condition and skips it
+# (services/youtube_service.py: _channel_outcome_parked, above the governor
+# token draw; archive_db.youtube_channel_outcomes for the durable row). Until
+# this block existed that park was INVISIBLE: the owner could not tell which
+# channels were parked, why, or un-park one, and a park nobody can see or
+# reverse is nearly as bad as the 12-minute retry loop it replaced - a channel
+# that gained a /streams tab would stay skipped forever with no way back.
+#
+# Two rules this block exists to hold, both copied from the age-gate park
+# precedent in routers/archive.py:
+#
+#   1. THE STABLE CODE IS THE CONTRACT. These endpoints ship the vocabulary CODE
+#      from services/ytdlp_outcomes and never the English sentence. A client
+#      branches on the code and renders its own localised phrase from it, so a
+#      wording change here can never break a stored row and a pt-BR/es client
+#      never shows an English literal. (The same reason
+#      archive_db.CAPTIONS_PARK_AGE_GATE_* stores codes and derives text at read
+#      time; and why these endpoints do NOT ship ytdlp_outcomes.OUTCOME_TEXT -
+#      attaching an English phrase to a response is precisely how a Brazilian
+#      ends up reading English.)
+#
+#   2. ABSENT IS NOT THE SAME AS GOOD. A channel with no learned outcome is not
+#      a healthy channel; it is a channel nobody has measured. So the single
+#      read returns `learned: null` WITH a machine-readable `status` saying
+#      which of the two it is, and a code this build does not recognise is
+#      reported as `unrecognised_code` - never as a park, and never as a
+#      fabricated success. The same NULL != 0 discipline the /api/asr/runtime
+#      fix and archive_db.note_channel_outcome_skipped exist for.
+
+
+def _park_ref_matches(stored_channel: str, requested: str) -> bool:
+    """True when a stored (already normalised) row key names the request.
+
+    Mirrors archive_db._norm_channel_ref so `?channel=@SeeelBR` finds the row
+    stored as `seeelbr`. The stored side comes back normalised by the DB layer;
+    only the request needs normalising here, and it is a display-layer compare,
+    so it is spelled out rather than importing a private helper across modules.
+    """
+    want = str(requested or "").strip().lstrip("@").lower()
+    return bool(want) and str(stored_channel or "").lower() == want
+
+
+def _park_view(row: dict) -> dict:
+    """One learned row as the API serves it: codes and counters, no prose.
+
+    Two separate honesty bits, and they are NOT the same question:
+
+      `permanent` - is this a learnable, skippable, releasable PER-CHANNEL
+        condition (ytdlp_outcomes.PERMANENT_CODES)? Only these may be learned
+        at all, so this is what makes a row a genuine park.
+      `known`     - does THIS build have a phrase for the code
+        (ytdlp_outcomes.EXPECTED_CODES)? `live_offline` is known but not
+        permanent: the app can describe it, and must not present it as a park.
+
+    A row holding neither (a code no build recognises) is still LISTED - it is a
+    real learned row the owner may need to release - but is never rendered with
+    a phrase this build invented.
+    """
+    code = str(row.get("outcome_code") or "")
+    return {
+        "channel": str(row.get("channel") or ""),
+        "tab": str(row.get("tab") or ""),
+        "outcome_code": code,
+        "permanent": ytdlp_outcomes.is_permanent(code),
+        "known": ytdlp_outcomes.is_expected(code),
+        "first_seen": str(row.get("first_seen") or ""),
+        "last_seen": str(row.get("last_seen") or ""),
+        "skipped": _skipped_of(row.get("skipped")),
+    }
+
+
+def _skipped_of(value: object) -> int:
+    """The skip counter, or 0 for anything that is not one.
+
+    Total, deliberately: this is a COUNT of skips served from memory, and 0
+    honestly means "no skip was ever counted". A non-numeric value must not
+    raise out of the row mapper and turn a whole snapshot read into an error -
+    and the client omits a zero rather than printing it, so a corrupt counter
+    costs the owner one number, not the panel.
+    """
+    try:
+        return max(0, int(value))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
+
+# Stable status codes for the single-channel read. A CODE, for the same reason
+# the park reason is: the client derives the sentence, so this is localisable.
+PARK_STATUS_PARKED = "parked"
+#: No learned row at all. NOT "this channel is fine" - it is unmeasured, and
+#: the next walk cycle will ask it for real.
+PARK_STATUS_NOT_LEARNED = "not_learned"
+#: A row exists but its code is not a park this build recognises. Reported
+#: honestly instead of being passed off as a known park reason.
+PARK_STATUS_UNRECOGNISED = "unrecognised_code"
+#: The read itself failed. NOT `not_learned`: a read that could not run has not
+#: established that anything is unmeasured, and saying so would be the same
+#: fabricated claim as reporting an empty table.
+PARK_STATUS_READ_FAILED = "read_failed"
+
+
+@router.get("/api/channel/outcome-parks")
+async def channel_outcome_parks(platform: str = "youtube"):
+    """Every currently-PARKED learned condition, for the channels surface.
+
+    Reads the PERSISTED rows (archive_db.channel_outcome_snapshot), so this is
+    the same list before and after a restart and for a process that never
+    re-proved anything. An empty list is a real answer - nothing is parked -
+    and the client is expected to say so explicitly rather than render nothing.
+
+    A FAILED read is NOT an empty list. Returning `parked: []` on an exception
+    would have the client render its explicit EMPTY state, telling the owner
+    nothing is parked at the exact moment the app has no idea. The `parked` key
+    is therefore deliberately ABSENT on failure, which the client's parser reads
+    as `unavailable` - the true claim.
+    """
+    plat = platform or "youtube"
+    try:
+        rows = channel_outcome_snapshot(plat)
+    except Exception:
+        # A broken/absent learning table is "no memory", never an exception in
+        # the UI's path: the walk degrades the same way (it treats a failed
+        # lookup as "not parked" and asks the channel again).
+        logger.debug("channel outcome-park read failed", exc_info=True)
+        return {"platform": plat, "error": "read_failed"}
+    parked = [_park_view(r) for r in rows]
+    return {"platform": plat, "count": len(parked), "parked": parked}
+
+
+@router.get("/api/channel/outcome-park")
+async def channel_outcome_park(
+    channel: str,
+    tab: str = "",
+    platform: str = "youtube",
+):
+    """The learned state of ONE (channel, tab) - or of the whole channel.
+
+    The endpoint that makes "absent" legible. `learned` is null unless there is
+    a live, recognised park, and `status` says WHY in a stable code:
+
+      parked              - a recognised permanent condition is being skipped
+      not_learned         - nothing is remembered; this is UNMEASURED, not ok
+      unrecognised_code   - a row exists but this build cannot name its reason
+      read_failed         - the read could not run; nothing was established
+
+    Omitting `tab` reads every tab of the channel, matching the release route.
+    """
+    plat = platform or "youtube"
+    want = str(channel or "").strip()
+    tab_norm = str(tab or "").strip().lower()
+    if not want:
+        raise HTTPException(status_code=400, detail="channel is required")
+    try:
+        rows = channel_outcome_snapshot(plat)
+    except Exception:
+        # A read that could not run has NOT established that this channel is
+        # unmeasured, so it must not answer `not_learned` - that would be the
+        # same fabricated claim as reporting an empty table.
+        logger.debug("channel outcome-park read failed for %s", want, exc_info=True)
+        return {
+            "channel": want.lstrip("@").lower(),
+            "tab": tab_norm or None,
+            "platform": plat,
+            "status": PARK_STATUS_READ_FAILED,
+            "learned": None,
+        }
+    if tab_norm:
+        rows = [
+            r for r in rows
+            if _park_ref_matches(r.get("channel", ""), want)
+            and str(r.get("tab") or "").lower() == tab_norm
+        ]
+    else:
+        rows = [r for r in rows if _park_ref_matches(r.get("channel", ""), want)]
+
+    recognised = [r for r in rows if ytdlp_outcomes.is_permanent(str(r.get("outcome_code") or ""))]
+    if recognised:
+        return {
+            "channel": str(recognised[0].get("channel") or ""),
+            "tab": tab_norm or str(recognised[0].get("tab") or ""),
+            "platform": plat,
+            "status": PARK_STATUS_PARKED,
+            "learned": _park_view(recognised[0]),
+        }
+    return {
+        "channel": want.lstrip("@").lower(),
+        "tab": tab_norm or None,
+        "platform": plat,
+        "status": PARK_STATUS_UNRECOGNISED if rows else PARK_STATUS_NOT_LEARNED,
+        # null, and never a synthesised "ok": the absence of a learned park is
+        # not evidence that the channel works, and a caller that treats it as
+        # such is how an empty listing gets cached as a verified-empty channel.
+        "learned": None,
+    }
+
+
+@router.post("/api/channel/outcome-park/release")
+async def release_channel_outcome_park(req: ChannelOutcomeReleaseRequest) -> dict:
+    """Release a learned park: the next cycle asks this (channel, tab) again.
+
+    WHAT THIS DOES AND DOES NOT PROMISE, because the difference is the whole
+    point of the button. It clears the MEMORY, not the condition: the next walk
+    asks the channel for real, and if the channel still answers the same way the
+    walk LEARNS IT AGAIN and the park comes back. So a release is never reported
+    as a fix, and the UI says so next to the button rather than in a comment.
+
+    The release is durable (archive_db.release_channel_outcome is a released_at
+    UPDATE on the same row, so it survives a restart exactly as the park does).
+    """
+    want = str(req.channel or "").strip()
+    if not want:
+        raise HTTPException(status_code=400, detail="channel is required")
+    plat = req.platform or "youtube"
+    tab_norm = str(req.tab or "").strip().lower() or None
+
+    # Count what is CURRENTLY parked and report the DELTA this call achieved.
+    # archive_db.release_channel_outcome returns how many rows are in a released
+    # state for the channel - a historical total, not a per-call count - so
+    # reusing it as "released N" would answer 1 on a second press that released
+    # nothing. That is exactly the fabricated-success hole this endpoint must
+    # not have, so the number is measured here instead.
+    def _live_rows() -> list[dict]:
+        try:
+            rows = channel_outcome_snapshot(plat)
+        except Exception:
+            logger.debug("channel outcome-park read failed for %s", want, exc_info=True)
+            return []
+        rows = [r for r in rows if _park_ref_matches(r.get("channel", ""), want)]
+        if tab_norm:
+            rows = [r for r in rows if str(r.get("tab") or "").lower() == tab_norm]
+        return rows
+
+    before = len(_live_rows())
+    if before == 0:
+        # Nothing parked: a second press, or a release that already happened.
+        # Reported as a no-op with a status, not as a successful release, and not
+        # as an error either - releasing twice must be safe.
+        return {
+            "channel": want.lstrip("@").lower(),
+            "tab": tab_norm,
+            "platform": plat,
+            "released": 0,
+            "status": "nothing_to_release",
+        }
+
+    youtube_service.release_learned_channel_outcome(want, tab_norm)
+    released = max(0, before - len(_live_rows()))
+    if released:
+        logger.info(
+            "released %d learned yt-dlp park(s) for %s%s - the next cycle asks again; "
+            "a condition that still holds is re-learned",
+            released, want, f"/{tab_norm}" if tab_norm else "",
+        )
+    return {
+        "channel": want.lstrip("@").lower(),
+        "tab": tab_norm,
+        "platform": plat,
+        "released": released,
+        "status": "released" if released else "nothing_to_release",
+    }

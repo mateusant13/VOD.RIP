@@ -106,6 +106,7 @@ import PreviewTimelineBar from './components/PreviewTimelineBar';
 import PreviewChatPanelTime from './components/PreviewChatPanelTime';
 import { panelMaxW, layoutMaxPanelHeight, layoutMaxPanelWidthAtSiblingMins, clampPanelSizeForLayout, clampAllLayoutPanels, clampPreviewPanelWidth, previewContainerHeight, previewPlayerColumnWidth, resizeLayoutGivingWidthTo, layoutRowEdgeInsets, layoutRowHasMultiplePanels as layoutHasMultiplePanels, applyPanelSize, startPanelResizeDrag, applyPanelWidth, startPanelWidthResize, defaultPanelLayout, loadPanelLayout, persistPanelLayout, clampLayoutNumber, sanitizeStoredPanelSize, effectiveLayoutFromPreferred, userOwnedWidthsFrom, healSqueezedPanelLayout, repairInconsistentPanelLayout, rowPanelHeightFromPreview, ownedPanelHeightSeed, type EffectivePanelLayout, PREVIEW_KEY_SKIP_SEC, PREVIEW_FS_CONTROLS_HIDE_MS, PREVIEW_DEFAULT_VOLUME, PREVIEW_PANEL_MIN_W, PREVIEW_PANEL_CHROME_H_EST, PREVIEW_VIDEO_ASPECT_DEFAULT, PANEL_MIN, EXPLORE_POPUP_Z, SEARCH_POPUP_Z, MAX_EXPLORE_POPUPS } from './layoutUtils';
 import ChannelListIndexBadge from './components/ChannelListIndexBadge';
+import ChannelParkedOutcomes from './components/ChannelParkedOutcomes';
 import ChannelPlatformLabel from './components/ChannelPlatformLabel';
 import PlatformVodIcon from './components/PlatformVodIcon';
 import ChannelClipThumb from './components/ChannelClipThumb';
@@ -7354,6 +7355,12 @@ export default function App() {
             {livePopupNotice && (
               <p className="text-amber-400 text-[10px] font-mono">{livePopupNotice}</p>
             )}
+            {/* Learned per-channel yt-dlp parks, in the channels tab because
+                that is where the owner looks at channels: a parked channel is
+                otherwise invisible — the walk skips it before drawing a
+                governor token, so the row never changes and there is no way to
+                un-park one. Self-fetching; one read on mount, one per release. */}
+            <ChannelParkedOutcomes />
 
             {savedChannels.length > 0 && (
               <div ref={channelListRef} className="flex flex-col gap-1">
