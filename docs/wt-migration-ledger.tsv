@@ -7,3 +7,12 @@
 #
 # lane<TAB>original_path<TAB>state<TAB>new_path<TAB>sha<TAB>moved_utc
 wt-ytgate	I:/TEMP/wt-ytgate	done	I:/vod-rip-wt/done/wt-ytgate	dbc6513527fb44386408b7877b2dd28df8a5f462	2026-10-05T06:34:49Z
+wbudget	I:/TEMP/wbudget	unsure	I:/vod-rip-wt/unsure/wbudget	cc8cc0e77fee38641595851344337b552cb9adaf	2026-10-05T09:41:11Z
+wt-asrsup	I:/TEMP/wt-asrsup	done	I:/vod-rip-wt/done/wt-asrsup	834d4abd8d00640dcb24598702a5a2eac11b2e11	2026-10-05T09:41:46Z
+wt-bind	I:/TEMP/wt-bind	done	I:/vod-rip-wt/done/wt-bind	ae2aba31c8195824fcb961638020b1a6516497dc	2026-10-05T09:42:01Z
+wt-db-teardown	I:/TEMP/wt-db-teardown	done	I:/vod-rip-wt/done/wt-db-teardown	5c0c624c075cdb6a1350c87c7a33b4c5b3f6124e	2026-10-05T09:42:37Z
+wt-deadlock	I:/TEMP/wt-deadlock	done	I:/vod-rip-wt/done/wt-deadlock	2e1f49efbe07f65695e66fceba970b8a49d247e1	2026-10-05T09:42:57Z
+wt-fmtaudio	I:/TEMP/wt-fmtaudio	done	I:/vod-rip-wt/done/wt-fmtaudio	ce22f9ef966d2505e93c374a685a03816a4ed236	2026-10-05T09:43:38Z
+wt-govcheck	I:/TEMP/wt-govcheck	done	I:/vod-rip-wt/done/wt-govcheck	d3a8edf48e56ebb0b3111612f3a7e89784b6f60a	2026-10-05T09:44:07Z
+wt-ar	I:/TEMP/wt-ar	wip	I:/vod-rip-wt/wip/wt-ar	7a409cfb7dc5a4b102a29f98402c966f6c970040	2026-10-05T09:46:21Z(recovered)
+wt-govegress	I:/TEMP/wt-govegress	done	I:/vod-rip-wt/done/wt-govegress	1d1edcfa12e84713d25057a0d0448888c3d6f207	2026-10-05T09:46:21Z(recovered)

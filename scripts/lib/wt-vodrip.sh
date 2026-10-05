@@ -200,15 +200,31 @@ wtv_move() {
     return 1
   fi
   printf '%s\n' "$out"
-  # POST-CONDITION — the registry must now point at the destination, and the old
-  # path must be gone from it. Verified, not assumed.
+  # POST-CONDITION — the destination must now be registered. This is the load-bearing
+  # half: if the destination is not registered, the move did not land, and refusing
+  # is correct.
   if ! git -C "$repo" worktree list --porcelain | grep -qF "worktree $dest"; then
     printf 'wt-move: REFUSED: postcondition failed — %s is not registered after the move.\n' "$dest" >&2
     return 1
   fi
-  if git -C "$repo" worktree list --porcelain | grep -qF "worktree $src"; then
-    printf 'wt-move: REFUSED: postcondition failed — %s is still registered after the move.\n' "$src" >&2
-    return 1
+  #
+  # The old row should be gone. MEASURED 2026-10-05: immediately after a move that DID
+  # land, this check can still match (wt-ar). The first version treated that as a hard
+  # failure, and the consequences were worse than the stale row: wt-migrate.sh exited
+  # non-zero and therefore NEVER WROTE THE LEDGER ROW, leaving a lane that had been
+  # moved with no recorded way back. A false failure that destroys the rollback record
+  # is far more dangerous than the stale row it was complaining about. So: retry
+  # briefly; if the destination is registered and the old row lingers, WARN and
+  # SUCCEED, so the ledger row is always written.
+  local i=0 stale=0
+  while [ "$i" -lt 3 ]; do
+    if ! git -C "$repo" worktree list --porcelain | grep -qF "worktree $src"; then
+      stale=0; break
+    fi
+    stale=1; i=$((i + 1)); sleep 1
+  done
+  if [ "$stale" = 1 ]; then
+    printf 'wt-move: WARNING: %s is still listed after the move to %s. The destination IS registered, so the move landed and the ledger row WILL be written; the old row looks stale. Do not run `git worktree prune` without checking what it would drop.\n' "$src" "$dest" >&2
   fi
   return 0
 }
