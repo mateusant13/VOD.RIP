@@ -241,6 +241,81 @@ Same payload on disk: `I:\!watcher\status\now.json`
 - Skill: `.omp/skills/steady-watcher/SKILL.md`
 <!-- /STEADY-WATCHER -->
 
+## yt-dlp executes a REMOTE challenge solver (owner-authorised, 2026-10-05)
+
+**This is the one place VOD.RIP downloads and executes code from the internet.** It is
+enabled by a named env var, it is off by default in the code, and turning it back off is
+one variable. Read this before touching `ytdlp_guard.sanitize_ytdlp_opts`.
+
+### What it does and why it exists
+
+YouTube hides its adaptive (audio-only) streams behind an **n-challenge** that can only
+be answered by *executing JavaScript*. The installed yt-dlp (`2026.08.19`) vendors only
+the `core` half of its solver — the `lib` half is **absent from the package** — so with
+no remote component the challenge cannot be solved, **every audio-only itag (140/251)
+drops out of the format list**, and `archive_ytdlp._AUDIO_ONLY_FORMAT_SPEC`
+(`bestaudio/best[vcodec=none][acodec!=none]`) has nothing to match. The lane then
+requeues, and before the `ce22f9e`/`f272355` guards it fell through to muxed itag 18 and
+handed h264 video to a speech recogniser.
+
+The option name, value, and default are read from the **installed package**
+(`yt_dlp/options.py` `--remote-components`, `globals.py:supported_remote_components`),
+not from memory: dest `remote_components`, values `ejs:github` / `ejs:npm`, **default
+empty — no remote component is allowed by default.**
+
+### The security consequence, stated plainly
+
+Enabling this makes yt-dlp **download JavaScript from a remote source and execute it**,
+in a local JS runtime (deno/node), while solving the challenge. That is remote code
+execution by design, and enabling it is a **permanent trust grant in the config** — it
+does not expire and it is not sandboxed beyond the runtime's own permissions.
+
+The source is **`github.com/yt-dlp/ejs` release assets**. Two bounds make it narrower
+than "run whatever GitHub serves": the URL is pinned to a version tag that yt-dlp itself
+carries (`jsc/_builtin/vendor/_info.py:VERSION`), and the downloaded script is verified
+against a **sha3-512 hash vendored inside the installed yt-dlp**, which yt-dlp refuses on
+mismatch. So a tampered asset is rejected — but the trust is in the installed package's
+manifest, and the package is part of the trust boundary.
+
+### The knob
+
+```
+VODRIP_YT_EXECUTE_REMOTE_CHALLENGE_SOLVER=1
+```
+
+- The name is deliberately verbose: it says *execute*, so nobody enables it by accident.
+- `1/true/yes/on` allows it. **`0/false/no/off` — or leaving it unset — forbids it.**
+- Only `ejs:github` is granted. `ejs:npm` would pull npm packages at solve time (a
+  second remote source) and is **not** enabled.
+
+### ONE documented way to turn it off
+
+```powershell
+# set this to 0 (or delete it) and restart the app
+$env:VODRIP_YT_EXECUTE_REMOTE_CHALLENGE_SOLVER='0'
+```
+
+This restores the **previous behaviour exactly**: no remote fetch, the n-challenge stays
+unsolved, audio-only formats stay absent, and the transcription lane requeues instead of
+downloading a video stream. It is a real revert, not a soft disable — `sanitize_ytdlp_opts`
+*overwrites* `remote_components` with `[]` when off, so a caller cannot smuggle the grant
+back in.
+
+### Where it lives, and the audit trail
+
+The grant is decided in **`services/ytdlp_guard.sanitize_ytdlp_opts`** — the function that
+already decides `fetch_pot` — so it rides the single guarded egress seam
+(`guarded_youtube_dl`) and cannot be bypassed by a caller. Do **not** move it into a
+module that constructs `YoutubeDL` directly.
+
+On startup, once per process, the module logs the resolved state: the component, the
+pinned version, and the first 16 hex of the expected hash — that log line is the answer
+to "did this box execute remote JS, and which bytes?".
+
+`backend/tests/test_remote_challenge_solver.py` fails if the grant is ever dropped from
+the effective opts at the seam. It asserts the **opts handed to a real `YoutubeDL`**,
+not a constant, because the failure mode is a refactor silently un-solving the challenge.
+
 ## How To: Split-Runtime Release (FUTURE releases)
 
 > **This is the release process for FUTURE releases — it is a documented target, NOT something to implement in this task.** No code, installer, or build changes are made to realize it here. Use the steps below when publishing the next release.

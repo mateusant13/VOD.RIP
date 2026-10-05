@@ -168,6 +168,84 @@ def test_a_caller_cannot_smuggle_the_grant_past_the_seam(solver_off):
     assert out["remote_components"] == []
 
 
+# --- turning it off also stops USING an already-cached script ---------------
+
+def test_disabling_purges_the_cached_solver_script(monkeypatch, tmp_path):
+    """`remote_components=[]` alone does NOT turn the grant off.
+
+    yt-dlp caches the downloaded solver at
+    ``<cachedir>/challenge-solver/lib.json`` (ejs.py `_web_release_source` ->
+    `ie.cache.store`), and `_cached_source` reads it WITHOUT consulting
+    `remote_components`. So a box that solved the challenge once would keep
+    EXECUTING the cached script with the knob at 0, and an operator told
+    "set it to 0" would be told a falsehood.
+
+    This was measured, not theorised: with the knob off but the cache
+    populated, the format list still carried audio-only itags 140/251.
+    """
+    cachedir = tmp_path / "yt-dlp"
+    lib = cachedir / "challenge-solver" / "lib.json"
+    lib.parent.mkdir(parents=True)
+    lib.write_text('{"yt-dlp_version": "x", "data": {}}', encoding="utf-8")
+    assert lib.is_file()
+
+    monkeypatch.setenv(ENV, "0")
+    monkeypatch.setattr(ytdlp_guard, "_EJS_PURGE_DONE", False, raising=False)
+    sanitize_ytdlp_opts({"cachedir": str(cachedir)})
+    assert not lib.exists(), (
+        "the cached solver script survived: the grant is unfetched but still "
+        "executed, so 'set it to 0' does not actually turn it off"
+    )
+
+
+def test_disabling_leaves_unrelated_cache_files_alone(monkeypatch, tmp_path):
+    """The purge must remove ONE known file, not the cache dir.
+
+    yt-dlp's cache also holds the po_token (`youtube-sigfuncs`, player
+    caches). Deleting those would silently break authentication — a much worse
+    outcome than a stale solver script.
+    """
+    cachedir = tmp_path / "yt-dlp"
+    solver = cachedir / "challenge-solver" / "lib.json"
+    sigfuncs = cachedir / "youtube-sigfuncs" / "8ab5c328-main-102.json"
+    pot = cachedir / "pot" / "player.json"
+    for p in (solver, sigfuncs, pot):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setenv(ENV, "0")
+    monkeypatch.setattr(ytdlp_guard, "_EJS_PURGE_DONE", False, raising=False)
+    sanitize_ytdlp_opts({"cachedir": str(cachedir)})
+
+    assert not solver.exists()
+    assert sigfuncs.exists(), "the purge deleted a po_token cache file"
+    assert pot.exists(), "the purge deleted a POT cache file"
+
+
+def test_purge_never_raises_on_a_missing_or_unwritable_cache(monkeypatch, tmp_path):
+    """A cache problem must not break yt-dlp — it is logged and the run goes on."""
+    monkeypatch.setenv(ENV, "0")
+    monkeypatch.setattr(ytdlp_guard, "_EJS_PURGE_DONE", False, raising=False)
+    # A path that cannot hold a file, and a plain non-existent dir: neither
+    # may raise out of the egress seam.
+    sanitize_ytdlp_opts({"cachedir": str(tmp_path / "nope" / "deeper")})
+    sanitize_ytdlp_opts({"cachedir": str(tmp_path)})
+
+
+def test_enabling_does_not_purge_the_cache(monkeypatch, tmp_path):
+    """The purge is a REVERT action; enabling must not delete a warm cache."""
+    cachedir = tmp_path / "yt-dlp"
+    lib = cachedir / "challenge-solver" / "lib.json"
+    lib.parent.mkdir(parents=True)
+    lib.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setenv(ENV, "1")
+    monkeypatch.setattr(ytdlp_guard, "_EJS_PURGE_DONE", False, raising=False)
+    out = sanitize_ytdlp_opts({"cachedir": str(cachedir)})
+    assert out["remote_components"] == list(EJS_REMOTE_SOLVER_COMPONENTS)
+    assert lib.exists(), "enabling the solver deleted the cached script"
+
+
 # --- the knob is legible and pinned -----------------------------------------
 
 def test_knob_name_states_that_it_executes_remote_code():
