@@ -33,7 +33,19 @@ describe('newWindowId', () => {
   });
 
   it('still produces a distinct id per call without randomUUID', () => {
-    setCrypto({ getRandomValues: (a: Uint8Array) => a });
+    // A stub that VARIES. The first version stubbed getRandomValues to a
+    // no-op, so every call saw the same zero buffer and this assertion was
+    // UNSATISFIABLE rather than informative - uniqueness cannot be asserted
+    // from a constant source. The assertion below is unchanged; it now
+    // actually exercises the getRandomValues path it claims to cover.
+    let n = 0;
+    setCrypto({
+      getRandomValues: (a: Uint8Array) => {
+        n += 1;
+        a.fill(n & 0xff);
+        return a;
+      },
+    });
     const ids = new Set(Array.from({ length: 50 }, () => newWindowId()));
     expect(ids.size).toBe(50);
   });

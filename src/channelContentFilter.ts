@@ -80,8 +80,15 @@ export function normalizeChannelContentFilter(value: unknown): ChannelContentFil
 /** Path segment that marks a YouTube Short. */
 const SHORTS_PATH = '/shorts/';
 
-/** Minimal shape needed to classify - keeps this testable without a full row. */
-export type ShortsCandidate = { url?: string | null };
+/** Minimal shape needed to classify - keeps this testable without a full row.
+ *
+ * content_kind is carried (and deliberately NOT read) because that is the
+ * shape production rows actually have: ChannelContentRow is this type
+ * intersected with that field, and the classifier is called with rows. The
+ * URL is the only discriminator, so a disagreeing content_kind must change
+ * nothing - which is only testable if the parameter accepts the field at all.
+ */
+export type ShortsCandidate = { url?: string | null; content_kind?: string | null };
 
 /**
  * True when the row is a YouTube Short.

@@ -284,7 +284,7 @@ interface ChannelRowProps {
   channelListRef: MutableRefObject<HTMLDivElement | null>;
   toggleChannelSelection: (id: string) => void;
   removeChannel: (id: string) => void;
-  refreshChannel: (channelId: string, channelOverride?: SavedChannel, contentMode?: 'vods' | 'clips' | 'streams', opts?: { incremental?: boolean; silent?: boolean; force?: boolean }) => Promise<unknown>;
+  refreshChannel: (channelId: string, channelOverride?: SavedChannel, contentMode?: ChannelContentFilter, opts?: { incremental?: boolean; silent?: boolean; force?: boolean }) => Promise<unknown>;
   clearChannelRefreshFlight: (channelId: string, mode?: 'vods' | 'clips' | 'streams') => void;
   startEditChannelLinks: (id: string) => void;
   removePlatformFromChannel: (channelId: string, platform: 'Kick' | 'Twitch' | 'YouTube') => void;

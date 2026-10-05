@@ -7,6 +7,7 @@
  * halves are asserted - the "no blank container" case is checked by asserting
  * real text content, not merely by the absence of a thrown error.
  */
+import type { ReactNode } from 'react';
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { render, screen, cleanup } from '@testing-library/react';
 import ErrorBoundary from './ErrorBoundary';
@@ -14,7 +15,7 @@ import { FRONTEND_CRASH_LOG_KEY, readFrontendCrashLog } from '../crashLog';
 import { DICTS, setLanguage, getLanguage } from '../i18n';
 
 /** A child that throws during render, the way a real App crash does. */
-function Boom({ message }: { message: string }) {
+function Boom({ message }: { message: string }): ReactNode {
   throw new Error(message);
 }
 

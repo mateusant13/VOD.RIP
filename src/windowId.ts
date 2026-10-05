@@ -38,7 +38,7 @@ export function newWindowId(): string {
   if (c && typeof c.randomUUID === 'function') return c.randomUUID();
   if (c && typeof c.getRandomValues === 'function') {
     // RFC-4122-shaped so the id is indistinguishable in logs from a real UUID.
-    return `${randomHex(4)}-${randomHex(2)}-4${randomHex(1).slice(1)}-a${randomHex(1).slice(1)}-${randomHex(6)}`;
+    return `${randomHex(4)}-${randomHex(2)}-4${randomHex(2).slice(1)}-a${randomHex(2).slice(1)}-${randomHex(6)}`;
   }
   lastIdCounter += 1;
   return `window-${Date.now().toString(36)}-${lastIdCounter.toString(36)}`;
