@@ -22,8 +22,9 @@ compressed, and targeted (specific-first) instead of exhaustive.
 ## 2. More GPU without lagging the system
 - (The faster-whisper engine that motivated this is gone — parakeet is one
   int8 model; the copy-budget design below carries over unchanged.)
-- `_worker_budget()`: CUDA → min(VODRIP_TRANSCRIBE_GPU_COPIES (default 1),
-  floor((mem_total − 512 MB headroom) / model_vram_estimate)); estimate from the first
+- `_worker_budget()`: CUDA → 1 shared-model slot (see the RETIRED KNOB note below —
+  VODRIP_TRANSCRIBE_GPU_COPIES is DEPRECATED and IGNORED, it is NOT read), floored by
+  floor((mem_total − 512 MB headroom) / model_vram_estimate); estimate from the first
   load (mem_get_info before/after) or 2 GB default for large-v3-turbo fp16.
   CPU → VODRIP_TRANSCRIBE_WORKERS (default 2, small models so RAM stays sane).
 - run_worker spawns ThreadPoolExecutor(max_workers=budget); each thread lazily owns its own
@@ -55,7 +56,11 @@ compressed, and targeted (specific-first) instead of exhaustive.
 - GET /api/archive/search → {hits, enriching}
 - messages.spam_count (additive); insert_messages collapses; chat_window includes spam_count
 - transcribe stats: `skipped_no_speech` flag → job done
-- Env: VODRIP_TRANSCRIBE_GPU_COPIES (default 1), VODRIP_TRANSCRIBE_WORKERS (default 2)
+- Env: VODRIP_TRANSCRIBE_WORKERS (default 2) — LIVE. VODRIP_TRANSCRIBE_GPU_COPIES
+  (default 1) is RETIRED: multi-copy was removed, the knob is DEPRECATED and IGNORED
+  (never read; see `backend/services/archive_transcribe.py:115`), and the budget is
+  one shared-model CUDA slot. Do not reintroduce it; `backend/tests/
+  test_env_knob_truthfulness.py` fails if any doc advertises it as working.
 - Settings: archive_smart_enrich default True
 - No new dependencies; skip formatters/linters/project-wide suites during work
 

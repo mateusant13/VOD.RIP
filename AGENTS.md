@@ -182,6 +182,37 @@ Every override is unset and `settings.data_dir` is empty on this box, so the ans
 
 `_migrate_db_to_data_dir()` (`archive_db.py:374`) is what walked the database along that chain — `%APPDATA%` → `G:` on 2026-09-17, then `G:` → `H:` later — **copying** at each step and leaving every predecessor behind.
 
+### Env overrides the code actually reads (learned 2026-10-05)
+
+Only three of these were documented before this table. The rest are live and undiscoverable, which is the same defect as a lying knob in reverse: a feature the owner cannot find is a feature the owner never uses. Every row is a real read, verified in the AST; the default lives at the cited line and is deliberately NOT restated here, so this table cannot drift away from the code.
+
+| variable | read at | what it moves |
+|---|---|---|
+| `VODRIP_ARCHIVE_DB` | `archive_db.py:341` | the live archive DB file (whole path) |
+| `VODRIP_DATA_DIR` | `archive_db.py:334` | the data root the auto tier starts from |
+| `VODRIP_APP_DATA` | `settings.py:21` | `%APPDATA%\VOD.RIP` — settings.json, logs |
+| `VODRIP_CACHE_DIR` | `settings.py:45` | yt-dlp cache, transcript-fix cache, temp |
+| `VODRIP_ARCHIVE_DIR` | `routers/disk.py:47` | the archive media folder, when not in settings |
+| `VODRIP_COOKIE_DB` | `cookie_store.py:70` | the cookie store DB (separate from the archive) |
+| `VODRIP_EMBED_MODEL` | `archive_embed.py:43` | semantic-embedding model directory |
+| `VODRIP_WHISPER_CACHE` | `archive_embed.py:61` | per-model weights cache (beats `VODRIP_CACHE_DIR`) |
+| `VODRIP_EMBED_CACHE` | `archive_embed.py:97` | embedding output cache |
+| `VODRIP_EMBED_BACKFILL` | `app.py:791` | on by default; set `0` to skip the backfill |
+| `VODRIP_KICK_GATE_FREEZE_SEC` | `kick_gate.py:38` | how long a Kick 403/429 streak freezes Kick |
+| `VODRIP_YT_GATE_FREEZE_SEC` | `yt_gate.py:35` | how long a YouTube bot-gate freezes YouTube jobs |
+| `VODRIP_TRANSCRIBE_WORKERS` | `archive_transcribe.py:113` | CPU ASR slots; `0` = GPU-only on a CUDA host |
+| `VODRIP_NO_CUDA_LIBS` | `archive_transcribe.py:1390` | force the CPU path even with a GPU |
+| `VODRIP_WHISPER_DEVICE` | `archive_transcribe.py:368` | pin the ASR device (supersedes auto-detect) |
+| `VODRIP_MAX_DOWNLOAD_BYTES` | `routers/downloads.py:71` | per-download size ceiling |
+| `VODRIP_NO_DAEMONS` | `app.py:128` | `1` = no background daemons (debug) |
+| `VODRIP_TAKE_PORT` | `server_lifecycle.py:456` | take a busy API port instead of failing |
+| `VODRIP_SKIP_PORT_RELEASE` | `run.py:85` | skip the pre-bind port release |
+| `VODRIP_ALLOW_PIP_INSTALL` | `run.py:103` | allow the dev path to shell out to pip |
+
+**One knob in the tree is RETIRED and does nothing:** `VODRIP_TRANSCRIBE_GPU_COPIES` is annotated `# DEPRECATED, IGNORED` at `archive_transcribe.py:115` and is read nowhere except the module self-check. Multi-copy ASR was removed; the budget is one shared-model CUDA slot. `todo.md` used to list it as a live dial — `backend/tests/test_env_knob_truthfulness.py` now fails if any doc advertises it as working, or if a live read path is reintroduced.
+
+Naming a knob in a doc is a claim the code must honour. Before documenting one, confirm the read exists; before trusting one, confirm it is not on this retired list.
+
 ### The rule
 
 **The log directory and the database directory are resolved by different code and can disagree.** Logs go to `%APPDATA%\VOD.RIP\logs\errors.jsonl` (`backend/services/error_log.py:62` — anchored to appdata, not to the data disk); the database goes through `disk_hygiene.data_dir()`. `errors.jsonl` is written there daily, which is exactly what keeps the stale `%APPDATA%` archive looking like the production one.
