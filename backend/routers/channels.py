@@ -1244,26 +1244,45 @@ def _park_ref_matches(stored_channel: str, requested: str) -> bool:
 def _park_view(row: dict) -> dict:
     """One learned row as the API serves it: codes and counters, no prose.
 
-    `known` is the honesty bit. Only a code the vocabulary RECOGNISES may be
-    presented as a park reason; a row holding anything else is still listed
-    (it is a real learned row the owner may need to release) but is marked
-    unknown rather than being rendered with a phrase this build invented.
+    Two separate honesty bits, and they are NOT the same question:
+
+      `permanent` - is this a learnable, skippable, releasable PER-CHANNEL
+        condition (ytdlp_outcomes.PERMANENT_CODES)? Only these may be learned
+        at all, so this is what makes a row a genuine park.
+      `known`     - does THIS build have a phrase for the code
+        (ytdlp_outcomes.EXPECTED_CODES)? `live_offline` is known but not
+        permanent: the app can describe it, and must not present it as a park.
+
+    A row holding neither (a code no build recognises) is still LISTED - it is a
+    real learned row the owner may need to release - but is never rendered with
+    a phrase this build invented.
     """
     code = str(row.get("outcome_code") or "")
     return {
         "channel": str(row.get("channel") or ""),
         "tab": str(row.get("tab") or ""),
         "outcome_code": code,
-        # Every PARKED condition is releasable, and only a permanent code may be
-        # learned at all (youtube_service._learn_channel_outcome_from_exc gates on
-        # ytdlp_outcomes.PERMANENT_CODES), so this is true for a well-formed row
-        # and false for exactly the rows that must not be shown as a park.
         "permanent": ytdlp_outcomes.is_permanent(code),
-        "known": ytdlp_outcomes.is_permanent(code),
+        "known": ytdlp_outcomes.is_expected(code),
         "first_seen": str(row.get("first_seen") or ""),
         "last_seen": str(row.get("last_seen") or ""),
-        "skipped": int(row.get("skipped") or 0),
+        "skipped": _skipped_of(row.get("skipped")),
     }
+
+
+def _skipped_of(value: object) -> int:
+    """The skip counter, or 0 for anything that is not one.
+
+    Total, deliberately: this is a COUNT of skips served from memory, and 0
+    honestly means "no skip was ever counted". A non-numeric value must not
+    raise out of the row mapper and turn a whole snapshot read into an error -
+    and the client omits a zero rather than printing it, so a corrupt counter
+    costs the owner one number, not the panel.
+    """
+    try:
+        return max(0, int(value))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
 
 
 # Stable status codes for the single-channel read. A CODE, for the same reason
@@ -1275,6 +1294,10 @@ PARK_STATUS_NOT_LEARNED = "not_learned"
 #: A row exists but its code is not a park this build recognises. Reported
 #: honestly instead of being passed off as a known park reason.
 PARK_STATUS_UNRECOGNISED = "unrecognised_code"
+#: The read itself failed. NOT `not_learned`: a read that could not run has not
+#: established that anything is unmeasured, and saying so would be the same
+#: fabricated claim as reporting an empty table.
+PARK_STATUS_READ_FAILED = "read_failed"
 
 
 @router.get("/api/channel/outcome-parks")
@@ -1285,17 +1308,24 @@ async def channel_outcome_parks(platform: str = "youtube"):
     the same list before and after a restart and for a process that never
     re-proved anything. An empty list is a real answer - nothing is parked -
     and the client is expected to say so explicitly rather than render nothing.
+
+    A FAILED read is NOT an empty list. Returning `parked: []` on an exception
+    would have the client render its explicit EMPTY state, telling the owner
+    nothing is parked at the exact moment the app has no idea. The `parked` key
+    is therefore deliberately ABSENT on failure, which the client's parser reads
+    as `unavailable` - the true claim.
     """
+    plat = platform or "youtube"
     try:
-        rows = channel_outcome_snapshot(platform or "youtube")
+        rows = channel_outcome_snapshot(plat)
     except Exception:
         # A broken/absent learning table is "no memory", never an exception in
         # the UI's path: the walk degrades the same way (it treats a failed
         # lookup as "not parked" and asks the channel again).
         logger.debug("channel outcome-park read failed", exc_info=True)
-        rows = []
+        return {"platform": plat, "error": "read_failed"}
     parked = [_park_view(r) for r in rows]
-    return {"platform": platform or "youtube", "count": len(parked), "parked": parked}
+    return {"platform": plat, "count": len(parked), "parked": parked}
 
 
 @router.get("/api/channel/outcome-park")
@@ -1312,6 +1342,7 @@ async def channel_outcome_park(
       parked              - a recognised permanent condition is being skipped
       not_learned         - nothing is remembered; this is UNMEASURED, not ok
       unrecognised_code   - a row exists but this build cannot name its reason
+      read_failed         - the read could not run; nothing was established
 
     Omitting `tab` reads every tab of the channel, matching the release route.
     """
@@ -1323,8 +1354,17 @@ async def channel_outcome_park(
     try:
         rows = channel_outcome_snapshot(plat)
     except Exception:
+        # A read that could not run has NOT established that this channel is
+        # unmeasured, so it must not answer `not_learned` - that would be the
+        # same fabricated claim as reporting an empty table.
         logger.debug("channel outcome-park read failed for %s", want, exc_info=True)
-        rows = []
+        return {
+            "channel": want.lstrip("@").lower(),
+            "tab": tab_norm or None,
+            "platform": plat,
+            "status": PARK_STATUS_READ_FAILED,
+            "learned": None,
+        }
     if tab_norm:
         rows = [
             r for r in rows

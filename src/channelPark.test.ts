@@ -161,6 +161,23 @@ describe('channelPark - not measured is not measured and empty', () => {
     expect(parkedState(snap)).toBe('empty');
   });
 
+  it('reads a failed read that the backend reported as unavailable', async () => {
+    // The backend deliberately omits `parked` on a failed read so the client
+    // cannot mistake "I could not read this" for "nothing is parked". This is
+    // the client half of that contract.
+    stubFetch(
+      () =>
+        new Response(JSON.stringify({ platform: 'youtube', error: 'read_failed' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    const snap = await readParkedSnapshot();
+    expect(snap).toBeNull();
+    expect(parkedState(snap)).toBe('unavailable');
+    expect(parkedState(snap)).not.toBe('empty');
+  });
+
   it('reads an unreadable payload as unavailable, NOT as empty', async () => {
     // Every one of these is "I do not know", and each must be unavailable. A
     // panel that answered "nothing is parked" here would be telling the owner
@@ -211,9 +228,10 @@ describe('channelPark - not measured is not measured and empty', () => {
     const snap = (await readParkedSnapshot()) as ParkedSnapshot;
     expect(parkedState(snap)).toBe('rows');
     expect(snap.parked).toHaveLength(2);
-    // A count that disagrees with the rows we can actually render must not be
-    // allowed to make the header lie about the list under it. A NUMERIC count
-    // is passed through verbatim, even when it disagrees.
+    // A NUMERIC count is passed through verbatim even when it disagrees with the
+    // rows, so a diagnostics client sees what the backend counted. The PANEL is
+    // what must not lie: it renders the number of rows it can actually show, and
+    // ChannelParkedOutcomes.test.tsx pins that (count 99, two rows -> header 2).
     expect(snap.count).toBe(99);
   });
 

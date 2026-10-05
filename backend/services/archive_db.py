@@ -4318,6 +4318,20 @@ def release_channel_outcome(
     return released
 
 
+def _skipped_count(value: Any) -> int:
+    """A skip counter as a non-negative int; 0 for anything that is not one.
+
+    Used by channel_outcome_snapshot so one corrupt cell cannot fail the whole
+    parked-channel read. 0 is the honest answer for a value we could not read:
+    it means "no skip was counted", and the UI omits a zero rather than printing
+    it, so nothing false reaches the owner either way.
+    """
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 def channel_outcome_snapshot(platform: str = "youtube") -> list[dict]:
     """Every currently-parked condition, for diagnostics and the API.
 
@@ -4342,7 +4356,16 @@ def channel_outcome_snapshot(platform: str = "youtube") -> list[dict]:
             "outcome_code": str(r["outcome_code"]),
             "first_seen": str(r["first_seen"]),
             "last_seen": str(r["last_seen"]),
-            "skipped": int(r["skipped"] or 0),
+            # Defensive, and deliberately so: a bare int() here raises on a
+            # non-numeric cell, and that raise escapes the sqlite3.Error guard
+            # above, so ONE corrupt counter would fail the WHOLE read and hide
+            # every genuinely parked channel behind it. A counter that will not
+            # convert is 0 - "no skip was ever counted" - and costs the caller
+            # one number instead of the list. (The column is
+            # INTEGER NOT NULL DEFAULT 0, so this only ever fires on a
+            # corrupted or hand-edited row; it is here because the failure mode
+            # it prevents is the worst kind: a silent, wrong, total absence.)
+            "skipped": _skipped_count(r["skipped"]),
         }
         for r in rows
     ]

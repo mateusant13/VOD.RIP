@@ -113,7 +113,18 @@ describe('ChannelParkedOutcomes - the states are distinct', () => {
     expect(q('[data-parked-empty]')).toBeNull();
   });
 
-  it('renders each parked channel with its tab, code, reason and learning time', async () => {
+  it('shows the number of rows it can render, not a count that disagrees', async () => {
+    // The backend serves `count` verbatim (a diagnostics client wants what it
+    // counted), so a stale count must never make this header lie about the list
+    // directly under it.
+    stubSnapshot([row(), row({ channel: 'other' })], { count: 99 });
+    render(<ChannelParkedOutcomes />);
+    await waitFor(() => expect(q('[data-parked-list]')).toBeTruthy());
+    expect(document.querySelectorAll('[data-parked-row]')).toHaveLength(2);
+    expect(q('[data-parked-count]')?.textContent).toBe('2');
+  });
+
+  it('each parked channel shows its tab, code, reason and learning time', async () => {
     stubSnapshot([row(), row({ channel: 'srdoglol', outcome_code: 'tab_absent', skipped: 12 })]);
     render(<ChannelParkedOutcomes />);
     await waitFor(() => expect(q('[data-parked-list]')).toBeTruthy());

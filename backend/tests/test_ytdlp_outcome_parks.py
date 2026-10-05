@@ -301,12 +301,66 @@ def test_an_unrecognised_code_is_not_presented_as_a_park(clean_outcomes):
 def test_a_transient_code_is_not_served_as_a_permanent_park(clean_outcomes):
     """Only PERMANENT_CODES may be presented as a park. A bot wall is IP state
     and 'Offline' resolves on its own; parking either would hide a channel that
-    recovers, which is the bug the release path exists to avoid."""
+    recovers, which is the bug the release path exists to avoid.
+
+    Note `known` stays TRUE: this build CAN describe 'live_offline'. The two
+    bits answer different questions - known (can we name it?) vs permanent (may
+    it be parked?) - and collapsing them would either hide a description the app
+    has or vouch for a park that must not exist."""
     _learn("livechan", "streams", ytdlp_outcomes.LIVE_OFFLINE)
     body = _read("livechan", "streams")
     assert body["learned"] is None
     assert body["status"] == channels.PARK_STATUS_UNRECOGNISED
-    assert _snapshot()["parked"][0]["permanent"] is False
+    row = _snapshot()["parked"][0]
+    assert row["permanent"] is False
+    assert row["known"] is True, "live_offline IS in EXPECTED_CODES - we can name it"
+
+
+def test_a_read_that_failed_is_never_reported_as_an_empty_table(clean_outcomes, monkeypatch):
+    """The load-bearing honesty test for this surface.
+
+    A read that blows up says NOTHING about what is parked. Returning
+    `parked: []` would make the client render its explicit EMPTY state - telling
+    the owner no channel is parked at the exact moment the app has no idea - and
+    answering `not_learned` for one channel would claim it was unmeasured. Both
+    are the fabricated claim this endpoint exists to avoid, so the failure is
+    reported as a failure in both shapes.
+    """
+    def _boom(_plat):
+        raise RuntimeError("the learning table is on fire")
+
+    monkeypatch.setattr(channels, "channel_outcome_snapshot", _boom)
+
+    snap = _snapshot()
+    assert "parked" not in snap, (
+        "a failed read must NOT carry an empty `parked` array - the client reads "
+        "its EMPTY state from that key and would report 'nothing is parked'"
+    )
+    assert snap.get("error"), "the failure must be reported as a failure"
+
+    body = _read("srdoglol", "streams")
+    assert body["status"] == channels.PARK_STATUS_READ_FAILED
+    assert body["learned"] is None
+    assert body["status"] != channels.PARK_STATUS_NOT_LEARNED, (
+        "a read that could not run has not established that this is unmeasured"
+    )
+
+
+def test_a_corrupt_skip_counter_does_not_break_the_whole_snapshot(clean_outcomes):
+    """A counter that will not convert costs the owner one number, not the
+    panel. Previously a non-numeric `skipped` raised out of the row mapper and
+    turned the entire read into an error - so one bad cell could hide every
+    genuinely parked channel."""
+    _learn("srdoglol", "streams", ytdlp_outcomes.TAB_ABSENT)
+    _learn("other", "streams", ytdlp_outcomes.CHANNEL_GONE)
+    archive_db.execute(
+        "UPDATE youtube_channel_outcomes SET skipped='not a number' "
+        "WHERE channel_norm='other'"
+    )
+    rows = {r["channel"]: r for r in _snapshot()["parked"]}
+    assert set(rows) == {"srdoglol", "other"}, "one corrupt cell must not hide the rest"
+    assert rows["other"]["skipped"] == 0
+    assert rows["srdoglol"]["skipped"] == 0
 
 
 def test_an_empty_snapshot_is_a_real_answer(clean_outcomes):
