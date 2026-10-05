@@ -135,7 +135,17 @@ def _bundled_node_exe() -> Optional[str]:
 
 
 def _ytdlp_engine_opts() -> dict:
-    """YouTube needs a JS runtime (2026+). Prefer Deno (yt-dlp default), then Node."""
+    """YouTube needs a JS runtime (2026+). Prefer Deno (yt-dlp default), then Node.
+
+    NOTE — a runtime is NECESSARY BUT NOT SUFFICIENT. The installed yt-dlp
+    vendors only the `core` half of its n-challenge solver, not the `lib` half,
+    so with a runtime present and no remote component allowed the challenge is
+    still unsolved and audio-only formats stay absent. The second half is
+    granted separately and reversibly by
+    ``VODRIP_YT_EXECUTE_REMOTE_CHALLENGE_SOLVER`` (see ytdlp_guard); the two
+    knobs are independent, and this function deliberately does not set the
+    remote one — it belongs to the single guarded egress seam.
+    """
     if _find_js_runtime("deno"):
         return {}
     node = _find_js_runtime("node")
