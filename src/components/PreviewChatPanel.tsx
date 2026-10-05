@@ -42,6 +42,8 @@ import { formatArchiveOffset } from '../archiveSearchUtils';
 import { resolveChatColor } from '../chatColors';
 import { seekToTimestamp } from '../seekToTimestamp';
 import { ChatEmoteText, useChatEmotes, type EmoteMap } from '../chatEmotes';
+import { captionsState, fetchParkedReason } from '../captionsPark';
+import CaptionsParkedNotice from './CaptionsParkedNotice';
 import {
   applyChatMarker,
   ChatMarkerChips,
@@ -262,6 +264,10 @@ interface PreviewChatPanelProps {
   onSeek?: (offsetSec: number) => void;
   /** True hides the panel (fullscreen) while keeping its state mounted. */
   hidden?: boolean;
+  /** Switches the app to the Settings tab, where CookieBridgeSection lives.
+   *  Offered by the parked-captions notice so an age-gated video's remedy is
+   *  one click away. Absent → the notice renders without the button. */
+  onOpenCookieBridge?: () => void;
   /** Initial open state. The explore popup opens collapsed (small strip)
    *  so the mini preview stays player-sized by default; the main preview
    *  keeps the panel open. */
@@ -565,6 +571,7 @@ export function PreviewChatPanel({
   channel,
   onSeek,
   hidden = false,
+  onOpenCookieBridge,
   defaultOpen = true,
   maxWidth: maxWidthProp,
   onLayoutChange,
@@ -953,6 +960,45 @@ export function PreviewChatPanel({
     () => activePanelRowIndex(subtitleOffsets, currentTime),
     [subtitleOffsets, currentTime],
   );
+  // ── Age-gated caption park ────────────────────────────────────────────
+  // `captions_parked_reason` arrives on /api/archive/videos, a different
+  // endpoint from the two this panel already reads. It is probed LAZILY - only
+  // once the panel has nothing to show - so a video with captions never pays
+  // for the request. A null/absent result is indistinguishable from an older
+  // backend and leaves every existing branch below byte-identical.
+  const parkProbeKey = platform && videoId ? `${platform}/${videoId}` : '';
+  const [parkProbe, setParkProbe] = useState<{ key: string; reason: string | null }>({
+    key: '',
+    reason: null,
+  });
+  // Keyed so a reason from the previously-previewed video can never render
+  // under the new one while the fresh probe is still in flight.
+  const parkedReason = parkProbe.key === parkProbeKey ? parkProbe.reason : null;
+  // Only YouTube age-gates. Twitch/Kick have no Subtitles tab, so their
+  // subtitleRows is always empty and would probe on every open for a park the
+  // backend can never report.
+  const needsParkProbe =
+    platform === 'youtube' && fetchState === 'done' && !!payload && subtitleRows.length === 0;
+  useEffect(() => {
+    if (!parkProbeKey || !needsParkProbe) return;
+    let cancelled = false;
+    const key = parkProbeKey;
+    void fetchParkedReason(platform, videoId, channel).then((reason) => {
+      if (cancelled) return;
+      setParkProbe({ key, reason });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [parkProbeKey, needsParkProbe, platform, videoId, channel, retryTick]);
+  /** Which of the four distinct caption facts the panel is currently showing. */
+  const captionsVerdict = captionsState({
+    parkedReason,
+    hasTranscript: !!payload?.has_transcript,
+    hasSubtitles: ytSubtitles?.has_subtitles ?? null,
+    cuesInWindow: subtitleRows.length,
+    subtitlesOnly,
+  });
   /** Subtitles-tab list: caption rows matching the search. */
   const subtitleList = useMemo(() => {
     if (!q) return subtitleRows;
@@ -1459,12 +1505,18 @@ export function PreviewChatPanel({
                   </button>
                 </div>
               )}
-              {subtitlesOnly && subsFetchState === 'done' && (!ytSubtitles?.has_subtitles || subtitleRows.length === 0) && (
+              {/* Age-gated park: its OWN state, never the generic "no
+                  subtitles" line below. That line is a permanent-sounding
+                  verdict for a condition the user clears by signing in. */}
+              {captionsVerdict === 'parked' && parkedReason && (
+                <CaptionsParkedNotice reason={parkedReason} onOpenCookieBridge={onOpenCookieBridge} />
+              )}
+              {captionsVerdict !== 'parked' && subtitlesOnly && subsFetchState === 'done' && (!ytSubtitles?.has_subtitles || subtitleRows.length === 0) && (
                 <p className="text-ui-sm font-mono text-zinc-400 text-center leading-relaxed">
                   {t('No subtitles available for this video.')}
                 </p>
               )}
-              {!subtitlesOnly && !payload.has_transcript && (
+              {captionsVerdict !== 'parked' && !subtitlesOnly && !payload.has_transcript && (
                 <p className="text-ui-sm font-mono text-zinc-400 text-center leading-relaxed">
                   {t('No captions for this video.')}
                 </p>
@@ -1573,7 +1625,13 @@ export function PreviewChatPanel({
                   }
                 />
               )}
-              {tab === 'transcript' && !qActive && !payload.has_transcript && timelineRows.length === 0 && (
+              {/* Same park, on the Transcript tab: a parked video has no
+                  transcript either, and "No transcript for this video." is the
+                  most permanent-sounding of the three. */}
+              {tab === 'transcript' && !qActive && captionsVerdict === 'parked' && parkedReason && timelineRows.length === 0 && (
+                <CaptionsParkedNotice reason={parkedReason} onOpenCookieBridge={onOpenCookieBridge} />
+              )}
+              {tab === 'transcript' && !qActive && captionsVerdict !== 'parked' && !payload.has_transcript && timelineRows.length === 0 && (
                 <EmptyState text={t('No transcript for this video.')} />
               )}
               {tab === 'transcript' && qActive && timelineList.length === 0 && (

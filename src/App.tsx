@@ -7129,6 +7129,10 @@ export default function App() {
                     onOpenChange={setPreviewChatOpen}
                     // Channel-scoped custom emotes (BTTV/FFZ/7TV) for twitch rows.
                     channel={videoInfo?.channel ?? null}
+                    // Age-gated caption park: its remedy is a YouTube sign-in,
+                    // which lives in Settings > Cookie Bridge. Same handler the
+                    // bot-gate banner uses to send the user there.
+                    onOpenCookieBridge={() => setTab('settings')}
                     // Click-to-seek: chat/transcript/event rows and the subtitle
                     // caption seek the CURRENT preview player. handlePreviewChatSeek
                     // widens the trim when the click falls outside it so the jump

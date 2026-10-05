@@ -651,6 +651,18 @@ const ptBR: Record<string, string> = {
   'cookieAuto.toggleInfo': 'Mostra a oferta de instalação com um clique quando os cookies ainda não estão pareados. Desligue para instalar apenas manualmente.',
   'cookieBridge.silentHint': 'Instalação automática em segundo plano — sem abrir chrome://extensions nem pastas na frente de você. Fallback manual: abra extensões, modo desenvolvedor ON, arraste VOD.RIP-cookies.',
   'cookieBridge.manualOpen': 'Instalar manualmente (abrir extensões)',
+  // ── Age-gated caption park (captionsPark.*) ───────────────────────
+  'captionsPark.title': 'Legendas pausadas',
+  'captionsPark.noSession':
+    'O YouTube não serve legendas a uma requisição anônima, e nenhuma sessão autenticada do YouTube está configurada. Este vídeo está esperando seu login — não está quebrado.',
+  'captionsPark.rejectedSession':
+    'A sessão do YouTube que este app tem foi rejeitada, então nenhuma legenda pôde ser lida. Entre de novo e este vídeo volta para a varredura de legendas.',
+  'captionsPark.unknown':
+    'Este vídeo é restrito por idade, então nenhuma legenda pôde ser lida. Entre no YouTube e ele volta para a varredura de legendas.',
+  'captionsPark.reversible':
+    'Não é uma falha, e nada se perde: o bloqueio se solta sozinho assim que o YouTube estiver autenticado.',
+  'captionsPark.openSettings': 'Abrir Cookie Bridge',
+  'captionsPark.sweepClause': '{count} pausados — entre no YouTube para liberá-los',
   // ── Tutorial reset (tutorial.*) ───────────────────────────
   'tutorial.button': 'Tutorial',
   'tutorial.resetToast': 'Mensagens de tutorial reativadas',
@@ -791,6 +803,18 @@ const en: Record<string, string> = {
   'tutorial.resetToast': 'Tutorial messages re-enabled',
   'cookieBridge.silentHint': 'Automatic background install — no chrome://extensions tab or folder popups in front of you. Manual fallback: open extensions, Developer mode ON, drag VOD.RIP-cookies.',
   'cookieBridge.manualOpen': 'Manual install (open extensions)',
+  // ── Age-gated caption park (captionsPark.*) ───────────────────────
+  'captionsPark.title': 'Captions paused',
+  'captionsPark.noSession':
+    'YouTube serves no captions to an anonymous request, and no signed-in YouTube session is configured. This video is waiting on your sign-in, not broken.',
+  'captionsPark.rejectedSession':
+    'The YouTube session this app has was rejected, so no captions could be read. Sign in again and this video goes back into the caption sweep.',
+  'captionsPark.unknown':
+    'This video is age-restricted, so no captions could be read. Sign in to YouTube and it goes back into the caption sweep.',
+  'captionsPark.reversible':
+    'Not a failure, and nothing is lost: the park releases itself the moment YouTube is signed in.',
+  'captionsPark.openSettings': 'Open Cookie Bridge',
+  'captionsPark.sweepClause': '{count} parked — sign in to YouTube to release them',
   // ── Chat START/END markers (chat .txt export) ────────────
   'Start': 'Start',
   'End': 'End',
@@ -1379,6 +1403,18 @@ const es: Record<string, string> = {
   'cookieAuto.toggleInfo': 'Ofrece la instalación con un clic cuando las cookies aún no están vinculadas. Desactívalo para instalar solo manualmente.',
   'cookieBridge.silentHint': 'Instalación automática en segundo plano — sin abrir chrome://extensions ni ventanas de carpetas delante de ti. Fallback manual: abre extensiones, modo desarrollador ON, arrastra VOD.RIP-cookies.',
   'cookieBridge.manualOpen': 'Instalar manualmente (abrir extensiones)',
+  // ── Age-gated caption park (captionsPark.*) ───────────────────────
+  'captionsPark.title': 'Subtítulos pausados',
+  'captionsPark.noSession':
+    'YouTube no sirve subtítulos a una petición anónima, y no hay ninguna sesión de YouTube autenticada configurada. Este vídeo está esperando tu inicio de sesión, no está roto.',
+  'captionsPark.rejectedSession':
+    'La sesión de YouTube que tiene esta app fue rechazada, así que no se pudieron leer subtítulos. Inicia sesión de nuevo y este vídeo vuelve al barrido de subtítulos.',
+  'captionsPark.unknown':
+    'Este vídeo tiene restricción de edad, así que no se pudieron leer subtítulos. Inicia sesión en YouTube y vuelve al barrido de subtítulos.',
+  'captionsPark.reversible':
+    'No es un fallo, y no se pierde nada: el bloqueo se libera solo en cuanto YouTube tenga la sesión iniciada.',
+  'captionsPark.openSettings': 'Abrir Cookie Bridge',
+  'captionsPark.sweepClause': '{count} pausados — inicia sesión en YouTube para liberarlos',
   // ── Tutorial reset (tutorial.*) ───────────────────────────
   'tutorial.button': 'Tutorial',
   'tutorial.resetToast': 'Mensajes de tutorial reactivados',
