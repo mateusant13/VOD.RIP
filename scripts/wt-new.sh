@@ -346,12 +346,24 @@ selftest() {
   echo "ARM 2/2  VOD.RIP manifest (read-only: creates nothing, moves nothing)"
   unset WORKTREE_ROOTS   # so the REAL repo-scoped manifest is the one under test
 
-  local m repo root proj
+  local m repo root proj scripts want
   m="$(wtroot_manifest)"
-  case "$(wtroot_norm "$m")" in
-    *vod-rip*/scripts/worktree-roots.tsv) _chk "default manifest is the REPO-SCOPED one" "yes" "yes" ;;
-    *) _chk "default manifest is the REPO-SCOPED one" "yes" "no" ;;
-  esac
+  # Anchor this on THIS repo's own scripts/ directory, computed from where the
+  # script actually lives. The previous form globbed a hardcoded `*vod-rip*`
+  # against the resolved path, which cannot match this repository: its
+  # directory is spelled `VOD.RIP`, and wtroot_norm lowercases, so the path
+  # contains `vod.rip`. The manifest was ALWAYS the repo-scoped one; the
+  # CHECK could not recognise it. That is the same class of bug as a
+  # line-pinned ratchet: a key that breaks on a rename reports "changed"
+  # when nothing changed, and a check that cries wolf is not a check.
+  scripts="$(cd "$(wtroot_lib_dir)/.." 2>/dev/null && pwd -W 2>/dev/null)" \
+    || scripts="$(cd "$(wtroot_lib_dir)/.." 2>/dev/null && pwd)"
+  want="$(wtroot_norm "$scripts")/worktree-roots.tsv"
+  if [ "$(wtroot_norm "$m")" = "$want" ]; then
+    _chk "default manifest is the REPO-SCOPED one" "yes" "yes"
+  else
+    _chk "default manifest is the REPO-SCOPED one" "yes" "no"
+  fi
   [ -f "$m" ] && _chk "default manifest exists" "yes" "yes" || _chk "default manifest exists" "yes" "no"
 
   proj="$(awk -F'\t' '/^[[:space:]]*#/ {next} NF>=4 {print $1}' "$m" | head -n1)"

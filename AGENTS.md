@@ -311,6 +311,63 @@ Rules:
 - Pagefile: `H:\pagefile.sys` 16GB fixed (same NVMe as C: so it mounts at boot).
 
 
+## Worktrees: the root is `I:`, and the migration is already done
+
+**`scripts/worktree-roots.tsv` is the source of truth for this project. Read it
+before touching anything worktree-shaped.** It is repo-scoped on purpose; the
+shared portfolio manifest at `I:\!manager\worktree-roots.tsv` is another repo's
+file and is left untouched.
+
+**THE ROOT IS `I:/vod-rip-wt`, NOT `G:/vod-rip-wt`.** I got this wrong by
+reading the shared manifest and not measuring, and it is worth recording why
+the shared row is wrong for us:
+
+- **`git worktree move` is SAME-DRIVE-ONLY.** Every registered VOD.RIP worktree
+  is on `I:`. A root on `G:` would not make the migration slow, it would make
+  it **IMPOSSIBLE** — git refuses a cross-drive move outright.
+- **Free space, measured 2026-10-05:** C: 13.1 GB · G: 7.4 GB · H: 102.1 GB ·
+  I: 49.0 GB. `G:` does not have room for the tree set plus growth.
+- `archive/` is a SIBLING of `wip`/`unsure`/`done` under the same root, so it
+  is on the same drive for free and a later move into `archive/` works.
+
+**Reorganising worktrees reclaims ZERO bytes.** It is a reorganisation, not a
+storage move. Measured: ~1.29 GiB across the worktrees, and it stays exactly
+where it was. Do not present a migration as freeing space.
+
+**The migration is DONE, and it is reversible.** `docs/wt-migration-ledger.tsv`
+has one row per move: `lane, original_path, state, new_path, sha, moved_utc`.
+Undo one with `scripts/wt-restore.sh --lane <lane>`, undo all with
+`scripts/wt-restore.sh --all`. **Nothing in that ledger is a deletion record.**
+10 worktrees were deliberately left in place because they carry a
+`node_modules` JUNCTION — `git worktree remove` destroyed a dependency tree
+through one of those — so they are not moved either. Retiring them is the
+owner's call, not a script's.
+
+**Create lanes only through the chokepoint**, never `git worktree add <path>`
+by hand:
+
+```bash
+bash scripts/wt-new.sh --project vod-rip --lane <name> --state wip|unsure|done|archive
+```
+
+Every refusal in that script is load-bearing. Each one exists because the
+wrong thing was MEASURED to succeed, and `git` has no concept of a correct
+worktree location, so the wrapper is the only choke point. A deleted guard is
+a permanent hole, not a cleanup. `--selftest` is read-only outside its own
+fixture and is the thing to run after touching it.
+
+### An empty commit is not "committing early"
+
+Measured: `git rev-list origin/main..HEAD` carried **four empty commits**, each
+repeating the previous commit's message verbatim. That is a lane's
+commit-early reflex firing on an already-clean tree — `git commit -F` with
+nothing staged still creates a commit.
+
+It is harmless, and it was deliberately **not** cleaned by rewriting shared
+history: squashing `main` under other lanes that pull from it is destructive
+for a cosmetic gain. The real cost is that a duplicate message reads as two
+independent pieces of work when it is one.
+
 <!-- STEADY-WATCHER -->
 ## Steady Watcher (local governor — OMP must read this)
 
