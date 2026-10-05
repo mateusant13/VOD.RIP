@@ -416,3 +416,20 @@ class PreviewSessionStatusResponse(BaseModel):
 
 class PreviewQualityUpdateRequest(BaseModel):
     prefer_height: int = 720
+
+
+class ChannelOutcomeReleaseRequest(BaseModel):
+    """POST /api/channel/outcome-park/release body.
+
+    `tab` is OPTIONAL and that optionality is the contract, not a convenience:
+    the learned state is keyed per (platform, channel, tab), because "no
+    /streams" says nothing about /videos (archive_db._CHANNEL_OUTCOME_DDL). So a
+    caller may release one tab, or omit it to release every tab of the channel.
+    Omitting it is therefore a real, wider action and must never be inferred
+    from a blank string — an empty `tab` is normalised to None at the route so
+    `{"tab": ""}` and an absent `tab` mean the same deliberate thing: all tabs.
+    """
+
+    channel: str
+    tab: Optional[str] = None
+    platform: str = "youtube"
