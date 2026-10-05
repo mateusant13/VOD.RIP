@@ -244,6 +244,8 @@ The live archive keeps growing, so the 244 is a floor, not a fixed number. Re-me
 
 **A fresh `-shm` mtime is the "someone just read the wrong file" signal.** A WAL database's `-shm` is touched when a connection opens it, so it moves even for a read-only open, while `archive.db` and `-wal` stay put. Measured 2026-10-05 07:11: `G:\VOD.RIP-data\archive.db-shm` had been written 06:39 that morning while its `archive.db` and `-wal` were frozen at 2026-09-17 — a process had the **wrong archive** open half an hour earlier. The trap is not historical. Check that mtime before recommending a delete, and read a fresh one as an active reader rather than a stale file.
 
+**It recurs, and it is not this repo.** The same `-shm` moved again to 07:17 with `archive.db` and `-wal` still frozen at 2026-09-17, so the reader is periodic rather than a one-off. No committed code path opens that file: the only `G:\VOD.RIP-data` literal in the tree is `backend/tests/test_data_dir_pin_cache.py:39`, a stub path the test compares and never opens. No running process holds the path in its command line either, so the reader is short-lived and lives outside the repo. Attribute it with handle-level tooling before deleting — do not re-grep this tree, it has already been ruled out.
+
 ### Decoys: `vodrip.db` is not the database
 
 The live data dir also holds a **`vodrip.db` that is 0 bytes** and referenced nowhere in the codebase — `grep vodrip.db` across `backend/` returns no matches. It sits *beside* the real archive rather than in a stale directory, which makes it the more dangerous of the four: a glob for `*.db` finds it, and it is the only one obviously empty. It is not a database and holds no rows. It is not an orphan predecessor either — it was never written to.
