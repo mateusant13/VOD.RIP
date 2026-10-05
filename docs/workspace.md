@@ -256,3 +256,5 @@ listed at the end.
 | `-MaxWorktrees <n>` | The worktree count above which the gate fails. Default 12. |
 | `-StaleHours <n>` | How old a silent lane may be before it counts as quiet. Default 24. |
 | `-FootprintBudgetSec <n>` | Time budget for measuring worktree sizes. Default 25. |
+| `-GitTimeoutMs <n>` | Time budget for one git call while probing a worktree. Default 10000. A worktree that exceeds it is reported `not_measured`, never dropped and never 0. |
+| `-ThrottleLimit <n>` | How many worktrees to probe at once. Default 6, kept modest because Steady Watcher shares this machine. |

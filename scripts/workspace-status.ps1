@@ -61,6 +61,11 @@ param(
   # (Steady Watcher) shares the machine with everything else.
   [int]$ThrottleLimit = 6,
 
+  # Per-git-call budget for one worktree. Under load a worktree probe can hang,
+  # and a tool that hangs is not a gate: anything over budget is reported
+  # not_measured with a reason, never dropped and never 0.
+  [int]$GitTimeoutMs = 10000,
+
   # Gate: registered worktrees above this count are a collision/over-cap FAIL.
   [int]$MaxWorktrees = 12,
 
@@ -204,6 +209,23 @@ function Get-GlobCollision {
 
 # -------------------------------------------------------------------- probe
 
+function ConvertTo-IsoStamp {
+  <#  A timestamp that means the same thing in every locale.
+      ConvertFrom-Json hands back [datetime] for ISO-8601 strings; stringifying
+      those yields "10/05/2026 02:01:48" on a pt-BR box, which is ambiguous next
+      to a file count of 9,561. Always print ISO-8601 UTC instead.  #>
+  param($Value)
+  if ($null -eq $Value) { return '' }
+  if ($Value -is [datetime]) {
+    return $Value.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  }
+  $d = [datetime]::MinValue
+  if ([datetime]::TryParse("$Value", [ref]$d)) {
+    return $d.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  }
+  return "$Value"
+}
+
 function Get-ProbeSummary {
   <#  Distribution of the live probe, never a single sample.
       Absent file => not_measured with a reason. NEVER 0.  #>
@@ -253,7 +275,12 @@ function Get-ProbeSummary {
     if ($okProp -and ($null -ne $okProp.Value)) { $ok = [bool]$okProp.Value }
     $ts = ''
     $tsProp = $o.PSObject.Properties['ts']
-    if ($tsProp) { $ts = "$($tsProp.Value)" }
+    if ($tsProp -and $null -ne $tsProp.Value) {
+      # ConvertFrom-Json turns an ISO-8601 string into a [datetime], which would
+      # then print in the machine's locale. Normalise back to ISO so the window
+      # is unambiguous wherever the report is read.
+      $ts = ConvertTo-IsoStamp $tsProp.Value
+    }
     $samples.Add([pscustomobject]@{ event = $evName; ms = $ms; ok = $ok; ts = $ts })
   }
 
@@ -634,6 +661,19 @@ function Get-WorktreeVerdict {
 # =====================================================================  main
 
 function Invoke-WorkspaceStatus {
+  # Numbers in a report are data, not prose. On a pt-BR box "12,9 GB" sits next
+  # to "9,561 files" and the reader cannot tell a decimal from a thousands
+  # separator. Format invariantly.
+  $prevCulture = [System.Threading.Thread]::CurrentThread.CurrentCulture
+  [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::InvariantCulture
+  try {
+    Invoke-WorkspaceStatusCore
+  } finally {
+    [System.Threading.Thread]::CurrentThread.CurrentCulture = $prevCulture
+  }
+}
+
+function Invoke-WorkspaceStatusCore {
   $lines = New-Object System.Collections.Generic.List[string]
   $add = { param([string]$s = '') $lines.Add($s) | Out-Null }
 
