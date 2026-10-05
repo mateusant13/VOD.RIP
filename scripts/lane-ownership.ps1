@@ -68,27 +68,34 @@ $env:GIT_OPTIONAL_LOCKS = '0'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repoRoot = Split-Path -Parent $here
 
+# Capture the caller's arguments BEFORE the dot-source below. Dot-sourcing runs
+# workspace-status.ps1's own param block in THIS scope, which resets $Repo and
+# $Manifest to that script's defaults and silently discards whatever was passed
+# to this CLI. Captured first, and under names the dot-source cannot overwrite.
+$cliRepo = $Repo
+$cliManifest = $Manifest
+
 . (Join-Path $here 'workspace-status.ps1')
 
-if (-not $Repo) {
-  $Repo = (git -C $here rev-parse --show-toplevel 2> $null | Select-Object -First 1)
-  if ($Repo) { $Repo = "$Repo".Trim() }
+if (-not $cliRepo) {
+  $cliRepo = (git -C $here rev-parse --show-toplevel 2> $null | Select-Object -First 1)
+  if ($cliRepo) { $cliRepo = "$cliRepo".Trim() }
 }
-if (-not $Repo) { Write-Error 'cannot resolve a repository (pass -Repo <path>)'; exit 1 }
-if (-not $Manifest) { $Manifest = Join-Path $Repo 'docs\lane-ownership.tsv' }
+if (-not $cliRepo) { Write-Error 'cannot resolve a repository (pass -Repo <path>)'; exit 1 }
+if (-not $cliManifest) { $cliManifest = Join-Path $cliRepo 'docs\lane-ownership.tsv' }
 
 $HEADER = @('lane_id', 'scope', 'owns', 'branch', 'worktree', 'dispatched_at', 'state', 'contact')
 
 function Get-ManifestRows {
-  if (-not (Test-Path -LiteralPath $Manifest)) { return @() }
-  $rows = @(Import-Csv -LiteralPath $Manifest -Delimiter "`t" -ErrorAction Stop)
+  if (-not (Test-Path -LiteralPath $cliManifest)) { return @() }
+  $rows = @(Import-Csv -LiteralPath $cliManifest -Delimiter "`t" -ErrorAction Stop)
   if (-not $rows) { return @() }
   return @($rows | Where-Object { $_.'lane_id' })
 }
 
 function Write-ManifestRows {
   param([Parameter(Mandatory = $true)]$Rows)
-  $dir = Split-Path -Parent $Manifest
+  $dir = Split-Path -Parent $cliManifest
   if ($dir -and -not (Test-Path -LiteralPath $dir)) {
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
   }
@@ -111,7 +118,7 @@ function Write-ManifestRows {
     [void]$sb.Append(($cells -join "`t"))
   }
   [void]$sb.Append("`n")
-  [System.IO.File]::WriteAllText($Manifest, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+  [System.IO.File]::WriteAllText($cliManifest, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
 }
 
 switch ($Action) {
@@ -135,7 +142,7 @@ switch ($Action) {
       exit 1
     }
 
-    $parsed = Read-LaneManifest -Path $Manifest
+    $parsed = Read-LaneManifest -Path $cliManifest
     $others = @($parsed.lanes | Where-Object { $_.lane_id -ne $Lane })
     $clashes = @()
     foreach ($o in $others) {
@@ -166,7 +173,7 @@ switch ($Action) {
     $kept = @($rows | Where-Object { $_.'lane_id' -ne $Lane })
     Write-ManifestRows -Rows (@($kept) + @($row))
     Write-Output ("ADDED lane={0} state={1} owns={2}" -f $Lane, $State, ($newOwns -join ' '))
-    Write-Output ("MANIFEST={0}" -f $Manifest)
+    Write-Output ("MANIFEST={0}" -f $cliManifest)
     exit 0
   }
 
@@ -185,11 +192,11 @@ switch ($Action) {
 
   'list' {
     $rows = @(Get-ManifestRows)
-    if (-not (Test-Path -LiteralPath $Manifest)) {
-      Write-Output ("no manifest at {0} - no lane is recorded as owning anything" -f $Manifest)
+    if (-not (Test-Path -LiteralPath $cliManifest)) {
+      Write-Output ("no manifest at {0} - no lane is recorded as owning anything" -f $cliManifest)
       exit 0
     }
-    Write-Output ("MANIFEST {0}   n={1}" -f $Manifest, $rows.Count)
+    Write-Output ("MANIFEST {0}   n={1}" -f $cliManifest, $rows.Count)
     Write-Output ('{0,-18} {1,-9} {2,-30} {3}' -f 'LANE', 'STATE', 'OWNS', 'BRANCH')
     foreach ($r in $rows) {
       Write-Output ('{0,-18} {1,-9} {2,-30} {3}' -f $r.'lane_id', $r.'state', $r.'owns', $r.'branch')
@@ -198,17 +205,17 @@ switch ($Action) {
   }
 
   'quiet' {
-    $parsed = Read-LaneManifest -Path $Manifest
+    $parsed = Read-LaneManifest -Path $cliManifest
     if (-not $parsed.present) {
       Write-Output ("not_measured  reason={0}" -f $parsed.reason)
       exit 3
     }
     $branches = @()
-    $gBr = Invoke-GitLines -GitDir $Repo -GitArgs @('for-each-ref', '--format=%(refname:short)', 'refs/heads')
+    $gBr = Invoke-GitLines -GitDir $cliRepo -GitArgs @('for-each-ref', '--format=%(refname:short)', 'refs/heads')
     if ($gBr.Exit -eq 0) { $branches = $gBr.Lines }
 
     $branchLast = @{}
-    $gBl = Invoke-GitLines -GitDir $Repo -GitArgs @('for-each-ref', '--format=%(refname:short)|%(committerdate:iso8601-strict)', 'refs/heads')
+    $gBl = Invoke-GitLines -GitDir $cliRepo -GitArgs @('for-each-ref', '--format=%(refname:short)|%(committerdate:iso8601-strict)', 'refs/heads')
     if ($gBl.Exit -eq 0) {
       foreach ($l in $gBl.Lines) {
         $p = $l -split '\|'
@@ -218,7 +225,7 @@ switch ($Action) {
         }
       }
     }
-    $gWT = Invoke-GitLines -GitDir $Repo -GitArgs @('worktree', 'list', '--porcelain')
+    $gWT = Invoke-GitLines -GitDir $cliRepo -GitArgs @('worktree', 'list', '--porcelain')
     $wtPaths = @()
     if ($gWT.Exit -eq 0) {
       foreach ($l in $gWT.Lines) { if ($l -like 'worktree *') { $wtPaths += ($l -replace '^worktree ', '').Trim() } }
