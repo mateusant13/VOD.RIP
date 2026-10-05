@@ -31,7 +31,7 @@ from pathlib import Path
 
 import pytest
 
-from services import archive_ytdlp, rate_budget
+from services import archive_ytdlp, rate_budget, ytdlp_guard
 from services.archive_ytdlp import YtGovernorExhausted
 
 
@@ -187,9 +187,7 @@ def test_extract_chokepoint_governed(acquires, monkeypatch):
     backfill_live_chat both go through it) — one token per extract."""
     ydl = _FakeYdl()
     monkeypatch.setattr(archive_ytdlp, "_yt_opts", lambda outdir, video_id=None: {})
-    monkeypatch.setattr(
-        archive_ytdlp, "guarded_youtube_dl", lambda opts: _ctx(ydl)
-    )
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl", lambda opts: _ctx(ydl))
     with archive_ytdlp._guarded_youtube_dl(Path("."), video_id="VzuPKrGl0z8") as y:
         y.extract_info("https://youtu.be/VzuPKrGl0z8", download=False)
     assert acquires.calls == [("youtube", "auto", "yt_dlp_extract")]
@@ -201,12 +199,14 @@ def test_bestaudio_chokepoint_governed(acquires, monkeypatch, tmp_path):
     inner segment request — a resume re-reads hundreds of chunks inside
     extract_info and pacing those would hold the download hostage.
 
-    NOTE the seam: download_bestaudio re-imports guarded_youtube_dl INSIDE the
-    function (archive_ytdlp.py:1156), so the module attribute is shadowed and
-    the patch has to land on services.ytdlp_guard. Patching the wrong one lets
-    the REAL yt-dlp run — which is a live network call, not a test."""
-    from services import ytdlp_guard
-
+    NOTE the seam: download_bestaudio used to re-import guarded_youtube_dl INSIDE
+    the function, which shadowed the module attribute — a patch on
+    archive_ytdlp missed it and the REAL yt-dlp ran, a live network call in a
+    unit test. The name now resolves through the module import
+    (`ytdlp_guard.guarded_youtube_dl`), so this ONE patch is the seam for every
+    guard call in the process. tests/test_guard_binding_seam.py fails if a
+    function-local re-import comes back.
+    """
     ydl = _FakeYdl()
     monkeypatch.setattr(archive_ytdlp, "_audio_resume_dir", lambda vid: tmp_path)
     monkeypatch.setattr(archive_ytdlp, "_apply_youtube_session", lambda *a, **kw: None)
@@ -222,8 +222,6 @@ def test_bestaudio_chokepoint_governed(acquires, monkeypatch, tmp_path):
 def test_bestaudio_refuses_before_touching_the_network(acquires, monkeypatch, tmp_path):
     """Ordering matters: a dry pool must be refused at the entry point, so no
     request is made at all (the whole point of gating here, not per request)."""
-    from services import ytdlp_guard
-
     ydl = _FakeYdl()
     monkeypatch.setattr(archive_ytdlp, "_audio_resume_dir", lambda vid: tmp_path)
     monkeypatch.setattr(archive_ytdlp, "_apply_youtube_session", lambda *a, **kw: None)
@@ -238,7 +236,7 @@ def test_bestaudio_refuses_before_touching_the_network(acquires, monkeypatch, tm
 
 def test_channel_list_chokepoint_governed(acquires, monkeypatch):
     ydl = _FakeYdl()
-    monkeypatch.setattr(archive_ytdlp, "guarded_youtube_dl_channel", lambda opts: _ctx(ydl))
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel", lambda opts: _ctx(ydl))
     out = archive_ytdlp.list_channel_videos("https://youtube.com/@chan", limit=3)
     assert [e["id"] for e in out] == ["VzuPKrGl0z8"]
     # One token per channel-tab walk — extract_flat makes it ONE listing
@@ -250,7 +248,7 @@ def test_display_name_backfill_governed_per_channel(acquires, monkeypatch):
     """A whole batch of distinct channel ids per run — the highest-frequency
     ungoverned YouTube egress in this module."""
     ydl = _FakeYdl()
-    monkeypatch.setattr(archive_ytdlp, "guarded_youtube_dl_channel", lambda opts: _ctx(ydl))
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel", lambda opts: _ctx(ydl))
     monkeypatch.setattr(
         archive_ytdlp.archive_db, "youtube_chat_user_ids_without_display_name",
         lambda limit: ["UCaaa", "UCbbb"],
@@ -265,7 +263,7 @@ def test_display_name_backfill_stops_the_batch_when_the_pool_is_dry(acquires, mo
     would turn a 20-id batch into a 20x stall. It stops, and the unresolved ids
     are picked up on a later run (the existing retry contract)."""
     ydl = _FakeYdl()
-    monkeypatch.setattr(archive_ytdlp, "guarded_youtube_dl_channel", lambda opts: _ctx(ydl))
+    monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel", lambda opts: _ctx(ydl))
     monkeypatch.setattr(
         archive_ytdlp.archive_db, "youtube_chat_user_ids_without_display_name",
         lambda limit: ["UCaaa", "UCbbb", "UCccc"],

@@ -33,11 +33,37 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from services import archive_db, transcript_fix
+from services import archive_db, transcript_fix, ytdlp_guard
 from services.chat_sinks.yt_live import _base_usec_from_info
 from services.ytdlp_ffmpeg import _ytdlp_engine_opts
-from services.ytdlp_guard import guarded_youtube_dl, guarded_youtube_dl_channel
 from services.youtube_diag import is_age_gate_error
+
+# --- the yt-dlp TEST SEAM (do not bind the names, import the MODULE) ---------
+#
+# Every guard call below reads `ytdlp_guard.guarded_youtube_dl(...)` or
+# `ytdlp_guard.guarded_youtube_dl_channel(...)`. That is deliberate and is the
+# single seam for the whole process: one
+# `monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl", stub)` intercepts
+# every YouTube egress here, in youtube_service, in ytdlp_hls — including any
+# added later.
+#
+# Do NOT `from services.ytdlp_guard import guarded_youtube_dl` here, and do NOT
+# re-import it inside a function. Either publishes a second, plausible-looking
+# attribute in this module: `archive_ytdlp.guarded_youtube_dl`. A test that
+# patches THAT is patching something that is not the seam — it intercepts only
+# the calls that resolve through the module global, so a function-local
+# re-import silently bypasses it and the REAL yt-dlp runs. That is a live
+# network request in a unit test, not a failure, and it is not hypothetical:
+# download_bestaudio re-imported the name at function scope and a test patched
+# the module attribute and reached YouTube. It cost two escapes before anyone
+# noticed, because a redundant import is indistinguishable from a deliberate
+# one at the call site.
+#
+# Note the asymmetry, so the rule is not misapplied: patching
+# services.ytdlp_guard DOES intercept a function-local re-import too (the
+# import reads the current attribute). The canonical seam is safe either way.
+# What is not safe is a consumer attribute that looks like a seam and is not.
+# tests/test_guard_binding_seam.py fails if a name binding reappears.
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +86,7 @@ PLATFORM = "youtube"
 # note at youtube_innertube.py:47-60, where a sleep inside _player_request blew
 # the 2.5s _RACE_TIMEOUT_SEC profile race and had to be moved out to the
 # entry point. yt-dlp has the same shape (extract_info fans out internally), so
-# the gate lives before the `with guarded_youtube_dl(...)` block, once.
+# the gate lives before the `with ytdlp_guard.guarded_youtube_dl(...)` block, once.
 #
 # Same accounting as the governed paths: one acquire() per egress unit, the
 # same AUTO/USER pool split, the same MAX_AUTO_WAIT_S bound. Only the outcome
@@ -589,7 +615,7 @@ def _guarded_youtube_dl(outdir: Path, *, video_id: Optional[str] = None,
     # without stalling a request mid-flight).
     _governor_admit_ytdlp(origin, "yt_dlp_extract")
     try:
-        with guarded_youtube_dl(_yt_opts(outdir, video_id=video_id)) as ydl:
+        with ytdlp_guard.guarded_youtube_dl(_yt_opts(outdir, video_id=video_id)) as ydl:
             yield ydl
     except Exception as exc:
         from services.yt_gate import classify_youtube_gate_error, note_youtube_gate
@@ -1153,7 +1179,6 @@ def download_bestaudio(
     continues from the bytes already on disk instead of re-requesting the whole
     video. A finished file is never re-fetched, and a partial is never
     presented as a finished one."""
-    from services.ytdlp_guard import guarded_youtube_dl
 
     url = _video_url(video_id)
     hooks: list[Callable[[dict], None]] = []
@@ -1210,7 +1235,7 @@ def download_bestaudio(
     # download hostage.
     _governor_admit_ytdlp("auto", "yt_dlp_bestaudio")
     try:
-        with guarded_youtube_dl(opts) as ydl:
+        with ytdlp_guard.guarded_youtube_dl(opts) as ydl:
             ydl.extract_info(url, download=True)
     except Exception as exc:
         from services.yt_gate import classify_youtube_gate_error, note_youtube_gate
@@ -1441,7 +1466,7 @@ def list_channel_videos(channel_url: str, *, tab: str = "streams", limit: int = 
         # makes this a single cheap listing request, so a flat channel walk is
         # one egress unit, not one per entry.
         _governor_admit_ytdlp("auto", "yt_dlp_channel_list")
-        with guarded_youtube_dl_channel(opts) as ydl:
+        with ytdlp_guard.guarded_youtube_dl_channel(opts) as ydl:
             info = ydl.extract_info(url, download=False)
         for e in info.get("entries") or []:
             if not e.get("id"):
@@ -1776,7 +1801,7 @@ def resolve_youtube_display_names(limit: int = 20) -> int:
             # ungoverned YouTube egress in this module (a whole batch of
             # distinct channel ids per run).
             _governor_admit_ytdlp("auto", "yt_dlp_channel_meta")
-            with guarded_youtube_dl_channel(
+            with ytdlp_guard.guarded_youtube_dl_channel(
                 {"quiet": True, "no_warnings": True, "skip_download": True}
             ) as ydl:
                 info = ydl.extract_info(

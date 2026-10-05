@@ -143,26 +143,31 @@ def _calls_named(fn, name: str) -> bool:
 
 @pytest.fixture()
 def no_ytdlp(monkeypatch):
-    """Stub the yt-dlp context manager AT BOTH SEAMS IT IS BOUND TO.
+    """Stub the yt-dlp context manager AT THE ONE SEAM IT IS BOUND TO.
 
-    The trap that bit this lane once already: the local import inside
-    `list_channel_videos_sync` resolves to `services.ytdlp_guard`, so patching
-    `youtube_service` would not intercept anything — but
-    `archive_ytdlp` binds the SAME name at MODULE level (its `from
-    services.ytdlp_guard import ...` on line 39), so patching only
-    `ytdlp_guard` leaves the archive_ytdlp walk reaching the REAL extractor.
-    That is a live network call, not a test.
+    The trap that bit this lane once already: the guard used to be imported
+    INSIDE `list_channel_videos_sync` (function-local) in youtube_service but
+    at MODULE level in archive_ytdlp, so there were two bindings and a patch
+    at either one left the other reaching the REAL extractor. That is a live
+    network call, not a test.
 
-    Both bindings are patched, and the result is asserted to be live so a
-    future rebind shows up as a failing test instead of a silent request.
+    Both consumers now resolve the name through the guard MODULE, so
+    `services.ytdlp_guard` is the single seam and this one patch intercepts
+    every channel egress in the process. The assertions below fail loudly if
+    a module re-binds the name, so a future rebind shows up as a failing test
+    instead of a silent request.
     """
     ydl = _FakeYdl()
     stub = lambda opts: _ctx(ydl)  # noqa: E731
     monkeypatch.setattr(ytdlp_guard, "guarded_youtube_dl_channel", stub)
-    monkeypatch.setattr(archive_ytdlp, "guarded_youtube_dl_channel", stub)
-    # Fail loudly if either module stops resolving to the stub.
+    # Fail loudly if a consumer re-binds the name instead of going through the
+    # module: that is the exact shape of the escape this fixture exists for.
     assert ytdlp_guard.guarded_youtube_dl_channel is stub
-    assert archive_ytdlp.guarded_youtube_dl_channel is stub
+    for mod in (archive_ytdlp, youtube_service):
+        assert not hasattr(mod, "guarded_youtube_dl_channel"), (
+            f"{mod.__name__} re-binds the guard name; patch "
+            f"services.ytdlp_guard instead or the stub is bypassed"
+        )
     return ydl
 
 
@@ -533,9 +538,9 @@ def test_gate_is_reached_from_the_real_chokepoint_not_a_wrapper(acquires, no_ytd
         "the app-facing entry point must carry the gate"
     )
     # ...and it must be drawn before yt-dlp is USED, not per inner request.
-    # Matched on the `with` statement, not the function-local import above it.
+    # Matched on the `with` statement, not any import above it.
     assert src.index("_governor_admit_channel_walk") < src.index(
-        "with guarded_youtube_dl_channel"
+        "with ytdlp_guard.guarded_youtube_dl_channel"
     ), "the gate is the operation's entry point: it runs before the extract"
 
 
