@@ -194,8 +194,25 @@ def assert_ytdlp_safe() -> None:
 # It is deliberately named "execute" so nobody enables it by accident. Set it
 # to 1/true/yes/on to allow; 0/false/no/off (or unset — the default) forbids.
 # ONE documented way to turn it off: set it to `0`. That restores the previous
-# behaviour exactly: no remote fetch, challenge unsolved, audio-only formats
-# absent, and the transcription lane requeues instead of downloading video.
+# behaviour exactly: no remote fetch and no remote execution. Whether that
+# currently costs the audio-only formats is NO LONGER REPRODUCIBLE on this box.
+#
+# RE-MEASURED 2026-10-06, and this line used to over-claim. It previously said
+# the challenge "cannot be solved and every audio-only itag (140/251) drops
+# out of the format list". Three arms on two real archived videos, all with
+# remote_components == [] and cookiefile == None (solver OFF, no cookies):
+#     Vja1Z1eoQrM (the video the original "0 audio-only itags" test used):
+#         47 formats, 5 audio-only  ids 139 140 249 250 251   <- 140/251 PRESENT
+#     ugqNqe-qaVo (11.92 h), three arms -- app defaults, cookies+extractor_args
+#     stripped, and also http_headers stripped:
+#         47 formats, 10 audio-only (139/140/249/250/251 + the -drc variants)
+# An earlier measurement on this same box recorded 0 audio-only itags on ten
+# real extracts, so SOMETHING changed - YouTube's gating, the yt-dlp build, or
+# session state. Nothing measured here identifies which. So the claim is now
+# scoped to what was seen, not to a mechanism nobody can reproduce:
+# the transcription lane currently gets audio at 16 kHz mono WITHOUT this
+# grant. Do not re-enable remote JS execution on the strength of the old
+# sentence - re-run the format check first.
 #
 # WHY IT LIVES HERE AND NOT IN A CALLER. `sanitize_ytdlp_opts` is the function
 # that already decides `fetch_pot`, and it runs on the single guarded egress
