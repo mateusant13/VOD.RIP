@@ -4140,23 +4140,20 @@ def _is_remote_permanent_error(exc: Exception) -> bool:
     return "no playable variant" in msg or "no hls source" in msg
 
 
-def _fetch_remote_audio_wav(platform: str, video_id: str, channel: str, out_wav: Path) -> None:
-    """Download the archived VOD's audio to a mono 16 kHz wav at transcribe time.
+def _resolve_remote_playback(platform: str, video_id: str, channel: str) -> tuple[str, dict]:
+    """(audio_url, ffmpeg headers) for a Twitch/Kick VOD's HLS master.
 
-    Twitch: GQL PlaybackAccessToken + usher VOD master (the same fast path
-    the preview proxy uses — twitch_gql_service.get_vod_playback_sync); the
-    audio-only variant is preferred so ffmpeg never pulls video packets,
-    else the LOWEST-bandwidth video variant (most Twitch VODs expose no
-    audio-only rendition) with -vn discarding the picture track.
-    Kick: the channel videos API resolves the VOD m3u8 (kick_api_service.
-    get_video_info_api) — Kick HLS has no audio-only variant, so ffmpeg
-    discards the video track (-vn). Both are bounded by
-    _REMOTE_AUDIO_FETCH_TIMEOUT_S. ffmpeg headers mirror the live-captions
-    rule: Twitch edge CDNs 403 an Origin header on segment fetches (the
-    usher master needs it, the nauth-signed segments must not carry it).
+    Shared by the whole-VOD fetch (_fetch_remote_audio_wav) and the bounded
+    preview slice (_fetch_remote_audio_slice), so the two cannot drift on the
+    variant-selection rule. That rule is load-bearing, not cosmetic: Twitch
+    exposes an audio-only variant on some VODs, and when it does NOT (the
+    common case) the lowest-bandwidth video variant is pulled with ffmpeg's
+    -vn discarding the picture — handing a video stream to a speech
+    recogniser is exactly the fallback the ingest path documents.
+
+    The Origin header is dropped for Twitch: edge CDNs 403 an Origin on the
+    segment fetches, while the usher master itself needs it.
     """
-    ffmpeg = _resolve_ffmpeg_exe()
-    headers: dict = {}
     if platform == "twitch":
         from services.twitch_gql_service import get_vod_playback_sync
 
@@ -4176,19 +4173,156 @@ def _fetch_remote_audio_wav(platform: str, video_id: str, channel: str, out_wav:
             elif tbr and tbr < fallback_tbr:
                 fallback_tbr, fallback_url = tbr, url
         if best_tbr < 0 and fallback_url:
-            # No audio-only rendition (the common Twitch case): pull the
-            # lowest-bandwidth video variant; -vn discards the picture.
             audio_url = fallback_url
-        headers = {k: val for k, val in headers.items() if k.lower() != "origin"}
-    else:
-        from services.kick_api_service import _BASE, get_video_info_api
+        return audio_url, {k: val for k, val in headers.items() if k.lower() != "origin"}
 
-        url = f"{_BASE}/{channel}/videos/{video_id}"
-        info = get_video_info_api(url)
-        if not info.m3u8_url:
-            raise RuntimeError(f"Kick VOD {video_id} has no HLS source")
-        audio_url = info.m3u8_url
-        headers = {"referer": url, "origin": _BASE}
+    from services.kick_api_service import _BASE, get_video_info_api
+
+    url = f"{_BASE}/{channel}/videos/{video_id}"
+    info = get_video_info_api(url)
+    if not info.m3u8_url:
+        raise RuntimeError(f"Kick VOD {video_id} has no HLS source")
+    return info.m3u8_url, {"referer": url, "origin": _BASE}
+
+
+def _fetch_remote_audio_slice(
+    platform: str,
+    video_id: str,
+    channel: str,
+    out_wav: Path,
+    seconds: float,
+    *,
+    timeout_s: float = 120.0,
+) -> float:
+    """Fetch ONLY the first ``seconds`` of a VOD's audio to a 16 kHz mono wav.
+
+    The preview path, not the archive path. _fetch_remote_audio_wav pulls the
+    WHOLE VOD (a 6h Twitch VOD is ~350 MB, minutes of transfer) because
+    transcription genuinely needs all of it. A preview does not: the panel
+    shows the first few minutes, and ffmpeg's -t before -i stops the HLS read
+    after that many seconds, so the cost is bounded by the preview and not by
+    the VOD.
+
+    Returns the seconds of audio actually written. Raises on a failed or
+    empty fetch, and on a permanent error the caller may classify.
+
+    No job row and no fetch heartbeat here (unlike _fetch_remote_audio_wav):
+    this runs on a request, not a queue lane, so there is nothing to keep
+    alive and nothing to reclaim. It is bounded by ``timeout_s`` instead,
+    which is deliberately short — a preview that blocks for minutes is worse
+    than a preview that shows nothing.
+    """
+    ffmpeg = _resolve_ffmpeg_exe()
+    audio_url, headers = _resolve_remote_playback(platform, video_id, channel)
+    cmd = [ffmpeg, "-y", "-v", "error", "-threads", "1"]
+    for key, value in (headers or {}).items():
+        cmd += ["-headers", f"{key}: {value}"]
+    # -t BEFORE -i bounds the INPUT read, which is what stops the HLS pull.
+    cmd += ["-t", "%.3f" % max(1.0, float(seconds)), "-i", audio_url,
+            "-threads", "1", "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", str(out_wav)]
+    try:
+        proc = sp.run(cmd, capture_output=True, timeout=timeout_s)
+    except sp.TimeoutExpired as exc:
+        raise TimeoutError(
+            f"{platform} preview audio slice exceeded {int(timeout_s)}s for {video_id}"
+        ) from exc
+    if proc.returncode != 0:
+        stderr = (proc.stderr or b"").decode("utf-8", "replace")[-400:]
+        raise RuntimeError(
+            f"ffmpeg HLS audio slice failed for {platform}/{video_id}: {stderr}"
+        )
+    if not out_wav.is_file() or out_wav.stat().st_size <= 44:
+        raise RuntimeError(f"ffmpeg produced no audio slice for {platform}/{video_id}")
+    return _wav_duration_sec(out_wav)
+
+
+def _wav_duration_sec(path: Path) -> float:
+    """Duration of a PCM wav from its header (no decode, no numpy dep)."""
+    try:
+        import wave
+
+        with wave.open(str(path), "rb") as w:
+            rate = w.getframerate() or 16000
+            return w.getnframes() / float(rate)
+    except Exception:  # noqa: BLE001 - a bad header must not sink the caller
+        return 0.0
+
+
+def parakeet_segments_from_array(
+    audio,
+    sample_rate: int,
+    *,
+    max_sec: Optional[float] = None,
+) -> list[dict]:
+    """Decode an in-memory 16 kHz mono float array into transcript segments.
+
+    The preview path's recognizer call. It mirrors what the archive decode
+    loop does per clip — one segment per chunk, word timestamps from
+    _parakeet_words, segment bounds clipped to the last word — WITHOUT the
+    shard/queue/progress machinery and WITHOUT touching the archive DB. A
+    preview caption is a read, and this keeps it one.
+
+    Returns [{start_sec, end_sec, text, words}]. An empty list means the audio
+    decoded to no words, which for parakeet is the no-hallucination-on-
+    silence behaviour, not an error.
+    """
+    global _parakeet_last_used
+    _parakeet_last_used = time.monotonic()
+    rec = _parakeet_model()
+    chunk = int(sample_rate * float(_MAX_CHUNK_SEC))
+    if chunk <= 0:
+        return []
+    limit = len(audio) if max_sec is None else min(len(audio), int(max_sec * sample_rate))
+    out: list[dict] = []
+    for start in range(0, limit, chunk):
+        piece = audio[start:min(start + chunk, limit)]
+        if len(piece) < int(sample_rate * 0.5):
+            break
+        clip_start = start / float(sample_rate)
+        clip_end = (start + len(piece)) / float(sample_rate)
+        stream = rec.create_stream()
+        stream.accept_waveform(sample_rate, piece)
+        rec.decode_stream(stream)
+        res = stream.result
+        text = (getattr(res, "text", "") or "").strip()
+        if not text:
+            continue
+        words = _parakeet_words(
+            getattr(res, "tokens", []) or [],
+            getattr(res, "timestamps", []) or [],
+            getattr(res, "ys_log_probs", None),
+        )
+        last_end = (words[-1]["end"] if words else (clip_end - clip_start)) + clip_start
+        out.append({
+            "start_sec": round(clip_start, 3),
+            "end_sec": round(min(clip_end, last_end + 0.3), 3),
+            "text": text,
+            "words": [
+                {**w, "start": round(w["start"] + clip_start, 3),
+                 "end": round(w["end"] + clip_start, 3)}
+                for w in words
+            ],
+        })
+    return out
+
+
+def _fetch_remote_audio_wav(platform: str, video_id: str, channel: str, out_wav: Path) -> None:
+    """Download the archived VOD's audio to a mono 16 kHz wav at transcribe time.
+
+    Twitch: GQL PlaybackAccessToken + usher VOD master (the same fast path
+    the preview proxy uses — twitch_gql_service.get_vod_playback_sync); the
+    audio-only variant is preferred so ffmpeg never pulls video packets,
+    else the LOWEST-bandwidth video variant (most Twitch VODs expose no
+    audio-only rendition) with -vn discarding the picture track.
+    Kick: the channel videos API resolves the VOD m3u8 (kick_api_service.
+    get_video_info_api) — Kick HLS has no audio-only variant, so ffmpeg
+    discards the video track (-vn). Both are bounded by
+    _REMOTE_AUDIO_FETCH_TIMEOUT_S. ffmpeg headers mirror the live-captions
+    rule: Twitch edge CDNs 403 an Origin header on segment fetches (the
+    usher master needs it, the nauth-signed segments must not carry it).
+    """
+    ffmpeg = _resolve_ffmpeg_exe()
+    audio_url, headers = _resolve_remote_playback(platform, video_id, channel)
     cmd = [ffmpeg, "-y", "-v", "error", "-threads", "1"]
     for key, value in (headers or {}).items():
         cmd += ["-headers", f"{key}: {value}"]

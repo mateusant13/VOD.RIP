@@ -91,6 +91,66 @@ _MISS = object()
 # re-raise it instead of duplicating the fetch).
 _INFLIGHT_TIMEOUT_S = 180.0
 
+# --- preview ASR (twitch / kick) -------------------------------------------
+# Neither platform publishes caption tracks, so a preview can only get words
+# by transcribing. Everything here is bounded on purpose: the head is capped,
+# the HLS read is capped by ffmpeg -t, and the decode is chunked.
+_PREVIEW_ASR_PLATFORMS = ("twitch", "kick")
+
+
+def _preview_canonical_url(platform: str, channel: str, video_id: str) -> str:
+    """Canonical URL shapes, matching the app's own builders
+    (channels.py:654 twitch, :828 kick) so the echoed url is one the app
+    could re-consume. Kick needs the channel in the path; Twitch does not."""
+    if platform == "kick":
+        return "https://kick.com/%s/videos/%s" % (channel, video_id)
+    return "https://www.twitch.tv/videos/%s" % video_id
+_PREVIEW_ASR_HEAD_SEC = 300.0
+_PREVIEW_ASR_HEAD_MAX_SEC = 900.0
+_PREVIEW_ASR_FETCH_TIMEOUT_S = 120.0
+_PREVIEW_ASR_VIDEO_ID_MAX = 128
+
+
+def _single_flight(key: str, produce):
+    """Run ``produce`` once per key; concurrent callers share the result.
+
+    Both caption paths need this: a preview panel re-fetches on tab switches
+    and a user can retry while the first call is still running, and each of
+    those would otherwise spawn a full extraction behind the global yt-dlp
+    lock. A failure is stored as the exception so waiters re-raise it rather
+    than repeating the work; the wait timeout falls back to doing the work
+    itself rather than hanging the request forever.
+    """
+    with _inflight_lock:
+        entry = _inflight.get(key)
+        if entry is None:
+            done = threading.Event()
+            holder: dict[str, object] = {"payload": _MISS}
+            _inflight[key] = (done, holder)
+            fetcher = True
+        else:
+            done, holder = entry
+            fetcher = False
+    if fetcher:
+        try:
+            payload = produce()
+            holder["payload"] = payload
+        except Exception as exc:  # noqa: BLE001 — waiters re-raise it
+            holder["payload"] = exc
+            raise
+        finally:
+            done.set()
+            with _inflight_lock:
+                _inflight.pop(key, None)
+        return payload
+    if not done.wait(_INFLIGHT_TIMEOUT_S):
+        logger.warning("subtitles in-flight wait timed out for %s", key)
+        return produce()
+    got = holder["payload"]
+    if isinstance(got, BaseException):
+        raise got
+    return got
+
 
 class _SubsCache:
     """Small process-lifetime LRU keyed by video id (None = no captions)."""
@@ -443,6 +503,131 @@ def _subtitle_langs_default() -> str:
     return _SUBTITLE_LANGS_DEFAULT
 
 
+@router.get("/api/preview/subtitles/{platform}/{video_id}")
+def preview_asr_subtitles(
+    platform: str,
+    video_id: str,
+    head_sec: float = Query(_PREVIEW_ASR_HEAD_SEC, ge=30.0, le=_PREVIEW_ASR_HEAD_MAX_SEC),
+) -> dict:
+    """Live captions for a Twitch/Kick preview, produced on the spot by ASR.
+
+    Neither platform publishes caption tracks, so there is nothing to fetch —
+    this is the only way a Twitch/Kick preview can show words at all. It
+    therefore does the small thing rather than the right thing: it transcribes
+    only the HEAD of the VOD (``head_sec``, default 5 min) and serves those
+    rows. The archived full transcription, when it exists, is a different
+    concern and is served by /api/preview/panel under the Transcript tab.
+
+    Bounded on purpose at every layer: ffmpeg's -t stops the HLS read at
+    head_sec, so the cost tracks the preview and not the VOD, and the decode
+    is chunked at _MAX_CHUNK_SEC. Measured on this box (RTX 5080, Parakeet
+    Redux, provider=cuda): 6.1 s model load then 1.1 s for the first 60 s of
+    audio — 94x realtime across a 2 min sample — so the head is seconds, not
+    the ~2 h a 12 h VOD costs through the archive path.
+
+    Response mirrors /api/subtitles so the panel renders it unchanged:
+    {url, lang, source: 'asr', has_subtitles, rows: [{offset_sec, text}],
+    covered_sec, partial}. ``partial`` is True whenever rows stop before
+    head_sec, which is the normal case and must not read as "this is all of
+    it". A VOD whose head is silent returns has_subtitles False — silence is
+    not an error and must not become a 502.
+
+    Never touches the archive DB: a preview caption is a read.
+    """
+    plat = (platform or "").strip().lower()
+    if plat not in _PREVIEW_ASR_PLATFORMS:
+        raise HTTPException(
+            status_code=400,
+            detail="Preview ASR subtitles are twitch/kick only; YouTube uses /api/subtitles",
+        )
+    vid = (video_id or "").strip()
+    if not vid or len(vid) > _PREVIEW_ASR_VIDEO_ID_MAX:
+        raise HTTPException(status_code=400, detail="Invalid video id")
+
+    # Bucket the head so 300 and 301 share one cache entry: the caller tunes
+    # a number, and an unbounded key would let a slider fill the cache.
+    head_bucket = float(int(head_sec / 30.0) * 30)
+    key = "asr:%s:%s:%d" % (plat, vid, int(head_bucket))
+    cached = _subs_cache.get(key)
+    if cached is not _MISS:
+        return cached
+
+    payload = _single_flight(key, lambda: _fetch_preview_asr(plat, vid, head_bucket))
+    _subs_cache.put(key, payload)
+
+    # A deeper request must not be served the shallower cached head.
+    covered = float(payload.get("covered_sec") or 0.0)
+    if covered + 1.0 < head_bucket:
+        payload = _single_flight(key, lambda: _fetch_preview_asr(plat, vid, head_bucket))
+        _subs_cache.put(key, payload)
+    return payload
+
+
+def _fetch_preview_asr(platform: str, video_id: str, head_sec: float) -> dict:
+    """Slice the VOD's head to a temp wav, ASR it, drop the temp dir."""
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    from services import archive_db as _db
+    from services import archive_transcribe as _at
+
+    rows = _db.query(
+        "SELECT channel FROM videos WHERE platform = ? AND video_id = ?",
+        (platform, video_id),
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="Video not found in the archive")
+    channel = rows[0]["channel"] or ""
+    if _at._is_live_stream_id(video_id):
+        raise HTTPException(status_code=400, detail="Live captures have no VOD audio")
+
+    url = _preview_canonical_url(platform, channel, video_id)
+    outdir = Path(tempfile.mkdtemp(prefix="vodrip-preview-asr-"))
+    try:
+        wav = outdir / "head.wav"
+        covered = _at._fetch_remote_audio_slice(
+            platform, video_id, channel, wav, head_sec,
+            timeout_s=_PREVIEW_ASR_FETCH_TIMEOUT_S,
+        )
+        import soundfile as sf
+
+        audio, sr = sf.read(str(wav), dtype="float32", always_2d=False)
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        segments = _at.parakeet_segments_from_array(audio, sr, max_sec=head_sec)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 — a preview must not 500 the panel
+        if _at._is_remote_permanent_error(exc):
+            # VOD deleted / sub-only / geo: a permanent condition, not a
+            # transient one. Cached as "no subtitles" so every later tab
+            # switch answers instantly instead of re-paying the fetch.
+            logger.info("preview ASR unavailable for %s/%s: %s", platform, video_id, exc)
+            return _preview_asr_empty(platform, video_id)
+        logger.warning("preview ASR failed for %s/%s: %s", platform, video_id, exc)
+        raise HTTPException(status_code=502, detail=f"Could not build preview subtitles: {exc}")
+    finally:
+        shutil.rmtree(outdir, ignore_errors=True)
+
+    return {
+        "url": url,
+        "lang": None,
+        "source": "asr",
+        "has_subtitles": bool(segments),
+        "rows": [{"offset_sec": s["start_sec"], "text": s["text"]} for s in segments],
+        "covered_sec": round(float(covered), 3),
+        "partial": True,
+    }
+
+
+def _preview_asr_empty(platform: str, video_id: str) -> dict:
+    return {
+        "url": "", "lang": None, "source": "asr", "has_subtitles": False,
+        "rows": [], "covered_sec": 0.0, "partial": True,
+    }
+
+
 @router.get("/api/subtitles")
 def get_subtitles(
     url: str = Query(...),
@@ -481,36 +666,6 @@ def get_subtitles(
     # retry pressed while the first fetch is still running) share one
     # extraction instead of each spawning a full yt-dlp fetch behind the
     # global yt-dlp lock.
-    with _inflight_lock:
-        entry = _inflight.get(video_id)
-        if entry is None:
-            done = threading.Event()
-            holder: dict[str, object] = {"payload": _MISS}
-            _inflight[video_id] = (done, holder)
-            fetcher = True
-        else:
-            done, holder = entry
-            fetcher = False
-    if fetcher:
-        try:
-            payload = _fetch_subtitles(url, lang_list)
-            holder["payload"] = payload
-        except Exception as exc:  # noqa: BLE001 — waiters re-raise it
-            holder["payload"] = exc
-            raise
-        finally:
-            done.set()
-            with _inflight_lock:
-                _inflight.pop(video_id, None)
-    else:
-        if not done.wait(_INFLIGHT_TIMEOUT_S):
-            # Fetcher hung past the wait — fetch anyway (best-effort dedupe).
-            logger.warning("subtitles in-flight wait timed out for %s", video_id)
-            payload = _fetch_subtitles(url, lang_list)
-        else:
-            got = holder["payload"]
-            if isinstance(got, BaseException):
-                raise got
-            payload = got
+    payload = _single_flight(video_id, lambda: _fetch_subtitles(url, lang_list))
     _subs_cache.put(video_id, payload)
     return payload
