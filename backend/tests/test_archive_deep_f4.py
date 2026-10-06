@@ -24,6 +24,14 @@ import pytest
 from routers import archive
 from services import archive_db
 
+#: Wall-clock ceiling for a deep-search job to settle in these tests.
+#: Measured 3.33 s / 3.49 s in isolation; the fixed `400 x 0.02 s` poll this
+#: replaced allowed only 8 s -- a 2.4x margin that is not a margin once the
+#: suite shares the process and the machine. It produced a false failure in
+#: the full run on 2026-10-06 (2 failed, 2138 passed) while passing in
+#: isolation. See _run() for why the acceptance is unchanged.
+_DEEP_SETTLE_BOUND_S = 60.0
+
 
 def _video(vid: str, created: str, title: str = "t") -> dict:
     return {
@@ -84,13 +92,41 @@ def _run(
             archive.DeepSearchRequest(channel=channel, query=query)
         )
     )["job_id"]
-    for _ in range(400):
+    # A WALL-CLOCK DEADLINE, not a poll count. The acceptance criterion is
+    # "the deep job settles and reports the right total / truncated flag" --
+    # the deadline is only the harness's way of noticing that it never did.
+    #
+    # WHY THE BUDGET IS GENEROUS. Measured in isolation on an idle box these
+    # two jobs settle in 3.33 s and 3.49 s against the 8 s this used to
+    # allow: a 2.4x margin, which is not a margin once the suite shares the
+    # process and the machine. They failed exactly that way in the full run
+    # (2026-10-06: 2 failed, 2138 passed) while passing in isolation -- a
+    # false failure, not a defect. `range(400)` also froze whenever the
+    # count was written down, so a duration that cannot be argued about
+    # lives here as a named constant next to the measurement.
+    #
+    # THIS DOES NOT WEAKEN THE TEST. A settled job is still returned and its
+    # contents are still asserted by the caller; a job that never settles
+    # still fails, loudly, and now names the status it was stuck on.
+    deadline = time.monotonic() + _DEEP_SETTLE_BOUND_S
+    last_status = "missing"
+    while time.monotonic() < deadline:
         with archive._deep_jobs_lock:
-            job = dict(archive._deep_jobs[job_id])
-        if job["status"] != "running":
+            job_row = archive._deep_jobs.get(job_id)
+            if job_row is None:
+                # Pruned out from under us - a different failure from "slow".
+                raise AssertionError(
+                    "deep job %s vanished from _deep_jobs before settling" % job_id
+                )
+            job = dict(job_row)
+        last_status = job["status"]
+        if last_status != "running":
             return job
         time.sleep(0.02)
-    raise AssertionError("deep job did not settle in 8s")
+    raise AssertionError(
+        "deep job did not settle within %.0fs (last status: %r)"
+        % (_DEEP_SETTLE_BOUND_S, last_status)
+    )
 
 
 # ── (iii) windowed pagination: 1200-video tab resolves to covered ──────────
