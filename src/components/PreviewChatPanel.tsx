@@ -6,6 +6,15 @@
  * manual preferred over auto) from /api/subtitles instead of offering chat
  * or transcription.
  *
+ * The Subtitles tab is no longer YouTube-only. Twitch and Kick publish no
+ * caption track, so a VOD with no archived transcript used to have nothing to
+ * show under it at all; /api/preview/subtitles/{platform}/{video_id} now
+ * produces the words by running local ASR over the head of the VOD. That call
+ * is slow on first use (~7 s: a model load plus the decode), so the panel
+ * shows a loading state and never blocks on it — subsequent calls are served
+ * from the backend cache. The rows arrive in the SAME shape the YouTube
+ * captions use, so everything below is one rendering path with two producers.
+ *
  * Performance contract (acceptance #6):
  *  - All panel state (open/tab/width/data) lives INSIDE this component, so
  *    toggling tabs, collapsing, resizing or loading rows never re-renders
@@ -94,13 +103,29 @@ export interface PreviewPanelPayload {
   chat_truncated?: boolean;
 }
 
-/** Live YouTube captions for URL-only previews (no archive row). */
+/**
+ * Preview captions for a video with NO archived transcript, from either of the
+ * two endpoints that produce them. The row shape is deliberately identical so
+ * the rendering path below never learns which endpoint answered:
+ *
+ *  - `/api/subtitles?url=…` — a YouTube caption track (en/pt/es, manual
+ *    preferred over auto). `source` is 'manual' | 'auto'.
+ *  - `/api/preview/subtitles/{platform}/{video_id}` — Twitch/Kick, which
+ *    publish NO caption track at all, so the words come from local ASR over
+ *    the head of the VOD (`source: 'asr'`). `covered_sec`/`partial` report how
+ *    much of the VOD those rows actually cover: the head is never the whole
+ *    VOD, so `partial` is always true there.
+ */
 export interface PreviewSubtitlesPayload {
   url: string;
   lang: string | null;
-  source: 'manual' | 'auto' | null;
+  source: 'manual' | 'auto' | 'asr' | null;
   has_subtitles: boolean;
   rows: PreviewPanelTranscriptRow[];
+  /** ASR path only: seconds of the VOD head that were transcribed. */
+  covered_sec?: number;
+  /** ASR path only: true whenever the rows stop before the whole VOD. */
+  partial?: boolean;
 }
 
 /** One row of the Transcript-tab timeline: a transcript segment or an
@@ -294,6 +319,15 @@ interface PreviewChatPanelProps {
    *  (useCallback) — it is invoked on every marker change and video switch. */
   onMarkersChange?: (markers: ChatMarkers) => void;
 }
+
+/**
+ * Platforms that publish NO caption track of their own, so a preview with no
+ * archived transcript can only show words by transcribing locally
+ * (`GET /api/preview/subtitles/{platform}/{video_id}`). YouTube is deliberately
+ * absent: it serves a real track, and sending it down the ASR path would pay a
+ * model load to reproduce what /api/subtitles already answers in ~1 s.
+ */
+const ASR_SUBTITLE_PLATFORMS: ReadonlySet<string> = new Set(['twitch', 'kick']);
 
 const TABS: ReadonlyArray<{
   id: PreviewPanelTab;
@@ -622,7 +656,9 @@ export function PreviewChatPanel({
   /** Bumped by the backfill poll loop (and the one refresh after 'done')
    *  to re-run the payload fetch without touching the cache. */
   const [pollTick, setPollTick] = useState(0);
-  const [ytSubtitles, setYtSubtitles] = useState<PreviewSubtitlesPayload | null>(null);
+  /** The one preview-captions payload: a YouTube caption track (subtitlesOnly)
+   *  or Twitch/Kick ASR rows. Never both — see `liveSubtitles`. */
+  const [subs, setSubs] = useState<PreviewSubtitlesPayload | null>(null);
   const [subsFetchState, setSubsFetchState] = useState<'idle' | 'loading' | 'done' | 'error'>('idle');
   /** Inline search (filter + prev/next cursor) — one query for EVERY tab.
    *  It used to render only under `tab === 'chat'`, i.e. the panel's default
@@ -794,31 +830,68 @@ export function PreviewChatPanel({
   // a bare URL has no archive data for.
   const subtitlesOnly =
     platform === 'youtube' && !!payload && !payload.has_transcript && !payload.has_chat;
+  // Twitch/Kick preview captions come from local ASR over the head of the VOD
+  // (neither platform publishes a caption track, so this endpoint is the only
+  // way such a preview can show words). Gated exactly like `subtitlesOnly` is
+  // for YouTube, with one deliberate difference: an ARCHIVED TRANSCRIPT wins
+  // here — it already renders under the Transcript tab, so running a ~7 s ASR
+  // pass to produce rows the panel has elsewhere is pure cost. Chat presence
+  // is NOT part of the gate (a Twitch VOD routinely has chat and no
+  // transcript, and chat carries no words).
+  //
+  // Known trade-off, shared with the YouTube gate above: `payload` still holds
+  // the PREVIOUS video's body for the one render that switches videos, so
+  // switching from a transcript-less VOD to one that has a transcript fires a
+  // wasted ASR request that is then abandoned (the `cancelled` flag drops its
+  // response, and the panel falls back to the archive rows once the new
+  // payload lands). It costs one model load on a rare transition, and fixing
+  // it here alone would leave the two paths disagreeing about the same race.
+  const asrSubtitles =
+    !!platform &&
+    ASR_SUBTITLE_PLATFORMS.has(platform) &&
+    !!videoId &&
+    !!payload &&
+    !payload.has_transcript;
+  /** The live-caption fetch this preview owes: a YouTube caption track, or
+   *  Twitch/Kick ASR. Mutually exclusive — they are gated on disjoint
+   *  platforms — so one payload slot and one state machine serve both. */
+  const liveSubtitles = subtitlesOnly || asrSubtitles;
   useEffect(() => {
-    if (!subtitlesOnly || !videoId) {
-      setYtSubtitles(null);
+    if (!liveSubtitles || !videoId || !platform) {
+      setSubs(null);
       setSubsFetchState('idle');
       return;
     }
-    const cached = subsCacheRef.current.get(videoId);
+    // Cache key is platform-scoped, not just videoId: Twitch ids are numeric
+    // and Kick ids are UUIDs, but the SAME string exists on both platforms and
+    // the backend keys its own ASR cache by platform for the same reason. A
+    // bare id would let one platform's rows answer for another's video.
+    const cacheKey = `${platform}/${videoId}`;
+    const cached = subsCacheRef.current.get(cacheKey);
     if (cached) {
-      setYtSubtitles(cached);
+      setSubs(cached);
       setSubsFetchState('done');
       return;
     }
-    // Fetch the live captions as soon as the URL-only state is known
-    // (session-create, in parallel with video loading) — no wait for
-    // canplay, so subtitles are ready by the time playback starts. The
-    // cache dedupes by videoId, so later re-runs of this effect never
-    // re-fetch.
+    // Fetch as soon as the no-archived-transcript state is known (session
+    // create, in parallel with video loading) — no wait for canplay, so the
+    // captions are ready by the time playback starts. The cache dedupes by
+    // platform+videoId, so later re-runs of this effect never re-fetch.
     let cancelled = false;
     setSubsFetchState('loading');
-    const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
-    apiGet<PreviewSubtitlesPayload>(`/api/subtitles?url=${encodeURIComponent(watchUrl)}&langs=en,pt,es`)
+    const path = subtitlesOnly
+      ? `/api/subtitles?url=${encodeURIComponent(
+          `https://www.youtube.com/watch?v=${videoId}`,
+        )}&langs=en,pt,es`
+      : // head_sec is left at the backend default (300 s): the panel has no
+        // control for it, and asking for more of the VOD would only make the
+        // first (uncached) call slower.
+        `/api/preview/subtitles/${platform}/${encodeURIComponent(videoId)}`;
+    apiGet<PreviewSubtitlesPayload>(path)
       .then((p) => {
         if (cancelled) return;
         const cache = subsCacheRef.current;
-        cache.set(videoId, p);
+        cache.set(cacheKey, p);
         if (cache.size > 8) {
           // ponytail: bounded subtitles cache — same LRU-ish prune as the
           // payload cache; upgrade path: shared cache helper if a third
@@ -826,7 +899,7 @@ export function PreviewChatPanel({
           const oldest = cache.keys().next().value;
           if (oldest !== undefined) cache.delete(oldest);
         }
-        setYtSubtitles(p);
+        setSubs(p);
         setSubsFetchState('done');
       })
       .catch(() => {
@@ -835,19 +908,20 @@ export function PreviewChatPanel({
     return () => {
       cancelled = true;
     };
-  }, [subtitlesOnly, videoId, retryTick]);
+  }, [liveSubtitles, subtitlesOnly, platform, videoId, retryTick]);
 
-  // Subtitles are a YouTube feature: the caption display is only offered for
-  // YouTube videos (URL-only previews fetch live captions; archived ones show
-  // their transcript). Twitch/Kick VODs and clips get the Transcript tab (the
-  // archive's auto-transcript) but no Subtitles tab.
-  const subtitlesTabEnabled = platform === 'youtube';
+  // The Subtitles tab is offered wherever preview captions exist: YouTube (its
+  // own caption track) and Twitch/Kick (local ASR over the VOD head). An
+  // archived transcript wins on every platform — the Subtitles tab then shows
+  // the archive rows, exactly as it always did for archived YouTube videos.
+  const subtitlesTabEnabled =
+    platform === 'youtube' || (!!platform && ASR_SUBTITLE_PLATFORMS.has(platform));
   // Subtitles-only previews have no chat/transcript tabs to land on.
   useEffect(() => {
     if (subtitlesOnly && tab !== 'subtitles') setTab('subtitles');
   }, [subtitlesOnly, tab]);
-  // Stale tab across video switches: a non-YouTube video must never keep the
-  // Subtitles tab selected (its tab is hidden for that platform).
+  // Stale tab across video switches: a preview that offers no captions at all
+  // (null/unknown platform) must never keep the Subtitles tab selected.
   useEffect(() => {
     if (!subtitlesTabEnabled && tab === 'subtitles') setTab('transcript');
   }, [subtitlesTabEnabled, tab]);
@@ -949,11 +1023,14 @@ export function PreviewChatPanel({
     () => activePanelRowIndex(timelineOffsets, currentTime),
     [timelineOffsets, currentTime],
   );
-  // Subtitles-tab rows: the archive transcript for archived YouTube videos,
-  // the live-fetched YouTube captions for URL-only previews. Non-YouTube
-  // platforms have no Subtitles tab (transcript lives in the Transcript tab).
+  // Subtitles-tab rows: whichever source owns this preview's captions —
+  // live YouTube captions (URL-only), live ASR rows (Twitch/Kick with no
+  // archived transcript), or the archive transcript for an already
+  // transcribed video on any platform.
   const subtitleRows = subtitlesTabEnabled
-    ? (subtitlesOnly ? (ytSubtitles?.rows ?? EMPTY_TRANSCRIPT) : transcriptRows)
+    ? liveSubtitles
+      ? (subs?.rows ?? EMPTY_TRANSCRIPT)
+      : transcriptRows
     : EMPTY_TRANSCRIPT;
   const subtitleOffsets = useMemo(() => subtitleRows.map((r) => r.offset_sec), [subtitleRows]);
   const activeSubtitleIdx = useMemo(
@@ -974,9 +1051,10 @@ export function PreviewChatPanel({
   // Keyed so a reason from the previously-previewed video can never render
   // under the new one while the fresh probe is still in flight.
   const parkedReason = parkProbe.key === parkProbeKey ? parkProbe.reason : null;
-  // Only YouTube age-gates. Twitch/Kick have no Subtitles tab, so their
-  // subtitleRows is always empty and would probe on every open for a park the
-  // backend can never report.
+  // Only YouTube age-gates. A Twitch/Kick caption comes from ASR over audio we
+  // just downloaded, so the backend can never report a park for one, and
+  // probing /api/archive/videos for it on every open would be a request that
+  // can only ever come back empty.
   const needsParkProbe =
     platform === 'youtube' && fetchState === 'done' && !!payload && subtitleRows.length === 0;
   useEffect(() => {
@@ -991,11 +1069,14 @@ export function PreviewChatPanel({
       cancelled = true;
     };
   }, [parkProbeKey, needsParkProbe, platform, videoId, channel, retryTick]);
-  /** Which of the four distinct caption facts the panel is currently showing. */
+  /** Which of the four distinct caption facts the panel is currently showing.
+   *  `hasSubtitles` is the measurement from whichever endpoint answered
+   *  (YouTube track or Twitch/Kick ASR); `subtitlesOnly` stays YouTube-scoped
+   *  because that is what captionsState's flag means. */
   const captionsVerdict = captionsState({
     parkedReason,
     hasTranscript: !!payload?.has_transcript,
-    hasSubtitles: ytSubtitles?.has_subtitles ?? null,
+    hasSubtitles: subs?.has_subtitles ?? null,
     cuesInWindow: subtitleRows.length,
     subtitlesOnly,
   });
@@ -1484,13 +1565,16 @@ export function PreviewChatPanel({
               aria-labelledby={`${tabIdBase}-tab-subtitles`}
               className="flex-1 min-h-0 overflow-y-auto custom-scrollbar flex flex-col items-center justify-center gap-2 px-3 py-4"
             >
-              {subtitlesOnly && subsFetchState === 'loading' && (
+              {/* Loading covers BOTH live sources, and it must: the Twitch/Kick
+                  ASR call pays a model load on its first run, so a spinner is
+                  the difference between "working" and "broken". */}
+              {liveSubtitles && subsFetchState === 'loading' && (
                 <div className="flex flex-col items-center justify-center gap-2 text-zinc-500">
                   <Loader2 size={13} className="animate-spin" />
                   <span className="text-ui-sm font-mono">{t('Loading subtitles…')}</span>
                 </div>
               )}
-              {subtitlesOnly && subsFetchState === 'error' && (
+              {liveSubtitles && subsFetchState === 'error' && (
                 <div className="flex flex-col items-center justify-center gap-2 px-4">
                   <span className="text-red-300 text-ui-sm font-mono text-center">
                     {t("Couldn't load subtitles.")}
@@ -1511,12 +1595,20 @@ export function PreviewChatPanel({
               {captionsVerdict === 'parked' && parkedReason && (
                 <CaptionsParkedNotice reason={parkedReason} onOpenCookieBridge={onOpenCookieBridge} />
               )}
-              {captionsVerdict !== 'parked' && subtitlesOnly && subsFetchState === 'done' && (!ytSubtitles?.has_subtitles || subtitleRows.length === 0) && (
+              {/* "We asked and there are none" — a YouTube track that is absent, or an
+                  ASR head that decoded to silence. Truthful for Twitch/Kick:
+                  they publish no track to begin with and are never parked, so
+                  the absence has no reversible cause to explain. */}
+              {captionsVerdict !== 'parked' && liveSubtitles && subsFetchState === 'done' && (!subs?.has_subtitles || subtitleRows.length === 0) && (
                 <p className="text-ui-sm font-mono text-zinc-400 text-center leading-relaxed">
                   {t('No subtitles available for this video.')}
                 </p>
               )}
-              {captionsVerdict !== 'parked' && !subtitlesOnly && !payload.has_transcript && (
+              {/* The archived-video fallback. Suppressed whenever a live fetch
+                  is in flight, has failed, or answered: those three states
+                  already speak for themselves, and stacking a "no captions"
+                  verdict under an error is a contradiction. */}
+              {captionsVerdict !== 'parked' && !liveSubtitles && !payload.has_transcript && (
                 <p className="text-ui-sm font-mono text-zinc-400 text-center leading-relaxed">
                   {t('No captions for this video.')}
                 </p>

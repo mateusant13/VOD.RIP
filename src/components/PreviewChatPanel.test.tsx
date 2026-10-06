@@ -46,12 +46,32 @@ const SUBTITLES_PAYLOAD = {
   ],
 };
 
+/** A Twitch/Kick preview-captions body: local ASR over the head of the VOD.
+ *  Same shape as the YouTube one on purpose — see PreviewSubtitlesPayload. */
+const ASR_SUBTITLES_PAYLOAD = {
+  url: 'https://www.twitch.tv/videos/2892722496',
+  lang: null,
+  source: 'asr',
+  has_subtitles: true,
+  rows: [
+    { offset_sec: 0, text: 'asr fala um' },
+    { offset_sec: 7, text: 'asr fala dois' },
+  ],
+  covered_sec: 300,
+  partial: true,
+};
+
 function mockPanelFetch(
   payload: PreviewPanelPayload | null,
   status = 200,
   failFor: (url: string) => boolean = () => false,
   subtitlesPayload: object | null = SUBTITLES_PAYLOAD,
   subtitlesDelayMs = 0,
+  /** Twitch/Kick ASR body; null = 200 with `null` rows (as the backend's
+   *  "nothing to show" answer would be shaped, minus the payload). */
+  asrPayload: object | null = ASR_SUBTITLES_PAYLOAD,
+  /** Non-200 for the ASR endpoint — the unreachable-audio 502. */
+  asrStatus = 200,
 ) {
   const fn = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
@@ -59,6 +79,23 @@ function mockPanelFetch(
       if (failFor(url)) return new Response(JSON.stringify({ detail: 'boom' }), { status: 500 });
       return new Response(JSON.stringify(payload), {
         status,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    // Twitch/Kick preview captions. Matched before /api/subtitles for
+    // readability only — '/api/preview/subtitles/' does not contain
+    // '/api/subtitles', so the two cannot collide.
+    if (url.includes('/api/preview/subtitles/')) {
+      if (asrStatus !== 200) {
+        return new Response(JSON.stringify({ detail: 'Could not build preview subtitles' }), {
+          status: asrStatus,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (subtitlesDelayMs > 0)
+        await new Promise<void>((resolve) => { setTimeout(resolve, subtitlesDelayMs); });
+      return new Response(JSON.stringify(asrPayload), {
+        status: 200,
         headers: { 'Content-Type': 'application/json' },
       });
     }
@@ -230,13 +267,33 @@ describe('PreviewChatPanel', () => {
     });
   });
 
-  it('hides the Subtitles tab for non-YouTube platforms (Twitch/Kick VODs, clips)', async () => {
-    mockPanelFetch(PAYLOAD);
-    render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
+  // REPLACES "hides the Subtitles tab for non-YouTube platforms", which
+  // asserted the pre-ASR design: Twitch/Kick published no caption track, so
+  // there was nothing to put under the tab and it was withheld. That is no
+  // longer true — /api/preview/subtitles/{platform}/{video_id} transcribes the
+  // head of the VOD — so the tab is now offered for those platforms.
+  it('offers the Subtitles tab for Twitch/Kick previews (was withheld before ASR captions existed)', async () => {
+    const fetchMock = mockPanelFetch(PAYLOAD);
+    const { rerender } = render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
     await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
     // The archived transcript stays available — under its Transcript tab.
     expect(screen.getByRole('tab', { name: 'Transcript' })).toBeTruthy();
-    expect(screen.queryByRole('tab', { name: 'Subtitles' })).toBeNull();
+    expect(screen.getByRole('tab', { name: 'Subtitles' })).toBeTruthy();
+
+    // …and the Subtitles tab shows the ARCHIVE rows for a VOD that already has
+    // a transcript: ASR is never paid for when the words are already here.
+    fireEvent.click(screen.getByRole('tab', { name: 'Subtitles' }));
+    await waitFor(() => {
+      expect(document.querySelector('[data-subtitle-line]')?.textContent).toContain('hello world');
+    });
+    expect(fetchMock.mock.calls.some((c) => String(c[0]).includes('/api/preview/subtitles/'))).toBe(
+      false,
+    );
+
+    // Kick gets the same tab — the ASR endpoint takes twitch and kick alike.
+    rerender(<PreviewChatPanel platform="kick" videoId="kick-uuid-1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByRole('tab', { name: 'Subtitles' })).toBeTruthy());
+    expect(screen.getByRole('tab', { name: 'Transcript' })).toBeTruthy();
   });
 
   it('interleaves acoustic events into the transcript timeline in offset order', async () => {
@@ -268,7 +325,9 @@ describe('PreviewChatPanel', () => {
     expect(laugh.textContent).toContain('(0.6s)');
   });
 
-  it('empty payload shows per-tab empty states; no Subtitles tab off-YouTube', async () => {
+  // The trailing clause changed with the design: it used to assert that a
+  // Twitch/Kick VOD had NO Subtitles tab. It now has one, backed by ASR.
+  it('empty payload shows per-tab empty states; the Subtitles tab falls back to ASR captions', async () => {
     mockPanelFetch(EMPTY_PAYLOAD);
     render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
     await waitFor(() => {
@@ -278,8 +337,13 @@ describe('PreviewChatPanel', () => {
     await waitFor(() => {
       expect(screen.getByText('No transcript for this video.')).toBeTruthy();
     });
-    // Subtitles are YouTube-only — a Twitch/Kick VOD has no Subtitles tab.
-    expect(screen.queryByRole('tab', { name: 'Subtitles' })).toBeNull();
+    // The tab is offered, and it is not blank: with no archived transcript the
+    // panel falls back to the ASR captions instead of withholding the tab.
+    expect(screen.getByRole('tab', { name: 'Subtitles' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('tab', { name: 'Subtitles' }));
+    await waitFor(() => {
+      expect(document.querySelector('[data-subtitle-line]')?.textContent).toContain('asr fala um');
+    });
   });
 
   it('null platform/videoId (clip/live/channel previews) shows an explanatory message instead of a blank panel', async () => {
@@ -495,6 +559,109 @@ describe('PreviewChatPanel', () => {
     // Archived videos never call the live-subtitles endpoint.
     const calls = fetchMock.mock.calls.map((c) => String(c[0]));
     expect(calls.some((u) => u.includes('/api/subtitles'))).toBe(false);
+  });
+
+  // ── Twitch/Kick preview captions (local ASR) ────────────────────────────
+  // Neither platform publishes a caption track, so the only way such a
+  // preview can show words is /api/preview/subtitles/{platform}/{video_id}.
+  // The rows come back in the YouTube shape, so the rendering path above is
+  // shared — only the producer differs.
+
+  it('fetches ASR preview captions for a Twitch VOD with no archived transcript', async () => {
+    const fetchMock = mockPanelFetch(EMPTY_PAYLOAD);
+    render(<PreviewChatPanel platform="twitch" videoId="2892722496" currentTime={0} />);
+    const urls = () => fetchMock.mock.calls.map((c) => String(c[0]));
+    await waitFor(() =>
+      expect(urls().some((u) => u.includes('/api/preview/subtitles/twitch/2892722496'))).toBe(true),
+    );
+    // The YouTube caption endpoint is never touched for a Twitch VOD.
+    expect(urls().some((u) => u.includes('/api/subtitles?url='))).toBe(false);
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Subtitles' }));
+    await waitFor(() => {
+      expect(document.querySelector('[data-subtitle-line]')?.textContent).toContain('asr fala um');
+    });
+  });
+
+  it('requests only the current platform’s ASR URL, and caches per platform', async () => {
+    const fetchMock = mockPanelFetch(EMPTY_PAYLOAD);
+    const asrUrls = () =>
+      fetchMock.mock.calls
+        .map((c) => String(c[0]))
+        .filter((u) => u.includes('/api/preview/subtitles/'));
+    const { rerender } = render(
+      <PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />,
+    );
+    await waitFor(() =>
+      expect(asrUrls().some((u) => u.includes('/api/preview/subtitles/twitch/v1'))).toBe(true),
+    );
+
+    // Same id on the other platform: the id alone must not be a cache key, or
+    // Kick would be handed Twitch's rows and never ask for its own.
+    rerender(<PreviewChatPanel platform="kick" videoId="v1" currentTime={0} />);
+    await waitFor(() =>
+      expect(asrUrls().some((u) => u.includes('/api/preview/subtitles/kick/v1'))).toBe(true),
+    );
+    expect(asrUrls()).toContain('/api/preview/subtitles/twitch/v1');
+    expect(asrUrls()).toContain('/api/preview/subtitles/kick/v1');
+    // No URL ever names a platform the preview is not on.
+    expect(asrUrls().filter((u) => u.includes('/api/preview/subtitles/twitch/')).length).toBe(1);
+    expect(asrUrls().filter((u) => u.includes('/api/preview/subtitles/kick/')).length).toBe(1);
+    expect(asrUrls()).not.toContain('/api/preview/subtitles/twitch/kick-uuid-1');
+    expect(asrUrls()).not.toContain('/api/preview/subtitles/kick/kick-uuid-1');
+  });
+
+  it('shows a loading state while the first ASR call runs (it pays a model load)', async () => {
+    mockPanelFetch(EMPTY_PAYLOAD, 200, () => false, SUBTITLES_PAYLOAD, 250);
+    render(<PreviewChatPanel platform="twitch" videoId="2892722496" currentTime={0} />);
+    fireEvent.click(screen.getByRole('tab', { name: 'Subtitles' }));
+    await waitFor(() => expect(screen.getByText('Loading subtitles…')).toBeTruthy());
+    await waitFor(() => {
+      expect(document.querySelector('[data-subtitle-line]')?.textContent).toContain('asr fala um');
+    });
+  });
+
+  it('explains an ASR answer of has_subtitles:false instead of a blank Subtitles tab', async () => {
+    mockPanelFetch(EMPTY_PAYLOAD, 200, () => false, SUBTITLES_PAYLOAD, 0, {
+      ...ASR_SUBTITLES_PAYLOAD,
+      has_subtitles: false,
+      rows: [],
+      covered_sec: 300,
+    });
+    render(<PreviewChatPanel platform="kick" videoId="kick-uuid-1" currentTime={0} />);
+    fireEvent.click(screen.getByRole('tab', { name: 'Subtitles' }));
+    await waitFor(() =>
+      expect(screen.getByText('No subtitles available for this video.')).toBeTruthy(),
+    );
+    // One verdict, not two: the archived-video line must not stack under the
+    // live one.
+    expect(screen.queryByText('No captions for this video.')).toBeNull();
+    expect(document.querySelector('[data-subtitle-line]')).toBeNull();
+  });
+
+  it('surfaces a retry state when ASR cannot reach the audio (502), without crashing', async () => {
+    mockPanelFetch(EMPTY_PAYLOAD, 200, () => false, SUBTITLES_PAYLOAD, 0, null, 502);
+    render(<PreviewChatPanel platform="twitch" videoId="2892722496" currentTime={0} />);
+    fireEvent.click(screen.getByRole('tab', { name: 'Subtitles' }));
+    await waitFor(() => expect(screen.getByText("Couldn't load subtitles.")).toBeTruthy());
+    expect(screen.getByRole('button', { name: /retry/i })).toBeTruthy();
+    // The panel is still a working panel — the failure is scoped to captions.
+    expect(screen.getByRole('tab', { name: 'Transcript' })).toBeTruthy();
+    expect(screen.getByRole('tab', { name: 'Chat' })).toBeTruthy();
+  });
+
+  it('never runs ASR when the archive already holds a transcript (either platform)', async () => {
+    const fetchMock = mockPanelFetch(PAYLOAD);
+    const { rerender } = render(
+      <PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />,
+    );
+    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+    rerender(<PreviewChatPanel platform="kick" videoId="kick-uuid-1" currentTime={0} />);
+    await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
+    // The Transcript tab already carries these words; a ~7 s ASR pass to
+    // reproduce them would be pure cost.
+    const urls = fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(urls.some((u) => u.includes('/api/preview/subtitles/'))).toBe(false);
   });
 
   it('searches chat inline: filters rows, counts matches, navigates with Enter', async () => {

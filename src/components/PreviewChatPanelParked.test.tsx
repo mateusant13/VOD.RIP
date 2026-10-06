@@ -34,6 +34,17 @@ const NO_SUBTITLES = {
   rows: [],
 };
 
+/** A Twitch/Kick preview captions body (local ASR over the VOD head). */
+const ASR_ROWS = {
+  url: '',
+  lang: null,
+  source: 'asr',
+  has_subtitles: true,
+  rows: [{ offset_sec: 0, text: 'fala transcrita' }],
+  covered_sec: 300,
+  partial: true,
+};
+
 /** `videos` rows for GET /api/archive/videos. */
 const ARCHIVE_VIDEOS = {
   videos: [
@@ -58,6 +69,12 @@ function mockFetch(videos: object | null) {
     }
     if (url.includes('/api/subtitles')) {
       return new Response(JSON.stringify(NO_SUBTITLES), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    if (url.includes('/api/preview/subtitles/')) {
+      return new Response(JSON.stringify(ASR_ROWS), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       });
@@ -159,5 +176,22 @@ describe('PreviewChatPanel — age-gated caption park', () => {
     // subtitlesOnly forces the Subtitles tab; a parked YouTube video with no
     // chat has no Transcript tab to fall back to, so the same notice covers it.
     expect(screen.queryByText('No transcript for this video.')).toBeNull();
+  });
+
+  it('never probes for a park on Twitch/Kick — only YouTube age-gates', async () => {
+    const fetchMock = mockFetch(ARCHIVE_VIDEOS);
+    render(<PreviewChatPanel platform="twitch" videoId="yt1" currentTime={0} />);
+    // A Twitch caption comes from ASR over audio we just downloaded, so the
+    // backend can never report a park for one. The probe would be a request
+    // that can only ever come back empty.
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some((c) => String(c[0]).includes('/api/preview/subtitles/')),
+      ).toBe(true);
+    });
+    expect(fetchMock.mock.calls.some((c) => String(c[0]).includes('/api/archive/videos'))).toBe(
+      false,
+    );
+    expect(document.querySelector('[data-captions-parked]')).toBeNull();
   });
 });
