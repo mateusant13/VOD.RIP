@@ -417,8 +417,42 @@ def _parse_srv3(text: str) -> list[dict]:
     return segments
 
 
+def _sniff_caption_format(data: str, default: str) -> str:
+    """The payload's ACTUAL shape; ``default`` is the requested fmt.
+
+    The requested format is not reliably honoured. Measured 2026-10-06: the
+    InnerTube ANDROID timedtext endpoint answered a ``fmt=vtt`` request with
+    srv3 XML — ``<?xml ...?><timedtext format="3">`` carrying ``<p t= d=><s>``
+    paragraphs — for every video probed. Dispatching on the REQUESTED fmt fed
+    that XML to _parse_vtt, which found no ``WEBVTT`` header and no ``-->``
+    timing lines and returned []. The result was an HTTP 200 carrying
+    has_subtitles=true and rows=[]: the caption track was found, fetched
+    (232 kB) and then silently dropped. A caption-less video and a
+    caption-found-but-unparsed one are indistinguishable from the outside,
+    which is why this sniffs instead of trusting the request.
+
+    Strictly additive: a payload whose shape matches the requested format
+    still resolves to that same format, so nothing that parses today changes.
+    Unrecognised bodies fall through to ``default`` unchanged.
+    """
+    head = (data or "").lstrip()[:256]
+    if head.startswith("WEBVTT"):
+        return "vtt"
+    if head.startswith("<?xml") or head.startswith("<timedtext"):
+        return "srv3"
+    if head.startswith("{"):
+        return "json3"
+    return default
+
+
 def _parse_caption(fmt: str, data: str) -> list[dict]:
-    """Dispatch a caption payload to its parser (vtt is the default)."""
+    """Dispatch a caption payload to its parser.
+
+    ``fmt`` is the REQUESTED format and only a default — the body is sniffed
+    first, because the timedtext endpoint does not always serve it (see
+    _sniff_caption_format). vtt stays the fallback for an unrecognised body.
+    """
+    fmt = _sniff_caption_format(data, fmt)
     if fmt == "json3":
         return _parse_json3(data)
     if fmt == "srv3":

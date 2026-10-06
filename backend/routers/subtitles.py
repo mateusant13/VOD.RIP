@@ -41,7 +41,7 @@ from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException, Query
 
-from services.archive_ytdlp import _parse_caption, _parse_vtt
+from services.archive_ytdlp import _parse_caption
 from services.ytdlp_ffmpeg import _ytdlp_engine_opts
 # The MODULE, never the name: the call below reads
 # `ytdlp_guard.guarded_youtube_dl(...)`, so the attribute is resolved at call
@@ -268,7 +268,12 @@ def _payload_from_info(url: str, info: dict, opener) -> dict | None:
         if got is None:
             continue
         fmt, data = got[1], got[2]
-        segments = _parse_vtt(data) if fmt == "vtt" else _parse_caption(fmt, data)
+        # Through _parse_caption, never straight to _parse_vtt: the requested
+        # fmt is not what the timedtext endpoint served (measured 2026-10-06 —
+        # fmt=vtt answered with srv3 XML, and _parse_vtt returned [] for it,
+        # so the panel showed has_subtitles=true with no rows). _parse_caption
+        # sniffs the body and picks the parser that matches it.
+        segments = _parse_caption(fmt, data)
         return {
             "url": url,
             "lang": lang,

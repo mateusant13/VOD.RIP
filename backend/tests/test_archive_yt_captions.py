@@ -398,3 +398,78 @@ def test_caption_speaker_markers_stripped():
     assert len(segs) == 1
     assert segs[0]["text"] == "oi"
     assert segs[0]["words"] == [{"word": "oi", "start": 1.2, "end": 4.0}]
+
+# --- caption body shape vs requested format (regression, 2026-10-06) -------
+# Measured: the InnerTube ANDROID timedtext endpoint answered a fmt=vtt
+# request with srv3 XML for every video probed (232 kB body,
+# <timedtext format="3"> with <p>/<s> paragraphs). Dispatching on the
+# REQUESTED fmt handed that XML to _parse_vtt, which found no WEBVTT header
+# and returned []. /api/subtitles then answered 200 with has_subtitles=true
+# and rows=[] -- the caption track was found, fetched, and silently dropped,
+# indistinguishable from a caption-less video. These pin the PARSER to the
+# BODY, not to the request.
+
+_XML_SERVED_AS_VTT = (
+    '<?xml version="1.0" encoding="utf-8" ?>'
+    '<timedtext format="3">\n<head>\n<ws id="0"/>\n</head>\n<body>\n'
+    '<w t="0" id="1" wp="1" ws="1"/>\n'
+    '<p t="268080" d="3000" w="1"><s ac="0">Olha</s></p>\n'
+    '<p t="297880" d="3000" w="1"><s ac="0">o jeito</s></p>\n'
+    "</body></timedtext>"
+)
+
+
+def test_parse_caption_reads_srv3_xml_served_as_vtt():
+    segs = archive_ytdlp._parse_caption("vtt", _XML_SERVED_AS_VTT)
+    assert len(segs) == 2, (
+        "srv3 XML served on a fmt=vtt entry must not parse to zero rows "
+        "(this is the bug: 200 OK, has_subtitles=true, rows=[])"
+    )
+    assert segs[0]["text"] == "Olha"
+    assert abs(segs[0]["start_sec"] - 268.08) < 0.01
+    assert segs[1]["text"] == "o jeito"
+
+
+def test_parse_caption_sniffer_leaves_a_matching_payload_alone():
+    """Additive by construction: a body matching the request is unchanged."""
+    vtt = "WEBVTT\n\n00:00:03.000 --> 00:00:20.470\nOi.\n"
+    assert archive_ytdlp._parse_caption("vtt", vtt) == archive_ytdlp._parse_vtt(vtt)
+    assert archive_ytdlp._parse_caption("json3", _JSON3) == archive_ytdlp._parse_json3(_JSON3)
+    assert archive_ytdlp._parse_caption("srv3", _SRV3) == archive_ytdlp._parse_srv3(_SRV3)
+
+
+def test_sniff_caption_format_uses_the_body_and_falls_back():
+    assert archive_ytdlp._sniff_caption_format("WEBVTT\n", "srv3") == "vtt"
+    assert archive_ytdlp._sniff_caption_format(
+        '<?xml version="1.0"?><timedtext format="3"/>', "vtt") == "srv3"
+    assert archive_ytdlp._sniff_caption_format(
+        '<timedtext format="1"><body/></timedtext>', "vtt") == "srv3"
+    assert archive_ytdlp._sniff_caption_format('{"events": []}', "vtt") == "json3"
+    # unrecognised / empty bodies keep the requested format
+    assert archive_ytdlp._sniff_caption_format("", "vtt") == "vtt"
+    assert archive_ytdlp._sniff_caption_format("garbage", "json3") == "json3"
+
+
+def test_payload_from_info_returns_rows_when_vtt_entry_serves_xml():
+    """The real seam: the router's own walk, with a vtt entry answering XML."""
+    from routers import subtitles as S
+
+    info = {
+        "subtitles": {},
+        "automatic_captions": {"pt": [{"ext": "vtt", "url": "u"},
+                                      {"ext": "json3", "url": "j"}]},
+    }
+
+    class _Op:
+        def urlopen(self, url):
+            return _Resp(_XML_SERVED_AS_VTT.encode("utf-8"))
+
+    payload = S._payload_from_info("https://youtu.be/abc", info, _Op())
+    assert payload is not None
+    assert payload["has_subtitles"] is True
+    assert payload["lang"] == "pt" and payload["source"] == "auto"
+    assert len(payload["rows"]) == 2, (
+        "preview-panel caption rows must survive an XML body on a vtt entry"
+    )
+    assert payload["rows"][0]["text"] == "Olha"
+    assert abs(payload["rows"][0]["offset_sec"] - 268.08) < 0.01
