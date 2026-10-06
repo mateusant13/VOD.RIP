@@ -226,6 +226,28 @@ export default function ChannelExplorePopup({
     open: false,
     width: readPreviewChatPanelWidth(),
   }));
+  // GUARDED WRITER - the closing edge of a render loop that React reports as
+  // "Maximum update depth exceeded" in this component.
+  //
+  // The chain, measured by reading both ends rather than guessing:
+  //   PreviewChatPanel renders `renderedW = open ? Math.min(width, widthCap) : 0`
+  //   -> useEffect(PreviewChatPanel.tsx:1211) calls onLayoutChange({open, width})
+  //   -> (raw setChatInfo, a NEW object every call) -> chatInfo
+  //   -> chatTotal (line 230) -> containerW -> layoutExplorePopupWindow
+  //   -> setPos / setPanelWidth -> maxWidth prop -> widthCap -> renderedW
+  //
+  // Every hop creates a fresh value, so the effect's deps change on every pass
+  // and the cycle never closes. The fix is the SAME guard this file already
+  // uses for setPos at line ~1315 (prev?.x === p.x && prev?.y === p.y ? prev :
+  // p): return `prev` unchanged when the reported geometry is identical, so an
+  // oscillating measurement settles instead of re-rendering. The behaviour is
+  // unchanged - a genuinely different width still lands - and the callback is
+  // stable, which also keeps it out of the panel's effect deps.
+  const handleChatLayoutChange = useCallback((next: { open: boolean; width: number }) => {
+    setChatInfo((prev) =>
+      prev.open === next.open && prev.width === next.width ? prev : next,
+    );
+  }, []);
   const chatTotalRef = useRef(0);
   const chatTotal = chatInfo.open ? chatInfo.width + 8 : chatInfo.width; // gap-2 row
   chatTotalRef.current = chatTotal;
@@ -2351,7 +2373,7 @@ export default function ChannelExplorePopup({
               // (seekVideo clamps to the effective duration and no-ops
               // until ready).
               onSeek={seekVideo}
-              onLayoutChange={setChatInfo}
+              onLayoutChange={handleChatLayoutChange}
               onMarkersChange={handleChatMarkersChange}
             />
           )}
