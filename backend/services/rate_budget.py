@@ -136,10 +136,36 @@ _DEFAULT_CEILING_RPM = 10.0  # any platform we have not calibrated yet
 _FLOOR_CEILING_RPM = 4.0     # never learn below this, however many events
 _MAX_CEILING_RPM = 120.0     # never climb above this
 
+# HARD per-platform ceilings. Unlike the learned ceiling (which starts
+# conservative and ramps up), these are absolute: the ramp-up and any learned
+# value are clamped to them, so no clean window can ever teach the governor a
+# rate above what the platform is known to tolerate. Requests/min.
+_HARD_CAP_RPM: Dict[str, float] = {
+    "youtube": 60.0,
+    "twitch": 90.0,
+    "kick": 60.0,
+}
+_DEFAULT_HARD_CAP_RPM = 60.0
+
 _SAFETY_FRACTION = 0.70      # aim at 70% of the rate that actually tripped us
 _UP_FACTOR = 1.05            # ~+5% per clean window
 _CLEAN_WINDOW_S = 300.0      # 5 min event-free before one up-step
 _MAX_CATCHUP_STEPS = 4       # bounded spring-back after a long idle
+
+# --- exponential backoff on a real limit event -------------------------------
+# A 429/rate-limit is expensive and repeated hits can escalate a soft limit
+# into a hard one. After each observed trip the platform is put in backoff for
+# ``_BACKOFF_BASE_S * 2**streak`` (bounded), so callers are refused WITHOUT the
+# token draw or the sub-second wait that turned a dry pool into a hot retry
+# loop. A clean window resets the streak.
+_BACKOFF_BASE_S = 30.0
+_BACKOFF_FACTOR = 2.0
+_BACKOFF_MAX_S = 1800.0
+_BACKOFF_RESET_S = 900.0     # clean for this long -> streak resets to 0
+
+# How much the scheduler should stretch its pass interval while a platform is
+# exhausted/in backoff. Capped so the archive never sleeps for hours.
+_MAX_CADENCE_MULTIPLIER = 4.0
 
 # The history table records `requests_at_limit_*` as a COUNT of requests
 # issued before the limiter fired, not a per-minute rate. When no request
@@ -222,6 +248,9 @@ class _PlatformState:
     hot_calls: int = 0
     hot_limited: int = 0
     hot_window_start: float = 0.0
+    # exponential backoff armed by a real limit event
+    backoff_until: float = 0.0
+    backoff_streak: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
@@ -235,6 +264,17 @@ _history_primed = False
 
 def _default_rpm(platform: str) -> float:
     return _PLATFORM_CEILING_RPM.get(platform, _DEFAULT_CEILING_RPM)
+
+
+def _hard_cap_rpm(platform: str) -> float:
+    """Absolute requests/min ceiling for a platform (never exceeded)."""
+    return _HARD_CAP_RPM.get(platform, _DEFAULT_HARD_CAP_RPM)
+
+
+def _backoff_delay(st: "_PlatformState") -> float:
+    """Next backoff delay for the current streak, bounded and never below base."""
+    streak = max(1, int(st.backoff_streak))
+    return min(_BACKOFF_MAX_S, _BACKOFF_BASE_S * (_BACKOFF_FACTOR ** (streak - 1)))
 
 
 def _state(platform: str) -> _PlatformState:
@@ -300,7 +340,15 @@ def _seconds_for_one_token(rate_per_min: float) -> float:
 # --- ceiling learning --------------------------------------------------------
 
 def _ramp_up(st: _PlatformState, now: float) -> None:
-    """Slow recovery. Caller holds the platform lock."""
+    """Slow recovery. Caller holds the platform lock.
+
+    Also ages out the backoff streak: a platform that has been clean for
+    ``_BACKOFF_RESET_S`` since its last event starts the ladder over, so a
+    single ancient 429 does not keep a recovered platform on a 30-min penalty.
+    The learned ceiling is always clamped to the platform's HARD cap."""
+    if st.events and st.backoff_streak and (now - st.last_event_ts) >= _BACKOFF_RESET_S:
+        st.backoff_streak = 0
+        st.backoff_until = 0.0
     if st.events == 0:
         return
     since_ramp = now - st.last_ramp_ts
@@ -311,7 +359,8 @@ def _ramp_up(st: _PlatformState, now: float) -> None:
         return
     steps = min(steps, _MAX_CATCHUP_STEPS)
     st.last_ramp_ts = now
-    st.ceiling_rpm = min(_MAX_CEILING_RPM, st.ceiling_rpm * (_UP_FACTOR ** steps))
+    cap = min(_MAX_CEILING_RPM, _hard_cap_rpm(st.platform))
+    st.ceiling_rpm = min(cap, st.ceiling_rpm * (_UP_FACTOR ** steps))
 
 
 def _record_trip(st: _PlatformState, now: float) -> None:
@@ -598,10 +647,20 @@ def note_limit(platform: str, *, kind: Optional[str] = None, status: Optional[in
         new_ceiling = max(_FLOOR_CEILING_RPM, learned)
         if new_ceiling > st.ceiling_rpm:
             new_ceiling = st.ceiling_rpm  # an event never raises the ceiling
-        st.ceiling_rpm = new_ceiling
+        st.ceiling_rpm = min(new_ceiling, _hard_cap_rpm(st.platform))
         st.events += 1
         st.last_event_ts = now
         st.last_ramp_ts = now
+        # Arm the exponential backoff. Each consecutive trip doubles the delay
+        # (bounded); a clean window resets the streak in _ramp_up. An explicit
+        # backoff_s (a platform Retry-After) is honoured as a floor, never a
+        # way to shorten the ladder.
+        st.backoff_streak = min(int(st.backoff_streak) + 1, 16)
+        delay = _backoff_delay(st)
+        if backoff_s is not None and float(backoff_s) > delay:
+            delay = min(_BACKOFF_MAX_S, float(backoff_s))
+        st.backoff_until = now + delay
+        backoff_s_applied = delay
         # AUTO is emptied: it is the most likely source of the burst that
         # tripped us. The USER reservation is deliberately left intact — that
         # headroom is the point of the split, and we cannot prove who caused
@@ -612,6 +671,24 @@ def note_limit(platform: str, *, kind: Optional[str] = None, status: Optional[in
         plat = st.platform
 
     _persist_event(plat, kind or "", src, ceiling_rpm, trip_rpm, events, recent_requests)
+    try:
+        from services import archive_journal
+
+        archive_journal.emit(
+            "rate_limit",
+            platform=plat,
+            kind=kind or "",
+            status=status,
+            source=src,
+            ceiling_rpm=round(ceiling_rpm, 2),
+            trip_rpm=round(trip_rpm, 2),
+            events=events,
+            backoff_s=round(backoff_s_applied, 1),
+            dedupe_key=f"rate_limit:{plat}:{kind or ''}:{status or ''}",
+            min_interval_s=60.0,
+        )
+    except Exception:  # noqa: BLE001 — journal is best-effort
+        pass
     decision = Decision(
         platform=st.platform,
         source=src,
@@ -679,12 +756,56 @@ def backoff_seconds(platform: str, source: Source = "auto") -> float:
         return min(MAX_AUTO_WAIT_S, _seconds_for_one_token(rate))
 
 
+def in_backoff(platform: str) -> bool:
+    """True while a real limit event's exponential backoff is still armed.
+
+    The scheduler and the yt-dlp seam consult this to REFUSE fast instead of
+    drawing a token and paying the sub-second wait that made a dry pool a hot
+    retry loop. Backoff only ever shortens with time (or is cleared by a clean
+    window in :func:`_ramp_up`); it is never extended by a refused request.
+    """
+    st = _state(platform)
+    with st.lock:
+        return _now() < float(st.backoff_until)
+
+
+def retry_after_s(platform: str) -> float:
+    """Seconds left on the platform's backoff (0 when not backing off)."""
+    st = _state(platform)
+    with st.lock:
+        return max(0.0, float(st.backoff_until) - _now())
+
+
+def cadence_multiplier(platform: Optional[str] = None) -> float:
+    """How much to STRETCH the scheduler cadence for a dry/backed-off platform.
+
+    Returns 1.0 when healthy; grows while the AUTO pool is exhausted or a
+    backoff is armed, and is capped so the archive never sleeps for hours. A
+    platform argument narrows it to that platform; ``None`` takes the maximum
+    across every known platform (the scheduler drives all of them).
+
+    This is the "when the budget is exhausted, LOWER the cadence, never raise
+    it" half of the governor: background work does not discover the limit by
+    hammering it, it slows down before it.
+    """
+    plats = [platform] if platform else _known_platforms()
+    mult = 1.0
+    for plat in plats:
+        st = _state(plat)
+        with st.lock:
+            now = _now()
+            _refill(st, now)
+            if now < float(st.backoff_until) or st.auto_tokens < 1.0:
+                steps = max(1, int(st.backoff_streak))
+                mult = max(mult, min(_MAX_CADENCE_MULTIPLIER, 1.0 + steps))
+    return round(mult, 3)
+
+
 def auto_exhausted(platform: str) -> bool:
     """True when background work has spent its share — the scheduler's signal.
 
-    Exposed, not enforced: the 24/7 scheduler is not gated on this (see the
-    module docstring / report). A caller that wants to skip a pass checks
-    this first.
+    A caller that wants to skip a pass checks this first. This is now enforced
+    by the scheduler's YouTube leg and the probe gate, not merely exposed.
     """
     st = _state(platform)
     with st.lock:
@@ -699,6 +820,9 @@ def scheduler_hint() -> Dict[str, Any]:
         out[plat] = {
             "auto_exhausted": auto_exhausted(plat),
             "backoff_s": round(backoff_seconds(plat, "auto"), 2),
+            "in_backoff": in_backoff(plat),
+            "retry_after_s": round(retry_after_s(plat), 1),
+            "cadence_multiplier": cadence_multiplier(plat),
         }
     return out
 
@@ -752,6 +876,12 @@ def platform_status(platform: str) -> Dict[str, Any]:
                 "tokens": round(max(0.0, st.user_tokens), 3),
                 "capacity": round(user_cap, 3),
                 "refill_rpm": round(st.ceiling_rpm, 3),
+            },
+            "hard_cap_rpm": _hard_cap_rpm(st.platform),
+            "backoff": {
+                "in_backoff": now < float(st.backoff_until),
+                "retry_after_s": round(max(0.0, float(st.backoff_until) - now), 1),
+                "streak": int(st.backoff_streak),
             },
             "learning": {
                 "events": st.events,

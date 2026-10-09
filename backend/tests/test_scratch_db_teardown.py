@@ -20,6 +20,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -278,4 +279,94 @@ def test_reaper_still_warns_for_a_genuinely_stuck_node(monkeypatch, tmp_path):
     monkeypatch.setattr(os, "unlink", deny_unlink)
     with pytest.warns(UserWarning, match="vodrip-tests-stuck"):
         _ct._wipe_vodrip_scratch(min_age_s=0.0)
-    assert stuck.exists(), "the node is still there — that is what is reported"
+    assert stuck.exists(), "the node is still there - that is what is reported"
+
+
+def test_reaper_keeps_a_live_temp_namespace_dir(tmp_path):
+    """The session-end sweep (min_age_s=0.0) must NOT delete a live temp ROOT.
+
+    tests/test_transcribe_shards.py:46-49 rebinds ``tempfile.tempdir`` onto a
+    ``vodrip-shardtest-scope-*`` dir at MODULE IMPORT, and collection imports
+    every module before the first test runs -- so from that point on every
+    ``mkdtemp()`` in the session lands inside it. That name also matches the
+    ``vodrip-`` reap prefix, so before this was floored at the staleness
+    threshold the session-END sweep deleted the running session's own temp
+    root, and every later-imported module raised FileNotFoundError:
+    [WinError 3] at COLLECTION time. The whole suite then exited rc=1 having
+    run ZERO tests, which no --collect-only gate can ever see.
+
+    The sandbox root is named outside every reap prefix, so this test's own
+    fixture can never be reaped by the session reaper.
+    """
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    live = sandbox / (_ct._LIVE_NAMESPACE_PREFIXES[0] + "live")
+    live.mkdir()
+    (live / "keepme").write_text("x", encoding="utf-8")
+
+    _ct._wipe_vodrip_scratch(min_age_s=0.0, root=sandbox)
+
+    assert live.exists(), (
+        "the reaper deleted a temp root a RUNNING session is using; every "
+        "later mkdtemp() in that session now raises FileNotFoundError"
+    )
+
+
+def test_reaper_still_reaps_a_dead_temp_namespace_dir(tmp_path):
+    """The other half, and the reason the fix above is a FLOOR and not a skip.
+
+    A scope dir is never self-reaped -- test_transcribe_shards.py removes its
+    own ``_TMP`` (line 264) but not the scope dir it created at line 46. So
+    skipping these names outright would leak one dir per session forever, which
+    is the exact regression DISK-01 was raised to kill. A live session keeps
+    the mtime fresh by writing into it; a dead one ages out and is reclaimed.
+    """
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    dead = sandbox / (_ct._LIVE_NAMESPACE_PREFIXES[0] + "dead")
+    dead.mkdir()
+    (dead / "keepme").write_text("x", encoding="utf-8")
+    old = time.time() - (_ct._STALE_MIN_AGE_S + 600.0)
+    os.utime(dead, (old, old))
+
+    _ct._wipe_vodrip_scratch(min_age_s=_ct._STALE_MIN_AGE_S, root=sandbox)
+
+    assert not dead.exists(), (
+        "a dead session's scope dir must still be reclaimed, or this fix "
+        "trades a crash for a permanent one-dir-per-session leak"
+    )
+
+
+def test_reaper_still_honours_the_worker_owned_exemption(tmp_path):
+    """The vodrip-shards- skip must survive the change next to it.
+
+    Those dirs are owned by an archive worker mid-job and the worker reaps its
+    own, so they are skipped OUTRIGHT (no age floor). The live-namespace guard
+    was added immediately beside that skip; this pins that the two did not get
+    conflated into one rule.
+    """
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    worker = sandbox / (_ct._WORKER_OWNED_PREFIXES[0] + "job")
+    worker.mkdir()
+
+    _ct._wipe_vodrip_scratch(min_age_s=0.0, root=sandbox)
+
+    assert worker.exists(), "worker-owned shard dirs are never this sweep's to delete"
+
+
+def test_kept_young_warning_reports_the_floor_that_actually_applied(tmp_path):
+    """A live-namespace keep must not be reported against the wrong floor.
+
+    The sweep is called with min_age_s=0.0 and returns kept_young. Printing
+    min_age_s there produced "younger than the 0.0s floor" for a node that was
+    in fact held to _STALE_MIN_AGE_S -- a message contradicting the decision it
+    reports. The warning must name the 6h floor.
+    """
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    live = sandbox / (_ct._LIVE_NAMESPACE_PREFIXES[0] + "live")
+    live.mkdir()
+
+    with pytest.warns(UserWarning, match="staleness floor"):
+        _ct._wipe_vodrip_scratch(min_age_s=0.0, root=sandbox)

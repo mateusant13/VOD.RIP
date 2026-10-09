@@ -132,6 +132,51 @@ class TestNodeModules:
         n, _ = gate.node_modules_state(tmp_path)
         assert n >= gate.MIN_NODE_MODULE_FILES
 
+    def test_the_reported_count_is_a_total_not_a_truncated_floor(self, tmp_path):
+        """``node_modules_state`` reports a POPULATION, so it must be exact.
+
+        The sibling test above asserts only ``n >= MIN_NODE_MODULE_FILES``, which
+        passes just as happily on a truncated 500 as on a true 10,848 - a green
+        that cannot go red. This one pins the exact number.
+
+        Measured defect (2026-10-06, this repo, ``<repo>/node_modules``):
+        ``count_files(nm, cap=MIN_NODE_MODULE_FILES)`` returned exactly 500 while
+        an uncapped walk of the SAME directory returned 10,848, and the gate
+        published ``node_modules holds 500 file(s)`` into the verdict file as if
+        it were a total. A floor presented as a total is the one number a lane
+        cannot audit: 500 sits exactly ON the trust floor, so "at the threshold"
+        and "ten thousand files over it" are indistinguishable to the reader.
+        """
+        nm = tmp_path / "node_modules"
+        (nm / "pkg").mkdir(parents=True)
+        expected = gate.MIN_NODE_MODULE_FILES + 5
+        for i in range(expected):
+            (nm / "pkg" / f"f{i}.js").write_text("x", encoding="utf-8")
+
+        n, note = gate.node_modules_state(tmp_path)
+
+        # Exact, not ">=". A capped walk returns MIN_NODE_MODULE_FILES here and
+        # fails this line; an uncapped walk returns `expected` and passes.
+        assert n == expected, (
+            f"node_modules_state reported {n}, but the tree holds exactly "
+            f"{expected}. A truncated count was published as a total."
+        )
+        # printed == matched: the human-readable note must carry the same number.
+        assert str(expected) in note, (
+            f"note {note!r} does not carry the measured total {expected}"
+        )
+
+    def test_the_cap_remains_available_for_early_exit_callers(self, tmp_path):
+        """The ``cap`` argument is a speed knob and stays; the REPORTING site
+        simply must not use it. A caller that wants an early exit can still get
+        one, and it is the caller's job to label the result a floor."""
+        d = tmp_path / "tree"
+        (d / "pkg").mkdir(parents=True)
+        for i in range(40):
+            (d / "pkg" / f"f{i}.js").write_text("x", encoding="utf-8")
+        assert gate.count_files(d, cap=10) == 10
+        assert gate.count_files(d, cap=None) == 40
+
 
 # ==========================================================================
 # 3. never pipe a native command when you need its exit code

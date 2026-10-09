@@ -120,10 +120,25 @@ def _governor_admit_ytdlp(
     deadlocks, and never silently proceeds into a wall it was told to avoid.
     """
     try:
-        from services.rate_budget import MAX_AUTO_WAIT_S, acquire
+        from services.rate_budget import (
+            MAX_AUTO_WAIT_S,
+            acquire,
+            in_backoff,
+            retry_after_s,
+        )
     except Exception:  # noqa: BLE001 — governor unavailable, never a new failure
         logger.debug("rate_budget unavailable — yt-dlp egress ungated", exc_info=True)
         return
+    # Fast refuse while a real limit event's backoff is armed. This is the fix
+    # for the measured hot loop: a dry AUTO pool used to draw a token, pay the
+    # bounded ~1s wait and retry on the very next pass, forever. Backoff is
+    # consulted BEFORE acquire so the pass is never stalled by a platform that
+    # has already told us to stop.
+    if not interactive and in_backoff(PLATFORM):
+        raise YtGovernorExhausted(
+            f"yt-dlp {kind} refused: {PLATFORM} in rate-limit backoff for "
+            f"{retry_after_s(PLATFORM):.0f}s — retrying later"
+        )
     try:
         decision = acquire(PLATFORM, source, kind=kind)  # type: ignore[arg-type]
     except Exception:  # noqa: BLE001 — the governor is advisory, never a failure mode
@@ -140,6 +155,7 @@ def _governor_admit_ytdlp(
             f"ceiling={decision.ceiling_rpm:.1f} rpm)"
         )
     wait = min(_YTDLP_GOVERNOR_MAX_WAIT_S, MAX_AUTO_WAIT_S, max(0.0, float(decision.wait_s)))
+    _journal_refusal(kind, decision, wait)
     if wait > 0:
         logger.info(
             "rate_budget: pacing yt-dlp %s for %.1fs (%s pool dry, ceiling %.1f rpm)",
@@ -151,6 +167,25 @@ def _governor_admit_ytdlp(
         f"waiting {wait:.0f}s (platform={PLATFORM} source={decision.source} "
         f"ceiling={decision.ceiling_rpm:.1f} rpm) — retrying later"
     )
+
+
+def _journal_refusal(kind: str, decision: Any, wait_s: float) -> None:
+    """Best-effort journal record of a budget refusal (never blocks the tick)."""
+    try:
+        from services import archive_journal
+
+        archive_journal.emit(
+            "ytdlp_refused",
+            platform=PLATFORM,
+            kind=kind,
+            source=decision.source,
+            ceiling_rpm=round(float(decision.ceiling_rpm), 2),
+            wait_s=round(float(wait_s), 1),
+            dedupe_key=f"ytdlp_refused:{kind}:{decision.source}",
+            min_interval_s=120.0,
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 # Priority rule: YouTube > Twitch > Kick (lower number wins).
 _CAPTION_LANG_PREF = ("pt", "pt-br", "en", "en-orig")

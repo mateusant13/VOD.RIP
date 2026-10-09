@@ -25,8 +25,20 @@ from httpx import ASGITransport, AsyncClient  # noqa: E402
 
 from app import app  # noqa: E402
 from services import instant_preview, yt_gate  # noqa: E402
+from services import probe_gate, rate_budget  # noqa: E402
 
 _MP4_MAGIC = b"\x00\x00\x00\x18ftypmp42"
+
+
+@pytest.fixture(autouse=True)
+def _reset_background_gates():
+    """The probe gate and rate budget are process-global by design; reset them
+    per test so one channel's backoff cannot leak into the next scenario."""
+    probe_gate.reset()
+    rate_budget.reset()
+    yield
+    probe_gate.reset()
+    rate_budget.reset()
 
 
 def _channel(cid="ch1", twitch="", kick="", youtube=""):

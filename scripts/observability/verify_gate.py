@@ -267,10 +267,30 @@ def count_files(path: Path, cap: int | None = None) -> int:
 
 
 def node_modules_state(repo: Path) -> tuple[int, str]:
+    """The node_modules POPULATION, counted EXACTLY.
+
+    No cap here, deliberately. ``count_files`` still takes a ``cap`` for callers
+    that want an early exit, but this function's number is printed to the
+    operator AND written into the verdict file as ``node_module_files``, so it
+    is read as a total by every lane that inspects a gate run.
+
+    Measured defect this fixes (2026-10-06, this repo): this function called
+    ``count_files(nm, cap=MIN_NODE_MODULE_FILES)``, so the gate published
+    ``node_modules holds 500 file(s)`` for a directory that holds 10,848 -
+    a floor wearing a total's label. 500 also sits exactly ON the trust floor,
+    which is the worst possible place to under-report: a reader could not
+    distinguish "exactly at the threshold" from "ten thousand files over it".
+
+    It also silently disabled the cross-check that justified the junction fix
+    in ``count_files``: STATE.md records that PowerShell and this counter "now
+    agree at 10,850", but a capped counter can never report more than 500 and
+    so could never have agreed. The fix cost is measured, not assumed: the
+    uncapped walk of 10,848 files takes ~1.05 s versus ~0.12 s capped.
+    """
     nm = repo / "node_modules"
     if not nm.exists():
         return 0, "node_modules does not exist"
-    n = count_files(nm, cap=MIN_NODE_MODULE_FILES)
+    n = count_files(nm)
     return n, f"node_modules holds {n} file(s)"
 
 

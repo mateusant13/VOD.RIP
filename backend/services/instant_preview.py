@@ -181,16 +181,39 @@ def _preview_current(channel_id: str, latest: dict) -> bool:
     )
 
 
+def _probe_id(latest: dict) -> Optional[str]:
+    """Stable identity of the newest VOD the preview gate keys on."""
+    return (
+        latest.get("vod_url")
+        or latest.get("vod_id")
+        or latest.get("video_id")
+    )
+
+
 def _refresh_channel(channel: dict, channel_id: str) -> None:
     platform = pick_platform(channel)
     if platform is None:
         return  # no slug on any platform — nothing to preview
     if platform == "youtube" and _youtube_gate_active():
         return  # bot-gate freeze — never hit YouTube while frozen (worker rule)
+    # PROBE GATE: the newest-VOD metadata fetch is the probe, and the FFmpeg
+    # slice follows it. With no proof of a new VOD since the last check, the
+    # whole pass is skipped and the per-channel backoff advances, so a quiet
+    # channel is not re-probed on every scheduler pass.
+    from services import probe_gate, rate_budget
+
+    if rate_budget.in_backoff(platform) or rate_budget.auto_exhausted(platform):
+        return  # budget dry — the next pass (cadence-stretched) will retry
+    if not probe_gate.should_probe(platform, channel_id):
+        return
     latest = _fetch_latest_vod(channel, platform)
     if not latest:
+        probe_gate.note_probe(platform, channel_id, found_new=False)
         raise RuntimeError(f"no VODs found on {platform}")
     if _preview_current(channel_id, latest):
+        probe_gate.note_probe(
+            platform, channel_id, found_new=False, latest_id=_probe_id(latest)
+        )
         return  # same VOD already previewed — no re-download
     mp4_path, json_path = _preview_paths(channel_id)
     try:
@@ -212,6 +235,9 @@ def _refresh_channel(channel: dict, channel_id: str) -> None:
         "duration_sec": PREVIEW_DURATION_SEC,
     }
     json_path.write_text(json.dumps(sidecar, ensure_ascii=False), encoding="utf-8")
+    probe_gate.note_probe(
+        platform, channel_id, found_new=True, latest_id=_probe_id(latest)
+    )
     logger.info(
         "instant preview %s: %s %s (first %.0fs)",
         channel_id, latest["platform"], latest["vod_url"], PREVIEW_DURATION_SEC,

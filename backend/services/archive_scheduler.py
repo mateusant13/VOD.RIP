@@ -321,10 +321,54 @@ def _ingest_youtube(channel: dict) -> None:
     handle = str(channel.get("youtubeSlug") or channel.get("youtube") or "").strip()
     if not handle:
         return
+    # RATE-BUDGET GATE (measured defect): the caption pump deep-enumerates
+    # three YouTube tabs per channel. When the learned budget is dry or a
+    # limit-event backoff is armed, running it anyway bought the same refusal
+    # every pass and produced 648 rate-limit lines in 4,000 log lines. Skip
+    # the whole leg — the cadence multiplier stretches the next pass, and the
+    # budget refills with wall time, so this self-clears.
+    from services import rate_budget
+
+    if rate_budget.in_backoff("youtube") or rate_budget.auto_exhausted("youtube"):
+        _journal_skip(handle, "budget", rate_budget)
+        return
+    # PROBE GATE: with no proof of a new VOD since the last check, the
+    # expensive enumerate is skipped and the per-channel backoff advances
+    # (60s -> ... -> 30min), so a quiet channel is not re-crawled every pass.
+    from services import probe_gate
+
+    if not probe_gate.should_probe("youtube", handle):
+        _journal_skip(handle, "probe_backoff", rate_budget)
+        return
     # Lazy import keeps the archive->scheduler dependency one-directional.
     from routers.archive import _run_channel_caption_ingest
 
-    _run_channel_caption_ingest(handle, budget=_yt_ingest_budget())
+    stats = _run_channel_caption_ingest(handle, budget=_yt_ingest_budget())
+    # A pass that processed nothing new (or errored) advances the backoff; a
+    # pass that archived something new clears it so the next upload is served
+    # immediately. The ingest returns a stats dict in production; a test seam
+    # may return anything, so only a dict is inspected.
+    processed = int(stats.get("processed") or 0) if isinstance(stats, dict) else 0
+    probe_gate.note_probe("youtube", handle, found_new=processed > 0)
+
+
+def _journal_skip(handle: str, reason: str, rate_budget) -> None:
+    """Best-effort journal record of a skipped YouTube caption pass."""
+    try:
+        from services import archive_journal
+
+        archive_journal.emit(
+            "scheduler_skip",
+            platform="youtube",
+            channel=handle,
+            reason=reason,
+            retry_after_s=round(rate_budget.retry_after_s("youtube"), 1),
+            cadence_multiplier=rate_budget.cadence_multiplier("youtube"),
+            dedupe_key=f"scheduler_skip:youtube:{handle}:{reason}",
+            min_interval_s=300.0,
+        )
+    except Exception:  # noqa: BLE001 — journal is best-effort
+        pass
 
 
 def _chat_job_guard(platform: str, video_id: str, *, retry_fresh_failed: bool = False) -> bool:
@@ -820,7 +864,19 @@ def _loop(*, interval: Optional[float] = None, delay: float = 0.0) -> None:
             logger.exception("archive scheduler pass failed")
         if _stop.is_set():
             break
-        _wake.wait(cadence)  # returns immediately on kick_scheduler_pass()
+        # Cadence LOWERING, never raising: while any platform's learned budget
+        # is exhausted or backed off, stretch the pass interval (bounded). The
+        # governor refills with wall time, so this self-clears; an explicit
+        # interval (tests) is never scaled.
+        effective = cadence
+        if interval is None:
+            try:
+                from services import rate_budget
+
+                effective = cadence * rate_budget.cadence_multiplier()
+            except Exception:  # noqa: BLE001 — pacing must never kill the loop
+                effective = cadence
+        _wake.wait(effective)  # returns immediately on kick_scheduler_pass()
         _wake.clear()
 
 

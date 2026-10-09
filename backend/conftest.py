@@ -4,6 +4,15 @@ The plugin is inert unless enabled with ``--impact`` or ``VODRIP_IMPACT=1``;
 see tests/test_impact_selfcheck.py for what it proves.
 """
 
+import sys
+from pathlib import Path
+
+# tests/ is not a package (no __init__.py), so make the backend/ root
+# importable as the `tests` namespace for pytest_plugins resolution.
+_backend_root = str(Path(__file__).resolve().parent)
+if _backend_root not in sys.path:
+    sys.path.insert(0, _backend_root)
+
 pytest_plugins = ["tests.impact_plugin"]
 
 import pytest
@@ -155,13 +164,41 @@ def _wipe_vodrip_scratch(min_age_s: float, root: Path | None = None) -> ScratchR
             name.startswith(_SCRATCH_PREFIXES) or name in _SCRATCH_NAMES
         ):
             continue
-        if name.startswith("vodrip-shards-"):
-            continue  # worker-owned, transient while a job runs
         try:
             mtime = p.lstat().st_mtime
         except OSError:
-            continue  # vanished between iterdir() and lstat(): not a leak
+            # DELIBERATE best-effort: the node vanished between iterdir() and
+            # lstat(), i.e. another process already removed it. NOTHING is
+            # lost — there is no longer anything to clean — so this must not
+            # become an error, and re-raising would abort a sweep over a race
+            # that is already resolved. Loses only the mtime of a node that
+            # does not exist.
+            continue
         age_s = now - mtime
+        if name.startswith(_WORKER_OWNED_PREFIXES):
+            continue  # worker-owned, transient while a job runs
+        if name.startswith(_LIVE_NAMESPACE_PREFIXES) and age_s < _STALE_MIN_AGE_S:
+            # A LIVE temp root another process is using right now — never reap
+            # on a min_age_s=0 sweep. test_transcribe_shards.py:46-49 rebinds
+            # tempfile.tempdir onto a vodrip-shardtest-scope-* dir at IMPORT,
+            # and collection imports every module before the first test runs,
+            # so from that point on EVERY mkdtemp() in the session lands inside
+            # it. Deleting it mid-collection is what turned a concurrent
+            # session's run into FileNotFoundError: [WinError 3] ... cannot
+            # find the path ... at collection time — the whole suite then
+            # exits rc=1 with zero tests run.
+            #
+            # Same "owned by a running process, not a leak" family as
+            # vodrip-shards- above, but that one is skipped OUTRIGHT because
+            # the worker reaps its own; a scope dir is not self-reaped, so
+            # skipping it unconditionally would leak one dir per session
+            # forever. Hence the floor rather than a bare continue: a live
+            # session keeps its mtime fresh by writing into it, and a dead one
+            # crosses _STALE_MIN_AGE_S and is reclaimed (asserted by
+            # test_reaper_still_reaps_a_dead_temp_namespace_dir in
+            # tests/test_scratch_db_teardown.py — the second half of the gate).
+            kept_young.append(name)
+            continue
         if age_s < -_MTIME_FUTURE_TOLERANCE_S:
             # A stamp this far ahead is not a fresh node, it is a WRONG one:
             # it cannot age past min_age_s until the clock catches up, so every
@@ -212,10 +249,31 @@ def _wipe_vodrip_scratch(min_age_s: float, root: Path | None = None) -> ScratchR
             stacklevel=2,
         )
     if kept_young:
+        # Report the floor that was ACTUALLY applied to these nodes, which is
+        # not always min_age_s: a live temp-namespace dir is held to
+        # _STALE_MIN_AGE_S even when the sweep asked for min_age_s=0.0 (see
+        # the _LIVE_NAMESPACE_PREFIXES guard above). Printing min_age_s there
+        # would say "younger than the 0.0s floor" for a node that was in fact
+        # held to 6h — a message that contradicts the decision it reports.
+        kept_live = [n for n in kept_young if n.startswith(_LIVE_NAMESPACE_PREFIXES)]
+        kept_ordinary = [n for n in kept_young
+                         if not n.startswith(_LIVE_NAMESPACE_PREFIXES)]
+        bits = []
+        if kept_ordinary:
+            bits.append(
+                "%d node(s) younger than the %.1fs floor (expected while "
+                "another process is live): %s"
+                % (len(kept_ordinary), min_age_s, ", ".join(kept_ordinary[:10]))
+            )
+        if kept_live:
+            bits.append(
+                "%d live temp-namespace dir(s) held to the %.1fs staleness "
+                "floor (a live session keeps its mtime fresh; a dead one ages "
+                "out and is reaped): %s"
+                % (len(kept_live), _STALE_MIN_AGE_S, ", ".join(kept_live[:10]))
+            )
         warnings.warn(
-            "conftest scratch reaper kept %d node(s) younger than the %.1fs "
-            "floor (expected while another process is live): %s"
-            % (len(kept_young), min_age_s, ", ".join(kept_young[:10])),
+            "conftest scratch reaper kept " + "; ".join(bits),
             UserWarning,
             stacklevel=2,
         )
@@ -256,6 +314,20 @@ _SCRATCH_PREFIXES = (
 # _isolated_download_appdata dir. Never scratch — see
 # test_wipe_leaves_bare_vodrip_dir_alone.
 _SCRATCH_NAMES = ("kd_test", "vodrip-search-lab")
+
+# Scratch dirs that belong to a RUNNING process and are therefore not leaks.
+#
+# _WORKER_OWNED_PREFIXES — owned by an archive worker mid-job; the worker
+# reaps its own stale ones, so this sweep skips them outright.
+#
+# _LIVE_NAMESPACE_PREFIXES — a pytest session's private TEMP ROOT, created at
+# MODULE IMPORT by test_transcribe_shards.py. It is not self-reaped, so it is
+# floored at _STALE_MIN_AGE_S rather than skipped outright: alive keeps its
+# mtime fresh, dead ages out and is reclaimed. See _wipe_vodrip_scratch.
+_WORKER_OWNED_PREFIXES = ("vodrip-shards-",)
+_LIVE_NAMESPACE_PREFIXES = ("vodrip-shardtest-scope-",)
+# Must stay in sync with the stale sweep in _reap_vodrip_scratch.
+_STALE_MIN_AGE_S = 6 * 3600.0
 
 
 # Module-level sqlite connections the tests create stay OPEN for the life of
@@ -306,7 +378,7 @@ def _reap_vodrip_scratch():
     to a private dir, and the scratch this session created is under the root
     captured at import. (See _TEMP_ROOT_AT_IMPORT.)
     """
-    _wipe_vodrip_scratch(min_age_s=6 * 3600.0,
+    _wipe_vodrip_scratch(min_age_s=_STALE_MIN_AGE_S,
                          root=_TEMP_ROOT_AT_IMPORT)  # stale from dead procs
     yield
     _close_scratch_db_handles()

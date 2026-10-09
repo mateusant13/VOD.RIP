@@ -436,6 +436,68 @@ _conns: list[sqlite3.Connection] = []
 # was closed underneath it re-opens instead of handing back a dead handle.
 _conn_gen = 0
 
+# --- hot-read snapshot -------------------------------------------------------
+#
+# The heartbeat/watchdog/transcribe/scheduler readers poll the SAME few rows
+# (worker liveness, pending work, channel-snapshot ages, priority windows) far
+# more often than those rows change. Left uncached, each poll thread opens its
+# own read cursor and the shared WAL is hammered with identical SELECTs (the
+# measured ~206k read ops/s). A tiny TTL snapshot coalesces concurrent readers
+# onto one query per window and is invalidated the moment ANY write lands, so
+# it can never serve a value a caller could have observed before its own write.
+_SNAPSHOT_TTL_S = float(os.environ.get("VODRIP_DB_SNAPSHOT_TTL_S", "2.0") or 2.0)
+_snapshot_lock = threading.Lock()
+_snapshot: dict[str, tuple[float, Any]] = {}
+_snapshot_stats = {"hits": 0, "misses": 0}
+# Total SQL reads issued through query() — the before/after metric for the
+# consolidation (exposed via read_ops_total()).
+_read_ops = 0
+_read_ops_lock = threading.Lock()
+
+
+def _snapshot_get(key: str, ttl: float, producer):
+    """Return a cached value for *key*, or produce and cache it.
+
+    ttl <= 0 (or VODRIP_DB_SNAPSHOT_TTL_S=0) disables the snapshot entirely.
+    The producer runs OUTSIDE the lock so a slow query never serializes other
+    readers; a benign race (two producers on a cold key) costs one extra query,
+    never a wrong answer."""
+    global _read_ops
+    if _SNAPSHOT_TTL_S <= 0 or ttl <= 0:
+        return producer()
+    now = time.monotonic()
+    with _snapshot_lock:
+        ent = _snapshot.get(key)
+        if ent is not None and now - ent[0] < ttl:
+            _snapshot_stats["hits"] += 1
+            return ent[1]
+    value = producer()
+    with _snapshot_lock:
+        _snapshot[key] = (time.monotonic(), value)
+        _snapshot_stats["misses"] += 1
+    return value
+
+
+def invalidate_snapshot() -> None:
+    """Drop every cached hot-read value. Called from execute() after a write."""
+    with _snapshot_lock:
+        _snapshot.clear()
+
+
+def snapshot_stats() -> dict:
+    """Diagnostics: snapshot hit/miss counters and the read-ops total."""
+    with _snapshot_lock:
+        stats = dict(_snapshot_stats)
+    stats["read_ops_total"] = read_ops_total()
+    stats["ttl_s"] = _SNAPSHOT_TTL_S
+    return stats
+
+
+def read_ops_total() -> int:
+    """Total SQL reads issued through query() (the consolidation metric)."""
+    with _read_ops_lock:
+        return _read_ops
+
 
 def _open_conn(path: Path) -> sqlite3.Connection:
     """Open a fresh WAL connection, re-applying PER-CONNECTION pragmas.
@@ -1676,12 +1738,16 @@ def _search_gen_now() -> int:
 
 
 def execute(sql: str, params: Any = ()) -> sqlite3.Cursor:
+    global _read_ops
     with _lock:
         conn = get_conn()
         cur = conn.execute(sql, _bind(params))
         conn.commit()
         if _SEARCHABLE_WRITE_RE.search(sql):
             _bump_search_gen()
+        # A write invalidates the hot-read snapshot: a cached liveness/snapshot
+        # value must never outlive the write that changed it.
+        invalidate_snapshot()
         return cur
 
 
@@ -1689,6 +1755,9 @@ def query(sql: str, params: Any = ()) -> list[sqlite3.Row]:
     # Per-thread READ connection: no _lock, so a long read (search,
     # _phrase_span_rows full-table scan, chat_window) neither serializes
     # against other readers nor blocks the write path.
+    global _read_ops
+    with _read_ops_lock:
+        _read_ops += 1
     return _get_read_conn().execute(sql, _bind(params)).fetchall()
 
 
@@ -1806,21 +1875,27 @@ def touch_channel_snapshot(platform: str, channel_key: str) -> None:
 
 
 def channel_snapshot_age_sec(platform: str, channel_key: str) -> Optional[float]:
-    """Seconds since the last successful fetch, or None when never fetched."""
-    row = query(
-        "SELECT fetched_at FROM channel_snapshots WHERE platform = ? AND channel_key = ?",
-        (platform, channel_key),
-    )
-    if not row:
-        return None
-    try:
-        from datetime import datetime, timezone
+    """Seconds since the last successful fetch, or None when never fetched.
 
-        fetched = datetime.fromisoformat(row[0]["fetched_at"])
-    except (ValueError, TypeError):
-        return None
-    age = (datetime.now(timezone.utc) - fetched).total_seconds()
-    return max(0.0, age)
+    Snapshot-cached for the hot-read TTL: the scheduler asks this once per
+    channel per pass, and the underlying row changes far more slowly."""
+    def _produce() -> Optional[float]:
+        row = query(
+            "SELECT fetched_at FROM channel_snapshots WHERE platform = ? AND channel_key = ?",
+            (platform, channel_key),
+        )
+        if not row:
+            return None
+        try:
+            from datetime import datetime, timezone
+
+            fetched = datetime.fromisoformat(row[0]["fetched_at"])
+        except (ValueError, TypeError):
+            return None
+        age = (datetime.now(timezone.utc) - fetched).total_seconds()
+        return max(0.0, age)
+
+    return _snapshot_get(f"snap_age:{platform}:{channel_key}", 2.0, _produce)
 
 
 # --- scheduler top-priority windows --------------------------------------
@@ -1856,13 +1931,19 @@ def mark_channel_priority(
 
 
 def priority_channel_keys() -> set[tuple[str, str]]:
-    """(platform, channel_key) pairs still inside their priority window."""
-    now = _now_iso()
-    rows = query(
-        "SELECT platform, channel_key FROM channel_priorities WHERE priority_until > ?",
-        (now,),
-    )
-    return {(r["platform"], r["channel_key"]) for r in rows}
+    """(platform, channel_key) pairs still inside their priority window.
+
+    Snapshot-cached for the hot-read TTL: read once per scheduler pass, written
+    only when the user opens/adds a channel."""
+    def _produce() -> set[tuple[str, str]]:
+        now = _now_iso()
+        rows = query(
+            "SELECT platform, channel_key FROM channel_priorities WHERE priority_until > ?",
+            (now,),
+        )
+        return {(r["platform"], r["channel_key"]) for r in rows}
+
+    return _snapshot_get("priority_channel_keys", 2.0, _produce)
 
 
 def expire_channel_priorities() -> int:
@@ -3726,13 +3807,16 @@ def list_jobs(limit: int = 50) -> list[dict]:
 def has_pending_jobs() -> bool:
     """True when any job is queued or running (a worker has real work).
 
-    The app boot uses this to decide between spawning the detached archive
-    worker and keeping the in-process one."""
-    return bool(
-        query(
-            "SELECT 1 FROM archive_jobs WHERE status IN ('queued','running') LIMIT 1"
+    The app boot and the background daemon poll this; snapshot-cached so the
+    poll does not hit the WAL on every tick. Invalidated by any job write."""
+    def _produce() -> bool:
+        return bool(
+            query(
+                "SELECT 1 FROM archive_jobs WHERE status IN ('queued','running') LIMIT 1"
+            )
         )
-    )
+
+    return _snapshot_get("has_pending_jobs", 2.0, _produce)
 
 
 def latest_job(platform: str, video_id: str, kind: Optional[str] = None) -> Optional[dict]:
@@ -3967,17 +4051,20 @@ def worker_heartbeat_owner(tag: str, age_s: int = 30) -> Optional[int]:
     daemon took over the machine (owner != own pid → exit 0)."""
     from datetime import datetime, timedelta, timezone
 
-    try:
-        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=age_s)).isoformat(
-            timespec="seconds"
-        )
-        row = query(
-            "SELECT pid FROM worker_heartbeats WHERE tag = ? AND at >= ?",
-            (tag, cutoff),
-        )
-        return row[0][0] if row else None
-    except sqlite3.Error:
-        return None
+    def _produce() -> Optional[int]:
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(seconds=age_s)).isoformat(
+                timespec="seconds"
+            )
+            row = query(
+                "SELECT pid FROM worker_heartbeats WHERE tag = ? AND at >= ?",
+                (tag, cutoff),
+            )
+            return row[0][0] if row else None
+        except sqlite3.Error:
+            return None
+
+    return _snapshot_get(f"hb_owner:{tag}:{age_s}", 2.0, _produce)
 
 
 def worker_live(age_s: int = 30, tag: str = "transcribe") -> bool:
@@ -3991,18 +4078,23 @@ def worker_live(age_s: int = 30, tag: str = "transcribe") -> bool:
     DB) or any SQL error means no heartbeat has ever been stamped → False."""
     from datetime import datetime, timedelta, timezone
 
-    try:
-        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=age_s)).isoformat(
-            timespec="seconds"
-        )
-        return bool(
-            query(
-                "SELECT 1 FROM worker_heartbeats WHERE tag = ? AND at >= ?",
-                (tag, cutoff),
+    def _produce() -> bool:
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(seconds=age_s)).isoformat(
+                timespec="seconds"
             )
-        )
-    except sqlite3.Error:
-        return False
+            return bool(
+                query(
+                    "SELECT 1 FROM worker_heartbeats WHERE tag = ? AND at >= ?",
+                    (tag, cutoff),
+                )
+            )
+        except sqlite3.Error:
+            return False
+
+    # Snapshot-cached: the transcribe worker, watchdog and scheduler poll this
+    # many times per second; the heartbeat row itself changes every ~30-45s.
+    return _snapshot_get(f"hb_live:{tag}:{age_s}", 2.0, _produce)
 
 
 def worker_heartbeat_age(tag: str) -> Optional[float]:
@@ -4013,21 +4105,24 @@ def worker_heartbeat_age(tag: str) -> Optional[float]:
     every 30s while alive. Timestamps are _now_iso() (UTC, seconds)."""
     from datetime import datetime, timezone
 
-    try:
-        rows = query(
-            "SELECT at FROM worker_heartbeats WHERE tag = ? LIMIT 1", (tag,)
-        )
-    except sqlite3.Error:
-        return None
-    if not rows:
-        return None
-    try:
-        at = datetime.fromisoformat(rows[0]["at"])
-    except ValueError:
-        return None
-    if at.tzinfo is None:
-        at = at.replace(tzinfo=timezone.utc)
-    return max(0.0, (datetime.now(timezone.utc) - at).total_seconds())
+    def _produce() -> Optional[float]:
+        try:
+            rows = query(
+                "SELECT at FROM worker_heartbeats WHERE tag = ? LIMIT 1", (tag,)
+            )
+        except sqlite3.Error:
+            return None
+        if not rows:
+            return None
+        try:
+            at = datetime.fromisoformat(rows[0]["at"])
+        except ValueError:
+            return None
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - at).total_seconds())
+
+    return _snapshot_get(f"hb_age:{tag}", 2.0, _produce)
 
 
 def captions_cover(platform: str, video_id: str, *, subtitles_first: Optional[bool] = None) -> bool:

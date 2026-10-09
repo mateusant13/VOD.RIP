@@ -105,7 +105,14 @@ def _preview_canonical_url(platform: str, channel: str, video_id: str) -> str:
     if platform == "kick":
         return "https://kick.com/%s/videos/%s" % (channel, video_id)
     return "https://www.twitch.tv/videos/%s" % video_id
-_PREVIEW_ASR_HEAD_SEC = 300.0
+
+
+# 120 s, not 300. Measured live 2026-10-06 on the 300 s default: 18-26 s per
+# preview. The cost is dominated by the HLS fetch and the decode, both roughly
+# linear in head length, and neither the preview itself nor the panel's seek
+# window needs more than the first couple of minutes. A deeper head stays
+# available per request; this is only the default.
+_PREVIEW_ASR_HEAD_SEC = 120.0
 _PREVIEW_ASR_HEAD_MAX_SEC = 900.0
 _PREVIEW_ASR_FETCH_TIMEOUT_S = 120.0
 _PREVIEW_ASR_VIDEO_ID_MAX = 128
@@ -514,23 +521,31 @@ def preview_asr_subtitles(
     Neither platform publishes caption tracks, so there is nothing to fetch —
     this is the only way a Twitch/Kick preview can show words at all. It
     therefore does the small thing rather than the right thing: it transcribes
-    only the HEAD of the VOD (``head_sec``, default 5 min) and serves those
+    only the HEAD of the VOD (``head_sec``, default 2 min) and serves those
     rows. The archived full transcription, when it exists, is a different
     concern and is served by /api/preview/panel under the Transcript tab.
+
+    The decode runs in a SIDECAR process (services.preview_asr_sidecar), not
+    here. Doing it in-process killed the API with ``Windows fatal exception:
+    access violation`` — a native CUDA fault no Python can catch — while a
+    preview decode was in flight (2026-10-06). A web server is the wrong host
+    for the ASR native stack; a crash there costs the whole app. Out of
+    process it also means the ~5.4 s model load is paid once per sidecar
+    lifetime instead of once per request.
 
     Bounded on purpose at every layer: ffmpeg's -t stops the HLS read at
     head_sec, so the cost tracks the preview and not the VOD, and the decode
     is chunked at _MAX_CHUNK_SEC. Measured on this box (RTX 5080, Parakeet
-    Redux, provider=cuda): 6.1 s model load then 1.1 s for the first 60 s of
-    audio — 94x realtime across a 2 min sample — so the head is seconds, not
-    the ~2 h a 12 h VOD costs through the archive path.
+    Redux, provider=cuda): warm decode 83x realtime, so the head is seconds,
+    not the ~2 h a 12 h VOD costs through the archive path.
 
     Response mirrors /api/subtitles so the panel renders it unchanged:
     {url, lang, source: 'asr', has_subtitles, rows: [{offset_sec, text}],
     covered_sec, partial}. ``partial`` is True whenever rows stop before
     head_sec, which is the normal case and must not read as "this is all of
-    it". A VOD whose head is silent returns has_subtitles False — silence is
-    not an error and must not become a 502.
+    it". A VOD that can never yield audio (deleted / sub-only / geo) also
+    returns has_subtitles False and is CACHED as such, so a doomed fetch is
+    not re-paid on every tab switch.
 
     Never touches the archive DB: a preview caption is a read.
     """
@@ -564,13 +579,18 @@ def preview_asr_subtitles(
 
 
 def _fetch_preview_asr(platform: str, video_id: str, head_sec: float) -> dict:
-    """Slice the VOD's head to a temp wav, ASR it, drop the temp dir."""
-    import shutil
-    import tempfile
-    from pathlib import Path
+    """Transcribe the head via the sidecar process. Raises on failure.
 
+    Deliberately NOT done in this process. Decoding Parakeet on CUDA inside
+    the web server killed it with `Windows fatal exception: access violation`
+    (native fault, uncatchable) while a preview decode was in flight; the
+    whole API went down with the decode. services.preview_asr_sidecar keeps
+    the ASR native stack in its own process, where a crash costs one preview
+    and the next request respawns it.
+    """
     from services import archive_db as _db
     from services import archive_transcribe as _at
+    from services import preview_asr_sidecar as _sidecar
 
     rows = _db.query(
         "SELECT channel FROM videos WHERE platform = ? AND video_id = ?",
@@ -582,41 +602,28 @@ def _fetch_preview_asr(platform: str, video_id: str, head_sec: float) -> dict:
     if _at._is_live_stream_id(video_id):
         raise HTTPException(status_code=400, detail="Live captures have no VOD audio")
 
-    url = _preview_canonical_url(platform, channel, video_id)
-    outdir = Path(tempfile.mkdtemp(prefix="vodrip-preview-asr-"))
     try:
-        wav = outdir / "head.wav"
-        covered = _at._fetch_remote_audio_slice(
-            platform, video_id, channel, wav, head_sec,
-            timeout_s=_PREVIEW_ASR_FETCH_TIMEOUT_S,
-        )
-        import soundfile as sf
-
-        audio, sr = sf.read(str(wav), dtype="float32", always_2d=False)
-        if audio.ndim > 1:
-            audio = audio.mean(axis=1)
-        segments = _at.parakeet_segments_from_array(audio, sr, max_sec=head_sec)
+        out = _sidecar.transcribe_head(platform, video_id, channel, head_sec)
     except HTTPException:
         raise
+    except _sidecar.SidecarPermanent as exc:
+        # VOD deleted / sub-only / geo: a settled fact. Cached as "no
+        # subtitles" so every later tab switch answers instantly instead of
+        # re-paying a fetch that can never succeed.
+        logger.info("preview ASR unavailable for %s/%s: %s", platform, video_id, exc)
+        return _preview_asr_empty(platform, video_id)
     except Exception as exc:  # noqa: BLE001 — a preview must not 500 the panel
-        if _at._is_remote_permanent_error(exc):
-            # VOD deleted / sub-only / geo: a permanent condition, not a
-            # transient one. Cached as "no subtitles" so every later tab
-            # switch answers instantly instead of re-paying the fetch.
-            logger.info("preview ASR unavailable for %s/%s: %s", platform, video_id, exc)
-            return _preview_asr_empty(platform, video_id)
-        logger.warning("preview ASR failed for %s/%s: %s", platform, video_id, exc)
+        logger.warning("preview ASR sidecar failed for %s/%s: %s", platform, video_id, exc)
         raise HTTPException(status_code=502, detail=f"Could not build preview subtitles: {exc}")
-    finally:
-        shutil.rmtree(outdir, ignore_errors=True)
 
+    segments = out.get("rows") or []
     return {
-        "url": url,
+        "url": _preview_canonical_url(platform, channel, video_id),
         "lang": None,
         "source": "asr",
         "has_subtitles": bool(segments),
         "rows": [{"offset_sec": s["start_sec"], "text": s["text"]} for s in segments],
-        "covered_sec": round(float(covered), 3),
+        "covered_sec": float(out.get("covered_sec") or 0.0),
         "partial": True,
     }
 
