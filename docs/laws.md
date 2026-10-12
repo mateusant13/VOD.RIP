@@ -1634,3 +1634,105 @@ The window mux is still skipped-or-failed and the fallback still serves the vide
 5.5 s cold click is 2.5 s over the owner's 3 s target and the remaining cost is the
 real extract+warm, which only a warm cache removes. The 0.5 ms snapshot hit is the
 3-second path and it needs the client warm to fire before the row is clicked.
+
+## Round: the preview-subtitles 502 was a budget aimed at the wrong phase
+
+Measured 2026-10-12 14:51 against `GET /api/preview/subtitles/twitch/<id>` on the
+running API (`tmp/vodrip-devall-api.log`), four requests in a row:
+
+| # | endpoint | outcome |
+|---|---|---|
+| 1 | `/api/preview/subtitles/twitch/2574054422` | 502 Bad Gateway |
+| 2 | `/api/preview/subtitles/twitch/2601888557` | 502 Bad Gateway |
+| 3 | `/api/preview/subtitles/twitch/2792110402` | 502 Bad Gateway |
+| 4 | (owner log) `/api/preview/subtitles/twitch/2574054422` | 502 Bad Gateway |
+
+The child log is the proof of the mechanism:
+
+```
+14:51:29 sidecar ready (pid=40552 provider=cuda load=13.8s)  <- ONE child, fully warm
+14:51:35 preview ASR sidecar cancel not acked; escalating
+14:51:35 failed for twitch/2574054422: no caption row within 4.0s
+14:51:56 failed for twitch/2792110402: sidecar closed its output (died?)
+```
+
+**Two candidate causes, and the first one was wrong.** `_ensure` handed out a
+child whose warm was still running (Popen assigns `_proc` before the CUDA load
+finishes, `FIRST_OUTPUT_S` is 4.0 s, the load measured 12.3-13.8 s), which is a
+real race and was fixed first (`64e2ebd`, warm gate + one spawn under a lock).
+It did not clear the 502: the 14:51 log shows a single warmed child. A fix is
+not evidence that the cause is gone — the same endpoint still answered 502
+afterwards, which is exactly how the wrong diagnosis was caught.
+
+**The real cause: `FIRST_OUTPUT_S` was charging the audio fetch.** The ceiling
+means "no caption row has appeared", which is a verdict about a hung *decode*.
+The child spends its first seconds *fetching* the VOD head, where no caption row
+can exist yet. A fetch longer than 4 s therefore looked identical to a hung
+model: the supervisor cancelled a working request, the child missed the cancel
+inside its blocking fetch ("cancel not acked"), was killed, and the next request
+respawned it and paid another ~14 s CUDA load before dying the same way. Four
+502s and ~40 s of reloading from one budget pointed at the wrong phase.
+
+**The law that replaced it.** A named phase is a promise about where the time is
+going: the child emits `{"event":"stage","stage":"fetch","budget_s":<total>}`
+and the supervisor replaces the decode ceiling with that phase budget, while
+`total_s` still bounds the whole request. Silence inside a named phase is no
+longer indistinguishable from a hung model — but a child that names a phase
+forever still dies at the total ceiling, which is the arm that stops this from
+becoming an escape hatch.
+
+**[CLOSED, falsified twice]** A red arm that neutralises the *real* stage branch
+turns both new tests red: the named phase is killed at the decode ceiling, and
+the total-ceiling test fails too because the stall now fires first and the total
+ceiling is never reached. An earlier red arm was a no-op (it inserted a `pass`
+*above* the live branch, so all three tests stayed green) — an arm that cannot
+go red is not evidence, and this one briefly looked like evidence because it
+was aimed at the wrong line.
+
+**Secondary, same file.** The startup banner `cobalt-canon: ok` is the child
+speaking before its first protocol line, not a protocol break. It is now debug
+until the first valid JSON, and a warning only after one.
+
+**Still not closed.**
+
+- No measurement yet that a live Twitch preview-subtitles request now answers
+  `200` with rows. The gate is 71 passed on the supervisor/worker contract; the
+  endpoint has only been observed failing.
+- `VODRIP_PREVIEW_ASR_FIRST_OUTPUT_S=4.0` remains the default, so a fetch that
+  names no phase (an older child) is still killed at 4 s.
+- The fetch itself has no progress signal: a fetch that stalls for 14 s is now
+  correctly *allowed*, but a user watching it sees nothing rather than "fetching".
+
+
+### Follow-up measurement, 15:10 (same endpoint, sidecar already warm)
+
+| id | outcome | wall |
+|---|---|---|
+| `2574054422` | 502 | 16,901 ms |
+| `2601888557` | 502 | 422 ms |
+| `2792110402` | 502 | 13,659 ms |
+
+The first-output kill is **gone**: the first request ran its whole budget and
+answered at 16.9 s instead of dying at 4.0 s, and the log line still reads
+"within 4.0s" because that string reports the ceiling value, not the elapsed
+time — a log that reads like a 4 s failure when the call took 16.9 s is its own
+trap and is worth remembering before quoting it.
+
+The remaining 502 is now the fetch itself. `15:10:49` => sidecar cancelled a
+still-working request, `15:10:50` => child dead, `preview ASR sidecar request
+failed (attempt 1/2): [Errno 22] Invalid argument` => transport broke under the
+supervisor, child respawned (`pid=42648 provider=cuda load=7.5s`), and the same
+id failed again. Two facts follow and neither is fixed:
+
+1. The child cannot be interrupted mid-fetch ("cancel not acked" every cycle),
+   so the supervisor has no clean way to reclaim a fetch that outlives its
+   budget — it escalates to a kill, which breaks the pipe for the *other*
+   in-flight riders.
+2. `at._fetch_remote_audio_slice` is the only stage with no progress signal and
+   no partial answer, so a fetch that yields nothing and a fetch that never
+   starts look identical from outside both.
+
+The next law to write is not another ceiling: it is that the audio fetch must
+answer *something* inside its budget — even `{"outcome":"no-audio"}` — because
+the current design lets the only stage that cannot report silence be the one
+that holds the longest.
