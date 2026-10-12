@@ -28,6 +28,25 @@ export function frameSnapInnerBox(rect: FrameRect): FrameRect {
   };
 }
 
+/**
+ * Width left for a snapped explore panel's VIDEO column: the cell inner width
+ * minus the chat column.
+ *
+ * The policy has to be explicit because a frame cell can be narrower than the
+ * chat column: the chat is clamped to what the cell can afford and the video
+ * takes the remainder, never negative and never overflowing the cell. A panel
+ * that asks for more room than the layout has is the "dropped into a layout and
+ * it breaks" failure, and it used to be reachable - the old fit used
+ * Math.max(EXPLORE_PANEL_MIN_W, inner.w - chatW), which for a narrow cell asked
+ * for more than the whole cell and desynchronised panelWidthRef from the
+ * React state derived from it.
+ */
+export function exploreSnapVideoWidth(innerW: number, chatW: number): number {
+  const w = Math.max(0, innerW);
+  const chat = Math.max(0, Math.min(chatW, w));
+  return Math.max(1, w - chat);
+}
+
 /** Top-left that centres `size` inside `rect`. */
 export function frameSnapPos(rect: FrameRect, size: FrameSnapSize): FrameSnapPos {
   const inner = frameSnapInnerBox(rect);

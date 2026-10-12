@@ -2107,14 +2107,13 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
     posRef,
     setPos: setPosition,
     fit: (inner) => {
-      const aspect = videoAspectRef.current || 16 / 9;
-      let w = Math.min(inner.w, sizeRef.current.w);
-      let h = w / aspect;
-      if (h > inner.h) {
-        h = inner.h;
-        w = h * aspect;
-      }
-      return { w: Math.max(1, w), h: Math.max(1, h) };
+      // FILL the cell. This used to be Math.min(inner.w, sizeRef.current.w),
+      // i.e. a window smaller than the cell stayed smaller than the cell - which
+      // is exactly the report "dragging a panel into a frame layout should make
+      // it the size of the whole layout". The window box is not the video box:
+      // the <video> keeps its own aspect inside it, so filling the cell cannot
+      // distort the picture.
+      return { w: Math.max(1, inner.w), h: Math.max(1, inner.h) };
     },
     onPin: (next) => setSize(next),
     repinKey: isFullscreen ? null : headerRef.current?.offsetHeight ?? 0,

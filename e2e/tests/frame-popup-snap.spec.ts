@@ -200,6 +200,13 @@ test.describe('Frame mode popup snap', () => {
     await expect(page.locator('button[title="Preview VOD"]')).toBeVisible({ timeout: 10_000 });
     await page.locator('button[title="Preview VOD"]').first().click();
 
+    // A drop that raises a client error is the other half of the report
+    // ("some kind of error interacting with layouts and panels"). Capture it
+    // here so the drag/snap path cannot pass while throwing.
+    const frameErrors: string[] = [];
+    page.on('pageerror', (e) => frameErrors.push('pageerror: ' + e.message));
+    page.on('console', (m) => { if (m.type() === 'error') frameErrors.push('console: ' + m.text()); });
+
     const popup = page.locator('.explore-frame-popup');
     await expect(popup).toBeVisible({ timeout: 10_000 });
     await expect(popup).toHaveAttribute('role', 'application');
@@ -235,8 +242,20 @@ test.describe('Frame mode popup snap', () => {
     expect(parseFloat(maxH)).toBeGreaterThan(0);
     expect(parseFloat(maxH)).toBeLessThanOrEqual(c.height - 12);
 
+    // FILL the layout, not merely fit inside it. The requirement is that a panel
+    // dragged into a frame layout becomes the size of that layout. Both fit()
+    // implementations used to return something strictly smaller - the live player
+    // kept Math.min(inner.w, sizeRef.current.w) (its own width) and the explore
+    // panel capped its video at 92% of the cell - so this pair failed before the
+    // 2026-10-12 fix and is the assertion that pins it.
+    const innerW = c.width - 12; // FRAME_SNAP_INNER_PAD (6) on both sides
+    const innerH = c.height - 12;
+    expect(a.width, `snapped width ${a.width} should fill the cell inner width ${innerW}`).toBeGreaterThanOrEqual(innerW - 2);
+    expect(a.height, `snapped height ${a.height} should fill the cell inner height ${innerH}`).toBeGreaterThanOrEqual(innerH - 2);
+
     // Overlay returned to idle after release.
     await expect(page.locator('[data-frame-overlay]')).toHaveCSS('pointer-events', 'none');
+    expect(frameErrors, 'drag+snap raised client errors: ' + frameErrors.join(' | ')).toEqual([]);
   });
 
   test('dragging the pinned popup body out of the cell releases it, dragging back re-pins', async ({ page }) => {

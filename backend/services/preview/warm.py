@@ -312,8 +312,15 @@ def _youtube_preflight_mux(
         return False
     out_dir = _preflight_mux_dir(vid, prefer_height)
     if _preflight_seg0_ready(out_dir):
-        from services.preview.session import resolve_stream_info
         return True
+    # This import used to live INSIDE the branch above, which returns before it
+    # could matter, so the two calls below raised NameError, the except swallowed
+    # it as "preflight mux resolve skipped" and the preflight warm never ran at
+    # all. Keep these imports on the path that uses them.
+    from services.preview.session import (
+        _resolve_youtube_preview_audio,
+        resolve_stream_info,
+    )
     try:
         _raw, headers, platform, variant_formats, _kind, yt_info = resolve_stream_info(
             url,
@@ -830,7 +837,17 @@ def kickoff_youtube_full_mux_warm(
             return
         try:
             with WARM_WORK_SEMAPHORE:
+                # Local imports: services.preview.session imports this module,
+                # so a module-level import here would be circular. Every name this
+                # function uses must be imported HERE - the resolve/audio/MuxJob
+                # calls below raised NameError, the handler marked the video
+                # warm-dead for 6h, and the full-mux warm never once ran.
                 from services.ytdlp_hls import warm_youtube_extract
+                from services.preview.session import (
+                    MuxJob,
+                    _resolve_youtube_preview_audio,
+                    resolve_stream_info,
+                )
 
                 if not warm_youtube_extract(url, cookies_file=cookies_file):
                     return

@@ -57,6 +57,12 @@ from services.preview_service import (
 from services.youtube_diag import youtube_error_response, youtube_user_message
 from services.ytdlp_service import detect_platform
 from services.preview_timing import log_preview_timing
+# The window-HLS resource route below compares against this marker. Without the
+# import the bare name raised NameError on EVERY /api/preview/hls/<sid>/resource
+# request: sessions were created fine (open_ms=1428) and then every segment 502ed
+# with "name WINDOW_HLS_MARKER is not defined", so the player spun forever and
+# finally errored (live report 2026-10-12 04:02 local, errors.jsonl http_502 x8).
+from services.preview import WINDOW_HLS_MARKER
 from services import archive_db, queue_policy
 
 logger = logging.getLogger(__name__)

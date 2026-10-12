@@ -1326,3 +1326,96 @@ by a previous run"), so all four shared ONE `archive_jobs` row and each `latest_
 there: `assert 'queued' == 'done'`. Each test now owns its own row (`vid-retry-ok`,
 `vid-requeue`, `vid-gated`, `vid-terminal`) and `_kick_video` documents why a caller must never
 share an id. Five consecutive runs of the file: 13 passed each time.
+
+---
+
+## Round: the user-level preview hang, and the frame layout fill (2026-10-12)
+
+Owner report, verbatim in substance: "when *I* click the preview button it loads
+forever and then errors", "measure like a user, through everything from the preview
+click, not just the backend", and "dragging a panel into a frame layout must make it the
+size of the whole layout, and stop erroring when interacting with layouts and panels".
+
+### Cause 1 - a bare name in the HLS resource route (all previews, not some)
+
+`routers/preview.py` compared `upstream.startswith(WINDOW_HLS_MARKER)` and never imported
+that name. Every `/api/preview/hls/<sid>/resource` request therefore raised
+`NameError: name WINDOW_HLS_MARKER is not defined`, which the route reported as 502. The
+player attached, then every segment 502ed: infinite loading, then an error - the report,
+exactly. Present at `b702625` (pre-existing, not introduced by the perf round).
+
+- measured before: `errors.jsonl` held 8 consecutive `http_502 ... name
+  WINDOW_HLS_MARKER is not defined` for one live session (`b570f7fb`, 07:03 UTC).
+- measured after: session -> master `200` (524 B) -> variant `200` -> first
+  `/resource` `200`. The route that raised the NameError now serves.
+
+### Cause 2 - three more of the same shape, all silent
+
+Fixed with the same reasoning, each verified by the scanner below and by the suite:
+
+| site | what it did |
+|---|---|
+| `warm.py` preflight | the `resolve_stream_info` import sat INSIDE the `if` branch that returns first, so the call below raised NameError, `except` logged "preflight mux resolve skipped" and the preflight warm **never ran** |
+| `warm.py` full-mux warm | used `resolve_stream_info`, `_resolve_youtube_preview_audio` and `MuxJob` with no import in scope: NameError was caught, and the handler **marked the video warm-dead for 6 h** |
+| `__main_launcher.py` `_probe` | `http_requests` was imported in a *sibling* function, so the launcher watchdog probe always answered False |
+
+### Law: no backend module may load a name it never binds in scope
+
+`backend/tests/test_no_undefined_module_names.py` walks the scope stack (module ->
+function -> nested function/class) and reports loads that resolve nowhere. Annotation
+semantics are honoured (`from __future__ import annotations`; local annotations are never
+evaluated).
+
+- clean arm: **0 undefined-name loads across 140 modules**.
+- red arm: the pre-fix router (`git show b702625:backend/routers/preview.py`) reports
+  `line 934: undefined name WINDOW_HLS_MARKER` - the law fails on the bug it exists for.
+- self-check arm: a synthetic module returning `window_hls_marker + 1` is flagged, and a
+  module using a closure read plus a deferred annotation is not. 3 passed.
+
+### Measurement: like a user, from the click
+
+`e2e/playwright.user.config.ts` + `e2e/tests/preview-user-latency.spec.ts` drive the real
+UI in the **installed Chrome** (Playwright 1.63 wants `chromium_headless_shell-1243`, which
+this box does not have cached - that is an environment gap, not an app result).
+
+- server-side readiness, measured directly: session create `200 in 16 ms`, then
+  `playlist_ready/segment_buffer_ready/mux_ready` all true at **4,157 ms**; without any
+  master-playlist fetch at all, **4,484 ms** - so there is no deadlock and no lazy kickoff.
+- the client gate is real and it is where the report comes from: `App.tsx:1990-2007`
+  awaits `waitForPreviewMuxReady` before opening the player for a cold YouTube HLS session,
+  and when the poll budget runs out it **throws** ("surface the retry UI").
+- worst single stall measured in the click timeline: `POST /api/preview/warm/batch`
+  `1188 ms -> 14367 ms` (**13.2 s**) while every other `/api/preview/*` call in the same
+  window answered in 10-200 ms. That, not the session create, is the remaining slow step
+  under a multi-popup burst and the next thing to fix.
+
+### Law: a panel dropped into a frame layout fills that layout
+
+Both snap `fit()` implementations returned something strictly smaller than the cell: the
+live player kept `Math.min(inner.w, sizeRef.current.w)` (its own width), and the explore
+panel capped its video at 92% of the cell. `frameSnapPin` writes `width = fit(...)`, so a
+snapped panel was always visibly smaller than the layout it was dropped into.
+
+- clean arm: `e2e/tests/frame-popup-snap.spec.ts` now asserts the snapped popup fills the
+  cell inner box (cell minus `FRAME_SNAP_INNER_PAD * 2`); **4 passed (12.9 s)**.
+- red arm: restoring the old 92% cap makes the same run **fail** - the assertion is not a
+  law that cannot fail.
+- no-error arm: the same test now collects `pageerror` + console errors across the drag and
+  snap and asserts the list is empty; it is. The reported "some kind of error interacting
+  with layouts and panels" is not reproduced by this path.
+
+- review loop (AGENTS.md): `gpt -f` on line ranges of the changed hunks - the whole
+  files were 49,866 chars, past the 30,000-char safe paste limit, so the full-file run
+  never got an answer and is not evidence. Two findings came back with the ranges:
+  (1) **the narrow-cell width policy was implicit and could overshoot the cell**:
+  `Math.max(EXPLORE_PANEL_MIN_W, inner.w - chatW)` on a cell narrower than the chat
+  column asks for more than the whole cell and leaves `panelWidthRef` disagreeing with
+  the React state derived from it (`inner.w - chatTotal`, which goes negative). The
+  policy is now the pure `exploreSnapVideoWidth()` in `src/frameSnap.ts`, used by BOTH the
+  ref and the state, and pinned by `src/frameSnap.test.ts` (5 passed: no-chat, with-chat,
+  chat wider than the cell, zero/negative inner width, no-overflow vs `frameSnapInnerBox`).
+  (2) filling the box could distort the video - **false here**: the element is
+  `<video ... style={{ width: 100%, height: 100%, objectFit: contain }} />`
+  (`LivePlayerPopup.tsx:2562`), so a filled cell letterboxes the picture. The first grep
+  for this searched `object-fit` and missed the camelCase inline style; the claim is now
+  measured, not asserted.

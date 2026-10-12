@@ -77,7 +77,7 @@ import {
 } from './explorePopupUtils';
 import type { FrameRect } from './frameLayout';
 import { encodeFrameDragPopupId, frameWindowKey } from './frameLayout';
-import { useFrameSnapPin } from './frameSnap';
+import { exploreSnapVideoWidth, useFrameSnapPin } from './frameSnap';
 import { formatHmsFull } from './utils';
 import { createFullscreenGate, FULLSCREEN_SETTLE_FALLBACK_MS, type FullscreenGate } from './utils/fullscreenGate';
 import type { PreviewSessionResponse, AiAskResponse } from './types';
@@ -1308,23 +1308,18 @@ export default function ChannelExplorePopup({
     posRef,
     setPos,
     fit: (inner) => {
-      const chatW = chatTotal;
-      let videoW = Math.max(
-        EXPLORE_PANEL_MIN_W,
-        Math.min(inner.w - chatW, inner.w * 0.92 - chatW),
-      );
-      let videoH = videoW / videoAspectRef.current;
-      const chrome = chromeHRef.current;
-      let totalH = chrome + videoH;
-      if (totalH > inner.h) {
-        videoH = Math.max(72, inner.h - chrome);
-        videoW = Math.min(inner.w - chatW, videoH * videoAspectRef.current);
-        totalH = chrome + videoW / videoAspectRef.current;
-      }
+      // FILL the cell. The panel used to cap its video at 92% of the cell and
+      // derive its height from the video aspect, so a snapped panel was always
+      // visibly smaller than the layout it was dropped into. The chat column
+      // keeps its width; the video takes what is left and letterboxes inside it
+      // (aspect preserved by the player, not by shrinking the window).
+      const videoW = exploreSnapVideoWidth(inner.w, chatTotal);
       panelWidthRef.current = videoW;
-      return { w: videoW + chatW, h: totalH };
+      return { w: inner.w, h: inner.h };
     },
-    onPin: ({ w }) => setPanelWidth(w - chatTotal),
+    // From the SAME number the ref holds - deriving it here as inner.w -
+    // chatTotal is what went negative on a cell narrower than the chat column.
+    onPin: () => setPanelWidth(panelWidthRef.current),
     repinKey: fullscreen ? null : `${chromeHVersion}|${videoAspect}|${chatTotal}`,
   });
 

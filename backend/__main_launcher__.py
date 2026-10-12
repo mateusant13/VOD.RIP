@@ -394,6 +394,10 @@ def _server_health_watchdog(port: int) -> None:
 
     def _probe() -> bool:
         try:
+            # requests is imported as http_requests in a SIBLING function, so this
+            # name was a NameError swallowed by the except below: _probe() always
+            # answered False and the launcher watchdog saw a server that never came up.
+            import requests as http_requests
             r = http_requests.get(f"http://127.0.0.1:{port}/api/info", timeout=1.0)
             return r.status_code == 200
         except Exception:
