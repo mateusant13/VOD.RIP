@@ -1773,3 +1773,91 @@ no-op and the green would have been worthless.
 | transcript rows are drag-safe | `PreviewChatPanel` rows are `<button>`, and its root carries `data-preview-chat-panel`, which `onPopupDrag`'s ignore list (`ChannelExplorePopup.tsx:1177`) already `closest()`-matches |
 | no click-eating overlays | 102 source files scanned for `absolute inset-0` with no `pointer-events-none`/`aria-hidden` in the next 4 lines: 12 hits, all video-area click catchers or intent-blocking error states |
 | no oversized shrink-0 rows left in the popup dock | every remaining `shrink-0` row in `ChannelExplorePopup.tsx` is either `flex-wrap`-parented or a single icon |
+
+## 2026-10-12 — A read timeout is not a budget, and a docstring is not a check
+
+The owner's complaint: *"extremamente lento ... sinto q ia carregar pra sempre."*
+The measured click, on a video that has been on YouTube since 2005
+(`jNQXAC9IVRw`): **`POST /api/preview/session` → 404 after 27,499 ms**, body
+`{"detail":"This video is unavailable."}`. The backend's own reason was
+`preview_race_exhausted`. The video was never unavailable.
+
+### What was actually true
+
+`_reextract_youtube_for_preview` (`session.py:2808`) — the `force_fresh=True`
+path a cold click takes — calls the **slow** collector first and the **fast** one
+second:
+
+| step | measured |
+|---|---|
+| `_collect_merged_innertube_info(vid, session, 12.0, "user")` | **142,048 ms**, 8 formats |
+| `innertube_extract_info(...)` — only reached if the first is rejected | **2,467 ms**, 1 format |
+| `_youtube_info_is_dash_only_progressive` on both | `False` — **neither was rejected** |
+
+So the 142 s was not a rejection. It was the first call. And the function's own
+docstring claimed the opposite:
+
+> *"Each probe is therefore clamped to the player read timeout — ... one hung
+> client must not cost 9x the table's worth of wall time."*
+
+**Measured: 8.3x the table's nominal worst case** (8 × `_READ_TIMEOUT_PLAYER_SEC`
+2.0 + `_TV_TIMEOUT_SEC` 1.1 = 17.1 s). The docstring described a guarantee the
+code did not have, and a reader who trusted it would look anywhere but here.
+
+### The law
+
+`read_timeout` bounds **one socket read**, not one request. A client that drips
+bytes overruns it without limit, and `_collect_merged_innertube_info` walks
+`_CLIENT_ORDER` **sequentially**, so the overrun is paid once per client. The
+caller's `12.0` was never a budget, because the parameter is neither named nor
+used as one.
+
+The contract now enforced — stated exactly, because it is *not* "kill an
+in-flight request": nothing here can interrupt a blocked socket read.
+
+1. no probe **starts** once the budget is spent;
+2. no probe is **handed** more time than the budget has left.
+
+| | before | after |
+|---|---|---|
+| `_collect_merged_innertube_info(read_timeout=12.0)` | 142,048 ms | **10,252 ms**, still 8 formats |
+| `POST /api/preview/session` — the real click | **404** in 27,499 ms | **200** in 6,285 ms |
+
+Breaking out early loses nothing: the walk accumulates `all_formats` across
+clients, so the deadline returns what the clients that answered already gave.
+The bot-gate path (`youtube_innertube.py:1250`) already `break`s and returns a
+partial merge, so partial results are not a new semantics — this adds a second
+reason to stop, not a new kind of answer.
+
+`backend/tests/test_innertube_wall_budget.py` pins both clauses deterministically
+with a fake clock: no `sleep`, no tolerance window.
+
+*Red arm, real:* against the unfixed file, **4 of 4 failed** (the real-clock arm
+measured 20.75 s on a 2.0 s budget). Green arm: 4 passed. 239 youtube/innertube
+tests passed with the fix, 1 skipped.
+
+### The review that made the test honest
+
+The first version asserted only `elapsed < 6.0` for a 2.0 s budget and
+`len(calls) < len(_CLIENT_ORDER)`. `gpt -f` rejected it correctly: 4 s of
+overrun is tolerated, and a table-length comparison does not prove the deadline
+caused the stop — a client with no profile is skipped for a different reason. The
+deterministic rewrite tests the contract clause by clause, and the third test
+requires the **last probe to have overshot the deadline**, so a walk that stopped
+early for any other reason fails it. **A test that tolerates the defect it names
+is a decoration.**
+
+### Still open — recorded, not fixed here
+
+- The user-facing message is still a lie in the remaining timeout cases: an
+  extract timeout surfaces as `"This video is unavailable."`, and the frontend's
+  `_PREVIEW_CREATE_FATAL_RE` matches `unavailable`, so it treats a **timeout** as
+  permanent and never retries.
+- The metric that reported green while the user waited is `click→open`
+  (`PREVIEW_TIMING`), which measures the popup opening, not the video. The same
+  log carries `click→open=-1ms` sentinels. The law the owner actually asked for
+  is **click → first decodable byte**.
+- 6,285 ms is working, not ≤3 s. What remains is the sequential walk itself; the
+  ordering fix — try the 2.5 s path before the 142 s one — is not in this change.
+
+

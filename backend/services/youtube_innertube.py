@@ -1218,14 +1218,35 @@ def _collect_merged_innertube_info(
     meta_data: Optional[dict] = None
 
     bot_hits = 0
+    # read_timeout is a per-request SOCKET read timeout, not a wall-clock
+    # budget: this walk is sequential over _CLIENT_ORDER, and a client that
+    # drips bytes overruns a read timeout without limit, so the overrun is
+    # paid once per client. Measured live 2026-10-12 on a cold preview click:
+    # read_timeout=12.0 returned after 142,048 ms with 8 formats -- 8.3x the
+    # table's nominal worst case (8 x _READ_TIMEOUT_PLAYER_SEC +
+    # _TV_TIMEOUT_SEC = 17.1 s) -- while the HTTP request abandoned at ~27 s
+    # and told the user "This video is unavailable." The deadline below is the
+    # wall-clock bound this function's docstring always claimed existed; a
+    # break still returns every format the earlier clients already gave us.
+    deadline = time.monotonic() + max(0.1, float(read_timeout))
     for name in _CLIENT_ORDER:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.05:
+            logger.debug(
+                "merged innertube walk spent its %.1fs wall budget on %s; "
+                "returning %d format(s) from the clients that answered",
+                read_timeout,
+                video_id,
+                len(all_formats),
+            )
+            break
         profile = _PROFILE_BY_NAME.get(name)
         if not profile:
             continue
         if name == "TVHTML5":
-            timeout = min(read_timeout, _TV_TIMEOUT_SEC)
+            timeout = min(remaining, _TV_TIMEOUT_SEC)
         else:
-            timeout = min(read_timeout, _READ_TIMEOUT_PLAYER_SEC)
+            timeout = min(remaining, _READ_TIMEOUT_PLAYER_SEC)
         data, _status, kind = _player_request(
             video_id, profile, timeout, session=session, http=http, source=source,
         )
