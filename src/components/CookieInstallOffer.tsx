@@ -3,6 +3,7 @@ import { CheckCircle2, Loader2, XCircle } from 'lucide-react';
 import { apiPost } from '../hooks/useApiClient';
 import { markSeen } from '../lib/firstTime';
 import { useI18n } from '../i18n';
+import { MODAL_Z } from '../layoutUtils';
 import { runSilentCookieExtensionInstall } from '../lib/cookieAutoInstall';
 
 /**
@@ -79,7 +80,16 @@ export default function CookieInstallOffer({
   };
 
   return (
-    <div className="fixed inset-0 z-[21000] flex items-center justify-center bg-black/70 p-4">
+    // MODAL_Z, the ONE app-modal base, not a magic 21000. A literal here
+    // reads as intent but means nothing: 21000 outranks every layer in the
+    // ladder (EXPLORE_POPUP_Z .. MODAL_Z = 10006) AND outranks nothing in
+    // particular, so the number could be 11000 and nothing would notice -
+    // and the NEXT modal written against the ladder would sit UNDER this one
+    // for no reason the reader can see. Every app modal uses MODAL_Z so they
+    // stack against each other instead of guessing.
+    <div className="fixed inset-0 flex items-center justify-center bg-black/70 p-4"
+      style={{ zIndex: MODAL_Z }}
+    >
       <div
         role="dialog"
         aria-modal="true"

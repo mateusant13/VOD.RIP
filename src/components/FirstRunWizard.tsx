@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { FEATURE_MANIFEST } from '../lib/featureManifest';
 import { getEnabledFeatures, hasCompletedOnboarding, markOnboardingDone, setFeaturesBulk } from '../lib/featureFlags';
 import { notifyFeatureChange } from '../hooks/useFeature';
+import { MODAL_Z } from '../layoutUtils';
 import { useI18n } from '../i18n';
 
 const LABELS: Record<string, string> = {
@@ -57,7 +58,14 @@ export default function FirstRunWizard({ onDone }: { onDone?: () => void }) {
   };
 
   const body = (
-    <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/70 p-4">
+    // MODAL_Z, not 9999. 9999 IS EXPLORE_POPUP_Z - the base every floating
+    // player is stacked on - so an explore popup opened after the wizard
+    // (EXPLORE_POPUP_Z + rank) painted ON TOP of a modal the user has to
+    // answer. The wizard is app-level chrome and belongs above the whole
+    // popup ladder.
+    <div className="fixed inset-0 flex items-center justify-center bg-black/70 p-4"
+      style={{ zIndex: MODAL_Z }}
+    >
       <div className="w-full max-w-[560px] bg-zinc-900 border-2 border-zinc-700 p-5 flex flex-col gap-4 max-h-[90vh] overflow-auto">
         <h2 className="text-sm font-black uppercase tracking-widest text-white">{t('Welcome to VOD.RIP — choose your setup')}</h2>
         <p className="text-xs font-mono text-zinc-400">{t('Some extra tools use more power and are off at first. You can turn them on anytime in Settings → Features.')}</p>
