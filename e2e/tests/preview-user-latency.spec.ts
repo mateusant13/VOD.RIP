@@ -48,14 +48,24 @@ test('one preview click: where does the time go', async ({ page }) => {
       if (await add.count()) await add.click({ timeout: 30000 }).catch(() => {});
       await page.waitForTimeout(1500);
     }
-    const chan = page.getByRole('button', { name: /titiltei/i }).first();
-    await expect(chan).toBeVisible({ timeout: 60000 });
-    await chan.click({ force: true });
+    // Same proven flow as preview-stress.spec.ts: the channel button whose
+    // accessible name repeats the channel name (triple-linked channel), then the
+    // Videos/VODs tab, then the row's PREVIEW button.
+    let chan = page.getByRole('button', { name: /titiltei.*titiltei.*titiltei/i });
+    if ((await chan.count()) === 0) {
+      const addInput = page.getByPlaceholder(/kick \/ twitch \/ youtube name or url/i);
+      await addInput.fill('https://www.youtube.com/@titiltei');
+      const add = page.getByRole('button', { name: /add channel/i });
+      if (await add.count()) await add.click({ timeout: 30_000 }).catch(() => {});
+      chan = page.getByRole('button', { name: /titiltei/i });
+    }
+    await expect(chan.first()).toBeVisible({ timeout: 60_000 });
+    await chan.first().click({ force: true, timeout: 30_000 });
     const vtab = page.getByRole('button', { name: /^(videos|vods)$/i }).first();
-    await expect(vtab).toBeVisible({ timeout: 90000 });
+    await expect(vtab).toBeVisible({ timeout: 60_000 });
     await vtab.click();
     const btn = page.getByRole('button', { name: /^preview$/i }).first();
-    await expect(btn).toBeVisible({ timeout: 120000 });
+    await expect(btn).toBeVisible({ timeout: 120_000 });
     t0.v = Date.now();
     events.length = 0;
     stamp('CLICK preview');

@@ -1419,3 +1419,58 @@ snapped panel was always visibly smaller than the layout it was dropped into.
   (`LivePlayerPopup.tsx:2562`), so a filled cell letterboxes the picture. The first grep
   for this searched `object-fit` and missed the camelCase inline style; the claim is now
   measured, not asserted.
+
+## The remaining UI hang, measured (2026-10-12 05:36, after the 502 fix was live)
+
+One preview click in the real UI, every `/api/preview/*` call timestamped. The mux
+poll is **not** the culprit and the unused budget is not the problem:
+
+```
+   0ms CLICK preview
+ 877ms REQ GET  preview/panel/youtube/TmI2QvpocDE      -> 37724ms (37.7 s)
+ 879ms REQ POST preview/session                       -> NO ANSWER for 61 s
+1192ms REQ GET  previews/status                        -> 42120ms
+37624ms RES 200 preview/warm/batch                    (28-36 s each, repeatedly)
+61273ms REQ POST preview/session   (client RETRIES the create it never got)
+86365ms RES 200 preview/session
+87085ms REQ GET  preview/hls/8a6d8c1c1e436b2f/stream.mp4
+151278ms RES 500 preview/hls/8a6d8c1c1e436b2f/stream.mp4
+```
+
+The API log names the cause:
+
+```
+rate_budget: pacing yt-dlp yt_dlp_extract for 4.3s (auto pool dry, ceiling 20.0 rpm)
+YtGovernorExhausted: yt-dlp yt_dlp_extract refused: YouTube rate limit budget still
+  exhausted after waiting 4s (platform=youtube source=auto ceiling=20.0 rpm)
+```
+
+A preview session create needs one YouTube extract. That extract runs through
+`_guarded_youtube_dl` -> `_governor_admit_ytdlp(origin, "yt_dlp_extract")`
+(`archive_ytdlp.py:686`) with **no `interactive` flag**, so it is metered against the
+same 20 rpm AUTO pool that the archive/transcribe lane drains (the log shows
+`chat-youtube-*` backfill jobs being refused by the same budget). `interactive=True`
+means source `user`, and the docstring states the policy plainly: AUTO waits at most
+`_YTDLP_GOVERNOR_MAX_WAIT_S` (30 s) and is then refused; **a USER caller never waits**
+(Twitch already implements exactly this split for user actions - `archive_twitch.py`:
+"an interactive kick (interactive=True) fail[s] fast".
+
+So a user click is currently queued behind hours of background work: it either waits
+~30 s per attempt and then errors, or the client retries and waits again. The 61 s of
+silence before the retry is the user-facing symptom, and `This video is unavailable`
+(http_404 on POST /api/preview/session) is what a refused extract tells the user.
+
+**Not fixed here - it is a policy decision for the owner, and it is one line once
+decided.** The choices:
+
+1. route the preview session create (and its first mux) through the interactive lane,
+   `interactive=True`, so a click is admitted immediately like a Twitch kick is;
+2. keep the auto pool but bound the click differently - fail fast (0 wait), then
+   retry with backoff inside the request - so the UI shows a state instead of
+   hanging 61 s;
+3. give preview its OWN bucket so background backfill cannot starve it at all
+   (larger blast radius, it is a real YouTube-egress policy change).
+
+This is the same class of decision as `VODRIP_YT_EXECUTE_REMOTE_CHALLENGE_SOLVER`:
+a dial that trades YouTube good standing for responsiveness. It should not be
+flipped silently by an agent.
