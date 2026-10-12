@@ -1736,3 +1736,40 @@ The next law to write is not another ceiling: it is that the audio fetch must
 answer *something* inside its budget — even `{"outcome":"no-audio"}` — because
 the current design lets the only stage that cannot report silence be the one
 that holds the longest.
+
+## 2026-10-12 16:20 — The modal ladder, and why a literal is worse than a wrong constant
+
+A second pass of the "hard to click / wrong hierarchy" audit. Every app-level
+overlay was supposed to sit on `MODAL_Z` (`EXPLORE_POPUP_Z + MAX_EXPLORE_POPUPS
++ 2 = 10006`, `layoutUtils.ts:1099`). Two did not:
+
+| file | what it used | the visible defect |
+|---|---|---|
+| `CookieInstallOffer.tsx` | `z-[21000]` | outranks the whole ladder by 10k for no reason |
+| `FirstRunWizard.tsx` | `z-[9999]` | **`z-[9999]` IS `EXPLORE_POPUP_Z`** — the base every floating player stacks on, so a preview popup opened afterwards painted over a wizard the user still has to answer |
+| `DownloadConfirmDialog.tsx`, `ExtensionWaitOverlay.tsx` | `zIndex: MODAL_Z` | correct |
+
+**A magic literal is worse than a wrong constant.** A wrong constant fails in a
+direction you can predict from its neighbours. `21000` fails in NO direction:
+it is above the ladder, it outranks every modal that WILL be written against
+the ladder, and no reader can tell that from the code, because the number is
+arbitrary rather than derived. The defect is not the value, it is that the
+value is a claim nothing can check. `ModalZLaw.test.tsx` now makes it checkable:
+`MODAL_Z > EXPLORE_POPUP_Z`, and each of the four modal files must carry
+`zIndex: MODAL_Z` and match neither `/z-\[\d+\]/` nor `/zIndex:\s*\d{3,}/`.
+
+*Red arm, real:* restoring `z-[21000]` and `z-[9999]` turned exactly 3 of 6
+assertions red (both per-file arms plus the aggregate offender scan) and left
+the ladder-order arm green. Green arm: 6/6. **A law that cannot fail is not
+evidence** — if the aggregate scan had not gone red, the arm would have been a
+no-op and the green would have been worthless.
+
+### Audited and found correct — recorded so the next pass does not redo it
+
+| claim | measurement |
+|---|---|
+| the live player's click-catcher does not block fullscreen | catcher is `absolute inset-0 z-0` (`LivePlayerPopup.tsx:2538`), the transport bar is `zIndex: 10` (`:2662`) — the transport is above it |
+| the captions overlay does not sit on the transport | `bottom-16 z-[5]` (`:2909`) vs transport `bottom: 0, zIndex: 10` — 64px of clearance |
+| transcript rows are drag-safe | `PreviewChatPanel` rows are `<button>`, and its root carries `data-preview-chat-panel`, which `onPopupDrag`'s ignore list (`ChannelExplorePopup.tsx:1177`) already `closest()`-matches |
+| no click-eating overlays | 102 source files scanned for `absolute inset-0` with no `pointer-events-none`/`aria-hidden` in the next 4 lines: 12 hits, all video-area click catchers or intent-blocking error states |
+| no oversized shrink-0 rows left in the popup dock | every remaining `shrink-0` row in `ChannelExplorePopup.tsx` is either `flex-wrap`-parented or a single icon |
