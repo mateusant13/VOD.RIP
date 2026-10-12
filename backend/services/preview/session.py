@@ -3697,6 +3697,23 @@ def _ensure_youtube_window_hls_mux(session: PreviewSession) -> bool:
             _clear_youtube_window_hls_cache(session)
             out_dir.mkdir(parents=True, exist_ok=True)
             failed_urls.update(u for u in (video_url, audio_url) if u)
+            # MEASURED 2026-10-12 (user log 11:58:53 and two of my own runs):
+            # a truncated BODY is a TRANSPORT failure, not a stale URL. Three
+            # attempts re-extracted fresh URLs every time and each one truncated
+            # identically on manifest.googlevideo.com ("truncated Range
+            # 0-1048576: got 1915 expected 1048577"), while the SAME URLs served
+            # 206 + 5.3 MB through the fallback seconds later. Re-extracting
+            # cannot fix a transport, so stop after the first truncated attempt
+            # and let the fallback - which is measured to work - take over.
+            _msg = str(exc).lower()
+            if "truncated" in _msg and "expired http" not in _msg:
+                logger.warning(
+                    "window hls mux truncated body session=%s: the URL is not stale, "
+                    "re-extracting cannot help — falling back now instead of "
+                    "spending two more attempts on it",
+                    session.session_id[:8],
+                )
+                break
             if attempt < 2:
                 _refresh_youtube_window_hls_urls(session, prefer_height=height)
                 video_url = (
