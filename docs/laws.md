@@ -1961,3 +1961,88 @@ fast-first cost the misses **24 s** (5.5 s miss paid before a 12 s walk). The
 race is never worse than either. Three of four still miss 3 s, and the honest
 reason is that both InnerTube legs lose on those videos and the yt-dlp fallback
 answers.
+
+## The warm was lying, and the lie was in the classifier (2026-10-12)
+
+**A preview click was slow because the warm had already "failed" — and the warm
+was wrong.** The API log carried, for videos the click then resolved in under a
+second:
+
+```
+cold preview resolve failed for UU6Rrs6y6Ec after 25.3s: This video is unavailable
+```
+
+Three videos were branded **definitively fatal for the life of the process** by
+`_classify_playability`, because it read an ambiguous status — InnerTube's bare
+`ERROR` — as proof of removal whenever the reason text merely contained
+"unavailable". `_record_playability` then refuses to downgrade a stored fatal,
+so one bad probe was permanent: the warm aborted, no snapshot was ever built, and
+every click paid a cold resolve.
+
+**The guard that already covered this was one branch earlier.**
+`_DEFINITIVE_PLAYABILITY_MARKERS` already lists every genuine removal ("removed
+by the uploader", "video removed", "private", "members only", "deleted", "no
+longer available", age and regional blocks). "This video is unavailable" is not
+on that list because it is not a removal — it is what YouTube says when it is
+rate-limiting you. Deleting the extra branch restores `retry` for
+`ERROR`/`UNPLAYABLE`/`CONTENT_CHECK_REQUIRED`.
+
+This is the **fourth** instance this session of the same defect class: *the
+correct guard exists and the call site uses the unguarded variant* — after
+`innertube_playability_verdict` vs `innertube_last_playability`,
+`ApiError.status` vs prose matching, and `res.statusText` leaking prose into a
+permanence decision. Three of the four were in the same function family, deciding
+permanence from text.
+
+### Red arm — the law can fail, and did
+
+| arm | before the fix | after |
+|---|---|---|
+| warm produces a snapshot | **0 of 4** | **4 of 4** |
+| `_classify_playability("ERROR", "This video is unavailable")` | `"fatal"` | `"retry"` |
+| module self-check at `youtube_innertube.py:1849` | pinned `"fatal"` | pins `"retry"` |
+
+The self-check is the interesting one: the module asserted its own wrong answer,
+so the process **crashed on import** the moment the branch was deleted. A guard
+that pins a bug is not a guard.
+
+### What the fix bought, measured on a fresh server (live HTTP)
+
+| regime | click |
+|---|---|
+| **snapshot ready (warm completed)** | **15 / 16 / 16 / 31 ms — 4 of 4 inside 3 s** |
+| click resolving with no warm running | 2,172–2,797 ms — inside 3 s |
+| **click landing while a warm is in flight** | 2,422 · 6,828 · 6,891 · 13,985 ms — **1 of 4** |
+
+### The budgets, and why the obvious fix was wrong
+
+The click's wait for an in-flight warm was `3.5 s + 5.0 s = 8.5 s`, paid
+*before* a resolve that costs 2.5 s — so the click could wait longer than the
+whole resolve it was waiting to avoid. Three budgets were tried and all three
+were measured, not argued:
+
+| wait budget | worst click |
+|---|---|
+| 0.5 s | 25,813 ms |
+| 3.05 s | 25,813 ms |
+| 5.8 s (join) | **39,563 ms** |
+
+Waiting longer made it **worse**, because the click then fell through to a
+resolve that competed with the warm it had just waited for. Two concurrent
+resolves for the same video contend upstream and degrade **both**: 5,625–39,563 ms
+together against 2,172–2,797 ms alone. The wait is now 0.5 s and the snapshot
+read is what catches a warm that finished — for free.
+
+Capping the resolve budgets (`_PREVIEW_EXTRACT_RACE_SEC` 5.5→2.8,
+`_PREVIEW_EXTRACT_FALLBACK_SEC` 24→3, `_PREVIEW_EXTRACT_WAIT_SEC` 24→1.4) was
+also tried and **reverted**: the race budget cut off a fast leg that genuinely
+needs 2.2–3.9 s, and videos that had been served from a snapshot began
+*failing*. A budget that manufactures failures is not a speed-up. `ytdlp_hls.py`
+is unchanged from HEAD.
+
+### Still open, stated plainly
+
+**1 of 4.** A click that lands in the same instant a warm is fired still misses
+3 s. The warm and the click are the same computation; nothing tried here makes
+them share it without one waiting on the other. The honest next step is a single
+in-flight resolve that both join, not a shorter timeout.

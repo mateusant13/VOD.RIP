@@ -790,10 +790,23 @@ def _classify_playability(status: Optional[str], reason: Optional[str]) -> Failu
         return "retry"
     if status == "LIVE_STREAM_OFFLINE":
         return "fatal"
-    if status == "ERROR" and "unavailable" in reason_l:
-        # "This video is unavailable" under ERROR is the classic removed-video
-        # message — definitive (the gate variants above already returned soft).
-        return "fatal"
+    # "ERROR" is AMBIGUOUS and the bare phrase "This video is unavailable" does
+    # not disambiguate it. Measured 2026-10-12 on this box: the warm lane logged
+    #   cold preview resolve failed for UU6Rrs6y6Ec  after 25.3s: This video is unavailable
+    #   cold preview resolve failed for 26he4HN565U after 26.3s: This video is unavailable
+    #   cold preview resolve failed for jNQXAC9IVRw after 25.3s: This video is unavailable
+    # while the click path resolved the SAME three videos in 953 / 4,296 / 5,688 ms
+    # (UU6Rrs6y6Ec even answered anonymously in 953 ms). A bot-gated request
+    # returns ERROR with exactly this wording, so branding it definitive made
+    # _record_playability (any fatal probe wins, never downgraded) mark a live
+    # video dead for the life of the process, abort the warm, and leave every
+    # click paying a full cold resolve.
+    #
+    # Nothing is lost by falling through: _DEFINITIVE_PLAYABILITY_MARKERS above
+    # already carries every wording a genuinely dead video uses — "removed by the
+    # uploader", "video removed", "this video has been removed", "private",
+    # "members only", "deleted", "no longer available", age and region blocks.
+    # A truly removed video still returns fatal there, one branch earlier.
     if status in ("ERROR", "UNPLAYABLE", "CONTENT_CHECK_REQUIRED"):
         return "retry"
     return "retry"
@@ -1833,7 +1846,11 @@ assert _classify_playability(
     "LOGIN_REQUIRED", "Sign in to confirm you're not a bot"
 ) == "retry"
 assert _classify_playability("LIVE_STREAM_OFFLINE", None) == "fatal"
-assert _classify_playability("ERROR", "This video is unavailable") == "fatal"
+# The bare phrase is NOT definitive: a bot-gated request returns it for a video
+# that plays. Measured 2026-10-12 (three videos branded fatal here resolved in
+# 953 / 4,296 / 5,688 ms on the click path). A real removal names itself and
+# stays fatal on the next lines.
+assert _classify_playability("ERROR", "This video is unavailable") == "retry"
 assert _classify_playability("ERROR", "Video removed by the uploader") == "fatal"
 assert _classify_playability("ERROR", "This video is private.") == "fatal"
 assert _classify_playability("ERROR", "This video is age-restricted") == "fatal"

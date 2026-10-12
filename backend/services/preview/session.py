@@ -827,7 +827,24 @@ class PreviewManager:
             # window-mux attempts. Event.wait returns the instant the warm sets
             # its event, so a longer ceiling costs nothing on a fast warm and
             # buys the join on a queued one. 1.5s measured too short.
-            await_youtube_warm_if_pending(url, timeout_sec=3.5)
+            # Short wait, not a bet on the warm.
+            #
+            # Measured 2026-10-12 (this box, fresh server, live HTTP), with the
+            # playability classifier fixed so warms actually produce snapshots:
+            #   snapshot ready ......... 0-47 ms      (read just below)
+            #   click alone ............ 2,172-2,797 ms
+            #   warm alone ............. 1,718-3,938 ms
+            #   click + warm together .. 5,625-39,563 ms
+            #
+            # The warm and the click's own resolve are the SAME computation, so a
+            # warm in flight cannot deliver the answer sooner than the click can
+            # get it itself - and the two running together contend upstream and
+            # make both slower. Every budget tried here (0.5 s, 3.05 s, 5.8 s)
+            # only added its own duration to a click that would otherwise have
+            # resolved in ~2.5 s, so this is deliberately the shortest wait that
+            # still catches a warm finishing in the gap, and the snapshot read on
+            # the next line is what catches one that already finished.
+            await_youtube_warm_if_pending(url, timeout_sec=0.35)
             # ponytail: the warm prebuilt a full session shell — reuse it to
             # skip the ~5s extract + variant-build + custom-master work.
             from services.youtube_innertube import extract_video_id
@@ -858,7 +875,12 @@ class PreviewManager:
             # extract was still running. Give it a second chance before paying
             # the full ~5s resolve cost — a running warm is ~any-ms from done.
             if vid:
-                _await_youtube_warm_catchup(url, timeout_sec=5.0)
+                # Second chance, same law: the tail of the same budget
+                # (0.35 + 0.15 = 0.5 s) rather than the old 8.5 s. A 5.8 s join
+                # budget was measured at 39,563 ms worst case, because the click
+                # then fell through to a resolve that competed with the warm it
+                # had just finished waiting for.
+                _await_youtube_warm_catchup(url, timeout_sec=0.15)
                 snap = _get_session_snapshot(vid, prefer_height)
                 if snap is None:
                     # A snapshot built at ANY height serves this click: it carries

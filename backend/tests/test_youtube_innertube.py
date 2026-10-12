@@ -121,7 +121,11 @@ def test_classify_playability_transient_gates_soft():
 
 def test_classify_playability_definitive_fatal():
     """Genuinely gone / hard-blocked videos stay fatal."""
-    assert _classify_playability("ERROR", "This video is unavailable") == "fatal"
+    # NOT the bare phrase: "ERROR" is ambiguous and a bot-gated request returns
+    # exactly "This video is unavailable" for a video that plays fine. Measured
+    # 2026-10-12 — see the classifier comment; the three videos this branded
+    # fatal resolved in 953 / 4,296 / 5,688 ms on the click path.
+    assert _classify_playability("ERROR", "This video is unavailable") == "retry"
     assert _classify_playability("ERROR", "This video is private.") == "fatal"
     assert _classify_playability("LOGIN_REQUIRED", "This video is private") == "fatal"
     assert _classify_playability("ERROR", "Video removed by the uploader") == "fatal"
@@ -237,3 +241,34 @@ def test_created_at_from_player_microformat():
         },
     })
     assert tz and "2005-04-2" in tz
+
+
+def test_the_ambiguous_phrase_never_outranks_a_real_removal():
+    """The law this file exists to keep falsifiable.
+
+    A bare "This video is unavailable" must NOT be fatal under any status,
+    because a bot gate emits it for live videos. A real removal names itself and
+    must stay fatal — so the two must never collapse into one rule.
+    """
+    ambiguous = "This video is unavailable"
+    for status in ("ERROR", "UNPLAYABLE", "LOGIN_REQUIRED", "CONTENT_CHECK_REQUIRED"):
+        assert _classify_playability(status, ambiguous) == "retry", (
+            f"{status} + the ambiguous phrase must stay retryable, got "
+            f"{_classify_playability(status, ambiguous)!r}"
+        )
+    # Every wording a genuinely dead video uses still resolves fatal, one branch
+    # earlier, via _DEFINITIVE_PLAYABILITY_MARKERS.
+    for reason in (
+        "Video removed by the uploader",
+        "This video has been removed",
+        "This video is private",
+        "This video is available to members only",
+        "Join this channel to get access",
+        "This video has been deleted",
+        "This video is no longer available",
+        "This video is age-restricted",
+        "Video not available in your country",
+    ):
+        assert _classify_playability("ERROR", reason) == "fatal", (
+            f"a real removal must stay fatal: {reason!r}"
+        )
