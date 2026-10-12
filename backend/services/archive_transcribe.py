@@ -5258,8 +5258,27 @@ def _process_chat_job(job_id: str, platform: str, video_id: str) -> dict:
             }
         _pace_youtube_chat()
         from services.archive_ytdlp import backfill_live_chat
+        from services.archive_ytdlp import YtGovernorExhausted
 
-        result = backfill_live_chat(video_id)
+        try:
+            result = backfill_live_chat(video_id)
+        except YtGovernorExhausted as exc:
+            # MEASURED 2026-10-12: this is TRANSIENT by construction - the rate
+            # budget is dry, not the video broken - yet it escaped as ERROR + a
+            # full traceback once per job, 8 times in 8 minutes in the owner log.
+            # The queue requeues on this exception's wording, so one WARNING line
+            # keeps the requeue and drops the traceback.
+            logger.warning(
+                "chat backfill deferred for %s (budget dry, requeued): %s",
+                video_id[:11],
+                str(exc)[:120],
+            )
+            return {
+                "job_id": job_id,
+                "platform": platform,
+                "video_id": video_id,
+                "requeued": "youtube-budget",
+            }
         archive_db.update_job(job_id, status="done", progress=1.0)
         return {
             "job_id": job_id,

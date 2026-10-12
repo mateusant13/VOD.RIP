@@ -819,13 +819,32 @@ class PreviewManager:
             # storm the warm for this URL may be *queued* (not running); waiting
             # 8s for it burns the whole preview SLA. A running warm is still
             # joined via the extract dedup inside cached_extract_info.
-            await_youtube_warm_if_pending(url, timeout_sec=1.5)
+            # MEASURED 2026-10-12 on the user's click: the warm for the clicked
+            # URL was QUEUED behind the process-wide guarded_youtube_dl lock (the
+            # archive scheduler and its chat jobs hold it), so at click time no
+            # snapshot existed yet and the click paid a full cold resolve -
+            # session_created server_ms=18703, dash_window=True, then 3 failed
+            # window-mux attempts. Event.wait returns the instant the warm sets
+            # its event, so a longer ceiling costs nothing on a fast warm and
+            # buys the join on a queued one. 1.5s measured too short.
+            await_youtube_warm_if_pending(url, timeout_sec=3.5)
             # ponytail: the warm prebuilt a full session shell — reuse it to
             # skip the ~5s extract + variant-build + custom-master work.
             from services.youtube_innertube import extract_video_id
 
             vid = extract_video_id(url or "")
             snap = _get_session_snapshot(vid, prefer_height) if vid else None
+            if vid and snap is None:
+                # One line that says WHY the 3-second path was missed. Without it
+                # the next measurement cannot separate "warm was queued" from
+                # "snapshot expired" from "height mismatch" - and those have
+                # three different fixes.
+                logger.info(
+                    "preview snapshot MISS vid=%s h=%s pending_warm=%s so the click pays a cold resolve",
+                    vid[:11],
+                    prefer_height,
+                    bool(_youtube_warm_inflight_key(url)),
+                )
             if snap:
                 session = self._reuse_youtube_snapshot(
                     url, crop_start, crop_end, prefer_height, snap, anonymous=youtube_anonymous
@@ -839,7 +858,7 @@ class PreviewManager:
             # extract was still running. Give it a second chance before paying
             # the full ~5s resolve cost — a running warm is ~any-ms from done.
             if vid:
-                _await_youtube_warm_catchup(url, timeout_sec=3.0)
+                _await_youtube_warm_catchup(url, timeout_sec=7.0)
                 snap = _get_session_snapshot(vid, prefer_height)
                 if snap is None:
                     # A snapshot built at ANY height serves this click: it carries
