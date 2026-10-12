@@ -858,7 +858,7 @@ class PreviewManager:
             # extract was still running. Give it a second chance before paying
             # the full ~5s resolve cost — a running warm is ~any-ms from done.
             if vid:
-                _await_youtube_warm_catchup(url, timeout_sec=7.0)
+                _await_youtube_warm_catchup(url, timeout_sec=5.0)
                 snap = _get_session_snapshot(vid, prefer_height)
                 if snap is None:
                     # A snapshot built at ANY height serves this click: it carries
@@ -3621,7 +3621,11 @@ def _ensure_youtube_window_hls_mux(session: PreviewSession) -> bool:
     ``window_hls_mux_start/end`` (capped chunk) are fetched/muxed per pass.
     Seek remux recenters the chunk via :func:`youtube_window_hls_seek_remux`.
     """
-    from services.ytdlp_hls import StaleGooglevideoUrl, _mux_dash_window_to_hls
+    from services.ytdlp_hls import (
+        GooglevideoTruncatedBody,
+        StaleGooglevideoUrl,
+        _mux_dash_window_to_hls,
+    )
 
     if not getattr(session, "dash_window_hls", False):
         return False
@@ -3705,8 +3709,12 @@ def _ensure_youtube_window_hls_mux(session: PreviewSession) -> bool:
             # 206 + 5.3 MB through the fallback seconds later. Re-extracting
             # cannot fix a transport, so stop after the first truncated attempt
             # and let the fallback - which is measured to work - take over.
-            _msg = str(exc).lower()
-            if "truncated" in _msg and "expired http" not in _msg:
+            # TYPE, not message text: GooglevideoTruncatedBody subclasses
+            # StaleGooglevideoUrl (ytdlp_hls.py:64), so the post-loop guard below
+            # already classifies it - but saying so with a type makes the intent
+            # explicit instead of a class-hierarchy accident, which is what a
+            # code review of this hunk asked for.
+            if isinstance(exc, GooglevideoTruncatedBody):
                 logger.warning(
                     "window hls mux truncated body session=%s: the URL is not stale, "
                     "re-extracting cannot help — falling back now instead of "

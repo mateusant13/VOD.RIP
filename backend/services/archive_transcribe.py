@@ -5266,17 +5266,23 @@ def _process_chat_job(job_id: str, platform: str, video_id: str) -> dict:
             # MEASURED 2026-10-12: this is TRANSIENT by construction - the rate
             # budget is dry, not the video broken - yet it escaped as ERROR + a
             # full traceback once per job, 8 times in 8 minutes in the owner log.
-            # The queue requeues on this exception's wording, so one WARNING line
-            # keeps the requeue and drops the traceback.
+            # Requeue the same way the youtube-gate branch above does: a durable
+            # queued row in the DB first, so the retry does not depend on the
+            # caller inspecting the return value. One WARNING line then replaces
+            # the ERROR + traceback.
+            archive_db.update_job(
+                job_id, status="queued",
+                error=f"youtube rate budget dry — requeued ({str(exc)[:80]})",
+            )
             logger.warning(
-                "chat backfill deferred for %s (budget dry, requeued): %s",
-                video_id[:11],
+                "chat backfill deferred for %s: youtube rate budget dry, job %s "
+                "requeued: %s",
+                video_id,
+                job_id,
                 str(exc)[:120],
             )
             return {
-                "job_id": job_id,
-                "platform": platform,
-                "video_id": video_id,
+                "job_id": job_id, "platform": platform, "video_id": video_id,
                 "requeued": "youtube-budget",
             }
         archive_db.update_job(job_id, status="done", progress=1.0)
