@@ -2961,17 +2961,59 @@ def _fetch_googlevideo_range_once(
     dest: str,
     cancel_event: Optional[threading.Event] = None,
 ) -> None:
-    """Single HTTP Range request to a local file."""
+    """Single HTTP Range request to a local file.
+
+    MEASURED 2026-10-12 (the user's preview, `window hls mux attempt 0/1/2`):
+    googlevideo closes the body after ~1.9 KB when the span is asked for over
+    FORCED HTTP/3 (QUIC) on these signed, IPv6-bound URLs -
+    `truncated Range 0-1048576: got 1915 expected 1048577`, three attempts in a
+    row, on a URL that is NOT stale: the very same URL then served 5.3 MB
+    through the fallback resource path seconds later. A short body is therefore
+    a TRANSPORT failure. Re-extracting (what StaleGooglevideoUrl makes callers
+    do) cannot fix a transport, so retry the IDENTICAL span over negotiated
+    HTTP before declaring it truncated.
+    """
+    for http_version in _googlevideo_transports(url):
+        try:
+            _fetch_googlevideo_range_try(
+                url, byte_range, headers, dest, http_version, cancel_event
+            )
+            return
+        except GooglevideoTruncatedBody:
+            continue
+    raise GooglevideoTruncatedBody(
+        f"truncated Range {byte_range[0]}-{byte_range[1]} on every transport "
+        f"for {url[:80]}",
+    )
+
+
+def _googlevideo_transports(url: str) -> list[Optional[str]]:
+    """Transports to try for one span, cheapest-broken first.
+
+    HTTP/3 stays first: it is what googlevideo wants and it works most of the
+    time. `None` lets curl_cffi negotiate HTTP/2, which is the fallback for the
+    QUIC-closes-early case measured above.
+    """
+    if "googlevideo.com" in url:
+        return ["v3", None]
+    return [None]
+
+
+def _fetch_googlevideo_range_try(
+    url: str,
+    byte_range: tuple[int, int],
+    headers: Optional[dict],
+    dest: str,
+    http_version: Optional[str],
+    cancel_event: Optional[threading.Event] = None,
+) -> None:
+    """One Range request on ONE transport. Raises on short bodies; never retries.
+    """
     b0, b1 = byte_range
     hdrs = dict(headers or {})
     hdrs["Range"] = f"bytes={b0}-{b1}"
     try:
         from curl_cffi import requests as cffi_requests
-
-        # QUIC/HTTP3 for googlevideo CDN
-        http_version = None
-        if "googlevideo.com" in url:
-            http_version = "v3"  # curl_cffi needs "v3" (not "3") for HTTP/3
 
         resp = cffi_requests.get(
             url,

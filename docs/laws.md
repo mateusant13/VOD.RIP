@@ -1542,3 +1542,40 @@ alive; the connection was recycled.
 
 An unmeasured check is never a pass: the backend half is green (served bytes above), the
 frontend half is not even started, and green on one half cannot speak for the other.
+
+## Round 2026-10-12 12:45 — the user's own log closes the timeline (and kills one of my theories)
+
+From `tmp/vodrip-devall-api.log`, session `93b4da96` (the user's dQw4w9WgXcQ):
+
+```
+11:58:35  session_created server_ms=18703  kind=hls  dash_window=True
+11:58:53  window hls mux attempt 2: truncated Range 0-1048576: got ... expected 1048577
+11:58:58  window hls fallback to hls session=93b4da96
+```
+
+and the same sequence reproduced at 12:19 and again at 12:43 in my own runs. So the
+user's click is NOT slow (their PREVIEW_TIMING lines say click->open 24 ms and 39 ms);
+the cost is **18.7 s to create the session + ~15 s of three failed mux attempts +
+the fallback** before anything is watchable.
+
+### The QUIC hypothesis is DISPROVEN (red not reproduced -> the law is falsifiable only if it can fail)
+
+I forced `http_version=v3` suspicion: retrying the same span over negotiated HTTP/2
+also truncates, and the log names the host -- **`manifest.googlevideo.com`**, not the
+`rr*---sn-*` media host that serves 5.3 MB seconds later through the resource proxy.
+A short body on the MANIFEST host is not a transport choice; the mux is issuing plain
+HTTP Range requests against a host that speaks the SABR/protobuf exchange (yt-dlp's own
+log warns "YouTube may have enabled the SABR-only streaming experiment"). The commit
+`65c3889` is followed by one that keeps the diagnostic but claims no fix.
+
+### What the fallback actually proves
+
+`window hls fallback to hls` ends with the video SERVING: master 200, media playlist
+200 with 38 segments, first segment 206 + 5,361,808 B of video/mp2t (measured after the
+fallback, three times). So the preview does eventually play; it pays ~34 s of failed
+window-mux work on the way, and the client's `waitForPreviewMuxReady` gate can throw
+on its deadline during exactly that window. The candidate fix follows from the
+measurement, not from the hypothesis: don't run the window mux at all when the media
+URLs are already directly servable, or give the gate the fallback's ready state
+sooner. Unmeasured until then.
+
