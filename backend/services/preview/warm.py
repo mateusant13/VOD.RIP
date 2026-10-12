@@ -917,6 +917,24 @@ def set_active_youtube_preview(url: Optional[str]) -> None:
             _pv_state._ACTIVE_YOUTUBE_PREVIEW_KEY = key
     except Exception:
         pass
+def youtube_warm_is_pending(url: str) -> bool:
+    """True while a warm for this video is ACTUALLY running.
+
+    _youtube_warm_inflight_key() is not this predicate and must never be read
+    as one: it returns "extract_video_id(raw) or raw" - a KEY, which is
+    non-empty for any non-empty URL. Reading it as a boolean is why the preview
+    miss log said pending_warm=True on every click, including clicks with no
+    warm at all, and it is the same defect class as the rest of this session:
+    the correct guard was never written and the wrong one answers every time.
+    """
+    key = _youtube_warm_inflight_key(url)
+    if not key:
+        return False
+    with _YOUTUBE_WARM_LOCK:
+        ev = _YOUTUBE_WARM_INFLIGHT.get(key)
+    return ev is not None and not ev.is_set()
+
+
 def await_youtube_warm_if_pending(url: str, timeout_sec: float = 1.0) -> None:
     """Briefly reuse paste warm; never let warm make preview feel stuck."""
     key = _youtube_warm_inflight_key(url)

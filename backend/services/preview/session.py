@@ -38,6 +38,7 @@ from services.preview.warm import (
     invalidate_youtube_preview_caches, _youtube_warm_inflight_key,
     kickoff_youtube_warm, kickoff_youtube_full_mux_warm,
     set_active_youtube_preview, await_youtube_warm_if_pending,
+    youtube_warm_is_pending,
     _await_youtube_warm_catchup, _enqueue_full_warm,
     warm_youtube_preview_resolve, warm_youtube_resolve_only,
     kickoff_youtube_batch_warm, kickoff_youtube_preflight_mux,
@@ -132,6 +133,7 @@ from services.preview.warm import (
     _warm_bot_gate_pause_until,
     _youtube_warm_inflight_key,
     await_youtube_warm_if_pending,
+    youtube_warm_is_pending,
 )
 MAX_SEGMENT_BYTES = 100 * 1024 * 1024
 SESSION_CACHE_MAX_BYTES = 100 * 1024 * 1024
@@ -844,6 +846,12 @@ class PreviewManager:
             # resolved in ~2.5 s, so this is deliberately the shortest wait that
             # still catches a warm finishing in the gap, and the snapshot read on
             # the next line is what catches one that already finished.
+            # Short wait. Measured 2026-10-12 (fresh server, live HTTP): a 4.5 s
+            # join made EVERY warm-in-flight click fail at 4,531-4,563 ms with
+            # "temporarily restricted" - waiting longer walked the click into
+            # the bot-gate window instead of out of it. 0.5 s total was the best
+            # of the four budgets measured (0.5 / 3.05 / 4.5 / 5.8 s), and the
+            # snapshot read below catches a warm that already finished for free.
             await_youtube_warm_if_pending(url, timeout_sec=0.35)
             # ponytail: the warm prebuilt a full session shell — reuse it to
             # skip the ~5s extract + variant-build + custom-master work.
@@ -860,7 +868,7 @@ class PreviewManager:
                     "preview snapshot MISS vid=%s h=%s pending_warm=%s so the click pays a cold resolve",
                     vid[:11],
                     prefer_height,
-                    bool(_youtube_warm_inflight_key(url)),
+                    youtube_warm_is_pending(url),
                 )
             if snap:
                 session = self._reuse_youtube_snapshot(

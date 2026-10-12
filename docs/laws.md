@@ -2046,3 +2046,55 @@ is unchanged from HEAD.
 3 s. The warm and the click are the same computation; nothing tried here makes
 them share it without one waiting on the other. The honest next step is a single
 in-flight resolve that both join, not a shorter timeout.
+
+## A key is not a predicate (2026-10-12, later the same day)
+
+**The line that was supposed to explain every slow click could not be wrong
+about anything, because its answer was always the same.** The preview miss log
+printed:
+
+```
+preview snapshot MISS vid=... h=... pending_warm=%s so the click pays a cold resolve
+```
+
+with `bool(_youtube_warm_inflight_key(url))`. That function returns
+`extract_video_id(raw) or raw` — **a key**, which is non-empty for any
+non-empty URL. So `pending_warm` was `True` on every click, including clicks
+with no warm at all.
+
+The line existed precisely to separate "a warm is queued" from "nothing is
+running" — two states with different fixes. It could not separate them. This is
+the fifth instance of the session's dominant defect class, and the purest one:
+not a guard that is never called, but **a guard that always answers the same
+thing**, which is indistinguishable from a working guard until you need it.
+
+`youtube_warm_is_pending()` now answers the question the log was asking, and
+`test_warm_pending_predicate.py` pins the distinction — including the red arm,
+which asserts that the old expression is `True` with nothing registered, so the
+test fails if anyone ever re-derives the predicate from the key.
+
+### The budgets, all four of them, measured
+
+The click's wait for an in-flight warm:
+
+| budget | worst click | outcome |
+|---|---|---|
+| 0.5 s | 25,813 ms | best of the four |
+| 3.05 s | 25,813 ms | no better |
+| 4.5 s | 4,563 ms | **every** warm-in-flight click failed |
+| 5.8 s (join) | 39,563 ms | worst |
+
+The 4.5 s row is the instructive one. It looks like the best number and is
+actually the worst result: the click stopped failing *slowly* and started failing
+*completely*, because waiting longer walked it into the YouTube bot-gate window
+instead of out of it. **A faster failure is not a faster preview.**
+
+### The blocker that is not a design problem
+
+Every failure in these runs carried `YouTube preview is temporarily restricted`
+and the API log held 160 `bot-gate cooldown until +1800s (innertube
+LOGIN_REQUIRED bot gate)` lines. This box is being rate-limited by YouTube. No
+backend budget, cache, or race fixes that: a resolve that YouTube refuses is
+refused at any speed. The design work above is what makes the *served* path fast;
+the bot gate is what makes the *unserved* path fail, and the two must not be
+confused when reading these numbers.
