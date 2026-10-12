@@ -373,11 +373,11 @@ def test_three_concurrent_asr_requests_overlap(worker, fake_soundfile):
                    "video_id": vid, "channel": ch, "head_sec": 30.0,
                    "first_output_s": 10.0, "total_s": 20.0})
     deadline = time.monotonic() + 20
-    while len([r for r in replies if r.get("event") != "rows"]) < 3 \
-            and time.monotonic() < deadline:
+    while len([r for r in replies if r.get("event") not in ("rows", "stage")]) < 3 \
+            and time.monotonic() < deadline:   # stage is liveness, not a final
         time.sleep(0.02)
 
-    finals = [r for r in replies if r.get("event") != "rows"]
+    finals = [r for r in replies if r.get("event") not in ("rows", "stage")]
     assert len(finals) == 3, "not all three replied: %d" % len(finals)
     assert be.peak_live == 3, (
         "three previews did NOT overlap (peak concurrent = %d). Serialised."
@@ -408,10 +408,10 @@ def test_each_reply_carries_its_own_id(worker, fake_soundfile):
                    "video_id": str(i), "channel": "c", "head_sec": 20.0,
                    "first_output_s": 10.0, "total_s": 20.0})
     deadline = time.monotonic() + 20
-    while len([r for r in replies if r.get("event") != "rows"]) < 3 \
+    while len([r for r in replies if r.get("event") not in ("rows", "stage")]) < 3 \
             and time.monotonic() < deadline:
         time.sleep(0.02)
-    finals = [r for r in replies if r.get("event") != "rows"]
+    finals = [r for r in replies if r.get("event") not in ("rows", "stage")]
     assert len(finals) == 3, finals
     assert sorted(r["id"] for r in finals) == ["id0", "id1", "id2"]
 
@@ -815,3 +815,86 @@ def test_deadline_never_raises_a_bare_timeout_from_join():
     body = src.split("def _roundtrip", 1)[1].split("def _cancel", 1)[0]
     assert ".join(" not in body, "_roundtrip waits with join() again"
     assert "q.get(timeout=" in body, "the deadline-bearing queue read is gone"
+def test_a_named_fetch_phase_is_not_killed_by_the_decode_ceiling():
+    """The measured 502: the FIRST-OUTPUT ceiling was charging the audio fetch.
+
+    Owner log 2026-10-12 14:51, four Twitch preview subtitles requests in a row:
+
+        sidecar ready (pid=40552 provider=cuda load=13.8s)   <- ONE spawn, warm
+        cancel not acked; escalating
+        failed for twitch/2574054422: no caption row within 4.0s
+        failed for twitch/2792110402: sidecar closed its output (died?)
+
+    The child was inside a blocking audio fetch, so no caption row had appeared
+    and the supervisor cancelled a request that was WORKING. The child then
+    missed the cancel inside the fetch, was killed, and the next request
+    respawned it and paid another ~14s CUDA load before dying identically.
+
+    The fetch is a PREREQUISITE and belongs to the request total, not to the
+    decode verdict. So the child names the phase with its own budget, and the
+    supervisor honours that budget instead of the first-output ceiling.
+
+    MUTATION: drop the ``event == "stage"`` branch in ``_roundtrip``. The child
+    is then silent past first_output_s and this request stalls at 0.2s instead
+    of returning ok at 0.45s - the shipped 502, reproduced deterministically.
+    """
+    from services import preview_asr_sidecar as sc
+
+    def script(payload, side):
+        if payload.get("op") == "cancel":
+            _reply(side, payload["id"] + ":ack",
+                   {"ok": True, "id": payload["id"], "delivered": True})
+            return
+        if payload.get("op") != "asr":
+            return
+        rid = str(payload["id"])
+
+        def work():
+            # "fetching the head": alive, working, NO caption row can exist yet
+            _reply(side, rid, {"event": "stage", "stage": "fetch",
+                              "budget_s": 5.0, "elapsed_s": 0.01})
+            time.sleep(0.40)
+            _reply(side, rid, {"ok": True, "outcome": "ok", "rows": [],
+                              "covered_sec": 30.0})
+
+        threading.Thread(target=work, daemon=True).start()
+
+    side = FakeChildSidecar(script)
+    t0 = time.monotonic()
+    out = side.request({"op": "asr", "platform": "twitch", "video_id": "1",
+                        "channel": "xqc", "head_sec": 30.0, "id": "r1"},
+                       timeout=5.0, first_output_s=0.2)
+    wall = time.monotonic() - t0
+    assert out.get("ok") is True, out
+    assert wall > 0.40, ("answered at %.2fs - before the fetch finished, so the "
+                        "fetch was killed by the decode ceiling" % wall)
+
+
+def test_a_named_phase_still_cannot_outlive_the_total_ceiling():
+    """A phase budget is not an escape hatch: silence past total_s still dies.
+
+    A child that declares a phase with an honest budget and then never answers
+    must hit the TOTAL ceiling, not hang the supervisor thread. Without this
+    the previous law could be satisfied by a child that names a stage forever.
+    """
+    from services import preview_asr_sidecar as sc
+
+    def script(payload, side):
+        if payload.get("op") == "cancel":
+            _reply(side, payload["id"] + ":ack",
+                   {"ok": True, "id": payload["id"], "delivered": True})
+            return
+        if payload.get("op") != "asr":
+            return
+        _reply(side, str(payload["id"]), {"event": "stage", "stage": "fetch",
+                                        "budget_s": 5.0, "elapsed_s": 0.01})
+        # and then never answers
+
+    side = FakeChildSidecar(script)
+    t0 = time.monotonic()
+    with pytest.raises(TimeoutError):
+        side.request({"op": "asr", "platform": "twitch", "video_id": "1",
+                      "channel": "xqc", "head_sec": 30.0, "id": "r2"},
+                     timeout=0.3, first_output_s=0.2)
+    wall = time.monotonic() - t0
+    assert wall < 2.0, "the total ceiling must bound it, not a hang: %.2fs" % wall

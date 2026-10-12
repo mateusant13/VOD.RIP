@@ -282,6 +282,18 @@ def _asr(platform: str, video_id: str, channel: str, head_sec: float,
         # The fetch is bounded by the SAME budget as the decode: a fetch that
         # cannot land inside the request's ceiling is a failed request, and an
         # unbounded one is a wedged child holding a concurrency slot.
+        # Announce the fetch BEFORE doing it. The supervisor's first-output
+        # ceiling measures "no caption row has appeared", which is a verdict about
+        # a hung DECODE. Measured 2026-10-12 on four Twitch previews: a fetch that
+        # takes >4s got the request cancelled before it could answer, the child
+        # then missed the cancel inside a blocking fetch ("cancel not acked;
+        # escalating"), the next request respawned the child and paid another
+        # 13.8s CUDA load - and died the same way. 502 four times in a row.
+        # The fetch is a PREREQUISITE and belongs to total_s, which this function
+        # already enforces itself.
+        _emit({"event": "stage", "stage": "fetch",
+               "budget_s": round(max(1.0, total_s), 3),
+               "elapsed_s": round(_elapsed(), 3)})
         covered = be.fetch(platform, video_id, channel, wav, head_sec,
                            timeout_s=max(1.0, total_s))
         fetch_s = _now() - fetch_t0

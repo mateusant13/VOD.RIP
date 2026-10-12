@@ -354,6 +354,24 @@ class _Sidecar:
                 except queue.Empty:
                     continue
 
+                if msg.get("event") == "stage":
+                    # The child is alive and named its own phase: "I am fetching
+                    # the audio, no caption row can exist yet". The first-output
+                    # ceiling is a verdict about a hung DECODE, so during a named
+                    # phase that ceiling is replaced by the phase's own budget -
+                    # and total_s still bounds the whole request, so a child that
+                    # names a phase forever cannot outlive its total budget.
+                    budget = msg.get("budget_s")
+                    try:
+                        budget = float(budget)
+                    except (TypeError, ValueError):
+                        budget = first_output_s
+                    deadline_first = time.monotonic() + max(0.05, budget)
+                    logger.debug("preview ASR sidecar stage=%s budget=%.1fs rid=%s",
+                                 msg.get("stage"), max(0.05, budget), rid)
+                    continue
+                    pass
+                    pass
                 if msg.get("event") == "rows":
                     if first_row_s is None:
                         first_row_s = time.monotonic() - t0
