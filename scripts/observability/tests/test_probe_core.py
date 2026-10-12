@@ -407,3 +407,240 @@ class TestDraftCompatibility:
         p.write_text(self.DRAFT_HEALTH + "\n", encoding="utf-8")
         assert probe.read_window(p, 9_999_999_999.0, check="health") == []
         assert len(probe.read_window(p, 0.0, check="health")) == 1
+
+    def test_an_absurd_ts_costs_that_record_not_the_whole_history(self, tmp_path):
+        """datetime.timestamp() raises OSError on Windows for extreme dates.
+
+        Measured 2026-10-11: datetime.fromisoformat("9999-12-31T23:59:59")
+        .timestamp() raises OSError [Errno 22] -- neither TypeError nor
+        ValueError -- so it escaped normalise_record and was then swallowed by
+        read_window's own `except OSError: return []`: one unreadable ts
+        emptied the whole window. That is the exact blindness this class exists
+        to fix, one line further in. The record is kept without an epoch, and
+        the good record beside it survives.
+        """
+        p = tmp_path / "liveness.jsonl"
+        absurd = ('{"check": "health", "ok": true, "status": 200, "ms": 12.0, '
+                  '"ts": "9999-12-31T23:59:59"}')
+        p.write_text(self.CURRENT + "\n" + absurd + "\n", encoding="utf-8")
+
+        assert probe.normalise_record(json.loads(absurd)).get("epoch") is None
+        rows = probe.read_window(p, None, check="health")
+        assert len(rows) == 2, rows
+
+
+# ==========================================================================
+# 8. The concurrent-platforms check grades the arms it actually got
+# ==========================================================================
+# MEASURED 2026-10-11: this check could never pass while the app was well. A
+# gate run graded two samples that answered HTTP 200 (1453 ms and 3969 ms) as
+# FAIL "HTTP 200", reason_class http_error, http_error_count=2. The merged
+# sample inherited ok=False from the blank default in _concurrent_sample, and
+# core._verdict carries no "ok" key, so classify() read every sample as an
+# error. These tests pin the arms' truth onto the merged sample.
+CONCURRENT_VIDEOS = {
+    "youtube": {"ok": True, "video_id": "aaaaaaaaaaa"},
+    "twitch": {"ok": True, "video_id": "1234567890"},
+    "kick": {"ok": True, "video_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"},
+}
+CONCURRENT_IDENT = {"pid": 4242, "proc_start": "2026-10-11T00:00:00+00:00"}
+
+
+class TestConcurrentPlatformsGradesItsArms:
+    def _run(self, monkeypatch, answers):
+        def fake_post(url, payload, timeout_s):
+            assert url.endswith("/api/preview/session"), url
+            return dict(answers[payload["platform"]])
+
+        monkeypatch.setattr(probe, "timed_post_json", fake_post)
+        s = probe.take_concurrent_platforms(
+            "http://127.0.0.1:1", 3000.0, 5.0, CONCURRENT_IDENT,
+            CONCURRENT_VIDEOS)
+        return core.summarise("concurrent-platforms", [s], 3000.0,
+                              window="one run")
+
+    def test_three_arms_answering_within_budget_is_a_pass(self, monkeypatch):
+        answers = {p: {"ok": True, "status": 200, "ms": 900.0, "error": None}
+                   for p in CONCURRENT_VIDEOS}
+        out = self._run(monkeypatch, answers)
+        assert out["verdict"] == core.PASS, out["reason"]
+        assert out["reason_class"] == "within_budget"
+        assert out["max_ms"] == 900.0
+        assert out["http_error_count"] == 0
+
+    def test_the_slowest_arm_is_the_graded_number(self, monkeypatch):
+        answers = {"youtube": {"ok": True, "status": 200, "ms": 300.0},
+                   "twitch": {"ok": True, "status": 200, "ms": 4200.0},
+                   "kick": {"ok": True, "status": 200, "ms": 800.0}}
+        out = self._run(monkeypatch, answers)
+        assert out["verdict"] == core.FAIL
+        assert out["reason_class"] == "over_budget"
+        assert out["max_ms"] == 4200.0
+
+    def test_a_5xx_arm_is_an_http_error(self, monkeypatch):
+        answers = {"youtube": {"ok": True, "status": 200, "ms": 900.0},
+                   "twitch": {"ok": True, "status": 200, "ms": 900.0},
+                   "kick": {"ok": False, "status": 503, "ms": 120.0,
+                            "error": "HTTP 503"}}
+        out = self._run(monkeypatch, answers)
+        assert out["verdict"] == core.FAIL
+        assert out["reason_class"] == "http_error"
+        assert out["http_error_count"] == 1
+
+    def test_an_answered_arm_with_no_timing_makes_the_whole_sample_unmeasured(self, monkeypatch):
+        answers = {"youtube": {"ok": True, "status": 200, "ms": 900.0},
+                   "twitch": {"ok": True, "status": 200, "ms": 900.0},
+                   "kick": {"ok": True, "status": 200, "ms": None}}
+        out = self._run(monkeypatch, answers)
+        assert out["verdict"] == core.NOT_MEASURED
+        assert out["reason_class"] == "no_timing"
+        assert out["max_ms"] is None
+
+    def test_an_unreachable_arm_is_unmeasured_not_a_zero_ms_pass(self, monkeypatch):
+        answers = {"youtube": {"ok": True, "status": 200, "ms": 900.0},
+                   "twitch": {"ok": False, "status": None, "ms": None,
+                              "error": "ConnectionRefusedError: refused"},
+                   "kick": {"ok": True, "status": 200, "ms": 900.0}}
+        out = self._run(monkeypatch, answers)
+        assert out["verdict"] == core.NOT_MEASURED
+        # summarise() owns the aggregate vocabulary: one unreachable sample is
+        # the whole population, so it reports the population-wide class.
+        assert out["reason_class"] == "all_unreachable"
+        assert out["n_measured"] == 0
+
+    def test_a_malformed_status_is_graded_not_raised(self, monkeypatch):
+        """A status nobody can read is an error, not an exception."""
+        answers = {"youtube": {"ok": True, "status": "not-a-status", "ms": 900.0},
+                   "twitch": {"ok": True, "status": 200, "ms": 900.0},
+                   "kick": {"ok": True, "status": 200, "ms": 900.0}}
+        out = self._run(monkeypatch, answers)
+        assert out["verdict"] == core.FAIL
+        assert out["reason_class"] == "http_error"
+
+    def test_classify_never_raises_on_an_unreadable_status(self):
+        v = core.classify({"ok": True, "status": "nope", "ms": 5.0}, 3000.0)
+        assert v["verdict"] == core.FAIL
+        assert v["reason_class"] == "http_error"
+        # The stored status stays the raw one so the second pass agrees.
+        assert core.classify(dict(v, ok=True), 3000.0)["verdict"] == core.FAIL
+
+    def test_classify_never_raises_on_a_status_of_infinity(self):
+        """int(float("inf")) raises OverflowError, not ValueError.
+
+        Measured 2026-10-11 on this box: int(float("inf")) -> OverflowError,
+        int(float("nan")) -> ValueError. The handler caught only the latter, so
+        a status that says "no number at all" escaped a function whose whole
+        contract is that it never raises -- and escaped the same way in
+        probe._status_code, one layer up, where it would lose a whole arm.
+        """
+        for status in (float("inf"), float("-inf"), float("nan")):
+            v = core.classify({"ok": True, "status": status, "ms": 5.0}, 3000.0)
+            assert v["verdict"] == core.FAIL, status
+            assert v["reason_class"] == "http_error", status
+            # the raw value is stored, so the second pass reaches the same answer
+            assert core.classify(dict(v, ok=True), 3000.0)["verdict"] == core.FAIL
+        assert probe._status_code(float("inf")) is None
+        assert probe._is_2xx_3xx(float("inf")) is False
+
+
+class TestUnknownPlatformsAreRefused:
+    """A platform with no shape and no URL builder is not a candidate."""
+
+    def test_an_unknown_platform_is_refused(self):
+        assert probe._shape_ok("myspace", "aaaaaaaaaaa") is False
+        assert probe.platform_url("myspace", {"video_id": "aaaaaaaaaaa"}) is None
+
+    def test_every_known_platform_still_matches_its_own_shape(self):
+        assert probe._shape_ok("youtube", "aaaaaaaaaaa") is True
+        assert probe._shape_ok("twitch", "1234567890") is True
+        assert probe._shape_ok("kick", "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0") is True
+
+    def test_a_wrong_shaped_id_is_still_refused(self):
+        assert probe._shape_ok("youtube", "too-short") is False
+        assert probe._shape_ok("twitch", "abc") is False
+        assert probe._shape_ok("youtube", "") is False
+
+    def test_every_platform_the_check_uses_has_both_a_shape_and_a_url(self):
+        for p in probe.CONCURRENT_PLATFORMS:
+            assert p in probe._VIDEO_ID_SHAPE, p
+            assert p in probe._PLATFORM_URL, p
+
+# ==========================================================================
+# 9. The preview checks warm the session before they grade it
+# ==========================================================================
+# MEASURED 2026-10-11, against the live app: the newest archived video answered
+# its FIRST /api/preview/session in 26,719 ms (HTTP 200) and then, with the same
+# session_id, in 43 ms, 6 ms and 16 ms. Gate run 4 graded that first call against
+# the 3000 ms budget and went red - and the previous run passed with 16 ms on a
+# session that happened to be warm. A check whose verdict is decided by "did the
+# archive grow since the last preview" is not measuring the app. These tests pin
+# which of the two calls is graded, in both directions.
+PREVIEW_VIDEO = {"ok": True, "video_id": "G7n-8q6PuwE", "channel": "Gaveta"}
+
+
+class TestPreviewGradesTheWarmCall:
+    def _run(self, monkeypatch, cold, warm):
+        calls = []
+
+        def fake_post(url, payload, timeout_s):
+            calls.append(timeout_s)
+            return dict(cold if len(calls) == 1 else warm)
+
+        monkeypatch.setattr(probe, "timed_post_json", fake_post)
+        s = probe.take_preview("http://127.0.0.1:1", 3000.0, 5.0,
+                               CONCURRENT_IDENT, PREVIEW_VIDEO)
+        return s, calls
+
+    def test_a_cold_session_is_recorded_but_not_graded(self, monkeypatch):
+        s, calls = self._run(monkeypatch,
+                             {"ok": True, "status": 200, "ms": 26_719.0},
+                             {"ok": True, "status": 200, "ms": 6.0})
+        assert len(calls) == 2, calls
+        assert s["path"] == "warm"
+        assert s["ms"] == 6.0
+        assert s["cold_ms"] == 26_719.0
+        assert s["verdict"] == core.PASS, s["reason"]
+        assert "not graded" in s["reason"]
+
+    def test_the_graded_call_is_still_graded(self, monkeypatch):
+        """Control: a slow WARM call must fail, or the warm-up hides the app."""
+        s, _ = self._run(monkeypatch,
+                         {"ok": True, "status": 200, "ms": 26_719.0},
+                         {"ok": True, "status": 200, "ms": 9_000.0})
+        assert s["verdict"] == core.FAIL
+        assert s["ms"] == 9_000.0
+
+    def test_a_cold_session_that_never_opens_is_not_a_pass(self, monkeypatch):
+        s, _ = self._run(monkeypatch,
+                         {"ok": False, "status": None, "ms": 180_000.0,
+                          "error": "TimeoutError: timed out"},
+                         {"ok": True, "status": 200, "ms": 6.0})
+        assert s["verdict"] != core.PASS
+        assert s["path"] == "cold"
+        assert "cold session could not be created" in s["reason"]
+
+    def test_the_cold_warmup_gets_a_timeout_the_real_path_fits_in(self, monkeypatch):
+        """A 27 s cold session must not be killed by the 5 s request timeout."""
+        _, calls = self._run(monkeypatch,
+                             {"ok": True, "status": 200, "ms": 26_719.0},
+                             {"ok": True, "status": 200, "ms": 6.0})
+        assert calls[0] >= probe.PREVIEW_COLD_TIMEOUT_S
+        assert calls[1] == 5.0
+
+    def test_the_concurrent_round_grades_the_warm_arms(self, monkeypatch):
+        """The concurrency check must not grade three cold extractions."""
+
+        def fake_post(url, payload, timeout_s):
+            # The warm-ups are the calls that ask for the long timeout, so this
+            # fake needs no counter and no lock to tell them apart.
+            cold = timeout_s >= probe.PREVIEW_COLD_TIMEOUT_S
+            return {"ok": True, "status": 200,
+                    "ms": 26_719.0 if cold else 40.0}
+
+        monkeypatch.setattr(probe, "timed_post_json", fake_post)
+        s = probe.take_concurrent_platforms("http://127.0.0.1:1", 3000.0, 5.0,
+                                            CONCURRENT_IDENT, CONCURRENT_VIDEOS)
+        out = core.summarise("concurrent-platforms", [s], 3000.0, window="one run")
+        assert out["verdict"] == core.PASS, out["reason"]
+        assert out["max_ms"] == 40.0
+        assert [a["warmup_ms"] for a in s["arms"]] == [26_719.0] * 3

@@ -94,6 +94,25 @@ def percentile(values: Sequence[float], p: float) -> float | None:
 # --------------------------------------------------------------------------
 # per-sample judgement
 # --------------------------------------------------------------------------
+def _as_status(value) -> int | None:
+    """*value* as an HTTP status int, or None when it is not one.
+
+    classify() promises never to raise. A malformed status is data, not a
+    crash: it is graded as an error with no code, because a status nobody can
+    read is not a status anybody can call healthy.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError is not decoration: int(float("inf")) raises it, and a
+        # status of infinity is exactly the kind of malformed data this function
+        # exists to absorb.  Measured 2026-10-11 on this box: int(float("inf"))
+        # -> OverflowError, int(float("nan")) -> ValueError.  Catching only the
+        # ValueError let the one value that says "no number at all" escape a
+        # function whose whole contract is that it never raises.
+        return None
+
+
 def classify(sample: dict | None, budget_ms: float | None = None) -> dict:
     """Grade ONE sample against a budget. Never raises.
 
@@ -120,21 +139,26 @@ def classify(sample: dict | None, budget_ms: float | None = None) -> dict:
         detail = err or "no HTTP status: the endpoint did not answer"
         return _verdict(NOT_MEASURED, f"unreachable: {detail}", "unreachable", budget_ms, ms, None)
 
-    if ok is False or not (200 <= int(status) < 400):
+    code = _as_status(status)
+    if ok is False or code is None or not (200 <= code < 400):
+        # The RAW status is stored, not the parsed code: an unreadable status
+        # must re-classify to this same failure later, and storing None here
+        # would re-read as "unreachable" -- a FAIL that turns into NOT_MEASURED
+        # on the second pass is a verdict nobody can act on.
         return _verdict(FAIL, f"HTTP {status}" + (f" ({err})" if err else ""),
-                        "http_error", budget_ms, ms, int(status))
+                        "http_error", budget_ms, ms, status)
 
     if ms is None:
         return _verdict(NOT_MEASURED, f"HTTP {status} answered but no timing was recorded",
-                        "no_timing", budget_ms, None, int(status))
+                        "no_timing", budget_ms, None, code)
 
     if budget_ms is not None and ms > budget_ms:
         return _verdict(FAIL, f"{ms:.1f} ms over the {budget_ms:.0f} ms budget",
-                        "over_budget", budget_ms, ms, int(status))
+                        "over_budget", budget_ms, ms, code)
 
     where = f"within the {budget_ms:.0f} ms budget" if budget_ms is not None else "answered"
     return _verdict(PASS, f"HTTP {status} in {ms:.1f} ms, {where}",
-                    "within_budget", budget_ms, ms, int(status))
+                    "within_budget", budget_ms, ms, code)
 
 
 def _verdict(verdict: str, reason: str, reason_class: str,
@@ -241,7 +265,14 @@ def summarise(name: str, samples: Sequence[dict], budget_ms: float | None,
     graded = [classify(s, s.get("budget_ms", budget_ms)) for s in samples]
     events = fold_events(samples, nominal_interval_s, gap_factor) if nominal_interval_s > 0 else []
 
-    measured = [g for g in graded if g["reason_class"] != "unreachable"]
+    # Only a sample that reached a verdict other than NOT_MEASURED counts as
+    # measured. Excluding "unreachable" alone counted a sample that ANSWERED
+    # but whose latency was never recorded (no_timing) as measured, so a
+    # one-sample window became PASS with p50/max null and the reason line read
+    # "1/1 answered within budget" -- a green with no latency anywhere in it.
+    # validate_verdict() already states the contract restored here: a
+    # not_measured check carries n_measured == 0, and a PASS carries >= 1.
+    measured = [g for g in graded if g["verdict"] != NOT_MEASURED]
     lats = [g["ms"] for g in measured if g["ms"] is not None]
 
     check: dict[str, Any] = {
@@ -281,9 +312,18 @@ def summarise(name: str, samples: Sequence[dict], budget_ms: float | None,
         check["reason"] = f"not measured: no {name} samples in the {window} window"
         check["reason_class"] = "no_population"
     elif not measured:
-        check["reason"] = (f"not measured: {n} {name} attempt(s) in the {window} window, "
-                           f"0 of them reached the endpoint")
-        check["reason_class"] = "all_unreachable"
+        # Nothing was measured, but the reason must name WHY: an endpoint that
+        # never answered and an endpoint that answered without a recorded
+        # latency are different facts about the box.
+        if all(g["reason_class"] == "unreachable" for g in graded):
+            check["reason"] = (f"not measured: {n} {name} attempt(s) in the {window} window, "
+                               f"0 of them reached the endpoint")
+            check["reason_class"] = "all_unreachable"
+        else:
+            first = graded[0]
+            check["reason"] = (f"not measured: {n} {name} attempt(s) in the {window} window "
+                               f"produced no measurement: {first['reason']}")
+            check["reason_class"] = first["reason_class"]
     elif fail_pairs:
         first = fail_pairs[0][1]
         extra = f" (+{len(fail_pairs) - 1} more)" if len(fail_pairs) > 1 else ""

@@ -139,12 +139,17 @@ describe("DiskSection", () => {
     expect(screen.getByLabelText("transcripts and chat data disk")).toBeInTheDocument();
     expect(screen.getByLabelText("ai models folder")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "transcripts, chat data & preview cache — takes effect after restart (moves the database)" })).toBeInTheDocument();
-    // Drive labels appear once per select (cache + data + model pickers).
-    expect(screen.getAllByRole("option", { name: "I: (344 GB free, NVMe)" })).toHaveLength(3);
-    expect(screen.getAllByRole("option", { name: "D: (402 GB free, SSD)" })).toHaveLength(3);
-    expect(screen.getByRole("option", { name: "Auto (biggest free space)" })).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "Auto (fastest: I:)" })).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "Auto (best fit: I:)" })).toBeInTheDocument();
+    // Drive labels appear once per select (cache + data + model pickers), and
+    // they arrive from /api/disks AFTER the labels awaited above are already in
+    // the DOM - so these lookups retry instead of assuming the fetch landed.
+    // Measured: the sync form failed the whole suite once ("Unable to find ...
+    // option ... I: (344 GB free, NVMe)") on a loaded box, while this file
+    // passes alone. The retry budget is explicit because the default is 1s.
+    expect(await screen.findAllByRole("option", { name: "I: (344 GB free, NVMe)" }, { timeout: 5000 })).toHaveLength(3);
+    expect(await screen.findAllByRole("option", { name: "D: (402 GB free, SSD)" }, { timeout: 5000 })).toHaveLength(3);
+    expect(await screen.findByRole("option", { name: "Auto (biggest free space)" }, { timeout: 5000 })).toBeInTheDocument();
+    expect(await screen.findByRole("option", { name: "Auto (fastest: I:)" }, { timeout: 5000 })).toBeInTheDocument();
+    expect(await screen.findByRole("option", { name: "Auto (best fit: I:)" }, { timeout: 5000 })).toBeInTheDocument();
   });
 
   it("selecting a model cache disk writes <drive>\\VOD.RIP-models", async () => {
@@ -176,7 +181,7 @@ describe("DiskSection", () => {
       <DiskSection settings={{ ...BASE_SETTINGS, whisper_model_cache: "Z:\\hub" }} setSettings={() => {}} />
     );
     await waitFor(() => expect(screen.getByLabelText("ai models folder")).toBeInTheDocument());
-    expect(screen.getByRole("option", { name: "Custom (Z:\\hub)" })).toBeInTheDocument();
+    expect(await screen.findByRole("option", { name: "Custom (Z:\\hub)" }, { timeout: 5000 })).toBeInTheDocument();
     expect(screen.getByLabelText("ai models folder")).toHaveValue("Z:\\hub");
   });
 
@@ -218,7 +223,7 @@ describe("DiskSection", () => {
       <DiskSection settings={{ ...BASE_SETTINGS, cache_dir: "D:\\caches" }} setSettings={() => {}} />
     );
     await waitFor(() => expect(screen.getByLabelText("heavy cache disk")).toBeInTheDocument());
-    expect(screen.getByRole("option", { name: "Custom (D:\\caches)" })).toBeInTheDocument();
+    expect(await screen.findByRole("option", { name: "Custom (D:\\caches)" }, { timeout: 5000 })).toBeInTheDocument();
     expect(screen.getByLabelText("heavy cache disk")).toHaveValue("D:\\caches");
   });
 });

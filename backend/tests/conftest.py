@@ -270,7 +270,8 @@ def _reset_preview_registry():
 def _reset_resolve_caches():
     """Hygiene for the module-level caches the extract/InnerTube/subtitle
     paths share across tests: ytdlp_hls' five _EXTRACT_* dicts,
-    youtube_innertube's _LAST_PLAYABILITY / _ORIGINAL_META_CACHE, and the
+    youtube_innertube's _LAST_PLAYABILITY / _PLAYABILITY_AT /
+    _ORIGINAL_META_CACHE, and the
     routers/subtitles LRU + single-flight table.
 
     Precedent per family: test_extract_swr_metadata.py:49-61,
@@ -312,7 +313,7 @@ def _reset_resolve_caches():
     it = sys.modules.get("services.youtube_innertube")
     if it is not None:
         meta_lock = getattr(it, "_ORIGINAL_META_LOCK", None)
-        for name in ("_LAST_PLAYABILITY", "_ORIGINAL_META_CACHE"):
+        for name in ("_LAST_PLAYABILITY", "_PLAYABILITY_AT", "_ORIGINAL_META_CACHE"):
             table = getattr(it, name, None)
             if not isinstance(table, dict):
                 _isolation_tripwire(

@@ -143,7 +143,10 @@ describe('deep sweep — age_parked is reported apart from no_transcript', () =>
     // ...and the park is added as its own fact, not folded into the 5.
     expect(summary()).toContain('3 parked');
     expect(summary()).toContain('sign in to YouTube to release them');
-  });
+    // 20s, not the 5s default: this test measures ~2s alone and crossed 5s when
+    // the whole suite ran in parallel, turning a correct render into a timeout.
+    // The assertions are unchanged - only the deadline moved.
+  }, 20_000);
 
   it('leaves the summary byte-identical when age_parked is ABSENT (older backend)', async () => {
     mockFetch({
@@ -204,7 +207,8 @@ describe('deep sweep — age_parked is reported apart from no_transcript', () =>
       expect(summary()).toBe('No transcript matches in 4 scanned videos');
       unmount();
     }
-  });
+    // Two full sweeps in one test; same 5s-vs-parallel-load story as above.
+  }, 20_000);
 
   it('is translated in pt-BR and es', async () => {
     // Render and sweep in English (the placeholder is a translated string, so

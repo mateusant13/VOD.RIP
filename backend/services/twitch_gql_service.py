@@ -404,7 +404,7 @@ def _parse_hls_master_variants(master_url: str, master_text: str) -> List[Dict[s
     return out
 
 
-def _get_vod_meta_sync(vod_id: str) -> dict:
+def _get_vod_meta_sync(vod_id: str, token_refused: bool = True) -> dict:
     """Fetch video metadata needed for cloudfront CDN bypass.
 
     Twitch answers this inline (non-persisted) query even for sub-only VODs.
@@ -416,7 +416,29 @@ def _get_vod_meta_sync(vod_id: str) -> dict:
     )
     video = (data or {}).get("video") or {}
     if not video.get("seekPreviewsURL"):
-        raise RuntimeError(f"VOD {vod_id} has no seekPreviewsURL")
+        if not token_refused:
+            # The caller DID get a playback token from Twitch (Usher merely
+            # failed to answer), so this id is not proven dead - only its CDN
+            # path is missing. Stay non-terminal so the caller can fall back
+            # to yt-dlp. Reviewer finding 2026-10-11 (gpt): a missing
+            # seekPreviewsURL alone is not proof of an unplayable VOD; it is
+            # proof only when Twitch also refused the playback token.
+            raise RuntimeError(f"VOD {vod_id} has no seekPreviewsURL")
+        # Twitch ANSWERED this query and reports no CDN path for the id, AND
+        # refused to issue a playback token (this function is only reached
+        # when `sig`/`token` were absent, or after Usher rejected the
+        # playlist): the VOD is removed, expired, or has no playable source.
+        # That is terminal, not transient. A bare RuntimeError here made the
+        # preview path fall through to a yt-dlp extract that reproduced the
+        # same verdict ~19s later as an HTTP 500 (measured 2026-10-11 on VOD
+        # 2883275549: token signature absent, no seekPreviewsURL, then
+        # "[twitch:vod] ... does not exist", and the client retried the 500
+        # twice more). TwitchVodUnavailable is the type the transcribe lane
+        # already treats as terminal, so the preview lane now agrees with it.
+        raise TwitchVodUnavailable(
+            f"Twitch VOD {vod_id} is unavailable — Twitch reports no playable "
+            "source for it (removed, expired, or sub-only)"
+        )
     return video
 
 
@@ -557,7 +579,7 @@ def get_vod_playback_sync(url_or_id: str) -> Tuple[str, dict, List[Dict[str, Any
             logger.info("Usher fetch failed for %s — trying cloudfront bypass", vid)
 
     logger.info("Trying cloudfront CDN bypass for VOD %s", vid)
-    video_data = _get_vod_meta_sync(vid)
+    video_data = _get_vod_meta_sync(vid, token_refused=not bool(sig and token))
     cf_variants = _resolve_cloudfront_variants(vid, video_data)
     if not cf_variants:
         raise RuntimeError(f"No playable variants for VOD {vid}")

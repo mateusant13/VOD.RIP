@@ -135,7 +135,7 @@ import { useInstantPreview } from './hooks/useInstantPreview';
 import { refreshInstantPreviews } from './instantPreview';
 import { useDirectMSEPlayer } from './hooks/useDirectMSEPlayer';
 import { youtubeIframeCommand, youtubeIframeListen } from './youtubeEmbed';
-import { previewRetryAfterError, previewRetryMode, type PreviewRetryStage, type PreviewRetryState } from './previewRetry';
+import { previewRetryAfterError, previewRetryMode, previewDeadlineVerdict, type PreviewRetryStage, type PreviewRetryState } from './previewRetry';
 import { PreviewStartTimeout } from './previewStartTimeout';
 import FrameToggle from './components/FrameToggle';
 import FrameOverlay from './components/FrameOverlay';
@@ -1774,7 +1774,10 @@ export default function App() {
         if (armedGen !== previewGenRef.current) return false;
         previewStartedRef.current = false;
         previewLoadedUrlRef.current = null;
-        setError(t('Preview took too long — try again'));
+        // The guard fires because the 'Starting' phase NEVER produced output,
+        // so the deadline was spent before first output in both stages.
+        const deadline = previewDeadlineVerdict({ stage, firstOutputArrived: false });
+        setError(t(deadline.messageKey));
         markPreviewError(url, stage);
         destroyPreviewPlayer();
         setPreviewOpen(false);
@@ -1999,7 +2002,8 @@ export default function App() {
           // the retry UI (session-stage: a fresh create re-muxes) instead of
           // attaching to an empty playlist and spinning until the guard.
           timing.mark('wait_mux_timeout');
-          throw new Error(t('Preview took too long — try again'));
+          const deadline = previewDeadlineVerdict({ stage: 'session', firstOutputArrived: false });
+          throw new Error(t(deadline.messageKey));
         }
         timing.mark('mux_ready');
       } else if (youtubePreview && (res.trim_timeline || !res.segment_buffer_ready)) {
@@ -2024,7 +2028,14 @@ export default function App() {
       previewStartedRef.current = false;
       previewLoadedUrlRef.current = null;
       const aborted = err instanceof DOMException && err.name === 'AbortError';
-      setError(aborted ? t('Preview took too long — try again') : (err.message || t('Preview failed')));
+      // A cut-short create is a deadline spent before first output; which side of
+      // the first-output line it landed on decides the wording, so the KEY comes
+      // from the table and no branch on a message is written here.
+      const deadline = previewDeadlineVerdict({
+        stage: guard.createResolved ? 'playback' : 'session',
+        firstOutputArrived: false,
+      });
+      setError(aborted ? t(deadline.messageKey) : (err.message || t('Preview failed')));
       markPreviewError(trimmedUrl, aborted ? (guard.createResolved ? 'playback' : 'session') : 'session');
       setPreviewOpen(false);
       setPreviewVideoLoading(false);

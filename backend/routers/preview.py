@@ -54,7 +54,7 @@ from services.preview_service import (
     _window_hls_seg0_ready,
 )
 
-from services.youtube_diag import youtube_http_status, youtube_user_message
+from services.youtube_diag import youtube_error_response, youtube_user_message
 from services.ytdlp_service import detect_platform
 from services.preview_timing import log_preview_timing
 from services import archive_db, queue_policy
@@ -79,11 +79,11 @@ _PANEL_HARD_TIMEOUT_SEC = max(
 )
 
 
-def _preview_user_message(exc: Exception) -> str:
+def _preview_user_message(exc: Exception, url=None) -> str:
     msg = str(exc)
     # Only wrap through YouTube diagnostics if it looks like a YouTube error
     if any(kw in msg.lower() for kw in ['youtu', 'innertube', 'player response', 'video id', 'sign in', 'age-gate']):
-        return youtube_user_message(exc, preview=True)
+        return youtube_user_message(exc, preview=True, url=url)
     return msg
 
 
@@ -511,6 +511,26 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
             preview_url = canonical_kick_clip_url(preview_url)
     except ValueError:
         pass
+    # Twitch clips are a DIFFERENT resource (clips.twitch.tv/<slug>), not a VOD
+    # id: before this guard the URL drained into the Twitch VOD chain and
+    # answered 500 "Preview failed - try again." after 8,034 ms (measured
+    # 2026-10-11 against the live API with a real clip URL shape). Kick clips
+    # keep their own canonicalization above. Fast 400 with the alternative.
+    try:
+        from services.ytdlp_download import is_clip_url
+        from services.ytdlp_service import detect_platform as _detect_platform
+        if is_clip_url(preview_url) and _detect_platform(preview_url) == "Twitch":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Twitch clips are not supported for preview - open the VOD "
+                    "(twitch.tv/videos/<id>) or the channel page instead."
+                ),
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass
     # ponytail: mark the URL the user is actively previewing in a context var so
     # stale warm jobs (channel-list scroll-over, hover) yield INFO_EXECUTOR
     # workers instead of stampeding the backend.
@@ -579,14 +599,30 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
         logger.warning("preview session rejected url=%s: %s", preview_url[:100], e)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        status = youtube_http_status(e)
-        logger.warning("preview session rejected url=%s status=%d msg=%s", preview_url[:100], status, _preview_user_message(e))
+        # A Twitch VOD that Twitch itself reports as having no playable source
+        # is TERMINAL, and must not be dressed as "try again": the client
+        # retries that wording twice, so a dead VOD cost 3 POSTs x ~13-19s
+        # before the spinner stopped (measured 2026-10-11, VOD 2883275549).
+        # 404 plus the explicit message also matches the client permanent-
+        # failure regex, which is what makes the retry stop.
+        from services.twitch_gql_service import TwitchVodUnavailable
+        if isinstance(e, TwitchVodUnavailable):
+            logger.warning(
+                "preview session rejected url=%s status=404 msg=%s",
+                preview_url[:100], e,
+            )
+            raise HTTPException(status_code=404, detail=str(e))
+        # One structured-playability lookup for both the status and the message,
+        # so a probe landing between two lookups cannot pair a 404 with "try
+        # again" (or a 503 with "This video is unavailable.").
+        status, message = youtube_error_response(e, preview=True, url=preview_url)
+        logger.warning("preview session rejected url=%s status=%d msg=%s", preview_url[:100], status, message)
         headers = {}
         if status == 503:
             # Gap 1: transient YouTube gate — the 30s negative cache makes an
             # immediate retry cheap; tell the client when to come back.
             headers["Retry-After"] = "30"
-        raise HTTPException(status_code=status, detail=_preview_user_message(e), headers=headers)
+        raise HTTPException(status_code=status, detail=message, headers=headers)
 
 
 @router.post("/api/preview/live")

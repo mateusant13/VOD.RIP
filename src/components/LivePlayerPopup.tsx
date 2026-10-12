@@ -51,7 +51,7 @@ import {
 import LiveChatPanel, { LIVE_CHAT_PANEL_W } from './LiveChatPanel';
 import TwitchLogoIcon from './TwitchLogoIcon';
 import TwitchClipPopup from './TwitchClipPopup';
-import { previewRetryAfterError, type PreviewRetryState } from '../previewRetry';
+import { previewRetryAfterError, previewDeadlineVerdict, type PreviewRetryState } from '../previewRetry';
 import { attachPreviewBufferingListeners, type PreviewBufferingHandle } from '../previewPlayerUtils';
 import { noteUserUnpause, pauseOtherPreviews, registerPreviewPlayback } from '../previewPlaybackBus';
 import { nextLiveEntry } from '../liveEntryFallback';
@@ -1575,7 +1575,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
           }
           if (!res) {
             if (tryAdvanceEntry()) return;
-            setError(t('No response from server'));
+            // Live create never answered: the deadline was spent before first
+            // output, session stage. The wording comes from the table.
+            const deadline = previewDeadlineVerdict({ stage: 'session', firstOutputArrived: false });
+            setError(t(deadline.messageKey));
             setLoading(false);
             markPreviewError();
             return;
@@ -1619,7 +1622,10 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       }
       if (!res) {
         if (tryAdvanceEntry()) return;
-        setError(t('No response from server'));
+        // Same stall as the live create loop: no response, session stage, spent
+        // before first output. Identical text through the same table.
+        const deadline = previewDeadlineVerdict({ stage: 'session', firstOutputArrived: false });
+        setError(t(deadline.messageKey));
         setLoading(false);
         markPreviewError();
         return;

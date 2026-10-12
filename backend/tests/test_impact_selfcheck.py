@@ -25,6 +25,7 @@ skipped and never touch backend/.impact-cache.json.
 """
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import shutil
@@ -37,13 +38,25 @@ import pytest
 
 from tests.impact_plugin import _find_repo_root, closure_info, should_skip
 
-os.environ["VODRIP_IMPACT_CACHE"] = str(
-    Path(tempfile.mkdtemp(prefix="impact-selfcheck-")) / "cache.json")
-
 _ROOT = _find_repo_root()
 _BACKEND = _ROOT / "backend"
 _SCRATCH = _BACKEND / "tests" / "_impact_scratch"
 _SELF = Path(__file__).resolve()
+
+# The cache must NOT live in the system temp root. conftest._SCRATCH_PREFIXES
+# lists "impact-selfcheck-" and EVERY pytest session teardown calls
+# _wipe_vodrip_scratch(min_age_s=0.0) on the temp root - so a nested pytest run
+# (this suite spawns them) reaped this module LIVE cache between its import and
+# the first seed write: FileNotFoundError on G:\Temp\impact-selfcheck-*\cache.json
+# in gate run 8, 2026-10-11. Proven with the real reaper on a private root:
+#   ScratchReap(removed=("impact-selfcheck-probe",)) on a one-second-old dir.
+# The repo-local scratch tree is not scanned by any reaper, and the session
+# fixture that owns it removes the whole tree after the module runs.
+_SCRATCH.mkdir(parents=True, exist_ok=True)
+_IMPACT_CACHE_DIR = Path(
+    tempfile.mkdtemp(prefix="impact-selfcheck-", dir=_SCRATCH))
+os.environ["VODRIP_IMPACT_CACHE"] = str(_IMPACT_CACHE_DIR / "cache.json")
+atexit.register(shutil.rmtree, _IMPACT_CACHE_DIR, ignore_errors=True)
 
 _FILES = {
     "seed_clean.py": (
@@ -184,3 +197,19 @@ def test_broken_git_degrades_to_noop():
     assert r.returncode == 0, r.stdout + r.stderr
     assert "impact:" not in r.stdout, r.stdout
     assert "3 passed" in r.stdout, r.stdout
+
+
+def test_live_impact_cache_is_outside_the_reaped_temp_root():
+    """The live cache must survive any pytest session teardown. conftest wipes
+    every _SCRATCH_PREFIXES dir in the system temp root at teardown with
+    min_age_s=0.0, and this suite spawns nested pytest sessions - so a cache in
+    that root is deleted mid-suite (gate run 8, 2026-10-11: FileNotFoundError on
+    G:\Temp\impact-selfcheck-*\cache.json between this import and the first
+    seed write). Measured with the real reaper on a private root:
+    ScratchReap(removed=('impact-selfcheck-probe',)) on a one-second-old dir.
+    """
+    cache_path = Path(os.environ["VODRIP_IMPACT_CACHE"]).resolve()
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    assert temp_root not in cache_path.parents, (
+        f"the live impact cache {cache_path} is inside the reaped temp root "
+        f"{temp_root} - any nested pytest session deletes it mid-suite")

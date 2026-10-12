@@ -520,3 +520,39 @@ def test_prime_prefers_a_measured_rate_over_a_raw_count(monkeypatch):
     # 8.0 rpm x 0.7 = 5.6, which is above the 4.0 floor.
     assert applied == {"twitch": 5.6}, applied
 
+
+
+# --- a refusal must not deepen the deficit it was refused for ----------------
+# Live 2026-10-11: the youtube AUTO pool reached -5,925 tokens because every
+# refused acquire still deducted one, so the deficit grew faster than the
+# 14/min refill could clear it and every background job was refused forever
+# (67 refusals for ONE video id). A token bucket cannot go negative: the
+# refill alone decides when the pool reopens.
+
+
+def test_refused_acquire_does_not_consume_a_token(clock):
+    cap = float(rate_budget.platform_status("kick")["auto"]["capacity"])
+    for _ in range(int(cap) + 2):
+        rate_budget.acquire("kick", "auto")
+    drained = rate_budget.acquire("kick", "auto")
+    assert not drained.allowed
+    # Decision.tokens is the RAW pool value; platform_status() clamps at 0.0,
+    # so the clamped display cannot be used to prove this.
+    assert drained.tokens >= 0.0, f"drained pool went negative: {drained.tokens}"
+    for i in range(50):
+        d = rate_budget.acquire("kick", "auto")
+        assert not d.allowed
+        assert d.tokens >= 0.0, f"refusal {i} deepened the deficit: {d.tokens}"
+    assert rate_budget.acquire("kick", "auto").tokens == pytest.approx(drained.tokens)
+
+
+def test_drained_pool_reopens_after_one_token_of_refill(clock):
+    """The deficit is bounded, so the wait the governor advertises is honest."""
+    cap = float(rate_budget.platform_status("kick")["auto"]["capacity"])
+    for _ in range(int(cap) + 2):
+        rate_budget.acquire("kick", "auto")
+    refused = rate_budget.acquire("kick", "auto")
+    assert not refused.allowed and refused.wait_s > 0.0
+    clock.advance(refused.wait_s + 0.05)
+    assert rate_budget.acquire("kick", "auto").allowed, "the pool never reopened"
+

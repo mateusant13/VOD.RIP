@@ -141,10 +141,15 @@ describe('PreviewChatPanel — age-gated caption park', () => {
         onOpenCookieBridge={onOpenCookieBridge}
       />,
     );
-    await waitFor(() => {
-      expect(screen.getByRole('button', { name: /open cookie bridge/i })).toBeTruthy();
-    });
-    screen.getByRole('button', { name: /open cookie bridge/i }).click();
+    // findByRole retries for a full 5s instead of one 1s waitFor pass: this test
+    // measures ~0.9s alone, so the button appeared just inside the old budget
+    // and outside it when the whole suite ran in parallel.
+    const bridge = await screen.findByRole(
+      'button',
+      { name: /open cookie bridge/i },
+      { timeout: 5000 },
+    );
+    bridge.click();
     expect(onOpenCookieBridge).toHaveBeenCalledTimes(1);
   });
 

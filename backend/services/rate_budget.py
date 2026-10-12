@@ -595,15 +595,26 @@ def acquire(platform: str, source: Source = "auto", *, kind: Optional[str] = Non
             st.window_start = now
         st.requests_since_event += 1
 
+        # Draw the token ONLY when the request is admitted. Deducting first and
+        # testing the sign afterwards let every REFUSAL deepen the hole it was
+        # refused for: measured live 2026-10-11, the youtube auto pool sat at
+        # -5,925 tokens (ceiling 20 rpm, auto refill 14/min) while the six most
+        # recent decisions each subtracted one more — a deficit no wait could
+        # clear, so every background job was refused forever and each refusal
+        # bought a token it never spent. A token bucket cannot go negative; the
+        # refill alone decides when the pool reopens. The admitted path is
+        # unchanged: exactly one token per admitted request.
         if src == "user":
-            st.user_tokens -= 1.0
-            allowed = st.user_tokens >= 0
+            allowed = st.user_tokens >= 1.0
+            if allowed:
+                st.user_tokens -= 1.0
             tokens = st.user_tokens
             reason = "ok" if allowed else "user_exhausted"
             wait_s = 0.0 if allowed else _seconds_for_one_token(st.ceiling_rpm)
         else:
-            st.auto_tokens -= 1.0
-            allowed = st.auto_tokens >= 0
+            allowed = st.auto_tokens >= 1.0
+            if allowed:
+                st.auto_tokens -= 1.0
             tokens = st.auto_tokens
             reason = "ok" if allowed else "auto_exhausted"
             wait_s = 0.0 if allowed else _seconds_for_one_token(st.ceiling_rpm * AUTO_SHARE)

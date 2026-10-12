@@ -86,7 +86,7 @@ import { resolveVideoThumbnail, isSyntheticArchiveId } from './channelUtils';
 import { channelVodSubline } from './channelUtils';
 import { platformPreviewCtrlBtn, platformCardShadow, type PlatformStyleKey } from './platformStyles';
 import { platformAccentColor } from './platformColors';
-import { previewRetryAfterError, previewRetryMode, type PreviewRetryStage, type PreviewRetryState } from './previewRetry';
+import { previewRetryAfterError, previewRetryMode, previewDeadlineVerdict, type PreviewRetryStage, type PreviewRetryState } from './previewRetry';
 
 function explorePlatformKey(raw: string): PlatformStyleKey {
   const p = raw.toLowerCase();
@@ -631,7 +631,10 @@ export default function ChannelExplorePopup({
     const guard = new PreviewStartTimeout(vod.url, {
       onTimeout: (_url, stage) => {
         if (armedGen !== sessionRetryTick) return false;
-        setError(t('Preview took too long — try again'));
+        // Same guard as App.tsx: the 'Starting' phase never reached canplay, so
+        // the deadline was spent before first output in both stages.
+        const deadline = previewDeadlineVerdict({ stage, firstOutputArrived: false });
+        setError(t(deadline.messageKey));
         markPreviewError(stage);
         hlsRef.current?.destroy();
         hlsRef.current = null;

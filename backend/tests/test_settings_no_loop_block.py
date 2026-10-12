@@ -40,6 +40,49 @@ BUSY_TIMEOUT_S = 10.0
 # Contract: supervisors must see an endpoint answer in well under 100ms while
 # a save is stuck behind the lock.
 LIVE_BUDGET_S = 0.1
+# How many times the warm-up may retry an endpoint that is still paying a cold
+# cost. Bounded, so a genuinely slow idle endpoint fails the warm-up by name.
+_WARM_ATTEMPTS = 6
+# The warm-up always takes at least this many samples, even after one lands
+# inside budget. A baseline of ONE fast call is a lottery: 226ms on one day and
+# 1277ms on another, and the derived budget inherits whichever we happened to
+# catch. The baseline is the worst of >=5 IDLE round-trips instead.
+_WARM_MIN_SAMPLES = 5
+# /api/asr/runtime is a pure filesystem stat of the models path: its handler
+# runs in a worker thread, so its round-trip measures the DISK and the EXECUTOR,
+# never the loop. Measured with the endpoint warmed: 226ms for one probe while
+# the save spun (and ~1030ms cold, per the note above). Gate run 5 measured the
+# gap that makes a fixed budget the wrong instrument: while the save spun, the
+# loop-bound endpoints peaked at 27.9ms and /api/asr/runtime at 1277ms. A
+# blocked loop delays EVERY request, so a 45x gap on ONE endpoint is a worker
+# delay, not a wedge - and the fixed budget blamed the loop for it. This number
+# is now only the WARM-UP target (what "warmed" means for the retry below).
+_ENDPOINT_BUDGET_S = {"/api/asr/runtime": 1.0}
+
+# Endpoints whose handler runs in a worker thread. They are graded against their
+# own worst IDLE round-trip (times _BASELINE_MULTIPLE, with a floor so a fast
+# baseline cannot make the budget unmeetable) instead of against the fixed
+# loop contract. Everything else keeps the fixed 100ms budget.
+_EXECUTOR_ENDPOINTS = ("/api/asr/runtime",)
+_BASELINE_MULTIPLE = 4.0
+_BASELINE_FLOOR_S = 0.25
+
+# When an endpoint is THIS slow while IDLE, its liveness cannot be measured at
+# all and the warm-up fails by name instead of pretending. It is deliberately
+# far above the graded budgets: the warm-up failing on a merely slow endpoint
+# would be a disk assertion wearing a liveness label (measured: /api/asr/runtime
+# took 1277ms while IDLE right after a mutation run, and 226ms an hour earlier).
+_IDLE_UNUSABLE_S = {"/api/asr/runtime": 5.0}
+
+# The assertion that actually deserves the name "the event loop was blocked": a
+# coroutine re-arms itself on the loop every _LOOP_BEAT_S and records how LATE it
+# wakes. A frozen loop is late by the freeze; a worker-thread delay is not.
+_LOOP_BEAT_S = 0.02
+_LOOP_STALL_BUDGET_S = 0.25
+# How long the beat is allowed to take its FINAL wake after the save returns.
+# Generous on purpose: a 20ms timer that cannot get a slot for 10s is a wedge by
+# itself, while 10s of headroom cannot be reached by an ordinary loaded box.
+_BEAT_DRAIN_TIMEOUT_S = 10.0
 # The probe URLs rotate one-per-sample so a single run covers every distinct
 # offload shape the app uses; adding an endpoint here is how its liveness gets
 # pinned.
@@ -167,15 +210,65 @@ async def test_liveness_endpoints_stay_live_during_busy_settings_save(client):
     # 2-28ms in the same run: the request was slow IN A WORKER THREAD, the loop
     # was fine. Timing those cold calls against a 100ms budget would assert on
     # disk warmth, not liveness. Everything measured below is steady-state.
+    # ...so warm each endpoint until it answers INSIDE the budget, not merely
+    # once. One warm call does not keep the models path warm for the 10s that
+    # follow: measured in a 13-minute parallel run, /api/asr/runtime still cost
+    # 1273ms after its single warm call, and the failure blamed the event loop
+    # for a cold drive. The retry is bounded, so an endpoint that is slow while
+    # IDLE fails HERE, by name, instead of being reported as a blocked loop.
+    idle_worst: dict[str, float] = {}
     for url in _PROBE_URLS:
-        warm = await client.get(url)
-        assert warm.status_code == 200, url
+        attempts: list[float] = []
+        for _attempt in range(_WARM_ATTEMPTS):
+            t_warm = time.perf_counter()
+            warm = await client.get(url)
+            assert warm.status_code == 200, url
+            attempts.append(time.perf_counter() - t_warm)
+            if (len(attempts) >= _WARM_MIN_SAMPLES
+                    and attempts[-1] < _ENDPOINT_BUDGET_S.get(url, LIVE_BUDGET_S)):
+                break
+        else:
+            worst_idle = max(attempts)
+            unusable = _IDLE_UNUSABLE_S.get(url, 1.0)
+            assert worst_idle < unusable, (
+                f"{url} answered in {worst_idle:.3f}s while IDLE (unusable above "
+                f"{unusable * 1000:.0f}ms) — the endpoint is slow with no lock "
+                "held, so the liveness assertion below cannot mean anything"
+            )
+        # The worst IDLE round-trip is this endpoint's own baseline. The
+        # during-save budget below is derived from it, so "slower than idle" is
+        # measured against the endpoint rather than against a number chosen for
+        # it on another day, on another disk, with another game running.
+        idle_worst[url] = max(attempts)
 
     with _ExclusiveHolder(db_path):
         per_url: dict[str, list[float]] = {u: [] for u in _PROBE_URLS}
         poller_errors: list[BaseException] = []
         stop = threading.Event()
         index = itertools.count()
+        loop_delays: list[float] = []
+        beat_marks: list[float] = []
+
+        async def _loop_beat() -> None:
+            # A beat that re-arms itself ON the loop and records how LATE it
+            # wakes. This - not a request round-trip - is the loop's own
+            # responsiveness: a request can be slow in a worker thread while
+            # the loop is perfectly free (measured: 1277ms on /api/asr/runtime
+            # with the loop answering /api/health in 28ms in the same window).
+            while True:
+                t0 = time.perf_counter()
+                await asyncio.sleep(_LOOP_BEAT_S)
+                now = time.perf_counter()
+                loop_delays.append(max(0.0, now - t0 - _LOOP_BEAT_S))
+                beat_marks.append(now)
+                if stop.is_set():
+                    # One final wake AFTER the spin. Cancelling the beat in the
+                    # finally instead would drop exactly this delay: cancellation
+                    # is delivered before an overdue sleep resumes, so a block
+                    # that ended with the save (the handler doing sync work after
+                    # its last await) would never be recorded and the test would
+                    # pass over a frozen loop. The beat exits here instead.
+                    return
 
         async def _probe_one(url: str) -> None:
             resp = await client.get(url)
@@ -218,15 +311,37 @@ async def test_liveness_endpoints_stay_live_during_busy_settings_save(client):
                 time.sleep(0.05)
         poller = threading.Thread(target=_poller, daemon=True)
         poller.start()
+        beat = asyncio.create_task(_loop_beat())
         t_post0 = time.perf_counter()
         try:
             resp = await asyncio.wait_for(
                 client.post("/api/settings", json=payload), timeout=60
             )
         finally:
+            # The SPIN is over the moment the POST returns. Measured here and
+            # not after the shutdown below: poller.join(timeout=15) can consume
+            # its whole timeout, and a 10s spin then reads as 26s (measured 2 of
+            # 4 runs) - which made "the save really spun" true for the wrong
+            # reason and inflated the window the loop beat is compared against.
+            post_elapsed = time.perf_counter() - t_post0
+            t_stop = time.perf_counter()
             stop.set()
-            poller.join(timeout=15)
-        post_elapsed = time.perf_counter() - t_post0
+            # Join the poller OFF the loop. poller.join() is synchronous, and
+            # the poller may be sitting in fut.result(timeout=60) on a coroutine
+            # that only the loop can run, so joining it from the loop deadlocks
+            # the loop for the whole timeout. Measured 2 of 4 runs: 15s of frozen
+            # loop caused by THIS test's teardown, which the beat then reported
+            # as a stall of 14,983ms - the instrument blocking the thing it
+            # measures. to_thread leaves the loop free, the pending request runs,
+            # and the thread exits in milliseconds.
+            await asyncio.to_thread(poller.join, 15)
+            poller_exit_s = time.perf_counter() - t_stop
+            beat_unfinished = False
+            try:
+                await asyncio.wait_for(beat, timeout=_BEAT_DRAIN_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                beat.cancel()
+                beat_unfinished = True
 
     # A probe that failed/raised on the poller thread must fail THIS test —
     # otherwise the exception dies as an "unhandled thread exception"
@@ -249,15 +364,75 @@ async def test_liveness_endpoints_stay_live_during_busy_settings_save(client):
     # Response shape unchanged (validation + save still work).
     body = resp.json()
     assert body["saved_channels"][0]["id"] == "locktest"
-    # 2) The contract: every concurrent probe answered fast while it spun.
-    #    Per-endpoint, so a failure names the route that blocked rather than
-    #    just "something was slow".
+    # 2) THE loop assertion. The module docstring's contract is "the loop
+    #    froze, so every endpoint queued"; this measures exactly that, and it
+    #    cannot be satisfied by a worker thread. Gate run 5 is why it exists:
+    #    the endpoint round-trips named /api/asr/runtime (1277ms) as a blocked
+    #    loop while /api/health answered in 28ms in the same window.
+    assert loop_delays, "the loop beat captured nothing"
+    assert not beat_unfinished, (
+        f"the loop beat did not get its final wake within"
+        f" {_BEAT_DRAIN_TIMEOUT_S:.0f}s of the save returning — the loop was still"
+        " blocked when the test ended"
+    )
+    worst_stall = max(loop_delays)
+    # THE loop assertion. The module docstring's contract is "the loop froze, so
+    # every endpoint queued"; this measures exactly that, and it cannot be
+    # satisfied by a worker thread. Gate run 5 is why it exists: the endpoint
+    # round-trips named /api/asr/runtime (1277ms) as a blocked loop while
+    # /api/health answered in 28ms in the same window. Checked BEFORE the
+    # coverage guard, because a stall is the verdict and coverage is only the
+    # sanity check on the instrument: a long stall makes the beat cover less of
+    # the window, so coverage would otherwise hide the real number.
+    assert worst_stall < _LOOP_STALL_BUDGET_S, (
+        f"the event loop stalled {worst_stall * 1000:.0f}ms while a WAL-busy save"
+        f" spun (budget {_LOOP_STALL_BUDGET_S * 1000:.0f}ms; spin {post_elapsed:.1f}s,"
+        f" {len(loop_delays)} beats) — the loop was blocked"
+    )
+    # A beat that died early would report no stall and pass, so show that it
+    # COVERED the window it claims to have watched. Measured: one beat per 20ms,
+    # 442 of them across a 12.5s spin. The 0.5 factor is drift margin: a box
+    # loaded enough to wake the beat every 40ms instead of every 20ms still
+    # covers half the window.
+    assert len(loop_delays) * _LOOP_BEAT_S >= post_elapsed * 0.5, (
+        f"the loop beat covered only {len(loop_delays) * _LOOP_BEAT_S:.1f}s of the"
+        f" {post_elapsed:.1f}s spin — it did not watch the window it reports on"
+        f" (beats from +{(beat_marks[0] - t_post0):.1f}s to"
+        f" +{(beat_marks[-1] - t_post0):.1f}s of the spin, worst delay"
+        f" {max(loop_delays) * 1000:.0f}ms, poller exit {poller_exit_s:.1f}s;"
+        " endpoints"
+        + "".join(f" {u}={max(v) * 1000:.0f}ms" for u, v in per_url.items() if v)
+        + ")"
+    )
+    # 3) Corroborating detail, per-endpoint so a failure names the route. The
+    #    loop-bound routes are held to the fixed contract; the executor-bound
+    #    one is held to its OWN idle baseline, because its handler does not run
+    #    on the loop and its round-trip is the disk's and the pool's.
+    # The poller must actually be gone: a thread still waiting on its last
+    # request has an UNMEASURED window, and "no slow sample" would then mean "no
+    # sample" - the shape of a check that can never fail. Before the join moved
+    # off the loop this could not even be asserted, because the join itself was
+    # what kept the thread alive.
+    assert not poller.is_alive(), (
+        f"the poller thread was still alive {poller_exit_s:.1f}s after stop - its"
+        " last request never completed, so the window is unmeasured"
+    )
     assert any(per_url.values()), "poller captured nothing"
     for url, got in per_url.items():
         assert got, f"{url} was never sampled"
-        assert max(got) < LIVE_BUDGET_S, (
+        idle = idle_worst.get(url, 0.0)
+        if url in _EXECUTOR_ENDPOINTS:
+            budget = max(idle * _BASELINE_MULTIPLE, _BASELINE_FLOOR_S)
+            why = ("its handler runs in a worker thread, so this is a worker/"
+                   "executor delay, not a blocked loop")
+        else:
+            budget = _ENDPOINT_BUDGET_S.get(url, LIVE_BUDGET_S)
+            why = ("a loop-bound route missed its contract (the loop beat above is "
+                   "the direct evidence of whether the LOOP was blocked)")
+        assert max(got) < budget, (
             f"{len(got)} probes, worst {url} round-trip {max(got)*1000:.0f}ms"
-            " while a WAL-busy save spun — the event loop was blocked"
+            f" (budget {budget*1000:.0f}ms, idle baseline {idle*1000:.0f}ms) while a"
+            f" WAL-busy save spun — {why}"
         )
 
 

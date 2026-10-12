@@ -504,6 +504,40 @@ def _get_resolved_stream_cached(key: str) -> Optional[Tuple]:
         if hit:
             _RESOLVED_STREAM_CACHE.pop(key, None)
     return None
+def _get_resolved_stream_cached_any_height(
+    prefix: str, prefer_height: int
+) -> Optional[Tuple]:
+    """Reuse a cached resolve stored under a DIFFERENT height.
+
+    ``get_vod_playback_sync`` returns the MASTER playlist plus the full variant
+    list, so ``prefer_height`` only chooses the STARTING tier - the entry is the
+    same stream for every height. Keying it per height made a quality change (or
+    a click whose preference differs from the last one) pay a full re-resolve:
+    measured 2026-10-11 on Twitch VOD 2535610650, 192 ms on the cached height vs
+    4,667 ms at another height 15 s later.
+
+    Ties prefer the lower stored height, then the higher one. Expired entries are
+    dropped here as well as in the exact lookup.
+    """
+    want = int(prefer_height or 0)
+    now = time.time()
+    best: Optional[Tuple[Tuple[int, int, int], Tuple]] = None
+    with _RESOLVED_STREAM_LOCK:
+        for key, hit in list(_RESOLVED_STREAM_CACHE.items()):
+            if not key.startswith(prefix):
+                continue
+            if not hit or (now - hit[0]) >= _RESOLVED_STREAM_TTL_SEC:
+                _RESOLVED_STREAM_CACHE.pop(key, None)
+                continue
+            try:
+                stored = int(str(key[len(prefix):]).split(":", 1)[0])
+            except ValueError:
+                continue
+            score = (abs(stored - want), 0 if stored <= want else 1, -stored)
+            if best is None or score < best[0]:
+                best = (score, hit[1])
+    return best[1] if best else None
+
 def _put_resolved_stream_cache(key: str, value: Tuple) -> None:
     with _RESOLVED_STREAM_LOCK:
         if len(_RESOLVED_STREAM_CACHE) >= _RESOLVED_STREAM_MAX:
@@ -525,6 +559,42 @@ def _get_session_snapshot(
         if hit:
             _SESSION_SNAPSHOT.pop(key, None)
     return None
+def _get_session_snapshot_closest(vid: str, height: int) -> Optional[Tuple[int, dict]]:
+    """Return ``(stored_height, snapshot)`` for *vid* at the closest live height.
+
+    A click does not have to match the warm height: the snapshot carries the whole
+    variant ladder and ``prefer_height`` only picks the STARTING tier, so a warm at
+    360 must serve a click at 720 instead of paying a fresh cold resolve. Measured
+    2026-10-11 on SrDoglol: 11 ms reuse at the matching height vs 6,342 ms on a
+    mismatch for the same already-warmed video (the client warm uses
+    ``PREVIEW_FAST_START_HEIGHT`` = 360 while the click sends its own preference, so
+    the mismatch was the normal case, not the exception).
+
+    Ties prefer the lower height (never upscale the first frame), then the higher
+    one. Expired entries are dropped here as well as in the exact lookup.
+    """
+    if not vid:
+        return None
+    want = int(height or 0)
+    now = time.time()
+    best: Optional[Tuple[Tuple[int, int, int], int, dict]] = None
+    with _SESSION_SNAPSHOT_LOCK:
+        for key in list(_SESSION_SNAPSHOT.keys()):
+            if key[0] != vid:
+                continue
+            ts, snap = _SESSION_SNAPSHOT[key]
+            if (now - ts) >= _SESSION_SNAPSHOT_TTL_SEC:
+                _SESSION_SNAPSHOT.pop(key, None)
+                continue
+            stored = int(key[1] or 0)
+            score = (abs(stored - want), 0 if stored <= want else 1, -stored)
+            if best is None or score < best[0]:
+                best = (score, stored, snap)
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
 def _put_session_snapshot(vid: str, height: int, snapshot: dict) -> None:
     """Stash session fields for click-time reuse."""
     if not vid:
@@ -852,7 +922,14 @@ def _await_youtube_warm_catchup(url: str, timeout_sec: float = 3.0) -> None:
 from concurrent.futures import ThreadPoolExecutor as _TPE
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 _FULL_WARM_EXECUTOR = _TPE(max_workers=1, thread_name_prefix="yt-full-warm")
-_ANON_PROBE_EXECUTOR = _TPE(max_workers=2, thread_name_prefix="yt-anon")
+_ANON_PROBE_EXECUTOR = _TPE(max_workers=6, thread_name_prefix="yt-anon")
+# 2 workers serialized a 3+ video burst: the 3rd anonymous probe queued past
+# _ANON_PROBE_HEAD_START_SEC, the click fell through to the yt-dlp chain, and
+# _YTDLP_EXTRACT_LOCK (2-3s per extract, held globally) serialized the rest -
+# measured 2026-10-11 on a 9-way parallel multi-platform burst: 3 concurrent
+# YouTube clicks took 6.7s / 10.8s / 11.0s while 3 Twitch VODs and 3 Kick VODs
+# answered in 1.5-1.9s. These probes are pure HTTP InnerTube calls with no lock
+# and no subprocess, so 6 workers let a burst stay on the lock-free path.
 _ANON_PROBE_HEAD_START_SEC = 2.0
 _full_warm_backoff_until = 0.0
 # Research (2026-08): YouTube's "sign in to confirm you're not a bot" check has

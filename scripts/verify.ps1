@@ -9,6 +9,7 @@
     3. vitest run
     4. the probe's own unit tests
     5. the backend pytest suite, ONLY when no other pytest is live
+    6. the law suite: every declared law run TWICE, clean and mutated red
 
   THE RULES THIS ENFORCES, each one bought with a real false green in this repo:
 
@@ -25,6 +26,11 @@
     live pytest makes the backend suite not_measured with that reason, and the
     gate does NOT fail for it.
 
+  * A law is only a law if it can fail. Each one is run twice by the law
+    runner - once clean, once with a mutation that must break it - and a law
+    whose red arm does not fail is ruled unearned, not passed. An arm that
+    declines to verdict at all is not a reproduction.
+
   * An unmeasured check is never a pass. It prints as NOT_MEASURED, it is listed
     in the verdict file, and -Strict turns it into exit 3.
 
@@ -32,10 +38,20 @@
   not_measured exits 3 instead of 0.
 
 .PARAMETER Fast
-  Skip every pytest step (probe + tsc + vitest only).
+  Skip every pytest step (probe + tsc + vitest, measured at about 56s). Only
+  pytest is skipped: a half-run gate is not a green one. The law suite is NOT
+  skipped by -Fast - it measured 13s, which is cheap enough that dropping it
+  would buy nothing and cost the only step that can catch a guard that can
+  no longer fail. Use -SkipLaws for that, and read what it costs: a skipped
+  law is a not_measured law, never a passed one.
 
 .PARAMETER SkipProbe
   Do not call the live app. The probe becomes not_measured - it is NOT a pass.
+
+.PARAMETER SkipLaws
+  Do not run the law suite. The law steps become not_measured - they are NOT
+  passes. -Fast does NOT skip it (it now runs the laws on purpose, see
+  .PARAMETER Fast); a gate half-run is not a green one.
 
 .EXAMPLE
   pwsh -NoProfile -File scripts/verify.ps1
@@ -52,19 +68,37 @@ param(
   [switch]$Strict,
   [switch]$Fast,
   [switch]$SkipProbe,
+  [switch]$SkipLaws,
   [string]$Repo = '',
   [string]$Verdict = '',
   [string]$Api = 'http://127.0.0.1:7897',
   [double]$HealthBudgetMs = 1000,
   [double]$PreviewBudgetMs = 3000,
-  [double]$WindowMinutes = 30
+  # 1 minute, not 30: the gate takes ONE fresh sample per check and then grades
+  # the window, so a 30-minute window folds in samples from PREVIOUS runs. That
+  # is measured, not theoretical - a 4282ms sample taken while this box was busy
+  # (vitest + a browser) failed a quiet run 20 minutes later, and the 1424s gap
+  # between the two runs was reported as an "unreachable window" (over the 900s
+  # floor) even though the app answered 200 throughout. The daemon keeps its own
+  # 30-minute default; the gate grades what it just measured. Pass
+  # -WindowMinutes 30 for the old behaviour.
+  [double]$WindowMinutes = 1
 )
 
 $ErrorActionPreference = 'Stop'
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$repoRoot = if ($Repo) { $Repo } else { Split-Path -Parent $here }
-$verdictFile = if ($Verdict) { $Verdict } else { Join-Path $repoRoot 'tmp\verify-verdict.json' }
+
+# Resolve the two caller-supplied paths to ABSOLUTE paths before anything reads
+# them. A relative -Verdict used to depend on the caller's CWD, so the gate could
+# write its verdict - and read node_modules - somewhere the caller never meant.
+# ($here is already absolute: it comes from MyInvocation.)
+function Resolve-AbsolutePath([string]$Path) {
+  if ([System.IO.Path]::IsPathRooted($Path)) { return [System.IO.Path]::GetFullPath($Path) }
+  return [System.IO.Path]::GetFullPath((Join-Path (Get-Location).Path $Path))
+}
+$repoRoot = if ($Repo) { Resolve-AbsolutePath $Repo } else { Split-Path -Parent $here }
+$verdictFile = if ($Verdict) { Resolve-AbsolutePath $Verdict } else { Join-Path $repoRoot 'tmp\verify-verdict.json' }
 $python = 'C:\Program Files\Python311\python.exe'
 if (-not (Test-Path $python)) {
   $python = (Get-Command python -ErrorAction SilentlyContinue).Source
@@ -132,6 +166,8 @@ $gateArgs = @(
 if ($Strict)    { $gateArgs += '--strict' }
 if ($Fast)      { $gateArgs += '--fast' }
 if ($SkipProbe) { $gateArgs += '--skip-probe' }
+# --skip-laws: the law suite becomes not_measured. Never pass a skipped law.
+if ($SkipLaws)  { $gateArgs += '--skip-laws' }
 
 & $python @gateArgs 1> $stdoutLog 2> $stderrLog
 $gateExit = $LASTEXITCODE

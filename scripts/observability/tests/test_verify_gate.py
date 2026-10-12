@@ -61,6 +61,38 @@ class TestOnePytestAtATime:
         for entry in live:
             assert "verify_gate.py" not in entry.get("cmdline", "")
             assert "verify.ps1" not in entry.get("cmdline", "")
+    def test_the_guard_sees_a_real_process_that_mentions_pytest(self):
+        """Control for the exclusion below: the query really reads live command
+        lines, so an exclusion test cannot pass by seeing nothing at all."""
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)  # pytest"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            try:
+                seen = gate.live_pytest_processes()
+            except RuntimeError as exc:  # pragma: no cover - broken host only
+                pytest.skip(f"guard query unavailable: {exc}")
+            pids = {entry["pid"] for entry in seen}
+            assert proc.pid in pids, (
+                f"the guard did not see live pid {proc.pid}, whose command line "
+                f"mentions pytest; it saw {sorted(pids)}"
+            )
+            excluded = gate.live_pytest_processes(exclude_pids={proc.pid})
+            assert proc.pid not in {entry["pid"] for entry in excluded}, (
+                "exclude_pids did not remove the gate's own child: the gate would "
+                "then skip the backend suite it just ran itself"
+            )
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_a_step_records_the_pid_it_spawned(self):
+        """The exclusion has something to exclude only if run() keeps the pid."""
+        check = gate.Check("pid_probe", [sys.executable, "-c", "print(1)"]).run(60)
+        assert check.pid is not None and check.pid > 0
+        assert check.exit_code == 0
+        assert check.detail["duration_s"] >= 0
+
 
 
 # ==========================================================================
@@ -369,18 +401,26 @@ class TestGateBites:
         as `200 in 0.0 ms`. Without this arm, a selftest that always exits 0
         proves nothing, and a gate never seen red is not a gate.
         """
-        import argparse
         import probe
 
         def lying_get(url, timeout_s):
             return {"ok": True, "status": 200, "ms": 0.0, "bytes": 0}  # the lie
 
         monkeypatch.setattr(probe, "timed_get", lying_get)
-        args = argparse.Namespace(
-            api="http://127.0.0.1:7897", archive=probe.LIVE_ARCHIVE,
-            jsonl=str(tmp_path / "l.jsonl"), verdict=str(tmp_path / "v.json"),
-            health_budget_ms=1000.0, preview_budget_ms=3000.0, window_minutes=30.0,
-            strict=False, selftest_arm=True, repo=str(tmp_path))
+        # Parsed by the probe's OWN parser and then overridden. A hand-
+        # written Namespace is a fixture that rots, and its rot surfaces as
+        # an AttributeError inside a grade rather than as a red arm.
+        args = probe.build_parser().parse_args([])
+        args.api = "http://127.0.0.1:7897"
+        args.archive = probe.LIVE_ARCHIVE
+        args.jsonl = str(tmp_path / "l.jsonl")
+        args.verdict = str(tmp_path / "v.json")
+        args.health_budget_ms = 1000.0
+        args.preview_budget_ms = 3000.0
+        args.window_minutes = 30.0
+        args.strict = False
+        args.selftest_arm = True
+        args.repo = str(tmp_path)
         assert probe._selftest_bites(args) == 9, "the selftest did not catch a fabricated 200"
 
     def test_a_budget_violation_alone_makes_the_window_fail(self):
@@ -431,3 +471,91 @@ class TestRealInputs:
         assert probe._port_from_url("http://example.com") is None
         ident = probe.serving_identity("http://example.com")
         assert ident["pid"] is None
+
+# ==========================================================================
+# 7. the probe's verdict file belongs to THIS run, not the previous one
+# ==========================================================================
+class TestAStaleVerdictIsNotThisRunAnswer:
+    """The verdict file, not the exit code, is what the gate grades the probe
+    from -- so a document left behind by an earlier run is an answer this run
+    never earned. A probe that fails to write is SILENCE, not a crash, and a
+    gate that fills silence in from disk grades the tree off a run that no
+    longer describes it.
+    """
+
+    def _repo_and_fake_probe(self, tmp_path):
+        repo = tmp_path / "repo"
+        (repo / "tmp").mkdir(parents=True)
+        here = tmp_path / "fake-observability"
+        here.mkdir()
+        # Starts, exits 0, writes nothing -- and leaves a marker so the test can
+        # tell "ran and stayed silent" from "was refused before it started".
+        (here / "probe.py").write_text(
+            "import pathlib, sys\n"
+            "pathlib.Path(__file__).with_name('probe-ran').write_text('ran', encoding='utf-8')\n"
+            "sys.exit(0)\n",
+            encoding="utf-8")
+        return repo, here
+
+    def _stale_healthy_verdict(self, verdict: Path) -> dict | None:
+        healthy = core.summarise("health", [{"check": "health", "ok": True, "status": 200,
+                                            "ms": 12.0}], 2500.0, window="a previous run")
+        assert healthy["verdict"] == core.PASS, healthy
+        core.write_verdict(verdict, core.build_verdict([healthy], {"gate": "a previous run"}))
+        return core.load_verdict(verdict)
+
+    def _probe_check(self, doc):
+        return next(c for c in doc["checks"] if c["check"] == "probe")
+
+    def test_a_healthy_verdict_from_a_previous_run_is_cleared_not_read(self, monkeypatch,
+                                                                      tmp_path, capsys):
+        repo, here = self._repo_and_fake_probe(tmp_path)
+        verdict = repo / "tmp" / "verify-verdict.json"
+        stale = self._stale_healthy_verdict(verdict)
+        # The trap is armed first: the file on disk IS a readable healthy verdict.
+        assert stale is not None and stale["verdict"] == core.PASS
+        monkeypatch.setattr(gate, "HERE", here)
+        rc = gate.main(["--repo", str(repo), "--fast", "--skip-laws",
+                        "--verdict", str(verdict)])
+        out = capsys.readouterr().out
+        assert rc == 0, out
+        assert (here / "probe-ran").exists(), "the probe must have run in this arm"
+        doc = core.load_verdict(verdict)
+        assert doc is not None
+        assert "probe.health" not in [c["check"] for c in doc["checks"]], (
+            "a previous run's check was graded as this run's answer")
+        probe_check = self._probe_check(doc)
+        assert probe_check["verdict"] == core.NOT_MEASURED
+        assert "wrote no verdict file" in probe_check["reason"]
+        assert core.validate_verdict(doc) == []
+
+    def test_a_verdict_path_that_cannot_be_cleared_refuses_the_probe(self, monkeypatch,
+                                                                    tmp_path, capsys):
+        repo, here = self._repo_and_fake_probe(tmp_path)
+        verdict = repo / "tmp" / "verify-verdict.json"
+        monkeypatch.setattr(gate, "HERE", here)
+        monkeypatch.setattr(gate, "_clear_stale_verdict",
+                            lambda p: f"cannot remove the previous verdict file {p}: denied")
+        rc = gate.main(["--repo", str(repo), "--fast", "--skip-laws",
+                        "--verdict", str(verdict)])
+        out = capsys.readouterr().out
+        assert rc == 0, out
+        assert not (here / "probe-ran").exists(), (
+            "the probe ran against a verdict path this run could not own")
+        doc = core.load_verdict(verdict)
+        assert doc is not None
+        probe_check = self._probe_check(doc)
+        assert probe_check["verdict"] == core.NOT_MEASURED
+        assert probe_check["reason_class"] == "stale_verdict_guard"
+        assert "cannot remove the previous verdict file" in probe_check["reason"]
+
+    def test_the_clear_helper_reports_a_path_it_cannot_remove(self, tmp_path):
+        # A directory is the cheapest real path unlink() refuses on both
+        # platforms, so this drives the helper rather than the filesystem.
+        target = tmp_path / "verdict-dir"
+        target.mkdir()
+        stale = gate._clear_stale_verdict(target)
+        assert stale is not None and "cannot remove the previous verdict file" in stale
+        # A path that was simply never written is not an error: most runs start clean.
+        assert gate._clear_stale_verdict(tmp_path / "never-written.json") is None
+

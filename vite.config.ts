@@ -25,6 +25,26 @@ export default defineConfig({
     environment: "jsdom",
     setupFiles: ["./src/test-setup.ts"],
     include: ["src/**/*.{test,spec}.{ts,tsx}"],
+    // The 5s vitest default is a deadline, not an assertion. On this box a
+    // 67-file run in parallel makes correct tests cross it (a 600-row render, a
+    // sweep that walks two full passes), and the failure then names a different
+    // file on every run: measured across three full runs, the failing set was
+    // {ArchiveSearchPopupAgeParked, PreviewChatPanel, PreviewChatPanelParked},
+    // then {PreviewChatPanel x2, PreviewChatPanelParked}, then
+    // {LivePlayerPopup, SettingsTab} - every one of them "Test timed out in
+    // 5000ms" or a waitFor that ran out of its 1s budget. 20s keeps a genuinely
+    // hung test a failure while removing the load-sensitivity.
+    testTimeout: 20_000,
+    hookTimeout: 20_000,
+    // This box has 20 logical processors and is SHARED: the owner plays League
+    // of Legends while the dev server runs. vitest's default is one worker per
+    // core, so a full run oversubscribes a machine already at the governor's
+    // limit - measured: three back-to-back full runs took 161-193s with
+    // environment time ballooning to 1493s (vs 403s in the gate run), and the
+    // pool gave up on its own worker ("[vitest-pool]: Timeout terminating forks
+    // worker"). Four workers keep every test running while removing the
+    // self-inflicted starvation that turned correct lookups into failures.
+    maxWorkers: 4,
   },
   server: {
     host: "localhost",

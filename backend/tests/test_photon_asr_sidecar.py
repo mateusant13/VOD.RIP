@@ -42,6 +42,18 @@ def _wait_gone(pid: int, timeout: float = 10.0) -> bool:
     return not _process_alive(pid)
 
 
+def _reap_sidecar(pid: int) -> None:
+    """Reap a sidecar a test proved survived, so a FAILING assertion cannot
+    leave an hour-long child (holding the GPU) running through the rest of the
+    suite. It uses the production killer, so the cleanup and the code under test
+    cannot disagree about what killing means.
+    """
+    if not pid:
+        return
+    photon_asr.kill_tree(pid)
+    _wait_gone(pid, timeout=5.0)
+
+
 # --- fake sidecars: the REAL protocol, without a GPU ----------------------
 
 _OK_SEGMENTS = [
@@ -170,8 +182,23 @@ def test_real_scratch_dir_is_writable():
 
 def test_real_runner_reports_missing_photon_cleanly(tmp_path):
     """The shipped runner must answer with a failure ENVELOPE, not an import
-    traceback on stderr, when the venv has no moondream. Run it under the test
-    interpreter, which has no moondream - the same shape as a broken venv."""
+    traceback on stderr, when the venv has no moondream.
+
+    The missing-moondream condition is CONSTRUCTED, not assumed. This test used
+    to run the runner under the test interpreter and rely on that interpreter
+    having no moondream; moondream is now installed here, so the runner really
+    ran and the test asserted against a real success. That made it a claim
+    about the machine, and it silently stopped testing the envelope. A shim
+    earlier on sys.path than site-packages raises ImportError for the runner's
+    own import line, so the envelope is measured on any box - with or without
+    moondream installed."""
+    shim = tmp_path / "no_moondream"
+    shim.mkdir()
+    (shim / "moondream.py").write_text(
+        "raise ImportError('no moondream in this venv (test shim)')\n",
+        encoding="utf-8")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(shim) + os.pathsep + env.get("PYTHONPATH", "")
     req = tmp_path / "req.json"
     pcm = tmp_path / "pcm.f32"
     _audio(1.0).tofile(str(pcm))
@@ -184,7 +211,7 @@ def test_real_runner_reports_missing_photon_cleanly(tmp_path):
     }), encoding="utf-8")
     proc = sp.run(
         [sys.executable, str(at.Path(photon_asr.runner_path())), str(req)],
-        capture_output=True, timeout=120, creationflags=at._NO_WINDOW,
+        capture_output=True, timeout=120, creationflags=at._NO_WINDOW, env=env,
     )
     assert proc.returncode != 0
     payload = json.loads(proc.stdout.decode("utf-8", "replace").strip())
@@ -247,6 +274,22 @@ def test_clip_count_mismatch_raises_protocol_error(monkeypatch, tmp_path):
     assert "clips for" in str(exc.value)
 
 
+def test_the_orphan_cleanup_reaps_a_real_survivor():
+    """Measured, not assumed: the finally-block that runs when the liveness
+    assertion FAILS must actually kill a live child. A cleanup helper that
+    silently does nothing would leave the suite exactly as polluted as no
+    cleanup at all, and nothing else in this file would notice.
+    """
+    proc = sp.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        assert _process_alive(proc.pid), "the fixture child is not running"
+        _reap_sidecar(proc.pid)
+        assert _wait_gone(proc.pid), "the cleanup did not reap a live child"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
 # --- THE hang: bounded in time AND actually killed ------------------------
 
 def test_hang_times_out_and_the_process_is_gone(monkeypatch, tmp_path):
@@ -260,13 +303,19 @@ def test_hang_times_out_and_the_process_is_gone(monkeypatch, tmp_path):
         )
     elapsed = time.monotonic() - t0
     pid = exc.value.pid
-    assert pid, "the timeout must report the pid it killed"
-    # Bounded in wall time...
-    assert 1.5 <= elapsed < 25.0, f"timeout did not bound the hang: {elapsed:.1f}s"
-    # ...and the process is ACTUALLY gone. This is the assertion that would
-    # fail for a timeout that only raised while leaving an orphan on the GPU.
-    assert _wait_gone(pid), f"sidecar pid {pid} survived the timeout"
-    assert not _process_alive(pid)
+    try:
+        assert pid, "the timeout must report the pid it killed"
+        # Bounded in wall time...
+        assert 1.5 <= elapsed < 25.0, f"timeout did not bound the hang: {elapsed:.1f}s"
+        # ...and the process is ACTUALLY gone. This is the assertion that would
+        # fail for a timeout that only raised while leaving an orphan on the GPU.
+        assert _wait_gone(pid), f"sidecar pid {pid} survived the timeout"
+        assert not _process_alive(pid)
+    finally:
+        # The assertion above is the one that CATCHES an orphan, so the run that
+        # finds the bug must not be the run that leaves it behind. On a green run
+        # the pid is already gone and kill_tree() is a no-op.
+        _reap_sidecar(pid)
 
 
 def test_hang_does_not_leave_scratch_behind(monkeypatch, tmp_path):

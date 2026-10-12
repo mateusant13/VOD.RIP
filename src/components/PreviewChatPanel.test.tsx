@@ -866,15 +866,21 @@ describe('PreviewChatPanel', () => {
     expect(screen.getByText('msg 500')).toBeTruthy();
     // The far head of the list is unmounted — the window truly moved.
     expect(screen.queryByText('msg 0')).toBeNull();
-  });
+    // 600 rows through jsdom is the slowest test in this file (~4s alone); the
+    // 5s default is a load-sensitive deadline, not a claim about the component.
+  }, 20_000);
 
   it('shows a note when the backend returned a bounded chat slice (chat_truncated)', async () => {
     mockPanelFetch({ ...PAYLOAD, chat_truncated: true, total_rows: 1200 });
     render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
     await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
-    expect(
-      screen.getByText('Chat history is incomplete — 4 of 1200 messages shown.'),
-    ).toBeTruthy();
+    // Retried, not asserted once: the note lands in a render pass behind the
+    // chat text, and a single getByText raced it under parallel load.
+    await waitFor(() =>
+      expect(
+        screen.getByText('Chat history is incomplete — 4 of 1200 messages shown.'),
+      ).toBeTruthy(),
+    );
     expect(document.querySelector('[data-chat-truncated]')).toBeTruthy();
   });
 

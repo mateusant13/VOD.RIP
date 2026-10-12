@@ -32,7 +32,7 @@ from services.preview.warm import (
     _warm_rate_limit_check, _record_warm_failure,
     _put_resolved_stream_cache, _get_resolved_stream_cached,
     _build_youtube_session_snapshot, _put_session_snapshot,
-    _get_session_snapshot, invalidate_session_snapshot,
+    _get_session_snapshot, _get_session_snapshot_closest, invalidate_session_snapshot,
     invalidate_resolved_stream_cache, _build_and_cache_youtube_snapshot,
     _resolve_and_cache_youtube_snapshot, _invalidate_youtube_resolve_caches,
     invalidate_youtube_preview_caches, _youtube_warm_inflight_key,
@@ -122,7 +122,9 @@ from services.preview.warm import (
     _await_youtube_warm_catchup,
     _FULL_WARM_BACKOFF_SEC,
     _get_resolved_stream_cached,
+    _get_resolved_stream_cached_any_height,
     _get_session_snapshot,
+    _get_session_snapshot_closest,
     _invalidate_youtube_resolve_caches,
     _put_resolved_stream_cache,
     _resolve_and_cache_youtube_snapshot,
@@ -839,6 +841,21 @@ class PreviewManager:
             if vid:
                 _await_youtube_warm_catchup(url, timeout_sec=3.0)
                 snap = _get_session_snapshot(vid, prefer_height)
+                if snap is None:
+                    # A snapshot built at ANY height serves this click: it carries
+                    # the whole variant ladder and prefer_height only chooses the
+                    # starting tier. Without this, the client warm (always
+                    # PREVIEW_FAST_START_HEIGHT = 360) missed every click that
+                    # asked for another height and the FIRST click paid a full
+                    # cold resolve - measured 2026-10-11 on SrDoglol: 11 ms reuse
+                    # at 360 vs 6,342 ms at 720 for the same warmed video.
+                    closest = _get_session_snapshot_closest(vid, prefer_height)
+                    if closest is not None:
+                        snap_height, snap = closest
+                        logger.info(
+                            "preview snapshot reused across heights vid=%s want=%d have=%d",
+                            vid[:11], prefer_height, snap_height,
+                        )
                 if snap:
                     session = self._reuse_youtube_snapshot(
                         url, crop_start, crop_end, prefer_height, snap, anonymous=youtube_anonymous
@@ -4415,6 +4432,20 @@ def resolve_stream_info(
         cache_key = f"twvod:{vid}:{prefer_height}" if vid else None
         if cache_key and not force_fresh:
             cached = _get_resolved_stream_cached(cache_key)
+            if cached is None and vid:
+                # Same height-key trap as the YouTube snapshot: this entry is the
+                # master playlist + the full variant ladder, so ANY stored height
+                # serves this click. Without it a quality change paid a full
+                # re-resolve - measured 2026-10-11: 192 ms cached vs 4,667 ms at
+                # another height on the same Twitch VOD 15 s later.
+                cached = _get_resolved_stream_cached_any_height(
+                    f"twvod:{vid}:", prefer_height,
+                )
+                if cached is not None:
+                    logger.info(
+                        "twitch resolve reused across heights vid=%s h=%d",
+                        vid, prefer_height,
+                    )
             if cached is not None:
                 return cached
         try:

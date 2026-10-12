@@ -651,6 +651,13 @@ def _streaming_url_formats(streaming: dict[str, Any]) -> list[dict[str, Any]]:
 # tracked. Upgrade path: per-attempt return value plumbing through
 # _race_profiles.
 _LAST_PLAYABILITY: dict[str, tuple[str, str, str]] = {}
+# When each record was written (time.monotonic), keyed the same way and evicted
+# with it. A record is only usable as evidence about a URL while it is fresh:
+# the reader (youtube_diag.structured_playability) is classifying a failure
+# that just happened, so a ten-minute-old record must not relabel a different
+# error. monotonic, not wall clock: a clock step must not make a fresh record
+# look stale.
+_PLAYABILITY_AT: dict[str, float] = {}
 
 
 def _record_playability(
@@ -670,15 +677,19 @@ def _record_playability(
     if not video_id:
         return
     if len(_LAST_PLAYABILITY) > 256:
-        _LAST_PLAYABILITY.pop(next(iter(_LAST_PLAYABILITY)), None)
+        _oldest = next(iter(_LAST_PLAYABILITY))
+        _LAST_PLAYABILITY.pop(_oldest, None)
+        _PLAYABILITY_AT.pop(_oldest, None)
     prev = _LAST_PLAYABILITY.get(video_id)
     if prev is None:
         _LAST_PLAYABILITY[video_id] = (status or "", reason or "", kind)
+        _PLAYABILITY_AT[video_id] = time.monotonic()
         return
     _prev_status, _prev_reason, prev_kind = prev
     if kind == "fatal" and prev_kind != "fatal":
         # Definitive beats soft — upgrade and carry the fatal probe's message.
         _LAST_PLAYABILITY[video_id] = (status or "", reason or "", "fatal")
+        _PLAYABILITY_AT[video_id] = time.monotonic()
     # A soft probe never downgrades a stored fatal (and equal severities keep
     # the first record — deterministic).
 
@@ -688,6 +699,35 @@ def innertube_last_playability(video_id: Optional[str]) -> tuple[str, str, str]:
     if not video_id:
         return ("", "", "")
     return _LAST_PLAYABILITY.get(video_id) or ("", "", "")
+
+
+def innertube_playability_verdict(
+    video_id: Optional[str], *, max_age_s: float = 300.0
+) -> Optional[tuple[str, str, str]]:
+    """(kind, status, reason) of a RECENT playability record, or None.
+
+    Unlike innertube_last_playability this refuses to answer when there is no
+    record, when the record is older than max_age_s, or when the kind is
+    something other than "fatal"/"retry". A caller that turns this into a
+    user-facing status code must not be handed a guess.
+
+    "kind" is the locale-independent half of the record and the reason this
+    function exists: the reason string is YouTube's own text, and a dead video
+    answers "Este video nao esta disponivel" in pt-BR, which matches no phrase
+    in the English table in services/youtube_diag.py. Measured 2026-10-11: that
+    turned a dead video into a hard HTTP 500 with a retry message.
+    """
+    if not video_id:
+        return None
+    rec = _LAST_PLAYABILITY.get(video_id)
+    if rec is None:
+        return None
+    if rec[2] not in ("fatal", "retry"):
+        return None
+    at = _PLAYABILITY_AT.get(video_id)
+    if at is None or (time.monotonic() - at) > max_age_s:
+        return None
+    return (rec[2], rec[0], rec[1])
 
 
 def _classify_http(status_code: int) -> FailureKind:

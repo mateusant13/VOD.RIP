@@ -198,3 +198,44 @@ def test_resolve_ms_surfaces_on_create(monkeypatch):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-x", "-q"]))
+
+
+def test_snapshot_is_reused_across_heights():
+    """A warm at 360 must serve a click at 720. The snapshot carries the whole
+    variant ladder, so the height key is a preference, not an identity - the
+    mismatch was the NORMAL case (client warms at PREVIEW_FAST_START_HEIGHT=360,
+    click sends its own height) and cost a full cold resolve: measured
+    2026-10-11, 11 ms reuse at 360 vs 6,342 ms at 720 for the same video.
+    """
+    import services.preview.warm as warm_mod
+
+    vid = "XACROSSHEIGHT"
+    snap = {"kind": "hls"}
+    warm_mod._put_session_snapshot(vid, 360, snap)
+    assert warm_mod._get_session_snapshot(vid, 720) is None, "exact key must miss"
+    got = warm_mod._get_session_snapshot_closest(vid, 720)
+    assert got is not None, "the warm at 360 was not offered to a 720 click"
+    stored_height, stored_snap = got
+    assert stored_height == 360 and stored_snap is snap
+    # Ties prefer the lower height so the first frame never upscales.
+    warm_mod._put_session_snapshot(vid, 720, snap)
+    assert warm_mod._get_session_snapshot_closest(vid, 540)[0] == 360
+    # A different video is never served from it.
+    assert warm_mod._get_session_snapshot_closest("OTHERVIDEOID", 720) is None
+
+
+def test_resolved_stream_cache_is_reused_across_heights():
+    """The Twitch resolve is the master playlist + full variant list, so a cached
+    entry at one height serves every other height. Keyed strictly per height, a
+    quality change re-resolved: measured 2026-10-11, 192 ms cached vs 4,667 ms at
+    another height on the same VOD 15 s later.
+    """
+    import services.preview.warm as warm_mod
+
+    value = ("https://master.example/vod.m3u8", {"User-Agent": "x"}, [{"height": 720}])
+    warm_mod._put_resolved_stream_cache("twvod:999:360", value)
+    got = warm_mod._get_resolved_stream_cached_any_height("twvod:999:", 1080)
+    assert got is not None, "a cached 360 resolve was not offered to a 1080 click"
+    assert got[0] == value[0]
+    # Another video must not be served from this cache entry.
+    assert warm_mod._get_resolved_stream_cached_any_height("twvod:123:", 1080) is None

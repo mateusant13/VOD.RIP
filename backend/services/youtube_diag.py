@@ -355,36 +355,128 @@ assert _pot_status_from_entries(
 assert _pot_sanitize("https://x/watch?v=a&pot=SECRET").endswith("pot=[REDACTED]")
 
 
-def youtube_http_status(exc: BaseException) -> int:
+PLAYABILITY_TRUST_S = 300.0
+
+# Sentinel for "the caller did not precompute a hint, so look it up from url".
+# None is a real value and means "no structured answer for this url".
+_NO_HINT: object = object()
+
+
+def structured_playability(url: Optional[str]) -> Optional[tuple[str, str]]:
+    """("unavailable"|"gate", reason) from the structured playability record.
+
+    The English substring tables below cannot see a localized failure. Measured
+    2026-10-11: YouTube answered a dead video with its pt-BR reason, which
+    matched no branch, so a dead video became HTTP 500 and "Preview failed -
+    try again." -- a hard retry for something that can never play. The innertube
+    probe that ran inside the same request had recorded (status, reason, kind)
+    for that video id, and "kind" is language-independent ("fatal" = retrying
+    cannot help), so it is the half that is safe to trust.
+
+    Only the two kinds the recorder actually writes are accepted, and every
+    field access sits inside the guard, so a malformed or future record is "no
+    structured answer" rather than an exception raised while handling another
+    one. The record is per video id and at most PLAYABILITY_TRUST_S old; it is
+    deliberately sticky across probes of the same id (a soft probe never
+    downgrades a stored fatal), so a video that failed once as fatal keeps that
+    verdict for the window even if a later probe is soft.
+    """
+    if not url:
+        return None
+    try:
+        from services import youtube_innertube as it
+
+        vid = it.extract_video_id(url)
+        rec = it.innertube_playability_verdict(vid, max_age_s=PLAYABILITY_TRUST_S)
+        if not rec:
+            return None
+        kind, _status, reason = rec
+        if kind == "fatal":
+            return ("unavailable", reason or "")
+        if kind == "retry":
+            return ("gate", reason or "")
+        return None
+    except Exception:
+        return None
+
+
+# The English substring tables, in ONE precedence order shared by both outputs.
+# They used to be walked in different orders, so a blob carrying both a
+# definitive phrase and a transient one -- which is what yt-dlp prints when it
+# tries one player client per line -- could pair HTTP 404 with "try again".
+# A tie goes to the transient branch on purpose: a wrong 404 tells the user a
+# playable video is gone forever, a wrong 503 costs one retry.
+_TRANSIENT_MARKERS = (
+    "cookie",
+    "blocked",
+    "bot",
+    "dpapi",
+    "decrypt",
+    "po_token",
+    "sign in",
+    "preview unavailable",  # soft-gate chain collapse -- transient, not 404
+)
+_CHANNEL_MEMBERSHIP_MARKERS = ("members-only content", "join this channel")
+_PRIVATE_VIDEO_MARKERS = ("private video",)
+_UNAVAILABLE_MARKERS = (
+    "video has been removed",
+    "video is not available",
+    "video is unavailable",
+    "video unavailable",
+)
+
+
+def _english_failure_class(exc: BaseException) -> Optional[str]:
+    """One failure class for one error text, or None if the tables match nothing.
+
+    One of "age_gate" | "transient" | "members" | "private" | "unavailable".
+    Both youtube_http_status and youtube_user_message map this single answer, so
+    the status and the message can no longer disagree about the same exception.
+    """
+    if is_age_gate_error(exc):
+        return "age_gate"
+    low = str(exc).lower()
+    if any(x in low for x in _TRANSIENT_MARKERS):
+        return "transient"
+    if any(x in low for x in _CHANNEL_MEMBERSHIP_MARKERS):
+        return "members"
+    if any(x in low for x in _PRIVATE_VIDEO_MARKERS):
+        return "private"
+    if any(x in low for x in _UNAVAILABLE_MARKERS):
+        return "unavailable"
+    return None
+
+
+def youtube_http_status(
+    exc: BaseException, *, url: Optional[str] = None, hint: Any = _NO_HINT
+) -> int:
     """Map a sanitized YouTube error to an HTTP status code.
 
     Returns 403 for permanent member/permission errors, 404 for unavailable
     videos, 503 for transient bot/cookie/auth issues, 500 for unknown.
+
+    `url` is an optional hint. When the English tables above match nothing, the
+    structured playability record for that URL decides. The tables are consulted
+    FIRST on purpose: a soft bot/age gate answers with the same generic
+    "Video unavailable" reason as a dead video, so a structured "fatal" must
+    never get ahead of a soft gate the text already recognised.
+
+    `hint` is the precomputed result of structured_playability(url), for callers
+    that also need the message and must not look the record up twice; the
+    default means "not precomputed".
     """
-    low = str(exc).lower()
-    if is_age_gate_error(exc):
+    kind = _english_failure_class(exc)
+    if kind == "age_gate":
         return 403  # needs a logged-in account — retrying never helps
-    if (
-        "members-only content" in low
-        or "join this channel" in low
-        or "private video" in low
-    ):
-        return 403
-    if (
-        "video has been removed" in low
-        or "video is not available" in low
-        or "video is unavailable" in low
-        or "video unavailable" in low
-    ):
-        return 404
-    if any(
-        x in low
-        for x in (
-            "cookie", "blocked", "bot", "dpapi", "decrypt", "po_token", "sign in",
-            "preview unavailable",  # soft-gate chain collapse — transient, not 404
-        )
-    ):
+    if kind == "transient":
         return 503
+    if kind in ("members", "private"):
+        return 403
+    if kind == "unavailable":
+        return 404
+    structured = structured_playability(url) if hint is _NO_HINT else hint
+    if structured is not None:
+        return 404 if structured[0] == "unavailable" else 503
     return 500
 
 
@@ -423,40 +515,71 @@ def age_gate_actionable_message(*, preview: bool = False) -> str:
     )
 
 
-def youtube_user_message(exc: BaseException, *, preview: bool = False) -> str:
-    """Sanitize YouTube errors for API/UI — never mention cookies or bot jargon."""
-    low = str(exc).lower()
+def youtube_user_message(
+    exc: BaseException,
+    *,
+    preview: bool = False,
+    url: Optional[str] = None,
+    hint: Any = _NO_HINT,
+) -> str:
+    """Sanitize YouTube errors for API/UI — never mention cookies or bot jargon.
+
+    `url` is the same optional hint as youtube_http_status: it lets a localized
+    definitive failure still say "This video is unavailable." instead of the
+    generic retry text. `hint` is the same precomputed value as in
+    youtube_http_status; pass it when one error becomes both a status and a
+    message, so the two cannot disagree about the record.
+    """
     # Definitive age gate — retrying never helps without a logged-in account;
     # the app's YouTube sign-in flow (cookie_bridge) is the only unlock.
-    if is_age_gate_error(exc):
+    kind = _english_failure_class(exc)
+    if kind == "age_gate":
         return age_gate_actionable_message(preview=preview)
-    if any(
-        x in low
-        for x in (
-            "cookie", "blocked", "bot", "dpapi", "decrypt", "po_token", "sign in",
-            "preview unavailable",  # ytdlp_hls soft-gate collapse (bot-gated box)
-        )
-    ):
+    if kind == "transient":
         return (
             "YouTube preview is temporarily restricted. Try again in a few minutes."
             if preview
             else "Could not load this YouTube video — try again in a moment."
         )
     # Definitive unplayable states — retrying will never help; say so.
-    if "members-only content" in low or "join this channel" in low:
+    if kind == "members":
         return "Members-only video — requires channel membership."
-    if "private video" in low:
+    if kind == "private":
         return "This video is private."
-    if (
-        "video has been removed" in low
-        or "video is not available" in low
-        or "video is unavailable" in low
-        or "video unavailable" in low
-    ):
+    if kind == "unavailable":
         return "This video is unavailable."
+    structured = structured_playability(url) if hint is _NO_HINT else hint
+    if structured is not None and structured[0] == "unavailable":
+        return "This video is unavailable."
+    if structured is not None and structured[0] == "gate":
+        # Localized soft gate — the same wording as the English bot/cookie
+        # table above, so a 503 never reads as a generic preview failure.
+        return (
+            "YouTube preview is temporarily restricted. Try again in a few minutes."
+            if preview
+            else "Could not load this YouTube video — try again in a moment."
+        )
     if preview:
         return "Preview failed — try again."
     return "Could not load video info — try again."
+
+
+def youtube_error_response(
+    exc: BaseException, *, preview: bool = False, url: Optional[str] = None
+) -> tuple[int, str]:
+    """(status, message) for one error, from ONE structured-playability lookup.
+
+    youtube_http_status and youtube_user_message each consult the record when
+    handed a url, so calling them separately can pair a 404 with "try again"
+    (or a 503 with "This video is unavailable.") if a probe for the same video
+    lands between the two calls. The error handler that raises the
+    HTTPException uses this instead.
+    """
+    hint = structured_playability(url)
+    return (
+        youtube_http_status(exc, hint=hint),
+        youtube_user_message(exc, preview=preview, hint=hint),
+    )
 
 
 assert "restricted" in youtube_user_message(RuntimeError("cookie database locked"), preview=True).lower()

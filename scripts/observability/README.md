@@ -1,15 +1,16 @@
 # VOD.RIP observability substrate
 
-Two tools, one command, and a set of rules that exist because this project has
-already published false greens.
+Three tools, one command, and a set of rules that exist because this project
+has already published false greens.
 
 | file | what it is |
 |---|---|
 | `probe.py` | continuous liveness + latency probe against **real** URLs and a **real** video id |
 | `probe_core.py` | the judgement layer: verdicts, budgets, restarts, gaps, percentiles. No I/O, so it is unit-testable |
-| `verify_gate.py` | the gate: probe verdict, `tsc`, `vitest`, probe tests, backend suite — with a real exit code |
+| `verify_gate.py` | the gate: probe verdict, `tsc`, `vitest`, probe tests, backend suite, law suite — with a real exit code |
 | `../verify.ps1` | the one command. PowerShell entry point; owns the one-pytest-at-a-time guard |
-| `tests/` | 69 tests, including mutation arms that prove the gate can go red |
+| `../laws/lawrunner.py` | the law suite: every law is measured twice — clean and red. A law that cannot fail is **not** a pass |
+| `tests/` | 206 tests, including mutation arms that prove the gate can go red |
 
 ## The one command
 
@@ -94,6 +95,11 @@ These are the whole point. Do not "simplify" one away.
 8. **The probe is never `pass` because it ran.** The gate reads the probe's
    *verdict file*, not its exit code, because the probe exits 0 whenever it
    managed to grade at all.
+9. **A law that cannot fail is not evidence.** Every law in `laws.vodrip.json`
+   runs twice: once clean, once with a mutation that must break it. A red arm
+   that did not reproduce makes the law `MISMATCH` — "unfalsifiable, so its
+   green is not evidence" — and an arm nobody observed is `NO_VERDICT`, never a
+   pass. `docs/laws.md` records the fold, the refusals, and the measurements.
 
 ## Rules the runner enforces, each bought with a real false green
 
@@ -131,7 +137,9 @@ automatically when a lane ends. See that plugin's `README.md` for the ledger
 python -m pytest scripts/observability/tests -q
 ```
 
-69 tests. The ones worth reading first:
+206 tests (probe core 65, laws 102, gate 39 — the laws suite is covered by
+`test_laws.py`, which is where the fold table is pinned). The ones worth
+reading first:
 
 - `test_unreachable_does_not_pollute_the_latency_distribution`
 - `test_percentile_of_an_empty_population_is_none_not_zero`

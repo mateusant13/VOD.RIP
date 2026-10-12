@@ -130,7 +130,16 @@ async function ensurePortFree(port, label) {
 
 function apiHealthy(port, timeoutMs = 2500) {
   return new Promise((resolve) => {
-    const req = http.get(`http://127.0.0.1:${port}/api/settings`, (res) => {
+    // Probe the DEDICATED liveness endpoint, never app work. /api/settings is
+    // app work: on 2026-10-11 a 9-way parallel multi-platform preview burst
+    // starved it past this 2.5s timeout for three consecutive 15s probes and
+    // this watchdog force-killed a LIVE API mid-request - six in-flight POST
+    // /api/preview/session sockets died with ECONNRESET and the app came back
+    // at 22:47:26. /api/health is answered by the 4-worker LIVENESS_EXECUTOR
+    // and exists for exactly this reason (deps.py: a burst of app work must
+    // "never queue the health probe behind app work and fake a dead app -
+    // the old watchdog-restart failure class").
+    const req = http.get(`http://127.0.0.1:${port}/api/health`, (res) => {
       resolve(res.statusCode === 200);
       res.resume();
     });
