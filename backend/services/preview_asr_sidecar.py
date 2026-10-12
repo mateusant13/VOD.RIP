@@ -133,6 +133,14 @@ class _Sidecar:
         self._pending: dict[str, "queue.Queue[dict]"] = {}
         self._reader: threading.Thread | None = None
         self._provider: str | None = None
+        # A Popen child is NOT a ready sidecar: the CUDA model load behind it
+        # takes ~5-12s and FIRST_OUTPUT_S is 4s, so handing out a child that has
+        # not finished warming is exactly the measured 502 in the owner log
+        # ("no caption row within 4.0s"). _warm_done is set only after the warm
+        # roundtrip answers ok, and _spawn_lock makes ONE thread do that work.
+        self._warm_done = False
+        self._saw_json = False  # has this child spoken protocol yet
+        self._spawn_lock = threading.Lock()
 
     # -- lifecycle ---------------------------------------------------------
     def _spawn(self) -> None:
@@ -157,6 +165,7 @@ class _Sidecar:
         with self._state_lock:
             self._proc = proc
             self._pending = {}
+            self._saw_json = False
         self._reader = threading.Thread(
             target=self._read_loop, args=(proc,), daemon=True, name="sidecar-reader")
         self._reader.start()
@@ -165,7 +174,7 @@ class _Sidecar:
         try:
             info = self._roundtrip({"op": "warm"}, rid="warm-%d" % next(_ids),
                                    first_output_s=_STARTUP_TIMEOUT_S,
-                                   total_s=_STARTUP_TIMEOUT_S)
+                                   total_s=_STARTUP_TIMEOUT_S, warming=True)
         except Exception:
             self.stop()
             raise
@@ -186,6 +195,7 @@ class _Sidecar:
     def stop(self) -> None:
         with self._state_lock:
             proc, self._proc = self._proc, None
+            self._warm_done = False
             pending, self._pending = self._pending, {}
         for q in pending.values():
             q.put({"ok": False, "outcome": "unavailable", "error": "sidecar stopped"})
@@ -233,8 +243,19 @@ class _Sidecar:
                 try:
                     msg = json.loads(line)
                 except Exception:  # noqa: BLE001
-                    logger.warning("preview ASR sidecar emitted non-JSON: %.120s", line)
+                    # Before the first protocol line this is the child's startup
+                    # chatter ("cobalt-canon: ok" - measured in the owner log);
+                    # after one it would be a real protocol break. Two different
+                    # meanings, so two different log levels.
+                    if self._saw_json:
+                        logger.warning(
+                            "preview ASR sidecar emitted non-JSON after a valid "
+                            "protocol line: %.120s", line)
+                    else:
+                        logger.debug("preview ASR sidecar startup chatter: %.120s",
+                                     line)
                     continue
+                self._saw_json = True
                 rid = str(msg.get("id") or "")
                 with self._state_lock:
                     q = self._pending.get(rid)
@@ -254,16 +275,35 @@ class _Sidecar:
                 q.put({"ok": False, "outcome": "unavailable",
                        "error": "sidecar closed its output (died?)"})
 
-    def _ensure(self) -> subprocess.Popen:
+    def _ensure(self, warming: bool = False) -> subprocess.Popen:
+        """Return a child that has FINISHED warming, spawning at most one.
+
+        ``warming=True`` is the re-entrant call made from inside _spawn's own warm
+        roundtrip: the process object already exists there, and trying to spawn
+        again from that call would deadlock the spawn lock.
+        """
         with self._state_lock:
             proc = self._proc
-        if proc is not None and proc.poll() is None:
+        if warming:
+            assert proc is not None
             return proc
-        self.stop()
-        self._spawn()
-        with self._state_lock:
-            assert self._proc is not None
-            return self._proc
+        with self._spawn_lock:
+            with self._state_lock:
+                proc = self._proc
+                warm = self._warm_done
+            if proc is not None and proc.poll() is None and warm:
+                return proc
+            # Two concurrent requests against a cold sidecar used to each spawn
+            # (owner log 13:59: pid=18524 load=12.3s AND pid=41436 load=0.0s) and
+            # the loser's stop() killed the winner's in-flight requests. Under
+            # this lock the second request waits on the SAME warm instead.
+            self.stop()
+            self._spawn()
+            with self._state_lock:
+                self._warm_done = True
+                proc = self._proc
+            assert proc is not None
+            return proc
 
     def _register(self, rid: str) -> "queue.Queue[dict]":
         q: "queue.Queue[dict]" = queue.Queue()
@@ -276,14 +316,15 @@ class _Sidecar:
             self._pending.pop(rid, None)
 
     def _roundtrip(self, payload: dict, *, rid: str, first_output_s: float,
-                   total_s: float, on_rows=None) -> dict:
+                   total_s: float, on_rows=None,
+                   warming: bool = False) -> dict:
         """One request, two ceilings, guaranteed to return.
 
         Never raises TimeoutError from a bare join: every wait is a queue read
         with its own deadline, so a wedged child cannot wedge this thread past
         ``total_s + _HARD_STOP_GRACE_S``.
         """
-        proc = self._ensure()
+        proc = self._ensure(warming=warming)
         q = self._register(rid)
         t0 = time.monotonic()
         try:

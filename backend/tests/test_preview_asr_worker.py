@@ -582,7 +582,7 @@ class FakeChildSidecar:
                 Child.killed = True
 
         Child.killed = False
-        side._ensure = lambda: Child()
+        side._ensure = lambda **kw: Child()   # warming= is passed since the warm gate
         side.writes = []
         side.child = Child
 
