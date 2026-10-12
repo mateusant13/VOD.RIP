@@ -57,6 +57,29 @@ export function frameSnapPos(rect: FrameRect, size: FrameSnapSize): FrameSnapPos
 }
 
 /**
+ * The DROP GHOST: where the window the user is holding would land in `rect`.
+ *
+ * While a drag is in flight the user is asking "what happens if I let go
+ * here?", and a highlighted cell alone answers it only for a window that
+ * exactly fills the cell. This returns the window's own size clamped into the
+ * cell's inner box and centred, so the preview shows the REAL result — a
+ * window wider than the cell is shrunk to it rather than drawn overflowing,
+ * and a window smaller than the cell is centred instead of stretched.
+ *
+ * Pure and honest about its inputs: a missing size (offsetWidth 0 on an
+ * unmeasurable window) falls back to filling the cell rather than drawing a
+ * degenerate one.
+ */
+export function frameDropGhost(rect: FrameRect, size: FrameSnapSize | null | undefined):
+  FrameSnapPos & FrameSnapSize {
+  const inner = frameSnapInnerBox(rect);
+  const w = Math.max(1, Math.min(size && size.w > 0 ? size.w : inner.w, inner.w));
+  const h = Math.max(1, Math.min(size && size.h > 0 ? size.h : inner.h, inner.h));
+  const pos = frameSnapPos(rect, { w, h });
+  return { x: pos.x, y: pos.y, w, h };
+}
+
+/**
  * Pin `el` into `rect` whenever `rect` is set (null = not snapped, the
  * caller keeps its own free-floating layout).
  *

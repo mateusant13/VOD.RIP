@@ -6,7 +6,8 @@ import {
   frameCellIndexAt,
   getFrameCellRect,
 } from '../frameLayout';
-import { EXPLORE_POPUP_Z } from '../layoutUtils';
+import { LIVE_POPUP_ACTIVE_Z } from '../layoutUtils';
+import { frameDropGhost } from '../frameSnap';
 
 /**
  * FrameOverlay — the 6-cell snap grid (dotted outlines, tmux-like).
@@ -55,6 +56,10 @@ export function FrameOverlay({
   // never fire an HTML5 dragstart. The armed window key is read straight off
   // the pointerdown target, so every window family snaps through one path.
   const pointerArmIdRef = useRef<string | null>(null);
+  // The element being dragged. The drop ghost needs its REAL size: a ghost
+  // that only lights the cell cannot show what a window narrower than the cell
+  // will look like, which is the question the user is actually asking mid-drag.
+  const pointerArmElRef = useRef<HTMLElement | null>(null);
 
   // handleDropCell (App.tsx) changes identity whenever visibleChannelVideos or
   // explorePopups churn (channel refresh, popup open/close). If it were a dep of
@@ -162,6 +167,7 @@ export function FrameOverlay({
         if (deadline != null) window.clearTimeout(deadline);
         deadline = null;
         pointerArmIdRef.current = key;
+        pointerArmElRef.current = host;
         setDragging(true);
         setHoverCell(null);
         document.body.dataset.frameDragging = '1';
@@ -184,6 +190,7 @@ export function FrameOverlay({
         const id = pointerArmIdRef.current;
         if (id === null) return;
         pointerArmIdRef.current = null;
+        pointerArmElRef.current = null;
         const idx = cellIndexAt(ev.clientX, ev.clientY);
         endDrag();
         if (idx != null) onDropCellRef.current?.(idx, encodeFrameDragPopupId(id));
@@ -200,6 +207,7 @@ export function FrameOverlay({
       return () => {
         disarm();
         pointerArmIdRef.current = null;
+        pointerArmElRef.current = null;
         document.removeEventListener('dragstart', onStart, true);
         document.removeEventListener('dragover', onDragOverAnywhere, true);
         document.removeEventListener('dragend', disarm, true);
@@ -242,7 +250,16 @@ export function FrameOverlay({
         // app underneath until a drag is actually in flight.
         pointerEvents: dragging ? 'auto' : 'none',
         opacity: dragging ? 1 : FRAME_IDLE_OVERLAY_OPACITY,
-        zIndex: dragging ? EXPLORE_POPUP_Z + 20 : 1,
+        // ABOVE every frame-capable window (EXPLORE_POPUP_Z + rank, max
+        // EXPLORE_POPUP_Z + MAX_EXPLORE_POPUPS) so the ghost is never painted
+        // under the thing the user is dragging - and BELOW MODAL_Z.
+        //
+        // This used to be EXPLORE_POPUP_Z + 20, which outranked MODAL_Z by 13:
+        // while a frame drag was in flight the grid covered the download
+        // confirm and the cookie-wait overlay (both pointer-events auto here),
+        // so their buttons could not be clicked. "Things sit on top that should
+        // not" was this line.
+        zIndex: dragging ? LIVE_POPUP_ACTIVE_Z : 1,
       }}
     >
       {cellRects.map((r, i) => (
@@ -273,6 +290,38 @@ export function FrameOverlay({
           }}
         >
           <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.4)', fontFamily: 'monospace' }}>{i + 1}</span>
+          {dragging && hoverCell === i && (() => {
+            // Ghost of the window being held, drawn at where it will LAND.
+            const el = pointerArmElRef.current;
+            const ghost = frameDropGhost(r, el ? { w: el.offsetWidth, h: el.offsetHeight } : null);
+            return (
+              <div
+                data-frame-ghost={pointerArmIdRef.current ?? ''}
+                style={{
+                  // Offsets are relative to the CELL, which is what holds it.
+                  position: 'absolute',
+                  left: ghost.x - r.x,
+                  top: ghost.y - r.y,
+                  width: ghost.w,
+                  height: ghost.h,
+                  boxSizing: 'border-box',
+                  border: '2px dashed rgba(255,255,255,0.9)',
+                  borderRadius: 6,
+                  background: 'rgba(255,255,255,0.12)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  color: 'rgba(255,255,255,0.8)',
+                  fontSize: 10,
+                  fontFamily: 'monospace',
+                  // A ghost must never eat the pointermove that keeps the drag alive.
+                  pointerEvents: 'none',
+                }}
+              >
+                {`${Math.round(ghost.w)}×${Math.round(ghost.h)}`}
+              </div>
+            );
+          })()}
         </div>
       ))}
     </div>

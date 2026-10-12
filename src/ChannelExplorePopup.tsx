@@ -76,7 +76,7 @@ import {
   type ResizeEdge,
 } from './explorePopupUtils';
 import type { FrameRect } from './frameLayout';
-import { encodeFrameDragPopupId, frameWindowKey } from './frameLayout';
+import { frameWindowKey } from './frameLayout';
 import { exploreSnapVideoWidth, useFrameSnapPin } from './frameSnap';
 import { formatHmsFull } from './utils';
 import { createFullscreenGate, FULLSCREEN_SETTLE_FALLBACK_MS, type FullscreenGate } from './utils/fullscreenGate';
@@ -1962,20 +1962,22 @@ export default function ChannelExplorePopup({
       >
         {!fullscreen && (
           <div
-            className="flex items-start justify-between gap-2 shrink-0"
-            draggable={frameMode && !fullscreen}
-            onPointerDown={frameMode && !fullscreen ? (e) => {
-              // The header is its own drag mechanism (HTML5 DnD), so it stops
-              // the body pointer drag from also firing — which means it must
-              // release the cell ITSELF. Without this a header drag of a
-              // snapped popup left it registered in frameCellContents while
-              // being dragged (stale registration, double-occupancy).
+            className="flex items-start justify-between gap-2 shrink-0 flex-wrap min-w-0"
+            // ONE drag mechanism for the whole window: the free pointer drag
+            // the body already uses. This header used to run its own HTML5
+            // drag (draggable + onDragStart), and that is why grabbing the
+            // title froze the window in place until release — Chromium shows
+            // a static drag image and only moves on drop. It also made every
+            // button inside a draggable ancestor, where a mousedown starts a
+            // drag instead of a click, which is why Close could not be
+            // clicked while docked.
+            //
+            // A header drag of a SNAPPED popup must still release the cell
+            // itself: the container's own handler does it too, but it used to
+            // be swallowed here, leaving a stale frameCellContents entry and
+            // a double-occupancy in the layout.
+            onPointerDown={frameMode && !fullscreen ? () => {
               if (frameSnapRect) onUnsnap?.();
-              e.stopPropagation();
-            } : undefined}
-            onDragStart={frameMode && !fullscreen ? (e) => {
-              e.dataTransfer.setData('text/plain', encodeFrameDragPopupId(id));
-              e.dataTransfer.effectAllowed = 'move';
             } : undefined}
           >
             <div className="min-w-0 flex items-start gap-1.5">
@@ -2040,6 +2042,7 @@ export default function ChannelExplorePopup({
               <button
                 type="button"
                 onClick={() => onClose()}
+                draggable={false}
                 className="text-zinc-500 hover:text-white p-0.5 shrink-0"
                 title={t('Close player')}
               >
@@ -2153,9 +2156,25 @@ export default function ChannelExplorePopup({
         <div
           ref={videoWrapRef}
           className={`relative bg-black overflow-hidden w-full cursor-pointer ${
-            fullscreen ? 'absolute inset-0 z-0 border-0' : 'border-2 border-zinc-700 shrink-0'
+            fullscreen
+              ? 'absolute inset-0 z-0 border-0'
+              // Snapped: the window IS the cell (fit() returns inner.w/inner.h),
+              // so the player column takes what is LEFT after the chrome and the
+              // video letterboxes inside it. `shrink-0` here kept this row at the
+              // video's intrinsic aspect height, which pushed the control bar —
+              // fullscreen and close included — out of the cell. That is the
+              // measured "buttons end up outside the div" and the reason
+              // fullscreen could not be clicked while docked: the click target
+              // was not where the case was.
+              : frameSnapRect
+                ? 'border-2 border-zinc-700 min-h-0 flex-1'
+                : 'border-2 border-zinc-700 shrink-0'
           }`}
-          style={fullscreen ? undefined : { aspectRatio: videoAspect, maxHeight: videoAspect < 1 ? '80vh' : undefined, transition: 'max-height 0.3s ease' }}
+          style={
+            fullscreen || frameSnapRect
+              ? undefined
+              : { aspectRatio: videoAspect, maxHeight: videoAspect < 1 ? '80vh' : undefined, transition: 'max-height 0.3s ease' }
+          }
           onPointerDown={frameMode && !fullscreen ? undefined : (e) => e.stopPropagation()}
           onClick={frameMode && !fullscreen ? undefined : () => {
             if (!ready) return;
