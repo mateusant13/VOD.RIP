@@ -5063,9 +5063,98 @@ def resolve_upstream(session_id: str, resource_id: Optional[str]) -> str:
     if not upstream and session.custom_master:
         _rebuild_synthetic_resource_map(session)
         upstream = session.resource_map.get(resource_id)
+    if not upstream and _is_synthetic_resource_id(resource_id):
+        # MEASURED (2026-10-12): the player was handed a master whose variant URI
+        # is a resource id from an OLD extract. The id is a sha256 prefix of the
+        # upstream URL, so every fresh extract (stale-URL recovery, the window-HLS
+        # fallback, a re-resolve on a rehydrated session) invalidates the IDs in a
+        # master the browser already fetched - and every segment then 404s
+        # "Unknown preview resource". That is the user-facing failure: the preview
+        # loads nothing, forever. A stale synthetic id is a RE-RESOLVE, not a dead
+        # player: serve the session's current variant so the segment the player
+        # asked for actually streams.
+        current = _current_variant_for_session(session, resource_id)
+        if current:
+            logger.warning(
+                "preview resource %s... is stale (master predates the current URLs); "
+                "serving the current variant instead of 404ing",
+                resource_id[:8],
+            )
+            upstream = current
     if not upstream:
         raise ValueError("Unknown preview resource")
     return upstream
+
+
+def _is_synthetic_resource_id(resource_id: str) -> bool:
+    """True for synthetic-master ids only (16 hex chars = sha256 prefix).
+
+    Window-HLS (``window-playlist``, ``window-seg-NNN``, ``init.mp4``) and replay
+    ids are named markers and must never take the stale-id path: they have their
+    own lazy re-registration above.
+    """
+    return len(resource_id) == 16 and all(c in "0123456789abcdef" for c in resource_id)
+
+
+def _current_variant_for_session(
+    session: PreviewSession, resource_id: str
+) -> Optional[str]:
+    """The current URL for the variant a STALE master still names, or None.
+
+    googlevideo URLs are signed and short-lived, so a master the browser already
+    fetched names sha256 digests of URLs from an older extract. This is the
+    self-healing half of that: same height the master advertised, current URL.
+
+    Only IDs that this session's MASTER TEXT names may be resolved - anything
+    else stays a 404 (see resolve_upstream's contract: "only IDs registered in
+    session.resource_map"). An id invented or replayed by a client must not buy
+    media, and a height the master never advertised must not be served silently.
+    """
+    master = session.custom_master or ""
+    marker = "id=%s" % resource_id
+    if resource_id not in master or marker not in master:
+        return None
+    shipped = 0
+    for line in master.splitlines():
+        if line.startswith("#EXT-X-STREAM-INF"):
+            m = _RESOLUTION_RE.search(line)
+            if m:
+                shipped = int(m.group(2))
+        elif marker in line:
+            break
+    entries = [
+        (int(h), u)
+        for h, u in (getattr(session, "variant_entries", None) or [])
+        if u
+    ]
+    if not entries:
+        return session.entry_url or None
+    if shipped:
+        for h, u in entries:
+            if h == shipped:
+                return u
+        logger.warning(
+            "preview resource %s... names height %s the session no longer offers; "
+            "serving the nearest current variant",
+            resource_id[:8],
+            shipped,
+        )
+        return min(entries, key=lambda hu: abs(hu[0] - shipped))[1]
+    prefer = int(getattr(session, "prefer_height", 0) or 0)
+    if prefer:
+        return min(entries, key=lambda hu: abs(hu[0] - prefer))[1]
+    return max(entries, key=lambda hu: hu[0])[1]
+    entries = [
+        (int(h), u)
+        for h, u in (getattr(session, "variant_entries", None) or [])
+        if u
+    ]
+    if not entries:
+        return session.entry_url or None
+    prefer = int(getattr(session, "prefer_height", 0) or 0)
+    if prefer:
+        return min(entries, key=lambda hu: abs(hu[0] - prefer))[1]
+    return max(entries, key=lambda hu: hu[0])[1]
 def get_master_playlist(session_id: str) -> str:
     session = get_session(session_id)
     if not session:

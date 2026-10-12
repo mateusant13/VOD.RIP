@@ -1474,3 +1474,71 @@ decided.** The choices:
 This is the same class of decision as `VODRIP_YT_EXECUTE_REMOTE_CHALLENGE_SOLVER`:
 a dial that trades YouTube good standing for responsiveness. It should not be
 flipped silently by an agent.
+
+## Round 2026-10-12 12:25 — the preview works; the browser never asks for it (user-POV trace, frontend → backend)
+
+**Correction first, because it matters more than the finding:** an earlier claim in this
+thread said a stale resource id 404 (`/resource?id=…`) had been reproduced as the user's
+failure. That was a **probe bug, not an app bug** — the media-playlist URIs in the master
+are already absolute paths (`/api/preview/hls/<sid>/…`) and my probe prefixed the host
+prefix a second time, so the server answered FastAPI's *no-route* body
+`{"detail":"Not Found"}` instead of the app's `Unknown preview resource`. Re-measured
+with the correct URL, the chain serves everything. The 404 claim is withdrawn.
+
+### Measured, same video the user clicked (`dQw4w9WgXcQ`), API on :7897, no browser
+
+```
+POST /api/preview/session            200  15 ms
+GET  .../master.m3u8                200  m3u8 1001 B
+GET  .../resource?id=371483f6c2bea291 200  m3u8 3084 B  (38 segments)
+GET  .../resource?id=ba8b47541b70c7  206  5,361,808 B video/mp2t   ← the first byte of video
+GET  .../resource?id=57654b616387ee  206  1,940,617 B video/mp2t
+GET  .../resource?id=b316d687ffba24  206  1,384,056 B video/mp2t
+```
+
+The window-HLS mux reaches `mux_ready` in 18–30 s and every variant's first segment
+streams. **The backend serves the user's video.** (Probe: `tmp/chain5.py`, log
+`tmp/chain5.log`; segment-path reachability also verified on Twitch: `preview_status_timings`
+cycle = ready.)
+
+### Measured, the same click in a real browser (Chrome, :5173, preview-user-latency.spec.ts)
+
+```
+1185ms  REQ POST preview/warm/batch
+1272ms  RES 200 preview/warm/batch      (12.7 s of yt-dlp)
+1689ms  REQ POST preview/warm/batch      ─ repeated TEN times, ~18.7 s each, all 200
+21525ms RES 200 previews/status
+         console: Failed to load resource: the server responded with a status of 500
+         (no POST /api/preview/session in 240 s — the test timed out before the player attached)
+```
+
+**The click never reaches preview-session creation.** The user's own log has the same
+signature — a single `POST /api/preview/warm/batch` at 11:56:51 and no session POST.
+
+### The user's `FastAPI on :7897 is not running` is a false alarm (log proof)
+
+```
+11:56:58.195  GET /api/settings/features   200
+11:57:02.983  extract ok video=7cfvItEnWGY
+```
+
+Requests were served on both sides of the user's 11:56:59 `ECONNRESET`, with no restart,
+no traceback and no shutdown in `tmp/vodrip-devall-api.log`. Only POSTs reset
+(`/api/settings`, `/api/presence`) — the signature of a busy event loop dropping idle
+**keep-alive** sockets, with vite's canned message blaming a dead server. The server was
+alive; the connection was recycled.
+
+### What this leaves, stated as hypothesis not measurement
+
+1. The click's request path is saturated by the **rail's warm flood** (sequential
+   `warm/batch`, ~19 s each) before it ever creates a session — the 61 s of unanswered
+   first `POST /api/preview/session` measured at 05:36 fits the same shape.
+2. The **AUTO vs interactive governor lane** is the owner's open question (recorded
+   earlier): measured `rate_budget: pacing yt-dlp yt_dlp_extract for 4.3s (auto pool
+   dry)` then `YtGovernorExhausted` → `http_404 POST /api/preview/session: This video
+   is unavailable`. A user's click rides the AUTO bucket behind archive backfills.
+3. The 500 and the exact hls.js fatal remain **unmeasured** — the spec timed out before
+   the player attached. That is the next measurement, not a conclusion.
+
+An unmeasured check is never a pass: the backend half is green (served bytes above), the
+frontend half is not even started, and green on one half cannot speak for the other.
