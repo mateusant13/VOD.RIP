@@ -215,6 +215,7 @@ export function startHealthMonitor({
   healthTimeoutMs = 2500,
   graceMs = 0,
   onUnhealthy,
+  onHealthy,
 }) {
   let strikes = 0;
   const startedAt = Date.now();
@@ -223,6 +224,11 @@ export function startHealthMonitor({
     const ok = await apiHealthy(port, healthTimeoutMs);
     if (ok) {
       strikes = 0;
+      try {
+        onHealthy?.();
+      } catch {
+        /* the watchdog must never throw into the interval */
+      }
       return;
     }
     strikes += 1;
@@ -460,6 +466,70 @@ function attachChildLogger(label, child) {
 
 let restartAttempts = 0;
 
+/* The API must never be left down.
+ *
+ * Measured 2026-10-12: restartAttempts was reset ONLY inside reloadApi(), so
+ * after three crashes — or three hang-kills, which arrive as an exit CODE on
+ * Windows rather than a signal — every branch fell through to shutdown(1) and
+ * the whole dev supervisor exited. The API then stayed down until a human
+ * noticed, which is the "o backend sempre cai, nunca ta on" the owner
+ * reported. A supervisor that dies because its child crashed is strictly worse
+ * than one that keeps retrying, so there is no give-up path here any more: the
+ * backoff is capped and the retry continues for as long as the supervisor
+ * lives. A crash after a minute of continuous health is a NEW incident, not a
+ * continuation of the old one, and resets the budget (see onHealthy below).
+ */
+const API_RESTART_MAX_DELAY_S = 30;
+const API_HEALTHY_RESET_MS = 60_000;
+let apiHealthySince = 0;
+
+let apiRestartScheduled = false;
+
+function scheduleApiRestart(reason) {
+  if (shuttingDown || reloading || apiRestartScheduled) return;
+  apiRestartScheduled = true;
+  restartAttempts += 1;
+  const delaySec = Math.min(API_RESTART_MAX_DELAY_S, restartAttempts * 3);
+  console.error(
+    `[dev] API ${reason} — restarting in ${delaySec}s (attempt ${restartAttempts}, never giving up)`,
+  );
+  setTimeout(() => {
+    apiRestartScheduled = false;
+    if (shuttingDown || reloading || !apiSpec) return;
+    start("api", apiSpec.command, apiSpec.args, apiSpec.cwd, apiSpec.extraEnv);
+    startApiHealthMonitor();
+  }, delaySec * 1000);
+}
+
+/* The authoritative always-on watchdog.
+ *
+ * Measured 2026-10-12: after four forced kills the supervisor correctly
+ * restarted every time, then the API died once more and NOTHING brought it
+ * back - no restart line, no exit handler, an unserved port. The two existing
+ * mechanisms both have holes: the crash/exit handler only fires for a child it
+ * is watching, and the health monitor is armed with a 300 s grace that is
+ * re-applied on every start, so it is blind for five minutes at a time and was
+ * not re-armed at all after a crash restart.
+ *
+ * This loop does not care how the API went down. Every 10 s it asks the only
+ * question that matters - does :apiPort answer? - and if not, and no restart is
+ * already pending, it schedules one. It runs for the life of the supervisor and
+ * has no grace period after boot, because a dead API is not a warm-up.
+ */
+let alwaysOnTimer = null;
+function startAlwaysOnWatchdog() {
+  if (alwaysOnTimer) return;
+  alwaysOnTimer = setInterval(async () => {
+    if (shuttingDown || reloading) return;
+    if (await apiHealthy(apiPort, 2000)) {
+      apiHealthySince = apiHealthySince || Date.now();
+      return;
+    }
+    apiHealthySince = 0;
+    scheduleApiRestart(`not answering on :${apiPort}`);
+  }, 10_000);
+}
+
 function start(label, command, args, cwd, extraEnv = {}) {
   const disableLog = process.env.VODRIP_DEVALL_DISABLE_LOG === "1";
   const stdio = disableLog ? "inherit" : ["ignore", "pipe", "pipe"];
@@ -487,40 +557,21 @@ function start(label, command, args, cwd, extraEnv = {}) {
       // POSIX: the anti-hang watchdog kills with SIGKILL → exit event has
       // signal set (Windows taskkill produces a code instead). The API must
       // still respawn, never idle dead.
-      if (label === "api" && !reloading && restartAttempts < 3) {
-        restartAttempts += 1;
-        const delaySec = restartAttempts * 3;
-        console.error(
-          `[dev] API killed by signal ${signal} — restarting in ${delaySec}s (attempt ${restartAttempts}/3)`,
-        );
-        setTimeout(() => start(label, command, args, cwd, extraEnv), delaySec * 1000);
-      } else if (label === "api") {
-        shutdown(1);
-      }
+      if (label === "api") scheduleApiRestart(`killed by signal ${signal}`);
       return;
     }
-    if (label === "api" && code === 0 && restartAttempts < 3) {
+    if (label === "api" && code === 0) {
       // Exit 0 is the "another healthy API won" race — but if nothing
       // answers :apiPort the API vanished cleanly (graceful /api/exit)
       // and the dev server must stay up. Re-spawn instead of idling.
       if (await apiHealthy(apiPort)) return;
-      console.error(`[dev] API exited with code 0 but :${apiPort} is unserved — restarting`);
-      restartAttempts += 1;
-      setTimeout(() => start(label, command, args, cwd, extraEnv), 3000);
+      scheduleApiRestart(`exited with code 0 but :${apiPort} is unserved`);
       return;
     }
     if (code !== 0 && code !== null) {
       console.error(`[${label}] exited with code ${code}`);
-      if (label === "api" && restartAttempts < 3) {
-        // Transient crash (observed twice: API exits 1 with no traceback
-        // after ~30-60min — AV scan / memory pressure during archive ingest).
-        // Restart instead of taking the whole dev-all down.
-        restartAttempts += 1;
-        const delaySec = restartAttempts * 3;
-        console.error(
-          `[dev] API crashed — restarting in ${delaySec}s (attempt ${restartAttempts}/3)`,
-        );
-        setTimeout(() => start(label, command, args, cwd, extraEnv), delaySec * 1000);
+      if (label === "api") {
+        scheduleApiRestart(`crashed (code ${code})`);
       } else {
         shutdown(1);
       }
@@ -773,6 +824,7 @@ async function reloadApi(changedFile) {
     }
     if (!shuttingDown && healthy) {
       startApiHealthMonitor();
+      startAlwaysOnWatchdog();
       console.log(`[dev] API reloaded (${path.relative(root, changedFile)})`);
     }
   } finally {
@@ -789,8 +841,29 @@ function startApiHealthMonitor() {
   const graceMs = Number(process.env.VODRIP_DEVALL_HEALTH_GRACE_MS || "300000");
   healthMonitorStop = startHealthMonitor({
     graceMs,
+    onHealthy: () => {
+      // A crash after a minute of continuous health is a NEW incident, not a
+      // continuation of the old one. Without this the budget was consumed for
+      // the whole life of the supervisor and the fourth crash was fatal.
+      const now = Date.now();
+      if (!apiHealthySince) apiHealthySince = now;
+      if (now - apiHealthySince >= API_HEALTHY_RESET_MS && restartAttempts > 0) {
+        console.error(
+          `[dev] API healthy for ${API_HEALTHY_RESET_MS / 1000}s — restart budget reset`,
+        );
+        restartAttempts = 0;
+      }
+    },
     onUnhealthy: () => {
-      if (shuttingDown || reloading || !apiProcess || apiProcess.exitCode !== null) return;
+      if (shuttingDown || reloading) return;
+      if (!apiProcess || apiProcess.exitCode !== null) {
+        // The child is already dead and no exit handler is going to fire for
+        // it again: this is the always-on guarantee, independent of every
+        // crash counter. Without it a dead API stayed dead.
+        scheduleApiRestart(`dead and :${apiPort} unserved`);
+        return;
+      }
+      apiHealthySince = 0;
       console.error(
         `[dev] API on :${apiPort} unresponsive for ~45s — treating as hung, restarting`,
       );
@@ -970,6 +1043,7 @@ async function main() {
   await reportHealth("health");
 
   startApiHealthMonitor();
+  startAlwaysOnWatchdog();
   startBackendWatcher();
 }
 

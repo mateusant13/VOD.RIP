@@ -3470,7 +3470,17 @@ def _enforce_window_hls_cache_budget(
     out_dir = _window_hls_dir(session)
     if not out_dir.is_dir():
         return
-    segs = list(out_dir.glob("seg_[0-9][0-9][0-9].ts"))
+    # The glob must match the extension the WRITER emits. USE_FMP4 is on by
+    # default and _window_hls_segment_path emits .m4s, so a .ts-only glob
+    # matched nothing, the early return below fired on its second line, and
+    # this 500 MB budget never evicted a single byte on a default box -
+    # unbounded growth behind a guard that could not fail. Both extensions
+    # are matched because USE_FMP4 is an env knob a box can flip mid-life.
+    segs = [
+        p
+        for p in out_dir.glob("seg_[0-9][0-9][0-9].*")
+        if p.suffix in (".ts", ".m4s") and p.is_file()
+    ]
     if not segs:
         return
     total = sum(s.stat().st_size for s in segs if s.is_file())

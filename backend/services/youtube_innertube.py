@@ -1210,6 +1210,24 @@ def _is_bot_gate(data: Optional[dict]) -> bool:
     return "bot" in reason or "confirm you're not" in reason or "confirm you" in reason
 
 
+# A bot wall is UNANIMOUS: every client that answered refused as a bot.
+#
+# The rule this replaces armed a process-wide 30-minute freeze after TWO
+# refusals anywhere in a walk over many clients. Two clients that do not
+# serve a video is not an IP-level wall, and the freeze it armed stops the
+# archive worker and channel previews for half an hour. Measured 2026-10-12:
+# 160 of the 162 gate arms in the API log came from this line, all inside one
+# ~80-minute burst, and no production code could clear the freeze afterwards
+# (clear_youtube_gate had test-only callers). A client that fails for a
+# non-bot reason counts as an attempt and breaks unanimity, because we then
+# do not know whether the wall is real.
+_BOT_GATE_UNANIMOUS_MIN = 3
+
+
+def _bot_wall_is_unanimous(bot_hits: int, client_attempts: int) -> bool:
+    """True only when at least N clients answered and every one was gated."""
+    return bot_hits >= _BOT_GATE_UNANIMOUS_MIN and bot_hits == client_attempts
+
 def _collect_merged_innertube_info(
     video_id: str,
     session: Optional["YouTubeSession"],
@@ -1231,6 +1249,7 @@ def _collect_merged_innertube_info(
     meta_data: Optional[dict] = None
 
     bot_hits = 0
+    client_attempts = 0
     # read_timeout is a per-request SOCKET read timeout, not a wall-clock
     # budget: this walk is sequential over _CLIENT_ORDER, and a client that
     # drips bytes overruns a read timeout without limit, so the overrun is
@@ -1264,9 +1283,10 @@ def _collect_merged_innertube_info(
             video_id, profile, timeout, session=session, http=http, source=source,
         )
         if kind != "ok" or not data:
+            client_attempts += 1
             if _is_bot_gate(data):
                 bot_hits += 1
-                if bot_hits >= 2:
+                if _bot_wall_is_unanimous(bot_hits, client_attempts):
                     # IP-level bot wall: arm the process-wide YouTube gate so
                     # the (in-process fallback) archive worker stops
                     # hammering and requeues its YouTube jobs; interactive

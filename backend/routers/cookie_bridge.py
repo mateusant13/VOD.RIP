@@ -1075,7 +1075,18 @@ async def session_cookies_status(request: Request):
         # One-click auto-install mirror — state: idle|running|done|error.
         "auto_install": {
             "state": ai["state"],
-            "installed": bool(ai["installed"]) or bool(_paired_token()),
+            # `installed` is the WORKER fact and nothing else. It used to be
+            # `bool(ai["installed"]) or bool(_paired_token())`, so a paired
+            # token made it permanently true: the extension was absent from
+            # every browser profile on this box, the installer failed, and
+            # this field still reported success. The frontend reads it as
+            # "the install succeeded" (src/lib/cookieAutoInstall.ts:62), so a
+            # failed install was indistinguishable from a working one and
+            # nothing ever retried. Paired and ready are reported separately
+            # because they are different facts.
+            "installed": bool(ai["installed"]),
+            "paired": bool(_paired_token()),
+            "bridge_ready": bool(ai["installed"]) or bool(_paired_token()),
             "extension_id": ai["extension_id"] or _ext_id() or None,
             "error": ai["error"],
             "started_at": ai["started_at"],
@@ -1084,6 +1095,39 @@ async def session_cookies_status(request: Request):
         },
     }
 
+
+@router.post("/api/session/cookies/gate/clear")
+async def session_cookies_gate_clear():
+    """Lift the process-wide YouTube bot-gate freeze right now.
+
+    clear_youtube_gate() has always described itself as the "tests / operator
+    escape hatch" (services/yt_gate.py:154), but it had test-only callers: no
+    route, no CLI, no setting. A freeze armed by a misread bot signal - and
+    160 of the 162 arms in the API log came from one misread threshold - could
+    therefore not be lifted by anything the operator or the app could reach.
+    It freezes the archive worker and channel previews for up to 30 minutes,
+    longest-wins, so a wrong arm was also a self-extending one.
+    """
+    from services.yt_gate import (
+        clear_youtube_gate,
+        gate_remaining_sec,
+        youtube_gate_active,
+    )
+
+    was_active = bool(youtube_gate_active())
+    cleared_sec = float(gate_remaining_sec())
+    clear_youtube_gate()
+    logger.info(
+        "YouTube bot gate cleared by operator (was_active=%s, cleared %.0fs)",
+        was_active,
+        cleared_sec,
+    )
+    return {
+        "ok": True,
+        "was_active": was_active,
+        "cleared_sec": cleared_sec,
+        "active": bool(youtube_gate_active()),
+    }
 
 @router.post("/api/session/cookies/disable")
 async def session_cookies_disable(request: Request):
