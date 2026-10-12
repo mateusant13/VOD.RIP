@@ -221,6 +221,14 @@ def test_transient_classifier():
 # --- archive_kick: download retry / requeue -------------------------------
 
 def _kick_video(video_id: str = "vid-r", title: str = "Retry Me") -> KickVideo:
+    """Every caller MUST pass its own id.
+
+    The job row PK is derived from the video id (``kick-{id}``) and
+    ``_ensure_job`` swallows the duplicate-key error, so four tests sharing one
+    id share ONE job row and leak each other status. That is exactly how
+    ``test_download_retries_once_then_succeeds`` failed once with
+    ``assert 'queued' == 'done'`` in gate 12 (2026-10-11) while passing in
+    isolation."""
     return KickVideo(id=video_id, title=title, created_at="2026-08-01T10:00:00Z", duration=60.0)
 
 
@@ -242,12 +250,12 @@ def test_download_retries_once_then_succeeds(scratch_db, tmp_path, monkeypatch):
     monkeypatch.setattr(archive_kick, "_download_with_budget", _flaky_download)
     monkeypatch.setattr(archive_kick, "_RETRY_DELAY_SEC", 0.0)
 
-    r = archive_kick._ingest_one(_kick_video(), "ch", download=True,
+    r = archive_kick._ingest_one(_kick_video("vid-retry-ok"), "ch", download=True,
                                  max_download_sec=30.0, quality="720",
                                  archive_dir=str(archive_dir))
     assert calls["n"] == 2, "transient failure must trigger exactly one retry"
     assert r["action"] == "downloaded" and r["status"] == "ready"
-    assert archive_db.latest_job("kick", "vid-r")["status"] == "done"
+    assert archive_db.latest_job("kick", "vid-retry-ok")["status"] == "done"
 
 
 def test_download_transient_twice_requeues_not_fails(scratch_db, tmp_path, monkeypatch):
@@ -265,14 +273,14 @@ def test_download_transient_twice_requeues_not_fails(scratch_db, tmp_path, monke
     monkeypatch.setattr(archive_kick, "_download_with_budget", _always_transient)
     monkeypatch.setattr(archive_kick, "_RETRY_DELAY_SEC", 0.0)
 
-    r = archive_kick._ingest_one(_kick_video(), "ch", download=True,
+    r = archive_kick._ingest_one(_kick_video("vid-requeue"), "ch", download=True,
                                  max_download_sec=30.0, quality="720",
                                  archive_dir=str(archive_dir))
     assert calls["n"] == 2, "retry happened once; transient is not terminal"
     assert r["action"] == "requeued" and r["status"] == "known"
-    job = archive_db.latest_job("kick", "vid-r")
+    job = archive_db.latest_job("kick", "vid-requeue")
     assert job["status"] == "queued" and "requeued" in job["error"]
-    row = archive_db.query("SELECT status FROM videos WHERE video_id='vid-r'")[0]
+    row = archive_db.query("SELECT status FROM videos WHERE video_id='vid-requeue'")[0]
     assert row["status"] == "known", "transient must never mark the video 'failed'"
 
 
@@ -291,12 +299,12 @@ def test_download_gated_skips_retry_and_requeues(scratch_db, tmp_path, monkeypat
     monkeypatch.setattr(archive_kick, "_download_with_budget", _gated)
     kick_gate._until = time.monotonic() + 3600.0
 
-    r = archive_kick._ingest_one(_kick_video(), "ch", download=True,
+    r = archive_kick._ingest_one(_kick_video("vid-gated"), "ch", download=True,
                                  max_download_sec=30.0, quality="720",
                                  archive_dir=str(archive_dir))
     assert calls["n"] == 1, "frozen gate → no retry, requeue immediately"
     assert r["action"] == "requeued" and r["status"] == "known"
-    assert archive_db.latest_job("kick", "vid-r")["status"] == "queued"
+    assert archive_db.latest_job("kick", "vid-gated")["status"] == "queued"
 
 
 def test_download_terminal_error_fails(scratch_db, tmp_path, monkeypatch):
@@ -314,9 +322,9 @@ def test_download_terminal_error_fails(scratch_db, tmp_path, monkeypatch):
     monkeypatch.setattr(archive_kick, "_download_with_budget", _terminal)
     monkeypatch.setattr(archive_kick, "_RETRY_DELAY_SEC", 0.0)
 
-    r = archive_kick._ingest_one(_kick_video(), "ch", download=True,
+    r = archive_kick._ingest_one(_kick_video("vid-terminal"), "ch", download=True,
                                  max_download_sec=30.0, quality="720",
                                  archive_dir=str(archive_dir))
     assert calls["n"] == 1, "no retry on a terminal error"
     assert r["action"] == "failed" and r["status"] == "failed"
-    assert archive_db.latest_job("kick", "vid-r")["status"] == "failed"
+    assert archive_db.latest_job("kick", "vid-terminal")["status"] == "failed"

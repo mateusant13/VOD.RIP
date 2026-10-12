@@ -1291,3 +1291,38 @@ end to end; the synthetic one was rejected in 334 ms, which is at least fast and
 - The `gpt` review of this round returned NO confirmed defects and explicitly listed what it could
   not see (the helper bodies and the Twitch cache implementation were outside the supplied line
   ranges). That is a scope limitation, not a clean bill of health.
+
+### 2026-10-11 (final): clips answered, and the kick-resilience flake
+
+**Kick clips work end to end - measured with a REAL clip id** fetched read-only from
+`https://kick.com/api/v2/channels/nicklink/clips` (20 clips available):
+`clip_01M4EVYSRK4QY36KQ22Y1H6JQ5`, 30 s. POST /api/preview/session with
+`https://kick.com/nicklink/clips/<id>`:
+
+| attempt | result |
+|---|---|
+| 1 (cold) | **200 in 1,336 ms**, kind=hls, dur=32.0 s, resolve_ms=1,328 |
+| 2 (cached) | **200 in 312 ms**, resolve_ms=296 |
+
+The API log line proves the path taken: `preview session=... platform=Kick kind=hls
+heights=[] synthetic_master=False entry=https://clips.ki...`. `kick_api_service` has
+`_clip_from_api_item` + `list_channel_clips_api`, so Kick clips are a supported shape; my
+earlier synthetic clip id was simply a clip that does not exist (400 "Kick channel not
+found" in 334 ms - fast and honest, but not a coverage result). Twitch clips remain
+explicitly unsupported (400 in 7 ms naming the VOD URL) - that is a decision, not a gap in
+testing.
+
+Implementation note, because it cost three attempts: the same probe run through PowerShell
+`Invoke-RestMethod` inside a joined one-liner died with exit 1 and wrote no log, twice, which
+looked like a hung clip preview. It was the harness, not the app - a 150 s `urllib` timeout in
+a plain Python script returned in 1.3 s. A probe that fails in the harness is not evidence
+about the app.
+
+**The gate-12 flake, fixed at the root.** `test_kick_resilience.py` had four tests all using
+the video id `vid-r`. The archive job PK is derived from the video id (`job_id =
+f"kick-{v.id}"`) and `_ensure_job` swallows the duplicate-key `IntegrityError` ("already queued
+by a previous run"), so all four shared ONE `archive_jobs` row and each `latest_job("kick",
+"vid-r")` assertion read whatever status the row happened to hold. Gate 12 failed exactly
+there: `assert 'queued' == 'done'`. Each test now owns its own row (`vid-retry-ok`,
+`vid-requeue`, `vid-gated`, `vid-terminal`) and `_kick_video` documents why a caller must never
+share an id. Five consecutive runs of the file: 13 passed each time.
