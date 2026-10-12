@@ -1,5 +1,5 @@
 import Hls from 'hls.js';
-import { apiPost } from './hooks/useApiClient';
+import { ApiError, apiPost } from './hooks/useApiClient';
 import { detectUrlPlatform, isClipUrl } from './channelUtils';
 import type { PreviewSessionResponse, PreviewSessionStatusResponse } from './types';
 
@@ -34,15 +34,48 @@ function _persistWarmCache(): void {
   } catch { /* quota exceeded or blocked */ }
 }
 
-/** Permanent-failure messages — retrying these can never succeed. */
-const _PREVIEW_CREATE_FATAL_RE = /members-only|membership|unavailable|private|removed/i;
+/**
+ * Permanent-failure phrases — retrying these can never succeed.
+ *
+ * Prose is the FALLBACK signal; `ApiError.status` is authoritative. It has to
+ * be: the message for a 503 whose body is not JSON falls back to
+ * `res.statusText`, which is the literal string "Service Unavailable". The old
+ * bare `unavailable` matched that and turned a transient blip into a dead end
+ * — the same defect as a backend reporting a timed-out extract as a dead video.
+ * Only phrases naming a video-level verdict survive, anchored so that
+ * "Service Unavailable" cannot match any of them.
+ */
+const _PREVIEW_CREATE_FATAL_RE =
+  /members-only|membership|this video is unavailable|video unavailable|private video|has been removed|removed by the uploader|does not exist/i;
 const _PREVIEW_CREATE_RETRIES = 2;
+
+/** Gone or forbidden for good — a retry would be a lie. */
+const _PERMANENT_STATUS = new Set([403, 404, 410]);
+/** Throttled or not-ready — a retry is exactly the right move. */
+const _TRANSIENT_STATUS = new Set([408, 425, 429]);
+
+/**
+ * Would retrying this failure be a lie?
+ *
+ * Status first, prose only as a fallback for throws that carry no status (a
+ * plain Error from a non-HTTP path). This is what keeps a genuine 404 — a
+ * video that really is gone — permanent while a 503 timeout stays retryable.
+ */
+function _isPermanentPreviewFailure(err: unknown): boolean {
+  if (err instanceof ApiError) {
+    if (_PERMANENT_STATUS.has(err.status)) return true;
+    if (_TRANSIENT_STATUS.has(err.status) || err.status >= 500) return false;
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  return _PREVIEW_CREATE_FATAL_RE.test(msg);
+}
 
 /**
  * POST /api/preview/session with bounded retries. A click that hits a cold
  * extract under load can 500 once while the server-side chain would succeed
  * a second later (inflight dedupe makes the retry cheap). Permanent failures
- * (members-only/unavailable/private) throw immediately.
+ * (404/403/410, or a members-only/removed verdict in the text) throw
+ * immediately; a 5xx or a throttle is retried.
  */
 export async function createPreviewSessionWithRetry(
   body: {
@@ -72,8 +105,7 @@ export async function createPreviewSessionWithRetry(
         // this the 20s timeout would add two dead 1.2s/2.4s backoff sleeps
         // before the error surfaces.
         if (err instanceof DOMException && err.name === 'AbortError') throw err;
-        const msg = err instanceof Error ? err.message : String(err);
-        if (_PREVIEW_CREATE_FATAL_RE.test(msg)) throw err;
+        if (_isPermanentPreviewFailure(err)) throw err;
         if (attempt < _PREVIEW_CREATE_RETRIES) {
           // ponytail: same executor form as useApiClient — tsconfig lib predates ES2024 Promise.withResolvers
           await new Promise<void>((resolve) => { window.setTimeout(resolve, 1200 * (attempt + 1)); });
@@ -92,7 +124,16 @@ function _dedupInflight<K, T>(map: Map<K, Promise<T>>, key: K, fn: () => Promise
   if (inflight) return inflight;
   const promise = fn();
   map.set(key, promise);
-  promise.finally(() => { map.delete(key); });
+  // Cleanup must not open a second rejection branch. `promise.finally(cb)`
+  // returns a DERIVED promise that rejects exactly like the original, and
+  // dropping it made every failed preview an unhandled rejection in the
+  // browser console (measured: one per failing test). `then(onOk, onErr)`
+  // with a non-throwing onErr always fulfils, so nothing is left unhandled
+  // while the original promise still carries the rejection to the caller.
+  // Identity-checked: if a future refactor ever replaces an entry before the
+  // older promise settles, this cleanup must not delete the NEWER one.
+  const cleanup = () => { if (map.get(key) === promise) map.delete(key); };
+  promise.then(cleanup, cleanup);
   return promise;
 }
 

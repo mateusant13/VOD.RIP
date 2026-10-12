@@ -473,6 +473,10 @@ export default function App() {
   /** Record which single media failed and at which stage. Keeps the per-media
    *  retry count so the NEXT RETRY click escalates stage retry → full pipeline. */
   const markPreviewError = useCallback((mediaUrl: string, stage: PreviewRetryStage) => {
+    // Terminal timing event for a click that never reached a playable frame.
+    // Every failure path in this component funnels through here, so one call
+    // covers them all. markFailed itself ignores post-playable failures.
+    previewTimingRef.current?.markFailed(`main:${stage}`);
     const wasRetry = previewRetryingRef.current;
     previewRetryingRef.current = false;
     setPreviewRetryBoth(previewRetryAfterError(previewRetryRef.current, mediaUrl, stage, wasRetry));
@@ -6127,6 +6131,11 @@ export default function App() {
     badge?: ChannelPreviewBadge,
     hint?: FetchVideoInfoHint,
   ) => {
+    // The user's click on a list VOD. openPreview() runs later from an effect
+    // (autoOpenPreviewTick), so without this the main surface had NO gesture
+    // origin at all and every preview_open reported click→open=unknown/-1 —
+    // the metric could never include the click segment the law is about.
+    notePreviewGesture();
     autoOpenPreviewPendingRef.current = vodUrl.trim();
     setAutoOpenPreviewTick((t) => t + 1);
     setUrl(vodUrl);

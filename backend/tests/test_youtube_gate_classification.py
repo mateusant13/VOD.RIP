@@ -41,7 +41,10 @@ def _retry_patches(stack: ExitStack, verdict):
     stack.enter_context(patch("services.ytdlp_hls._youtube_manual_auth_configured", return_value=False))
     stack.enter_context(patch("services.ytdlp_hls._youtube_has_user_auth", return_value=True))
     stack.enter_context(
-        patch("services.youtube_innertube.innertube_last_playability", return_value=verdict)
+        # The SAFE reader: production code calls this one, so a patch on the
+        # unsafe innertube_last_playability would be a no-op decoration.
+        # Tuple order is (kind, status, reason).
+        patch("services.youtube_innertube.innertube_playability_verdict", return_value=verdict)
     )
 
 
@@ -50,7 +53,7 @@ def test_preview_retries_soft_verdict_falls_through_to_fallback():
     NOT abort the chain with the gate reason — it falls through to the slow
     ladder and ends in the generic transient message."""
     with ExitStack() as stack:
-        _retry_patches(stack, ("LOGIN_REQUIRED", "Video unavailable", "retry"))
+        _retry_patches(stack, ("retry", "LOGIN_REQUIRED", "Video unavailable"))
         with pytest.raises(RuntimeError) as ei:
             _youtube_extract_preview_with_retries(YOUTUBE_URL, {})
     assert str(ei.value) == "YouTube preview unavailable for this video"
@@ -59,7 +62,7 @@ def test_preview_retries_soft_verdict_falls_through_to_fallback():
 def test_preview_retries_fatal_verdict_aborts_with_reason():
     """A definitive fatal verdict aborts immediately with the real reason."""
     with ExitStack() as stack:
-        _retry_patches(stack, ("ERROR", "This video is unavailable", "fatal"))
+        _retry_patches(stack, ("fatal", "ERROR", "This video is unavailable"))
         with pytest.raises(RuntimeError) as ei:
             _youtube_extract_preview_with_retries(YOUTUBE_URL, {})
     assert str(ei.value) == "This video is unavailable"
@@ -74,7 +77,10 @@ def _cache_patches(stack: ExitStack, chain_exc, verdict):
         patch("services.ytdlp_hls._youtube_extract_with_retries", side_effect=chain_exc)
     )
     stack.enter_context(
-        patch("services.youtube_innertube.innertube_last_playability", return_value=verdict)
+        # The SAFE reader: production code calls this one, so a patch on the
+        # unsafe innertube_last_playability would be a no-op decoration.
+        # Tuple order is (kind, status, reason).
+        patch("services.youtube_innertube.innertube_playability_verdict", return_value=verdict)
     )
 
 
@@ -89,7 +95,7 @@ def test_soft_verdict_never_stamps_fatal_cache():
             _cache_patches(
                 stack,
                 RuntimeError("This video is unavailable"),
-                ("LOGIN_REQUIRED", "Video unavailable", "retry"),
+                ("retry", "LOGIN_REQUIRED", "Video unavailable"),
             )
             with pytest.raises(RuntimeError):
                 cached_extract_info(YOUTUBE_URL, {})
@@ -110,7 +116,7 @@ def test_soft_verdict_uses_short_neg_cache_only():
             _cache_patches(
                 stack,
                 RuntimeError("YouTube preview unavailable for this video"),
-                ("LOGIN_REQUIRED", "Sign in to confirm you're not a bot", "retry"),
+                ("retry", "LOGIN_REQUIRED", "Sign in to confirm you're not a bot"),
             )
             with pytest.raises(RuntimeError):
                 cached_extract_info(YOUTUBE_URL, {})
@@ -130,7 +136,7 @@ def test_fatal_verdict_stamps_fatal_cache():
             _cache_patches(
                 stack,
                 RuntimeError("YouTube preview unavailable for this video"),
-                ("ERROR", "This video is unavailable", "fatal"),
+                ("fatal", "ERROR", "This video is unavailable"),
             )
             with pytest.raises(RuntimeError):
                 cached_extract_info(YOUTUBE_URL, {})
@@ -195,8 +201,8 @@ def test_create_session_does_not_retry_soft_verdict_in_request():
         rsi = _session_patches(stack)
         stack.enter_context(
             patch(
-                "services.youtube_innertube.innertube_last_playability",
-                return_value=("LOGIN_REQUIRED", "Video unavailable", "retry"),
+                "services.youtube_innertube.innertube_playability_verdict",
+                return_value=("retry", "LOGIN_REQUIRED", "Video unavailable"),
             )
         )
         sleep = stack.enter_context(
@@ -214,8 +220,8 @@ def test_create_session_does_not_retry_fatal_verdict():
         rsi = _session_patches(stack)
         stack.enter_context(
             patch(
-                "services.youtube_innertube.innertube_last_playability",
-                return_value=("ERROR", "This video is unavailable", "fatal"),
+                "services.youtube_innertube.innertube_playability_verdict",
+                return_value=("fatal", "ERROR", "This video is unavailable"),
             )
         )
         with pytest.raises(RuntimeError):

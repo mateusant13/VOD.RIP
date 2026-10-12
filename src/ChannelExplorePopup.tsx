@@ -619,9 +619,18 @@ export default function ChannelExplorePopup({
     setQualityMenuOpen(false);
     requestedHeightRef.current = 0;
     appliedHeightRef.current = 0;
-    const timing = new PreviewTiming(platform ?? 'unknown', 'explore');
+    // A retry re-runs this effect (sessionRetryTick is a dep). See
+    // PreviewTiming.isRetryOf: restarting the clock there made a retried open
+    // look FASTER than the click the user actually made, and reported
+    // click→open=-1 because the gesture had already been consumed.
+    const openKey = vod.url.slice(0, 80);
+    const priorTiming = previewTimingRef.current;
+    const timing = priorTiming?.isRetryOf(openKey)
+      ? priorTiming
+      : new PreviewTiming(platform ?? 'unknown', 'explore');
     previewTimingRef.current = timing;
-    timing.markOpen(vod.url.slice(0, 80));
+    if (timing.isRetryOf(openKey)) timing.mark('retry');
+    else timing.markOpen(openKey);
 
     // Hard bound on the 'Starting…' phase: from here until canplay (or a
     // terminal error). A hung session-create or playback that never starts
@@ -636,6 +645,10 @@ export default function ChannelExplorePopup({
         const deadline = previewDeadlineVerdict({ stage, firstOutputArrived: false });
         setError(t(deadline.messageKey));
         markPreviewError(stage);
+        // Terminal timing event. Without one the log's last word was the fast
+        // preview_open line, so a click that hung and then failed read as a
+        // success in the very log kept to catch it.
+        timing.markFailed(`start_timeout:${stage}`);
         hlsRef.current?.destroy();
         hlsRef.current = null;
         setLoading(false);
@@ -727,10 +740,12 @@ export default function ChannelExplorePopup({
         });
       } catch (err: unknown) {
         if (!cancelled) {
-          setError(err instanceof Error ? err.message : 'Could not start player');
+          const msg = err instanceof Error ? err.message : 'Could not start player';
+          setError(msg);
           setLoading(false);
           guard.settle();
           markPreviewError('session');
+          timing.markFailed(`session: ${msg}`.slice(0, 160));
         }
       }
     })();

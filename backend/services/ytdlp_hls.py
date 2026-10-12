@@ -939,7 +939,7 @@ def _youtube_extract_preview_with_retries(url: str, opts: dict) -> dict:
     attempts: list[dict] = [opts]
     from services.youtube_innertube import (
         extract_video_id as _evid,
-        innertube_last_playability,
+        innertube_playability_verdict,
     )
 
     vid0 = _evid(url)
@@ -960,7 +960,20 @@ def _youtube_extract_preview_with_retries(url: str, opts: dict) -> dict:
         # InnerTube's definitive verdict (deleted/private/members/age/region)
         # — skip the remaining passes and the 30s yt-dlp fallback grind.
         # Soft verdicts (bot/consent gates) fall through to the ladder.
-        _st, _rs, _kd = innertube_last_playability(vid0)
+        #
+        # Use the FRESH, kind-validated reader -- never
+        # innertube_last_playability. That one has no age limit and
+        # _record_playability never downgrades a stored fatal, so ONE transient
+        # bot-gated probe ("a bot-gated WEB probe reports 'Video unavailable'
+        # while ANDROID plays the same video") branded the video for the life of
+        # the process. Measured 2026-10-12: jNQXAC9IVRw -- on YouTube since 2005
+        # -- returned 404 "This video is unavailable." after 27,499 ms, and the
+        # client treats "unavailable" as permanent, so it never retried.
+        # innertube_playability_verdict exists for exactly this ("A caller that
+        # turns this into a user-facing status code must not be handed a guess").
+        # NOTE: its tuple order is (kind, status, reason), not the unsafe
+        # reader's (status, reason, kind).
+        _kd, _st, _rs = innertube_playability_verdict(vid0) or ("", "", "")
         if _kd == "fatal":
             raise RuntimeError(_rs or "This video is unavailable")
         if i + 1 < len(attempts):
@@ -1317,10 +1330,18 @@ def cached_extract_info(url: str, opts: dict) -> dict:
             # honest "try again in a moment" user message via youtube_user_message.
             from services.youtube_innertube import (
                 extract_video_id as _evid,
-                innertube_last_playability,
+                innertube_playability_verdict,
             )
 
-            _pb_status, _pb_reason, _pb_kind = innertube_last_playability(_evid(url))
+            # Same rule as the preview ladder: only a FRESH, kind-validated
+            # verdict may replace the message or stamp the 300s fatal cache --
+            # the unsafe reader answers forever, so one transient bot-gated
+            # probe would make a healthy video permanently "fatal". Tuple order
+            # is (kind, status, reason). A missing or stale record degrades to
+            # blanks, which is the previous behaviour, never to a guess.
+            _pb_kind, _pb_status, _pb_reason = innertube_playability_verdict(
+                _evid(url)
+            ) or ("", "", "")
             # Only a DEFINITIVE verdict may replace the exception message. A
             # soft verdict (bot/consent/age gate) must not — its reason text
             # ("Video unavailable") matches the fatal markers below and would

@@ -1861,3 +1861,103 @@ is a decoration.**
   ordering fix — try the 2.5 s path before the 142 s one — is not in this change.
 
 
+
+## 2026-10-12 — A guard nobody calls is not a guard (and a metric can lie while it runs)
+
+Four defects fixed in one pass. They share one shape: **the correct signal
+existed, and the call site used the unguarded one.**
+
+### 1. A stale playability record branded a live video dead
+
+`POST /api/preview/session` on `jNQXAC9IVRw` — a video on YouTube since 2005 —
+returned **404 `"This video is unavailable."` in 27,499 ms**. The backend log's
+last word was `extract fail ... reason=preview_race_exhausted`, which maps to
+**503** and an honest "try again" message. So the 404 came from somewhere else.
+
+It came from `_youtube_extract_preview_with_retries` (`ytdlp_hls.py:963`)
+calling `innertube_last_playability` — a reader with **no age limit and no kind
+validation** — and turning its answer into a user-facing verdict. Two facts make
+that fatal:
+
+- `_record_playability` **never downgrades a stored fatal**;
+- its own docstring records that "a bot-gated WEB probe reports 'Video
+  unavailable' while ANDROID plays the same video".
+
+So **one transient bot-gated probe branded that video for the life of the
+process.** Its sibling `innertube_playability_verdict` exists for exactly this
+and says so: *"A caller that turns this into a user-facing status code must not
+be handed a guess."* It was used by `youtube_diag.structured_playability` and by
+**neither** extraction call site.
+
+Fix: both sites now use the validated reader. Note the trap — the two readers
+return tuples in **different orders**: `(status, reason, kind)` vs
+`(kind, status, reason)`.
+
+The client matched `unavailable` as permanent (`_PREVIEW_CREATE_FATAL_RE`), so
+the wrong word here was not cosmetic: it turned a retryable timeout into a dead
+end the user could not escape by clicking again.
+
+### 2. The frontend made the same mistake with prose
+
+The same regex matched the message a **503** gets when its body is not JSON:
+`useApiClient.ts:114` falls back to `res.statusText`, the literal string
+**"Service Unavailable"**. `ApiError` already carried `.status` — its own
+docstring states the intent, *"so callers can tell a terminal 404/410 from a
+transient blip"* — and the classifier ignored it. Now status decides
+(403/404/410 permanent; 408/425/429/5xx transient) and prose is only a fallback
+for throws with no status.
+
+**`zIOnnd61w40` really is gone** and must stay permanent; it does, by status.
+
+### 3. The metric measured the popup, not the click
+
+`full_path` reported `click→playable` as `open→playable` whenever no gesture
+had been captured, and **the main surface never captured one** (`openPreview`
+runs from an effect, not from the click). A click that hung 26 s logged
+`preview_open click→open=29ms` and nothing else, because a failed preview
+emitted **no terminal event at all**.
+
+Now: an unmeasurable segment reports `unknown` instead of being silently
+substituted; `selectVod` captures the gesture for the main surface; and
+`markFailed` gives every failed click a terminal line with its own duration
+(guarded so a post-playable stall is not called a failed click).
+
+### 4. A dropped `.finally()` made every failed preview an unhandled rejection
+
+`_dedupInflight` chained `promise.finally(cleanup)` and **discarded the derived
+promise**, which rejects exactly like the original. Found because the new
+frontend tests emitted exactly one unhandled rejection per test — 8 tests, 8
+errors — and the trace pointed back into the source. `then(ok, err)` with
+non-throwing handlers always fulfils.
+
+### The law
+
+**A guard that exists but has no caller is not a guard. A reader with no age
+limit is not evidence. A metric that cannot fail is not a measurement.**
+
+Red arms (all measured, not asserted):
+
+| mutation | result |
+|---|---|
+| restore the unsafe reader | `test_a_stale_fatal_record_does_not_abort_the_ladder` + the AST source law both fail |
+| `const measured = true` | the no-gesture test fails |
+| `if (true) return` in `markFailed` | the terminal-event test fails |
+| drop the `.finally()` fix | 8 unhandled rejections, one per test |
+
+### Still open — measured, not fixed here
+
+The ≤3 s law is **not met**. Racing the two InnerTube paths (which replaced both
+sequential orders, each measured worse) gives, on cold clicks:
+
+| video | before | after |
+|---|---|---|
+| UU6Rrs6y6Ec | 2,186 ms | **953 ms** ✓ |
+| 26he4HN565U | 7,077 ms | 4,296 ms |
+| bUQCh9abGwo | 7,101 ms | 5,485 ms |
+| jNQXAC9IVRw | 6,285 ms | 5,688 ms |
+
+Ordering was measured, not guessed: merged-first cost every click 6.3–7.1 s;
+fast-first cost the misses **24 s** (5.5 s miss paid before a 12 s walk). The
+race is never worse than either. Three of four still miss 3 s, and the honest
+reason is that both InnerTube legs lose on those videos and the yt-dlp fallback
+answers.

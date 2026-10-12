@@ -32,6 +32,8 @@ export class PreviewTiming {
   private sessionId = '';
   private firstPlayableSent = false;
   private clickToOpenMs = -1;
+  /** Key of the open this tracker is measuring (see isRetryOf). */
+  private openedKey = '';
 
   constructor(
     private readonly platform: string,
@@ -46,13 +48,30 @@ export class PreviewTiming {
     const gap = _gestureStartMs > 0 ? this.tOpen - _gestureStartMs : -1;
     this.clickToOpenMs = gap >= 0 && gap < 15_000 ? gap : -1;
     _gestureStartMs = 0;
+    this.openedKey = detail ?? '';
     emitTiming({
       platform: this.platform,
       surface: this.surface,
       event: 'preview_open',
       open_ms: 0,
-      detail: `${detail ?? ''} click→open=${this.clickToOpenMs.toFixed(0)}ms`,
+      detail:
+        `${detail ?? ''} click→open=` +
+        (this.clickToOpenMs >= 0 ? `${this.clickToOpenMs.toFixed(0)}ms` : 'unknown'),
     });
+  }
+
+  /**
+   * Is this the SAME open we already measured, re-running?
+   *
+   * The popup's open effect depends on sessionRetryTick, so a retry re-runs it.
+   * Calling markOpen again there was wrong twice over: the gesture had already
+   * been consumed, so it reported click→open=-1, and it RESTARTED the clock, so
+   * a retried open looked faster than the click the user actually made — the
+   * metric improving as the experience got worse. A retry keeps the original
+   * origin and is recorded as its own event.
+   */
+  isRetryOf(detail?: string): boolean {
+    return this.tOpen > 0 && this.openedKey === (detail ?? '');
   }
 
   setSessionId(sessionId: string): void {
@@ -87,16 +106,53 @@ export class PreviewTiming {
       detail: detail ?? `open→playable=${ms.toFixed(0)}ms`,
     });
     // Full-path summary: the one line that accounts for the whole click.
-    const total = this.clickToOpenMs >= 0 ? this.clickToOpenMs + ms : ms;
+    //
+    // When no gesture was captured, clickToOpenMs is -1 and this used to report
+    // `click→playable = open→playable` — a number wearing the name of a segment
+    // it did not contain. On the explore surface that was EVERY click (the
+    // popup never called notePreviewGesture), so the log read green while the
+    // user waited ~26 s. An unmeasurable segment is now reported as unknown and
+    // never silently substituted.
+    const measured = this.clickToOpenMs >= 0;
+    const total = measured ? this.clickToOpenMs + ms : -1;
     emitTiming({
       platform: this.platform,
       surface: this.surface,
       event: 'full_path',
       session_id: this.sessionId || undefined,
-      open_ms: total,
+      open_ms: measured ? total : ms,
+      detail: measured
+        ? `click→open=${this.clickToOpenMs.toFixed(0)} open→playable=${ms.toFixed(0)} ` +
+          `click→playable=${total.toFixed(0)}ms`
+        : `click→open=unknown open→playable=${ms.toFixed(0)} ` +
+          `click→playable=unknown (no gesture captured — this is open→playable only)`,
+    });
+  }
+
+  /**
+   * Terminal event for a click that never reached a playable frame.
+   *
+   * Without it the last word in the log was the fast `preview_open` line
+   * (20-29 ms), so a click that hung for 26 s and then failed read as a success
+   * in the very log kept to catch it. A failed click must state its own
+   * duration.
+   */
+  markFailed(reason: string): void {
+    // A failure AFTER the first playable frame is not a failed click: the
+    // preview opened and played, so this is a stall/playback event. Reporting
+    // it as preview_failed would make a working open look broken.
+    if (this.firstPlayableSent) return;
+    const ms = this.openMs();
+    const total = this.clickToOpenMs >= 0 ? this.clickToOpenMs + ms : -1;
+    emitTiming({
+      platform: this.platform,
+      surface: this.surface,
+      event: 'preview_failed',
+      session_id: this.sessionId || undefined,
+      open_ms: ms,
       detail:
-        `click→open=${this.clickToOpenMs.toFixed(0)} open→playable=${ms.toFixed(0)} ` +
-        `click→playable=${total.toFixed(0)}ms`,
+        `click→fail=${total >= 0 ? `${total.toFixed(0)}ms` : 'unknown'} ` +
+        `open→fail=${ms.toFixed(0)}ms reason=${reason}`,
     });
   }
 
