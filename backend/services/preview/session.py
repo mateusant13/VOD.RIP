@@ -1873,14 +1873,27 @@ def _stash_youtube_preview_formats(
 def _refresh_youtube_window_hls_urls(
     session: PreviewSession, prefer_height: int = 720
 ) -> None:
-    """Refresh googlevideo URLs for the window HLS mux — swap URL set, keep window cache."""
+    """Refresh googlevideo URLs for the window HLS mux — swap URL set, keep window cache.
+
+    A seek does NOT change the format ladder: the googlevideo URLs for a VOD are
+    the same whichever 20 s window we mux, and _RESOLVED_STREAM_CACHE already
+    treats a resolve as good for _RESOLVED_STREAM_TTL_SEC in every other path.
+    This function used to invalidate that cache and force a fresh resolve on
+    EVERY seek, paying a measured 2.2-2.8 s for a result it already had - the
+    mid-preview seek the owner asked to make fast.
+
+    Expiry is still covered, by the path that exists for it: when the URLs
+    really are dead the mux fails, and the fallback at the end of
+    _ensure_youtube_window_hls_mux invalidates and re-resolves with
+    force_fresh=True before switching to a progressive session. Force-refresh
+    belongs there, not on every seek.
+    """
     if session.platform != "YouTube":
         return
-    _invalidate_youtube_resolve_caches(session.vod_url, prefer_height)
     _raw, headers, _platform, variant_formats, _kind, yt_info = resolve_stream_info(
         session.vod_url,
         prefer_height=prefer_height,
-        force_fresh=True,
+        force_fresh=False,
     )
     session.http_headers = _merge_youtube_session_cookies(headers, session.vod_url)
     session.variant_entries = [
