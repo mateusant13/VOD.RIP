@@ -1579,3 +1579,58 @@ measurement, not from the hypothesis: don't run the window mux at all when the m
 URLs are already directly servable, or give the gate the fallback's ready state
 sooner. Unmeasured until then.
 
+
+## 2026-10-12 14:40 — "arruma tudo restante": the 3-second path, and a review
+that found a hole I could not see
+
+Owner instruction: apply everything suggested and every friction seen. Three commits:
+`c13c4ee`, `f4885fd`, `90c4040`.
+
+### Measured, the owner's own click path
+
+| path | server_ms |
+|---|---|
+| warm/batch -> snapshot ready, extract cached | 0.5 ms (13:03:35,729 -> .229) |
+| warm/batch -> snapshot ready, cold extract | 1.5 s (owner log 12:58:37 -> 39) |
+| CLICK while the warm is queued — BEFORE | 18,703 ms (owner log 11:58:35) |
+| CLICK while the warm is queued — AFTER c13c4ee | 5,610 ms |
+| CLICK, progressive path, no mux at all | 5,485 ms |
+
+The 18.7 s was never the governor: the preview extract already runs on the
+interactive lane (`ytdlp_hls.py:1498`, `kind="interactive"`; the `guarded_youtube_dl
+lock at :4134 is the clip-audio path, which is why it is irrelevant here). It was a
+snapshot MISS: the warm for the clicked URL was still queued behind the process-wide
+`guarded_youtube_dl` lock, so `create_session` found no snapshot after 1.5 s + 3 s of
+waiting and paid a full cold resolve. `Event.wait` returns the instant the warm sets
+its event, so raising the ceilings to 3.5 s + 5 s costs nothing on a fast warm and
+buys the join on a queued one - that is the whole fix, and the number proves it.
+
+### The mux loop was paying for a transport fix a re-extract cannot buy
+
+`truncated Range 0-1048576: got 1915 expected 1048577` on `manifest.googlevideo.com`,
+three attempts, each with freshly re-extracted URLs, all identically truncated -
+while the SAME URLs served 206 + 5.3 MB through the fallback seconds later. A
+truncated body is a transport, not a stale URL, so the loop now breaks after the
+first one. RED ARM VERIFIED: with the branch removed, the attempt count goes 1 -> 3.
+
+### The review loop earned its keep (the part worth remembering)
+
+`gpt -f` over the two commits returned three findings. The [CRITICAL] one was
+wrong and is now DISPROVEN BY TEST rather than by argument: `GooglevideoTruncatedBody`
+subclasses `StaleGooglevideoUrl` (`ytdlp_hls.py:64`), so the post-loop isinstance guard
+already classifies it and the fallback still runs - the test asserts one attempt AND
+the fallback, and its red arm is the fail-fast being removed.
+
+The [HIGH] one was right, and only because it said UNKNOWN. "The deferred chat job
+returns a dict; if the caller ignores it the job is never requeued" - the caller was
+unknown to the reviewer, so I went and read it: the neighbouring youtube-gate branch
+requeues through `archive_db.update_job(status="queued")` FIRST and only then returns.
+Mine only returned. Red arm: `assert 'queued' == 'running'` - the job sat in
+running forever. A review that reports its own blind spot is the useful kind.
+
+### Not closed
+
+The window mux is still skipped-or-failed and the fallback still serves the video; the
+5.5 s cold click is 2.5 s over the owner's 3 s target and the remaining cost is the
+real extract+warm, which only a warm cache removes. The 0.5 ms snapshot hit is the
+3-second path and it needs the client warm to fire before the row is clicked.
