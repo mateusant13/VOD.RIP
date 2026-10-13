@@ -1465,10 +1465,12 @@ async def release_channel_outcome_park(req: ChannelOutcomeReleaseRequest) -> dic
     # nothing. That is exactly the fabricated-success hole this endpoint must
     # not have, so the number is measured here instead.
     def _live_rows() -> list[dict]:
+        # SYNC on purpose: this helper is executed inside run_in_executor by its
+        # caller, so it must NOT await. A bulk edit once put an await here and
+        # the API refused to start ("SyntaxError: await outside async function"),
+        # which is caught by the import-time parse on every boot.
         try:
-            rows = await asyncio.get_running_loop().run_in_executor(
-            None, channel_outcome_snapshot, plat
-        )
+            rows = channel_outcome_snapshot(plat)
         except Exception:
             logger.debug("channel outcome-park read failed for %s", want, exc_info=True)
             return []
