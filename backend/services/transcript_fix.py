@@ -62,6 +62,8 @@ confidence threshold overriding both engines), VODRIP_TRANSCRIPT_CACHE
 
 from __future__ import annotations
 
+from services import http_opener
+
 import json
 import logging
 import math
@@ -552,7 +554,7 @@ def _write_cache(path: Path, names: dict) -> None:
 
 
 def _fetch_latest_version() -> str:
-    with urllib.request.urlopen(VERSIONS_URL, timeout=HTTP_TIMEOUT_S) as resp:
+    with http_opener.open_url(VERSIONS_URL, timeout=HTTP_TIMEOUT_S) as resp:
         versions = json.load(resp)
     if not isinstance(versions, list) or not versions:
         raise ValueError("ddragon versions.json empty")
@@ -568,7 +570,7 @@ def _fetch_gazetteer_names() -> Optional[dict]:
         out: dict[str, dict[str, str]] = {}
         for locale in LOCALES:
             url = CDN_URL.format(version=version, locale=locale)
-            with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT_S) as resp:
+            with http_opener.open_url(url, timeout=HTTP_TIMEOUT_S) as resp:
                 payload = json.load(resp)
             data = payload.get("data") or {}
             out[locale] = {

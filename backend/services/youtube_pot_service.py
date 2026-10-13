@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Optional
 
 from services.os_services import _NO_WINDOW
+from services import http_opener
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +179,7 @@ def _pot_main_js() -> Optional[Path]:
 
 def _http_get(url: str, *, timeout: float) -> Optional[bytes]:
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with http_opener.open_url(url, timeout=timeout) as resp:
             return resp.read()
     # ponytail: best-effort HTTP — any I/O / HTTP / URL failure returns None
     except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError) as exc:
@@ -198,7 +199,7 @@ def _http_post_json(url: str, payload: dict, *, timeout: float) -> Optional[dict
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with http_opener.open_url(req, timeout=timeout) as resp:
             raw = resp.read()
     # ponytail: best-effort HTTP — any I/O / HTTP / URL failure returns None
     except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError) as exc:
@@ -297,7 +298,7 @@ def _bootstrap_pot_server_bundle() -> bool:
         root.mkdir(parents=True, exist_ok=True)
         if not zip_path.is_file():
             logger.info("POT bootstrap: downloading bgutil %s", tag)
-            with urllib.request.urlopen(zip_url, timeout=120) as resp:
+            with http_opener.open_url(zip_url, timeout=120) as resp:
                 zip_path.write_bytes(resp.read())
         extract_root = root / f"bgutil-ytdlp-pot-provider-{tag}"
         if not extract_root.is_dir():

@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 from services import archive_db
+from services import http_opener
 
 logger = logging.getLogger(__name__)
 
@@ -207,7 +208,7 @@ def _ensure_checkpoint() -> str:
         import urllib.request
 
         Path(ckpt).parent.mkdir(parents=True, exist_ok=True)
-        with urllib.request.urlopen(url, timeout=60) as resp, open(part, "wb") as f:
+        with http_opener.open_url(url, timeout=60) as resp, open(part, "wb") as f:
             shutil.copyfileobj(resp, f, length=1024 * 256)
         os.replace(part, ckpt)
     except Exception as exc:

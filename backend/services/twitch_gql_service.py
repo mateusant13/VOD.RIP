@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ssl
 import json
 import logging
 
@@ -52,6 +53,30 @@ actual BANDWIDTH when fetched.  (ponytail: no realtime m3u8 parse for
 bandwidth — probes are cheap enough.)
 '''
 TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
+
+# ONE SSL context and ONE opener for the whole process.
+#
+# Measured 2026-10-13 with py-spy against a silent API process. The MainThread was
+# idle in asyncio _poll (the loop was fine) while a worker held the GIL in:
+#
+#   Thread "live-platform_0" (active+gil):
+#       _load_windows_store_certs (ssl.py:588)
+#       load_default_certs (ssl.py:596)
+#       create_default_context (ssl.py:775)
+#       __init__ (http/client.py:1437)
+#       urlopen (urllib/request.py:216)
+#       _gql_request (twitch_gql_service.py:751)
+#
+# urllib.request.urlopen() builds a NEW HTTPSHandler per call, and that calls
+# ssl.create_default_context(), which on Windows enumerates the ENTIRE certificate
+# store. It is slow AND it holds the GIL, so the event loop cannot run and
+# /api/health stops answering - and the supervisor restarts an API that was never
+# hung. The four urlopen sites in this module now share one opener, so the store is
+# loaded once per process instead of once per request.
+_GQL_SSL_CONTEXT = ssl.create_default_context()
+_GQL_OPENER = urllib.request.build_opener(
+    urllib.request.HTTPSHandler(context=_GQL_SSL_CONTEXT)
+)
 
 
 class TwitchVodUnavailable(RuntimeError):
@@ -491,7 +516,7 @@ def _resolve_cloudfront_variants(vod_id: str, video_data: dict) -> List[Dict[str
     def _responsive(url: str) -> bool:
         try:
             req = urllib.request.Request(url, headers=twitch_http_headers())
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with _GQL_OPENER.open(req, timeout=10) as r:
                 return r.status == 200 and bool(r.read(65536))
         except (urllib.error.HTTPError, urllib.error.URLError, OSError):
             return False
@@ -571,7 +596,7 @@ def get_vod_playback_sync(url_or_id: str) -> Tuple[str, dict, List[Dict[str, Any
         headers = twitch_http_headers()
         try:
             req = urllib.request.Request(master_url, headers=headers, method="GET")
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with _GQL_OPENER.open(req, timeout=15) as resp:
                 master_text = resp.read().decode("utf-8", errors="replace")
             variants = _parse_hls_master_variants(master_url, master_text)
             return master_url, headers, variants
@@ -748,7 +773,7 @@ def _gql_request(
         # GQL request (see services.rl_counter). No DB write, no
         # archive_db import, no lock beyond that counter's own.
         with rl_counter.request_scope("twitch"):
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with _GQL_OPENER.open(req, timeout=20) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")[:200]
@@ -793,7 +818,7 @@ def _gql_persisted(
         # and is therefore counted twice - which is correct, the platform
         # saw two requests.
         with rl_counter.request_scope("twitch"):
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with _GQL_OPENER.open(req, timeout=20) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")[:200]

@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from services.ytdlp_service import detect_platform
+from services import http_opener
 from utils import vod_id_from_url
 
 logger = logging.getLogger(__name__)
@@ -482,7 +483,7 @@ def write_thumbnail_sidecar(thumbnail: Optional[str], output_file: str) -> Optio
         req = urllib.request.Request(
             url, headers={"User-Agent": __import__("services._version", fromlist=["USER_AGENT"]).USER_AGENT}
         )
-        with urllib.request.urlopen(req, timeout=_THUMB_FETCH_TIMEOUT) as resp:
+        with http_opener.open_url(req, timeout=_THUMB_FETCH_TIMEOUT) as resp:
             body = resp.read(_THUMB_SIZE_CAP + 1)
         if len(body) > _THUMB_SIZE_CAP or not body:
             return None

@@ -35,6 +35,7 @@ import urllib.request
 from typing import Any, Callable, Dict, List, Optional
 
 from services import archive_db
+from services import http_opener
 from services import rl_counter
 from services import twitch_gql_service
 from services.archive_scheduler import _enqueue_chat_job
@@ -307,7 +308,7 @@ def _post_comments_page(
         # Instrumentation: one in-memory increment + in-flight gauge per
         # page fetch (see services.rl_counter). Never a DB write.
         with rl_counter.request_scope("twitch"):
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with http_opener.open_url(req, timeout=20) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")[:200]

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
 from services import ytdlp_guard
+from services import http_opener
 from services import ytdlp_outcomes
 
 logger = logging.getLogger(__name__)
@@ -552,7 +553,7 @@ def _fetch_youtube_rss_rows(
             f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}",
             headers={"User-Agent": USER_AGENT},
         )
-        raw = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", "replace")
+        raw = http_opener.open_url(req, timeout=15).read().decode("utf-8", "replace")
         ns = {
             "a": "http://www.w3.org/2005/Atom",
             # YouTube's RSS feed declares xmlns:yt="http://www.youtube.com/xml/schemas/2015"
