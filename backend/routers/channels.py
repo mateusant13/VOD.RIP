@@ -811,10 +811,31 @@ async def channel_videos(
         except Exception:
             _overrides = {}
         eff_language = None
+        # OFF THE EVENT LOOP. Measured 2026-10-13 with py-spy during a live
+        # preview click, after the archive_focus_stamp fix landed and every OTHER
+        # thread had gone idle (so this is not lock contention - it is one long
+        # synchronous query on the loop):
+        #
+        #   Thread MainThread (active):
+        #       query (services/archive_db.py:1761)
+        #       channel_language_tally (services/archive_db.py:2062)
+        #       _transcript_evidence (services/channel_language.py:104)
+        #       aggregate_channel_language (services/channel_language.py:178)
+        #       channel_videos (routers/channels.py:816)
+        #
+        # channel_videos is `async def` and this is the channel the user opened, so
+        # the whole API stalled for the duration of the tally.
+        _loop = asyncio.get_running_loop()
         for label in wanted:
             archive_platform, _, _ = platform_specs[label]
-            _agg = aggregate_channel_language(
-                archive_platform, channel, overrides=_overrides
+            _agg = await _loop.run_in_executor(
+                None,
+                functools.partial(
+                    aggregate_channel_language,
+                    archive_platform,
+                    channel,
+                    overrides=_overrides,
+                ),
             )
             if _agg.get("language"):
                 eff_language = _agg["language"]
