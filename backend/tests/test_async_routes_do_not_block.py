@@ -29,7 +29,26 @@ BACKEND = Path(__file__).resolve().parents[1]
 BLOCKING = ("archive_db.", "cookie_store.")
 
 
-def _direct_blocking_calls(tree) -> list[tuple[int, str, str]]:
+def _bare_blocking_names(tree) -> set[str]:
+    """Names bound by `from ...archive_db|cookie_store import X`.
+
+    The first version of this law only matched the attribute form
+    `archive_db.foo()`. `routers/channels.py` imports `mark_channel_priority`
+    directly, so the call read as a bare name and the detector stayed silent
+    while that route blocked the event loop for ~48 s on every channel open -
+    measured with py-spy, 2026-10-13. A law with a blind spot is not a law.
+    """
+    names: set[str] = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom) and n.module:
+            if n.module.endswith("archive_db") or n.module.endswith("cookie_store"):
+                for a in n.names:
+                    names.add(a.asname or a.name)
+    return names
+
+
+def _direct_blocking_calls(tree, bare: set[str] | None = None) -> list[tuple[int, str, str]]:
+    bare = bare or set()
     hits: list[tuple[int, str, str]] = []
     async_stack: list[str] = []
     sync_depth = 0
@@ -68,12 +87,32 @@ def _direct_blocking_calls(tree) -> list[tuple[int, str, str]]:
                 if isinstance(f, ast.Attribute):
                     base = f.value.id if isinstance(f.value, ast.Name) else ""
                     name = f"{base}.{f.attr}"
-                if name.startswith(BLOCKING):
+                elif isinstance(f, ast.Name):
+                    # A bare imported name (`from ...archive_db import foo`) has no
+                    # attribute to read, so without this branch `name` stayed "" and
+                    # the detector could never see it. That blind spot is precisely
+                    # how routers/channels.py:441 escaped the first version of this
+                    # law while blocking the event loop for ~48 s per channel open.
+                    name = f.id
+                if name.startswith(BLOCKING) or name in bare:
                     hits.append((node.lineno, async_stack[-1], name))
             self.generic_visit(node)
 
     V().visit(tree)
     return hits
+
+
+def test_the_channel_route_does_not_block_the_event_loop():
+    """RED before the fix: channel_videos called mark_channel_priority etc.
+
+    Measured with py-spy 2026-10-13: three separate blocking calls in this
+    one route (mark_channel_priority at :441, channel_snapshot_age_sec at
+    :901), each freezing /api/health for the sqlite busy_timeout.
+    """
+    src = (BACKEND / "routers" / "channels.py").read_text(encoding="utf-8", errors="replace")
+    tree = ast.parse(src)
+    bad = _direct_blocking_calls(tree, _bare_blocking_names(tree))
+    assert not bad, f"routers/channels.py blocks the event loop again: {bad}"
 
 
 def test_the_focus_route_does_not_block_the_event_loop():
@@ -95,6 +134,25 @@ def test_it_still_does_the_work_it_used_to():
     for call in ("clear_user_focus", "set_user_focus", "set_job_priority"):
         assert call in body, f"the fix dropped {call}"
     assert "run_in_executor" in body
+
+
+def test_the_scanner_catches_a_bare_imported_name():
+    """The blind spot that hid the real defect: `from x import foo; foo()`.
+
+    RED before this arm existed: the detector only matched `archive_db.foo()`
+    and returned [] for the bare form, which is exactly how
+    routers/channels.py:441 escaped it.
+    """
+    src = (
+        "from services.archive_db import mark_channel_priority\n"
+        "async def route():\n"
+        "    mark_channel_priority(\"twitch\", \"x\")\n"
+    )
+    tree = ast.parse(src)
+    hits = _direct_blocking_calls(tree, _bare_blocking_names(tree))
+    assert len(hits) == 1 and hits[0][2] == "mark_channel_priority", (
+        "a bare imported blocking call is invisible to the law again"
+    )
 
 
 def test_the_scanner_can_actually_fail():

@@ -349,7 +349,24 @@ def _ramp_up(st: _PlatformState, now: float) -> None:
     if st.events and st.backoff_streak and (now - st.last_event_ts) >= _BACKOFF_RESET_S:
         st.backoff_streak = 0
         st.backoff_until = 0.0
-    if st.events == 0:
+    # A platform with NO events is exactly the case the ramp exists for. This
+    # read `if st.events == 0: return`, so a clean platform never recovered: the
+    # ceiling is a one-way ratchet in practice, which contradicts the module
+    # contract right above ("After CLEAN_WINDOW_S with no event, the ceiling
+    # grows by _UP_FACTOR").
+    #
+    # Measured 2026-10-13: youtube sat at ceiling_rpm 6.797 with
+    # learning.events 0, ramp_pending false and seconds_since_event null - a
+    # clean platform, pinned, forever. Every YouTube channel walk was then
+    # refused ("YouTube rate limit budget still exhausted") and the YouTube tab
+    # returned 0 videos, which is why the owner never got a YouTube preview.
+    #
+    # Safe to ramp on the ceiling alone: last_ramp_ts is initialised at state
+    # creation (line ~293), set by prime_from_history, and reset by note_limit,
+    # so this cannot fire immediately after a trip - it still waits a full
+    # CLEAN_WINDOW_S, and it stops the moment the ceiling reaches the cap.
+    cap = min(_MAX_CEILING_RPM, _hard_cap_rpm(st.platform))
+    if st.ceiling_rpm >= cap:
         return
     since_ramp = now - st.last_ramp_ts
     if since_ramp < _CLEAN_WINDOW_S:
@@ -359,7 +376,6 @@ def _ramp_up(st: _PlatformState, now: float) -> None:
         return
     steps = min(steps, _MAX_CATCHUP_STEPS)
     st.last_ramp_ts = now
-    cap = min(_MAX_CEILING_RPM, _hard_cap_rpm(st.platform))
     st.ceiling_rpm = min(cap, st.ceiling_rpm * (_UP_FACTOR ** steps))
 
 
@@ -901,7 +917,8 @@ def platform_status(platform: str) -> Dict[str, Any]:
                 "seconds_since_event": (
                     round(now - st.last_event_ts, 1) if st.events else None
                 ),
-                "ramp_pending": bool(st.events and (now - st.last_ramp_ts) >= _CLEAN_WINDOW_S),
+                "ramp_pending": bool((now - st.last_ramp_ts) >= _CLEAN_WINDOW_S
+                             and st.ceiling_rpm < min(_MAX_CEILING_RPM, _hard_cap_rpm(st.platform))),
             },
             "hot": {
                 "calls_last_min": st.hot_calls if hot_age < _HOT_WINDOW_S else 0,

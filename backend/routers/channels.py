@@ -438,7 +438,22 @@ async def channel_videos(
         ):
             if (_slug or "").strip():
                 try:
-                    mark_channel_priority(_p, _slug)
+                    # OFF THE EVENT LOOP. mark_channel_priority is blocking sqlite on
+                    # the shared write connection, and this route is `async def`.
+                    # Measured 2026-10-13 with py-spy during a channel load:
+                    #
+                    #   Thread MainThread (idle):
+                    #       execute (services/archive_db.py:1742)
+                    #       mark_channel_priority (services/archive_db.py:1924)
+                    #       channel_videos (routers/channels.py:441)
+                    #
+                    # settings.py:70 was already fixed for this exact function and
+                    # backend/tests/test_settings_no_loop_block.py pins it there;
+                    # this call site was missed, which is why the whole API stalled
+                    # for ~48s on every channel open.
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, mark_channel_priority, _p, _slug
+                    )
                 except Exception:  # noqa: BLE001 — marking must never fail the fetch
                     logger.debug("channel priority mark skipped for %s/%s", _p, _slug, exc_info=True)
         if not wanted:
@@ -883,7 +898,9 @@ async def channel_videos(
         for label in wanted:
             archive_platform, snap_key, window = platform_specs[label]
             age = (
-                channel_snapshot_age_sec(archive_platform, snap_key)
+                await asyncio.get_running_loop().run_in_executor(
+                    None, channel_snapshot_age_sec, archive_platform, snap_key
+                )
                 if snap_key else None
             )
             fresh[label] = age is not None and age < window
@@ -1089,7 +1106,9 @@ async def channel_clips(
         ):
             if (_slug or "").strip():
                 try:
-                    mark_channel_priority(_p, _slug)
+                    await asyncio.get_running_loop().run_in_executor(
+        None, mark_channel_priority, _p, _slug
+    )
                 except Exception:  # noqa: BLE001 — marking must never fail the fetch
                     logger.debug("channel priority mark skipped for %s/%s", _p, _slug, exc_info=True)
         if not wanted:
@@ -1338,7 +1357,9 @@ async def channel_outcome_parks(platform: str = "youtube"):
     """
     plat = platform or "youtube"
     try:
-        rows = channel_outcome_snapshot(plat)
+        rows = await asyncio.get_running_loop().run_in_executor(
+            None, channel_outcome_snapshot, plat
+        )
     except Exception:
         # A broken/absent learning table is "no memory", never an exception in
         # the UI's path: the walk degrades the same way (it treats a failed
@@ -1373,7 +1394,9 @@ async def channel_outcome_park(
     if not want:
         raise HTTPException(status_code=400, detail="channel is required")
     try:
-        rows = channel_outcome_snapshot(plat)
+        rows = await asyncio.get_running_loop().run_in_executor(
+            None, channel_outcome_snapshot, plat
+        )
     except Exception:
         # A read that could not run has NOT established that this channel is
         # unmeasured, so it must not answer `not_learned` - that would be the
@@ -1443,7 +1466,9 @@ async def release_channel_outcome_park(req: ChannelOutcomeReleaseRequest) -> dic
     # not have, so the number is measured here instead.
     def _live_rows() -> list[dict]:
         try:
-            rows = channel_outcome_snapshot(plat)
+            rows = await asyncio.get_running_loop().run_in_executor(
+            None, channel_outcome_snapshot, plat
+        )
         except Exception:
             logger.debug("channel outcome-park read failed for %s", want, exc_info=True)
             return []

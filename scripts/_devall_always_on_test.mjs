@@ -74,7 +74,10 @@ const revivesDeadChild = (s) =>
 const hasAuthoritativeWatchdog = (s) =>
   /function startAlwaysOnWatchdog\(/.test(s) &&
   /startAlwaysOnWatchdog\(\);/.test(s) &&
-  /not answering on :\$\{apiPort\}/.test(s);
+  // The message moved from a bare "not answering on" to a MEASURED
+  // "silent on :PORT for Ns". Pin the capability, not the old wording: the
+  // watchdog must still schedule a restart on its own initiative.
+  /scheduleApiRestart\(`(not answering on|silent on) :\$\{apiPort\}/.test(s);
 
 console.log("dev-all is always-on:");
 check("no restart-attempt cap remains", noGiveUp(src));
