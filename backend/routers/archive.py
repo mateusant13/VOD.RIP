@@ -168,8 +168,23 @@ async def _run_backfill(
                 _backfill_failed_resumes[video_id] = 0
         # Bulk chat inserts leave the FTS index fragmented; merge after every
         # completed backfill (manual or auto) so searches stay fast.
+        #
+        # OFF THE EVENT LOOP. Measured 2026-10-13 with py-spy against a silent API
+        # process, and this was the MainThread itself:
+        #
+        #   Thread 44784 (active): "MainThread"
+        #       execute (services/archive_db.py:1760)
+        #       optimize_fts (services/archive_db.py:4516)
+        #       _run_backfill (routers/archive.py:172)
+        #       _run (asyncio/events.py:84)
+        #
+        # The function already offloads the backfill with asyncio.to_thread two
+        # lines above, then ran the FTS merge inline. optimize_fts rewrites the
+        # whole FTS index - millions of rows here - and on the loop that means
+        # /api/health cannot answer at all until it finishes, so the supervisor
+        # restarts an API that was only merging an index.
         try:
-            archive_db.optimize_fts()
+            await asyncio.to_thread(archive_db.optimize_fts)
         except Exception:
             logger.exception("fts optimize failed after backfill")
 
