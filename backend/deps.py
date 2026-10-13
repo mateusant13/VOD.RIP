@@ -85,7 +85,16 @@ LIVENESS_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="livene
 # LIVENESS: 4 install calls would saturate the 4 liveness workers and queue
 # /api/health behind app work"). Same reasoning, opposite endpoint.
 # Module-global, never shut down at request/lifespan scope, like every pool.
-HEALTH_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="health")
+# 6 workers, not 2. Measured 2026-10-13: the API was being killed by its own
+# supervisor while it was demonstrably working, and this pool was the last link.
+# The busy_timeout above is 10s, so TWO concurrent WAL-busy probes occupy the
+# whole pool and a third - the supervisor watchdog, or the frontend status poll -
+# queues for up to 20s and reads as a dead app. Six workers absorb five
+# simultaneous stalled probes and still cannot starve LIVENESS, because the pool
+# is dedicated and runs only sub-second reads. The isolation argument above is
+# preserved; only the depth changes. (The supervisor now also requires sustained
+# silence before restarting, so the two fixes are independent.)
+HEALTH_EXECUTOR = ThreadPoolExecutor(max_workers=6, thread_name_prefix="health")
 
 # ── Warm-work global cap ────────────────────────────────────────────────
 # Boot warm storm spans WARM(3)+GESTURE(2)+FULL(1)+ANON(2)+sync-wave(2) and

@@ -487,6 +487,17 @@ let restartAttempts = 0;
  */
 const API_RESTART_MAX_DELAY_S = 30;
 const API_HEALTHY_RESET_MS = 60_000;
+/* How long :apiPort must stay silent before "busy" becomes "hung".
+ *
+ * Measured 2026-10-13: the API was killed repeatedly while it was demonstrably
+ * WORKING - the log shows extract-ok lines right up to each verdict. The probe
+ * used a 2 s timeout, but the app sqlite busy_timeout is 10 s
+ * (archive_db.py:515) and /api/health runs its DB probe on a 2-worker pool
+ * (deps.py:88 HEALTH_EXECUTOR), so two WAL-busy probes queue the third for ~20 s.
+ * A two-second probe therefore cannot distinguish a hung API from a busy one,
+ * and treating "no answer in 2 s" as proof of a hang is what kept killing it.
+ * Silence must be SUSTAINED before it counts. */
+const API_HUNG_GRACE_MS = 60_000;
 let apiHealthySince = 0;
 
 /* Reclaim :apiPort before a restart — the missing half of the handshake.
@@ -579,16 +590,32 @@ function scheduleApiRestart(reason) {
  * has no grace period after boot, because a dead API is not a warm-up.
  */
 let alwaysOnTimer = null;
+let apiUnresponsiveSince = 0;
 function startAlwaysOnWatchdog() {
   if (alwaysOnTimer) return;
   alwaysOnTimer = setInterval(async () => {
     if (shuttingDown || reloading) return;
     if (await apiHealthy(apiPort, 2000)) {
       apiHealthySince = apiHealthySince || Date.now();
+      apiUnresponsiveSince = 0;
       return;
     }
     apiHealthySince = 0;
-    scheduleApiRestart(`not answering on :${apiPort}`);
+    // Silence is not a hang until it is SUSTAINED. A single missed 2 s probe is
+    // what a 10 s sqlite busy_timeout looks like from the outside, and the old
+    // code restarted on exactly that - killing the app mid-extract, over and
+    // over, which the owner experienced as previews that never load. Retry
+    // first; restart only after API_HUNG_GRACE_MS of continuous silence.
+    if (!apiUnresponsiveSince) {
+      apiUnresponsiveSince = Date.now();
+      console.log(
+        `[dev] :${apiPort} missed a probe — watching for ${API_HUNG_GRACE_MS / 1000}s of silence before treating it as hung`,
+      );
+      return;
+    }
+    const silentMs = Date.now() - apiUnresponsiveSince;
+    if (silentMs < API_HUNG_GRACE_MS) return;
+    scheduleApiRestart(`silent on :${apiPort} for ${Math.round(silentMs / 1000)}s`);
   }, 10_000);
 }
 

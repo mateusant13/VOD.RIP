@@ -1276,17 +1276,40 @@ async def archive_focus_stamp(body: dict):
     natural 'the user navigated away' signal."""
     platform = str(body.get("platform") or "").strip().lower()
     video_id = str(body.get("video_id") or "").strip()
+    # OFF THE EVENT LOOP. This route is `async def`, so its body runs on the
+    # asyncio loop, and every archive_db call here is BLOCKING sqlite on the
+    # shared write connection. Measured 2026-10-13 with py-spy against a live
+    # hung process - the stack was unambiguous:
+    #
+    #   MainThread:
+    #       execute (services/archive_db.py:1742)
+    #       clear_user_focus (services/archive_db.py:3504)
+    #       archive_focus_stamp (routers/archive.py:1280)
+    #
+    # while EVERY background thread (boot-maintenance, archive-watchdog,
+    # archive-scheduler, app-activity-hb, entity-watcher, app-activity_0) sat on
+    # the same archive_db.execute line waiting for the write lock. One blocked
+    # sync call here froze the loop for the whole busy_timeout, /api/health could
+    # not answer, and the supervisor killed an API that was merely waiting on its
+    # own database - which the owner experienced as previews that never load.
+    # run_in_executor is the pattern the rest of this router already uses.
+    loop = asyncio.get_running_loop()
     if not video_id or platform not in archive_db.PLATFORMS:
-        archive_db.clear_user_focus()
+        await loop.run_in_executor(None, archive_db.clear_user_focus)
         return {"ok": True, "focus": None}
-    archive_db.set_user_focus(platform, video_id)
+    await loop.run_in_executor(
+        None, archive_db.set_user_focus, platform, video_id
+    )
     # Bump the focused item's job to the focus tier so it also wins the
     # priority ordering against older queued work. Never touches a running
     # job (set_job_priority refuses) — a running job is already past the
     # claim decision, which is the no-preemption invariant.
     try:
-        archive_db.set_job_priority(
-            f"transcribe-{platform}-{video_id}", queue_policy.PRIORITY_FOCUS
+        await loop.run_in_executor(
+            None,
+            archive_db.set_job_priority,
+            f"transcribe-{platform}-{video_id}",
+            queue_policy.PRIORITY_FOCUS,
         )
     except Exception:
         logger.debug("focus priority bump skipped", exc_info=True)
