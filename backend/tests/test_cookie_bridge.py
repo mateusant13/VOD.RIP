@@ -935,7 +935,8 @@ def test_auto_install_worker_installs_both_extensions(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cb, "_run_auto_install_script", run)
     monkeypatch.setattr(cb, "_kick_overlay_src", lambda: overlay)
-    monkeypatch.setattr(cb, "_wake_extension_browser", lambda: None)
+    # Sem monkeypatch de wake-up: a ponte nao abre mais nenhuma janela de
+    # navegador (ver test_cookie_bridge_wakeup.py).
     cb._auto_install_worker("chrome", Path("C:/cookies"), True)
 
     assert calls == [("chrome", Path("C:/cookies")), ("chrome", overlay)]

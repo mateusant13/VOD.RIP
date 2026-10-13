@@ -48,8 +48,15 @@ POST /api/session/cookies/auto-install          (cookie_bridge.py:985)
                         -ExtensionDir <dir> -Browser <browser> -DebugPort 7897
                  └─ parse the trailing JSON line (stdout = ONE JSON object)
             └─ (optional) same for vendor/kick-overlay/
-  └─ on success: _wake_extension_browser()  → opens a platform page in the
-     background so the extension's service worker wakes and pushes cookies
+  └─ on success: nothing browser-side. The extension wakes itself: a fresh
+     install fires chrome.runtime.onInstalled, which pushes cookies from the
+     service worker (no page, no renderer). Measured 2026-10-13: the old
+     _wake_extension_browser() opened a hidden tab "to wake the SW" but looked
+     the browser up by PLATFORM name (twitch/youtube/kick) — a key
+     _find_browser does not have — so it never ran (0 spawns, 0 wake lines
+     in 31,721 log lines) and the bridge works without it. The SW's own
+     channels: cookies.onChanged, tabs.onUpdated, a 10-min alarm, and a 30-s
+     poll of /api/extension/status.
 ```
 
 Frontend: `runSilentCookieExtensionInstall()` in `src/lib/cookieAutoInstall.ts`

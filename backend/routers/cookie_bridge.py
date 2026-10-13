@@ -627,51 +627,6 @@ def _open_extension_manager() -> dict:
     return {"launched": False, "browser": None, "url": None}
 
 
-def _wake_extension_browser() -> None:
-    """Open a platform page in the background to wake the extension's service
-    worker after install — the SW polls the backend for cookie directives on
-    its 30s alarm and on content-script messages; a page load on a supported
-    platform triggers the content script, which delivers the initial message
-    that wakes the SW.  Fire-and-forget: failures are silently ignored.
-
-    The window is placed off-screen and started minimized to avoid focus
-    steal — the page only needs the renderer alive so the content script
-    can push cookies, not a visible UI.
-    """
-    platform_urls = {
-        "twitch": "https://www.twitch.tv/",
-        "youtube": "https://www.youtube.com/",
-        "kick": "https://kick.com/",
-    }
-    for name, url in platform_urls.items():
-        path = _find_browser(name)
-        if not path:
-            continue
-        try:
-            # ponytail: upgrade path is native CDP wake-up or extension push
-            # notification.  Off-screen + minimized keeps the window invisible
-            # but the renderer alive (the content script needs it).
-            kwargs = {}
-            if os.name == "nt":
-                si = subprocess.STARTUPINFO()
-                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                si.wShowWindow = 7  # SW_SHOWMINNOACTIVE — minimized, no focus steal
-                kwargs["startupinfo"] = si
-            subprocess.Popen(
-                [
-                    str(path),
-                    "--new-tab",
-                    "--window-position=-32000,-32000",
-                    url,
-                ],
-                **kwargs,
-            )
-            logger.info("cookie wake-up: background tab on %s to activate extension SW", name)
-            return
-        except OSError as exc:
-            logger.debug("cookie wake-up %s failed: %s", name, exc)
-
-
 @router.get("/api/extension/status")
 async def extension_status():
     """Version + pending reload directive for the cookie extension's SW.
@@ -870,14 +825,16 @@ def _auto_install_worker(
         _AUTO_INSTALL_STATE["error"] = error
         _AUTO_INSTALL_STATE["finished_at"] = time.time()
         logger.info("extension auto-install finished: %s", _AUTO_INSTALL_STATE["state"])
-    # Success: wake the cookie bridge service worker immediately; its alarm is
-    # a fallback for browsers that do not wake the worker on a page load.
+    # No browser is spawned to rouse the extension. A fresh install fires
+    # chrome.runtime.onInstalled inside the extension, which pushes cookies
+    # itself; the service worker needs no page renderer for that. The removed
+    # _wake_extension_browser() spawned a hidden browser tab for the same
+    # purpose and was measured dead on 2026-10-13: it looked the browser up by
+    # PLATFORM name ("twitch"/"youtube"/"kick"), a key _find_browser does not
+    # have (browsers are "chrome"/"msedge"/"brave"), so an instrumented
+    # in-process run recorded subprocess.Popen calls == [] and the API log
+    # holds 0 wake lines in 31,721 lines.
     if ok:
-        try:
-            _wake_extension_browser()
-        except Exception:
-            pass
-        # ponytail: upgrade path is native push notification or CDP wake-up.
         with _AUTO_INSTALL_LOCK:
             _AUTO_INSTALL_STATE["state"] = "idle"
 
@@ -972,12 +929,28 @@ async def session_cookies_enable(request: Request):
     s = settings_mgr.get()
     s.cookie_bridge_enabled = True
     settings_mgr.save(s)
-    # Wake the extension's service worker by opening a supported-platform page
-    # in the background — the content script on that page delivers the first
-    # message that wakes the SW, which immediately pushes cookies to the
-    # freshly-enabled backend (no 30s alarm wait).  Fire-and-forget: the
-    # browser open is best-effort and never blocks the response.
-    threading.Thread(target=_wake_extension_browser, daemon=True).start()
+    # No browser is spawned to rouse the extension, and none is needed: the
+    # extension's service worker collects cookies itself (chrome.cookies.
+    # getAll) and pushes on cookies.onChanged, on navigation of a
+    # bridge-domain tab, on a 10-minute heartbeat alarm, and on a 30-s poll
+    # of /api/extension/status — all measured live on 2026-10-13 with the
+    # bridge paired and no rousing browser anywhere.
+    #
+    # The removed _wake_extension_browser() justified itself with "the page
+    # script needs the renderer", but the cookie bridge injects no page
+    # script at all: the manifest's only injected scripts are the Twitch clip
+    # editor (twitch.tv/videos/*, clips.twitch.tv/create*), and the platform
+    # root URLs it used to open match none of them. Its documented upgrade
+    # paths are unavailable too: 9222 is not a CDP endpoint the app can use
+    # (404 on /json/version and /json/list; the WebSocket handshake is
+    # rejected 403 by the OMP browser-relay sharing the port), and a
+    # CDP-capable fresh-profile Chrome carries neither the paired cookie
+    # extension nor the cookies.
+    #
+    # Accepted trade-off: after a re-enable the next push can wait for the next
+    # cookie change or the heartbeat (<=10 min). Closing that gap windowlessly
+    # means having the SW push when its 30-s status poll sees the bridge
+    # freshly enabled — an extension change, not a browser window.
     return {"enabled": True}
 
 
