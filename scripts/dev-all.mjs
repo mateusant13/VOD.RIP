@@ -219,11 +219,17 @@ export function startHealthMonitor({
 }) {
   let strikes = 0;
   const startedAt = Date.now();
+  // Measured, not computed. The old call site printed the constant "~45s"
+  // (maxStrikes x healthIntervalMs), so a monitor whose clock predated a
+  // restart announced "unresponsive for ~45s" about an API that had been
+  // alive for four seconds. The number was a claim the code never made.
+  let lastOkAt = Date.now();
   const timer = setInterval(async () => {
     if (Date.now() - startedAt < graceMs) return;
     const ok = await apiHealthy(port, healthTimeoutMs);
     if (ok) {
       strikes = 0;
+      lastOkAt = Date.now();
       try {
         onHealthy?.();
       } catch {
@@ -234,7 +240,7 @@ export function startHealthMonitor({
     strikes += 1;
     if (strikes === maxStrikes) {
       try {
-        onUnhealthy(strikes);
+        onUnhealthy(strikes, Date.now() - lastOkAt);
       } catch {
         /* watchdog must never throw into the interval */
       }
@@ -483,6 +489,55 @@ const API_RESTART_MAX_DELAY_S = 30;
 const API_HEALTHY_RESET_MS = 60_000;
 let apiHealthySince = 0;
 
+/* Reclaim :apiPort before a restart — the missing half of the handshake.
+ *
+ * Measured 2026-10-12 21:06 in tmp/devall11.log. This is the whole of "o
+ * backend sempre cai, nunca ta on":
+ *
+ *   run.py re-executes itself, so the process that actually HOLDS :7897 is a
+ *   GRANDCHILD of this supervisor (observed: 604 -> 12548, 34436 -> 40040).
+ *   The exit handler kills the child it spawned; the grandchild survives and
+ *   keeps LISTENing with six sockets in CLOSE_WAIT — the signature of an event
+ *   loop that stopped servicing its accept queue. Every respawn then dies with
+ *   [Errno 10048] "only one usage of each socket address is permitted". With
+ *   the old three-strikes budget that ended the supervisor; with the
+ *   never-give-up budget it became an infinite loop ("attempt 25") because
+ *   NOTHING in the restart path freed the port. ensurePortFree already did the
+ *   work and was called from the startup path only (dev-all.mjs:919-993).
+ *
+ * run.py:84 asserts "dev-all.mjs releases the port before spawning us" and
+ * dev-all.mjs:98 says "We deliberately do NOT call release_api_port here".
+ * Each half waited for the other, and VODRIP_SKIP_PORT_RELEASE=1 (line 969)
+ * made sure run.py would not do it either. This is that missing half.
+ *
+ * Two deliberate differences from ensurePortFree:
+ *
+ *  1. It NEVER calls process.exit. ensurePortFree aborts the whole supervisor
+ *     when the port stays busy (dev-all.mjs:128), which is the opposite of
+ *     always-on — a failure here must leave the watchdog free to try again.
+ *  2. It refuses to kill a port that ANSWERS. A hung API holds the port and
+ *     does not reply; a healthy sibling dev-all session does reply, and killing
+ *     that is the murder loop the single-instance lock exists to prevent
+ *     (dev-all.mjs:292-299).
+ */
+async function reclaimApiPort(port) {
+  if (!(await isPortListening(port))) return true;
+  if (await apiHealthy(port, 2000)) {
+    console.log(`[dev] :${port} answers — leaving it alone`);
+    return true;
+  }
+  for (let attempt = 1; attempt <= 8; attempt++) {
+    releasePort(port);
+    if (await waitPortFree(port, 4000)) {
+      console.log(`[dev] reclaimed :${port} from an unresponsive listener`);
+      return true;
+    }
+  }
+  console.error(
+    `[dev] could not reclaim :${port} — the next watchdog tick will try again`,
+  );
+  return false;
+}
 let apiRestartScheduled = false;
 
 function scheduleApiRestart(reason) {
@@ -493,7 +548,14 @@ function scheduleApiRestart(reason) {
   console.error(
     `[dev] API ${reason} — restarting in ${delaySec}s (attempt ${restartAttempts}, never giving up)`,
   );
-  setTimeout(() => {
+  setTimeout(async () => {
+    if (shuttingDown || reloading || !apiSpec) {
+      apiRestartScheduled = false;
+      return;
+    }
+    // Reclaim the PORT, not just our child. Without this the respawn cannot
+    // bind and the loop never ends — see reclaimApiPort above.
+    await reclaimApiPort(apiPort);
     apiRestartScheduled = false;
     if (shuttingDown || reloading || !apiSpec) return;
     start("api", apiSpec.command, apiSpec.args, apiSpec.cwd, apiSpec.extraEnv);
@@ -839,6 +901,17 @@ async function reloadApi(changedFile) {
 }
 function startApiHealthMonitor() {
   const graceMs = Number(process.env.VODRIP_DEVALL_HEALTH_GRACE_MS || "300000");
+  // ONE monitor, always. This used to overwrite healthMonitorStop WITHOUT
+  // calling it, so every restart leaked a live setInterval that nothing could
+  // ever clear. Measured 2026-10-12 21:29: with four leaked monitors, four
+  // "unresponsive" verdicts arrived per window and each one taskkilled the API
+  // - an API that had been listening for four seconds and was mid-extract.
+  // That is the murder loop behind "o backend sempre cai": the app was killed
+  // by its own watchdog faster than it could serve a single preview, forever.
+  if (healthMonitorStop) {
+    healthMonitorStop();
+    healthMonitorStop = null;
+  }
   healthMonitorStop = startHealthMonitor({
     graceMs,
     onHealthy: () => {
@@ -854,7 +927,7 @@ function startApiHealthMonitor() {
         restartAttempts = 0;
       }
     },
-    onUnhealthy: () => {
+    onUnhealthy: (_strikes, unresponsiveMs) => {
       if (shuttingDown || reloading) return;
       if (!apiProcess || apiProcess.exitCode !== null) {
         // The child is already dead and no exit handler is going to fire for
@@ -865,7 +938,7 @@ function startApiHealthMonitor() {
       }
       apiHealthySince = 0;
       console.error(
-        `[dev] API on :${apiPort} unresponsive for ~45s — treating as hung, restarting`,
+        `[dev] API on :${apiPort} unresponsive for ~${Math.round((unresponsiveMs || 0) / 1000)}s — treating as hung, restarting`,
       );
       if (process.platform === "win32") {
         spawn("taskkill", ["/PID", String(apiProcess.pid), "/T", "/F"], {
