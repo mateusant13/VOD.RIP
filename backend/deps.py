@@ -119,7 +119,20 @@ CHANNEL_CLIP_LIMIT = 25
 CHANNEL_CLIP_MAX_DURATION_SEC = 60
 CLIP_FETCH_TIMEOUT_SEC = 20
 CHANNEL_VOD_FETCH_TIMEOUT_SEC = 20
-YOUTUBE_CHANNEL_FETCH_TIMEOUT_SEC = 30  # ponytail: yt-dlp cold bootstrap + enrich; was90s but health watchdog triggers at 45s
+# Ceiling on the user-visible wait for a YouTube channel fetch. It bounds
+# ONLY the wait: the fetch runs on CHANNEL_EXECUTOR via run_in_executor, so
+# when asyncio.wait_for fires the yt-dlp crawl CONTINUES in its thread (an
+# executor future cannot be cancelled) — moving this number moves the error
+# message, never the work. Measured 2026-10-13 against live YouTube from
+# fresh processes: cold /videos delta 6.4-25.5s (n=4), big-channel deep page
+# 44.4s (@jynxzi, playlistend=750), cold /shorts 70.2-187.8s (the RSS-union
+# probes), warm browse 0.00ms from the L1 cache / 1.35ms from the disk index.
+# NOT the launcher watchdog's number: that watchdog polls /api/info every
+# 15s and restarts after 3 misses — a 45s horizon of EVENT-LOOP
+# unresponsiveness — and a fetch in this pool cannot cause a miss. 30s keeps
+# the user's "timed out — try again" ahead of that horizon; the invariants
+# are pinned by tests/test_youtube_channel_fetch_timeout.py.
+YOUTUBE_CHANNEL_FETCH_TIMEOUT_SEC = 30
 # Delta refresh: after the disk index is warm, refreshes fetch only the
 # newest N items per platform and merge — never the full list again.
 CHANNEL_DELTA_LIMIT = 25
