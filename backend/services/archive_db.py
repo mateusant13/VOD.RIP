@@ -1025,6 +1025,10 @@ def _clean_legacy_transcript_text(text: str) -> str:
     return re.sub(r"\s*>{2,}\s*", " ", text).strip()
 
 
+# Bump ONLY when a new one-time transcript data migration is added.
+# Stored in PRAGMA user_version; 0 means "never run".
+_TRANSCRIPT_MIGRATION_VERSION = 1
+
 def _migrate_transcript_data(conn: sqlite3.Connection) -> None:
     """Idempotent one-time data migration on transcripts (batch-3).
 
@@ -1054,6 +1058,29 @@ def _migrate_transcript_data(conn: sqlite3.Connection) -> None:
     either starts a clean connection (_init_schema's migration pass) or has
     already committed.
     """
+    # ONE TIME, EVER - recorded in PRAGMA user_version.
+    #
+    # Measured 2026-10-13 on the live archive (H:\VOD.RIP-data\archive.db,
+    # 3,372,472 transcript rows). Step (1) below is:
+    #
+    #     SELECT id, text FROM transcripts
+    #     WHERE text LIKE '%&amp;%' OR text LIKE '%&lt;%' OR text LIKE '%&gt;%'
+    #
+    # A leading-wildcard LIKE cannot use an index, so it scans every row AND reads
+    # the whole `text` column - the entire transcript corpus - into memory via
+    # fetchall(). And the corpus had NOTHING to clean: the same predicate with
+    # LIMIT 1 returns None. So this paid a full-corpus scan on EVERY process start,
+    # inside _init_schema, ON THE READ PATH, with every other thread parked on
+    # _ensure_schema_ready - which py-spy showed as the last reason /api/health went
+    # silent (commit 9afa568 fixed a sibling of this: optimize_fts on the loop).
+    #
+    # Step (2) already had a cheap reader-only EXISTS probe before its write, and
+    # the comment there says why. Step (1) did not. Rather than add a probe that
+    # still full-scans once per boot, the whole migration is now gated on a
+    # persisted marker: PRAGMA user_version was 0 and unused, so it is the
+    # migration ledger. The scan then costs one boot, not every boot.
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= _TRANSCRIPT_MIGRATION_VERSION:
+        return
     with conn:
         # (1) entity unescape + turn-marker strip.
         legacy = conn.execute(
@@ -1133,6 +1160,8 @@ def _migrate_transcript_data(conn: sqlite3.Connection) -> None:
         # search cache by hand. Unconditional: a boot migration runs once, so
         # an extra bump costs nothing and cannot be skipped by a caller.
         _bump_content_ref("transcripts")
+        # Mark it done so the full-corpus scan above runs ONCE, not every boot.
+        conn.execute(f"PRAGMA user_version = {_TRANSCRIPT_MIGRATION_VERSION}")
 
 
 def _ensure_spam_column(conn: sqlite3.Connection) -> None:
