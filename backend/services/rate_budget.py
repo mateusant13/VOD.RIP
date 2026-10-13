@@ -177,6 +177,21 @@ _MAX_CADENCE_MULTIPLIER = 4.0
 # the count fallback entirely and trust only a measured rate.
 _HISTORY_COUNT_WINDOW_MIN = 60.0
 
+# How far back priming may look for evidence that a platform is throttled.
+#
+# Measured 2026-10-13 on the live archive (H:\VOD.RIP-data\archive.db, table
+# rate_limit_events, 331 rows): the newest YouTube row was 2026-10-12T21:49:54 -
+# ~15 hours before the reading - and it was a `bot_gate` burst
+# (context="innertube LOGIN_REQUIRED bot gate", backoff_s=1800). Nothing had
+# been recorded since. Priming read the 24 h summary, found that burst, and
+# pinned the ceiling to 6.8 rpm on EVERY boot, so the ramp in _ramp_up could
+# recover within a process and was then thrown away by the next restart.
+#
+# Recency is the point: priming exists to carry a limit ACROSS the process
+# boundary while it is still relevant, not to make an old one permanent. An
+# event older than this window is history, not current pressure.
+_PRIME_WINDOW_HOURS = 2.0
+
 # --- pool split --------------------------------------------------------------
 AUTO_SHARE = 0.70            # AUTO may hold/regenerate this much of the ceiling
 _MIN_POOL_TOKENS = 2.0       # always allow a small burst so a page fetch is
@@ -396,7 +411,8 @@ def _record_trip(st: _PlatformState, now: float) -> None:
 # The history lane is expected to provide these on services.archive_db:
 #   record_rate_limit(platform, kind, *, surface, origin, context,
 #                     backoff_s, recent_requests)
-#   rate_limit_summary(platform=None, since_hours=24)  -> per-platform/origin
+#   rate_limit_summary(platform=None, since_hours=_PRIME_WINDOW_HOURS)
+#                                                       -> per-platform/origin
 #     aggregate
 # They may not exist yet; every use is guarded so the governor still runs.
 
@@ -486,7 +502,7 @@ def _read_history() -> List[Dict[str, Any]]:
         fn = getattr(archive_db, "rate_limit_summary", None)
         if fn is None:
             return []
-        payload = fn(since_hours=24)
+        payload = fn(since_hours=_PRIME_WINDOW_HOURS)
     except Exception:  # noqa: BLE001
         logger.debug("rate_budget: rate_limit_summary failed", exc_info=True)
         return []

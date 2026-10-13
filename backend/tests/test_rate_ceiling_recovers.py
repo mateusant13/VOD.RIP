@@ -81,3 +81,30 @@ def test_the_old_early_return_is_gone():
     assert "if st.events == 0:" not in code, (
         "the events==0 early return is back - a clean platform can no longer recover"
     )
+
+
+def test_priming_only_looks_at_recent_history():
+    """RED before the fix: priming read a 24 h window and pinned the ceiling.
+
+    Measured 2026-10-13 on the live archive (H:\\VOD.RIP-data\\archive.db,
+    rate_limit_events, 331 rows): the newest YouTube row was
+    2026-10-12T21:49:54 - ~15 h old - a bot_gate burst with backoff_s=1800.
+    Priming found it every boot and set the ceiling to 6.8 rpm, throwing away
+    whatever the ramp had recovered. A limit event older than the window is not
+    current pressure.
+    """
+    src = (BACKEND / "services" / "rate_budget.py").read_text(encoding="utf-8", errors="replace")
+    # Comments may NAME the old window while explaining what changed (the module
+    # contract block above does exactly that). A law that cannot tell prose from a
+    # call fails on correct code - this file already carries that lesson twice.
+    code = "\n".join(
+        ln for ln in src.splitlines() if not ln.lstrip().startswith("#")
+    )
+    assert "since_hours=24" not in code, (
+        "priming reads a 24 h window again - an ancient burst can pin the ceiling"
+    )
+    assert "_PRIME_WINDOW_HOURS" in src
+    assert "since_hours=_PRIME_WINDOW_HOURS" in src
+    assert rate_budget._PRIME_WINDOW_HOURS <= 6.0, (
+        "the priming window grew back; measure the events table before changing it"
+    )
