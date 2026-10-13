@@ -1564,6 +1564,23 @@ export default function ChannelExplorePopup({
         testBandwidth: false,
         ...twitchAdBlockHlsConfig({ onAdRotation }),
         startPosition: trimTimelineRef.current ? 0 : (pendingSeekSecRef.current ?? 0),
+        // START AT THE LOWEST MANIFEST LEVEL.
+        //
+        // Measured 2026-10-13, and this is the whole of the 23 s the owner
+        // experiences. The master playlist lists 1920x1080 FIRST
+        // (BANDWIDTH=6395936) and hls.js defaults to the first level, so the
+        // very first segment fetched was 5,779,496 bytes. The HLS chain itself
+        // is not slow: master 0.00 s, child playlist 0.33 s, segment 1.24 s -
+        // the cost is the SIZE of the first segment, which must fully arrive
+        // before a frame can be shown. The app own timing events put the whole
+        // overshoot in one phase: session_ready 3579 ms -> canplay 26842 ms.
+        //
+        // startLevel: 0 is already set in LivePlayerPopup.tsx:1195 and
+        // TwitchClipPopup.tsx:441, and previewPlayerUtils.pinHlsToLowestLevel
+        // exists for exactly this. The channel popup - the one used for channel
+        // previews - was missing it. ABR ramps up on its own afterwards; this
+        // only decides which level the FIRST fragment comes from.
+        startLevel: 0,
       });
       hlsRef.current = hls;
       setHlsRef(hls);
