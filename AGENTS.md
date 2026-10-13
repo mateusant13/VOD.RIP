@@ -145,6 +145,7 @@ codeintel search "callers of schedule_youtube_window_hls_mux"
 
 - Kick Overlay (Twitch ad-kill): `vendor/kick-overlay/`
 - Cookies (VOD.RIP cookie/po_token): `vendor/cookie-extension/src/` — installed from the `VOD.RIP-cookies` subfolder (staging: `%APPDATA%\VOD.RIP\cookie-extension\VOD.RIP-cookies\`)
+- **Install/update mechanism** (silent UIA installer + zero-window reload, every trap): `docs/extension-auto-install.md`. Read it before touching `backend/scripts/cookie_extension_auto_install.ps1` or the `/api/session/cookies/auto-install` route.
 
 
 ## Runtime logs
