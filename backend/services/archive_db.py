@@ -167,6 +167,16 @@ CREATE TABLE IF NOT EXISTS transcripts (
 );
 CREATE INDEX IF NOT EXISTS idx_transcripts_video ON transcripts(platform, video_id, start_sec);
 
+-- `lang` needs its own index. Measured 2026-10-13 on the live archive
+-- (H:\VOD.RIP-data\archive.db, 3,372,472 transcript rows): _migrate_transcript_data
+-- probes `WHERE t.lang IS NULL AND EXISTS(...)` and, with no index on lang, the
+-- planner answered SCAN t - a FULL TABLE SCAN that took 83.93 s. That probe runs
+-- inside _init_schema, which _ensure_schema_ready calls from _get_read_conn, i.e.
+-- ON THE READ PATH, so the first reader paid 84 s and every other thread blocked
+-- behind _init_lock. It is also what py-spy showed as an active thread inside a
+-- plain `query` call while /api/health went unanswered.
+CREATE INDEX IF NOT EXISTS idx_transcripts_lang ON transcripts(lang);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS transcripts_fts USING fts5(
   text, content='transcripts', content_rowid='id');
 
@@ -767,6 +777,12 @@ _VIDEO_INDEX_SQL = (
     "CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos(channel)",
     "CREATE INDEX IF NOT EXISTS idx_videos_canonical ON videos(canonical_key)",
 )
+
+# NOTE: idx_transcripts_lang is created by the SCHEMA block above, NOT here.
+# _init_schema runs executescript(SCHEMA) on every open (lines ~564/590), and
+# CREATE INDEX IF NOT EXISTS is idempotent, so an existing 7.5 GB archive gets
+# it too. A separate migration tuple was written first and removed: it was never
+# executed, and an unexecuted guard is a defect in this tree own terms.
 
 
 def _ensure_kind_check_includes_stream(conn: sqlite3.Connection) -> None:
