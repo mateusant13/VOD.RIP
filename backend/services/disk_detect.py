@@ -206,8 +206,10 @@ def relocate_cache(src_dir, dst_dir) -> dict:
 # --- per-drive inventory + media classification (disk tiering) -------------
 # WS/disk-tiering: Settings > Storage picks a "heavy cache disk" (biggest
 # free space — throwaway data), a "transcripts & chat data disk" (fastest —
-# DB + preview media), and an "AI models folder" (best value: free space +
-# speed credit — large weights, downloaded once). Space comes from
+# DB + preview media), and an "AI models folder" (speed-first: the FASTEST bus
+# tier with >= 8 GB free wins, ties within a tier break by free space — see
+# best_model_cache_drive; no GB-equivalent speed credit exists in the code).
+# Space comes from
 # ctypes/shutil; media/bus classification comes from one cached PowerShell
 # call (Get-PhysicalDisk/Get-Partition). Every probe fails soft — an
 # unreadable drive or missing PowerShell just yields Unknown ranking.

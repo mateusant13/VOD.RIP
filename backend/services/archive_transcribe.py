@@ -1278,11 +1278,26 @@ def _make_pool(plan: list[tuple[str, str]], budget: int) -> ThreadPoolExecutor:
 # Dedicated I/O pool for audio downloads — decouples I/O wait from
 # transcription threads.  When a single GPU lane runs jobs sequentially,
 # overlapping downloads via the pool halves wall-clock (download A +
-# download B in parallel, then transcribe A + transcribe B).  ponytail:
-# 4 threads covers the typical hybrid budget (2 GPU + 2 CPU); raising
-# above 4 only helps when >4 transcription lanes run concurrently.
+# download B in parallel, then transcribe A + transcribe B).
+#
+# ponytail (measured 2026-10-13 on this host): the width is bounded by the
+# JOB cap, NOT by the lane budget — each running job submits exactly ONE
+# prefetch, so in-flight downloads <= queue_policy.transcribe_job_concurrency()
+# (live = 1, on 104/104 worker starts in backend/logs/worker.log), while the
+# lane plan itself moved between 2, 3 and 4 slots.  The "2 GPU + 2 CPU"
+# budget that used to justify a width of 4 is unreachable: _gpu_copies() is
+# 0 or 1, so the plan is 1 GPU + 1..3 CPU.  At the live cap of 1 every width
+# >= 1 measures the same wall-clock (6 tracks: 2.49 s / 2.54 s / 2.46 s at
+# widths 8 / 4 / 64), because ThreadPoolExecutor spawns threads on demand —
+# a wide pool holds a single thread until that many downloads are really in
+# flight, so an oversized width costs nothing while idle.  The width only
+# pays once the job cap passes 4: 8 threads drained 8 tracks in 0.45 s
+# against 0.83 s at 4 threads.
+# _DOWNLOAD_POOL_SIZE = 4 threads is the no-governor FALLBACK width; with the
+# governor the pool is built at _POOL_SIZE = 8 threads, matching _NET_MAX so
+# the AIMD semaphore (2..8), not the pool, is what limits real concurrency.
 _download_pool: Optional[ThreadPoolExecutor] = None
-_DOWNLOAD_POOL_SIZE = 4  # concurrent ffmpeg/yt-dlp downloads
+_DOWNLOAD_POOL_SIZE = 4  # fallback width when the governor is unavailable
 
 
 def _get_download_pool() -> ThreadPoolExecutor:
@@ -5090,9 +5105,24 @@ def _claim_next_job() -> Optional[dict]:
     cap = _transcribe_cap[0]
     if cap > 0:
         try:
+            # Only rows whose heartbeat is INSIDE the stale window count toward
+            # the cap. A 'running' row past _STALE_JOB_TIMEDELTA has no live
+            # executor behind it - the worker that owned it is dead (hard kill,
+            # crash, give-up) - so it occupies no lane and must not hold the
+            # transcribe queue shut. Live evidence: the cap counted a row whose
+            # heartbeat had been frozen for 193.4 h (transcribe-twitch-
+            # 2873292667, 2026-10-05T17:03Z), so all 480 queued transcribe jobs
+            # waited behind a job nobody was running, and the stale-window
+            # reclaim could never fire because the dead row was never even
+            # selected. A live VOD still counts: its heartbeat is refreshed by
+            # progress (2 s) and by the fetch watchdog (5 min), far inside the
+            # 45-minute window, so "one VOD at a time" is unchanged - see
+            # tests/test_stale_transcribe_reclaim_cap_gate.py.
             running = archive_db.query(
                 "SELECT COUNT(*) AS n FROM archive_jobs "
-                "WHERE kind='transcribe' AND status='running'"
+                "WHERE kind='transcribe' AND status='running' "
+                "AND COALESCE(heartbeat, updated_at) >= ?",
+                (transcribe_cutoff,),
             )
             at_cap = int(running[0]["n"] or 0) >= cap
         except Exception:

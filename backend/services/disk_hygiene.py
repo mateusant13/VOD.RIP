@@ -276,13 +276,21 @@ def whisper_cache_dir() -> Path:
 # and warmed at live-caption open, so a slow HDD is the worst home — speed
 # beats headroom; ties within a tier break by most free space.
 _MODEL_CACHE_MIN_FREE_BYTES = 8 * 1024**3  # room for a model + growth
-# Speed credit in GB of equivalent free space: NVMe +64 GB, SSD +32 GB. An
-# SSD with "adequate" free space (e.g. 100 GB -> 164 GB score) beats an HDD
-# with a bit more (120 GB -> 120 GB), while a large slow HDD with >X GB free
-# (X = free_ssd + credit) beats a nearly-full SSD — exactly the intended
-# tradeoff. ponytail: bus-classified credit (disk_detect._speed_rank) is a
-# heuristic; upgrade path is a measured rank (CrystalDiskMark-style small
-# benchmark, cached like _storage_layout) if bus classification ever misleads.
+# NO speed credit in GB of equivalent free space — the code below has never
+# implemented one (an earlier "NVMe +64 GB / SSD +32 GB" design note here was
+# exactly that: a note, not code). What best_model_cache_drive() really does:
+# pure bus-classification rank from _speed_rank (1=NVMe, 2=SSD, 3=HDD,
+# 4=Unknown), a floor of _MODEL_CACHE_MIN_FREE_BYTES (8 GB) free below which a
+# drive does not compete at all, the lowest rank wins, and ties WITHIN one rank
+# break by most free space. ponytail: the upgrade path is a measured rank
+# (CrystalDiskMark-style small benchmark, cached like _storage_layout) — and
+# it was measured and REJECTED on this box (2026-10-13): a 16-32 MB probe
+# measures device cache, not disk, and INVERTS the ranking (a SATA SSD read
+# 3293-3445 MB/s against 1752-1779 MB/s from an NVMe whose own probe said
+# 1305-1779), while the honest >=64 MB size costs ~18 s across 5 drives
+# (~500 MB written + read per drive per 60 s window) and still flipped the
+# NVMe-vs-NVMe tie in 4 of 6 passes. Bus classification is the cheaper, more
+# stable signal until a benchmark beats that.
 def best_model_cache_drive() -> Optional[str]:
     """Drive root (e.g. 'H:\\') of the best model-cache pick.
 
