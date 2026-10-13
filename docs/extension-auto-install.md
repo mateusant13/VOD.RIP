@@ -136,10 +136,35 @@ Pure BCL/PowerShell + `Add-Type` P/Invoke + UIAutomation. **No CDP** (see §4.9)
     `ScriptCache\` and `Database\` with the browser closed is the only reliable
     reset.
 
-## 5. The update path (reload in place)
+## 5. The update path
 
-Because "Load unpacked" cannot update, a live unpacked extension reloads
-**itself** — zero windows, zero focus steal:
+### 5a. Simplest: re-run the install (VERIFIED 2026-10-13)
+
+**Re-running the installer with `-Force` updates (reloads) an already-loaded
+unpacked extension.** Clean test on the owner machine (Chrome 154): change only
+one file the content script loads (leave `manifest.json` untouched), run
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File backend/scripts/cookie_extension_auto_install.ps1 `
+  -ExtensionDir "<dir>" -Browser chrome -Force
+```
+
+then reload a page the extension matches — the new content-script code is live.
+No `chrome://extensions` visit, no reload button, no focus steal.
+
+> This **contradicts** the older manager note (2026-09-20) and rule 8 in §4
+> ("Load unpacked does NOT update"). Rule 8 is where the false-OK *detection*
+> risk lives (the profile lookup can match the old record) — but on the current
+> Chrome the load is a real reload. Keep both facts: trust the post-update
+> behaviour, and still verify by behaviour, not by the ``installed:true`` JSON.
+
+The self-reload below is the fallback when re-running the install is not
+possible.
+
+### 5b. Zero-window self-reload (fallback)
+
+A live unpacked extension can also reload **itself** — zero windows, zero focus
+steal:
 
 1. Stage the new folder (same path, so the id is unchanged).
 2. `POST /api/extension/reload {to:<version>}` persists a directive; the
