@@ -3,6 +3,7 @@ Channel browsing routes — VODs and clips for saved Kick/Twitch channels.
 """
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import functools
 import logging
 import re
@@ -11,6 +12,16 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import unquote
 
 from fastapi import APIRouter, HTTPException
+
+# A dedicated, tiny pool for fire-and-forget bookkeeping writes.
+#
+# NOT the default executor: run_in_executor(None, ...) shares its threads with
+# every other offloaded call, and these writes contend for the single sqlite
+# write connection (busy_timeout 10 s). Measured 2026-10-13: three of them
+# occupied the default pool while /api/channel/videos timed out at 280 s.
+_PRIORITY_MARK_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="prio-mark")
+# Strong refs: a Future with no reference may be collected mid-flight.
+_PRIORITY_MARK_PENDING: set = set()
 
 from deps import (
     CHANNEL_CLIP_LIMIT,
@@ -451,9 +462,26 @@ async def channel_videos(
                     # backend/tests/test_settings_no_loop_block.py pins it there;
                     # this call site was missed, which is why the whole API stalled
                     # for ~48s on every channel open.
-                    await asyncio.get_running_loop().run_in_executor(
-                        None, mark_channel_priority, _p, _slug
+                    # FIRE AND FORGET, on a pool of its own.
+                    #
+                    # Measured 2026-10-13 with py-spy while /api/channel/videos took
+                    # >280 s and the MainThread was IDLE in asyncio _poll (so the loop
+                    # was fine). EVERY default-executor thread was parked on:
+                    #
+                    #   execute (services/archive_db.py:1742)
+                    #   mark_channel_priority (services/archive_db.py:1924)
+                    #
+                    # - all competing for the ONE shared sqlite write connection, each
+                    # able to wait the full 10 s busy_timeout. Offloading with
+                    # run_in_executor(None, ...) moved the wait off the event loop and
+                    # onto the DEFAULT pool, which then stalled every other caller
+                    # behind it. This is bookkeeping: marking a channel the user is
+                    # looking at must not gate the response that shows it.
+                    _mark = asyncio.get_running_loop().run_in_executor(
+                        _PRIORITY_MARK_POOL, mark_channel_priority, _p, _slug
                     )
+                    _PRIORITY_MARK_PENDING.add(_mark)
+                    _mark.add_done_callback(_PRIORITY_MARK_PENDING.discard)
                 except Exception:  # noqa: BLE001 — marking must never fail the fetch
                     logger.debug("channel priority mark skipped for %s/%s", _p, _slug, exc_info=True)
         if not wanted:
@@ -1106,9 +1134,11 @@ async def channel_clips(
         ):
             if (_slug or "").strip():
                 try:
-                    await asyncio.get_running_loop().run_in_executor(
-        None, mark_channel_priority, _p, _slug
-    )
+                    _mark = asyncio.get_running_loop().run_in_executor(
+                        _PRIORITY_MARK_POOL, mark_channel_priority, _p, _slug
+                    )
+                    _PRIORITY_MARK_PENDING.add(_mark)
+                    _mark.add_done_callback(_PRIORITY_MARK_PENDING.discard)
                 except Exception:  # noqa: BLE001 — marking must never fail the fetch
                     logger.debug("channel priority mark skipped for %s/%s", _p, _slug, exc_info=True)
         if not wanted:
