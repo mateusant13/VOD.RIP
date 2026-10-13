@@ -166,6 +166,18 @@ interface ChannelLiveStatus {
   }>;
 }
 
+/** How long a list-VOD click waits for /api/video-info before opening the
+ *  preview without it.
+ *
+ *  Measured 2026-10-13: with no deadline the open effect treated missing
+ *  metadata as "not ready yet" forever, so when that fetch was slow or failed
+ *  openPreview() was never called and the player never asked for a source -
+ *  the video element stayed empty for 49 s with zero /api/preview/* requests.
+ *  1500 ms leaves the fast path unchanged (info normally lands well under 1 s)
+ *  and bounds the slow one; a preview needs neither duration nor trim bounds to
+ *  start playing. */
+const PREVIEW_OPEN_INFO_DEADLINE_MS = 1500;
+
 const IS_DEV_UI = import.meta.env.DEV;
 /** Concurrent live players allowed at once (user requirement). */
 const MAX_LIVE_POPUPS = 5;
@@ -620,6 +632,16 @@ export default function App() {
   const livePrefetchInFlightRef = useRef<string | null>(null);
   /** URL of the last VOD clicked in a list — auto-opens the main preview once its info loads. */
   const autoOpenPreviewPendingRef = useRef<string | null>(null);
+  /**
+   * When the last list-VOD click happened.
+   *
+   * The open effect must let metadata DELAY the preview, never veto it: with no
+   * timestamp it could not tell "the info fetch is still running" from "the info
+   * fetch will never land", and chose to wait forever. Measured 2026-10-13: the
+   * video element stayed empty for 49 s and not one /api/preview/* request was
+   * ever made.
+   */
+  const autoOpenPreviewClickedAtRef = useRef<number>(0);
   /** Bumped on every list-VOD click so re-clicking the already-active VOD re-fires the auto-open effect. */
   const [autoOpenPreviewTick, setAutoOpenPreviewTick] = useState(0);
   const previewTimingRef = useRef<PreviewTiming | null>(null);
@@ -2061,10 +2083,26 @@ export default function App() {
       autoOpenPreviewPendingRef.current = null;
       return;
     }
-    if (loading) return; // info fetch still in flight
-    if (videoInfoUrl !== pendingUrl) return; // fetch failed or still running — wait
+    // METADATA IS NOT A HARD GATE ON THE PREVIEW.
+    //
+    // Measured 2026-10-13, end to end: clicking a channel VOD created the video
+    // element and then NOTHING happened for 49+ seconds - the element stayed
+    // {src: "", paused: true, ct: 0, rs: 0} while the network carried ZERO
+    // /api/preview/* requests. The cause was here: this effect returned early
+    // unless /api/video-info had ALREADY landed for the clicked URL, and again
+    // unless it carried a positive duration. When that fetch is slow or fails,
+    // `videoInfoUrl !== pendingUrl` stays true forever, openPreview() is never
+    // called, and the user gets a player shell that never even asks for a
+    // source. A preview needs neither the duration nor the trim bounds to start
+    // playing, so metadata may DELAY it but must never veto it.
+    const waitedMs = Date.now() - (autoOpenPreviewClickedAtRef.current || 0);
+    const infoReady =
+      !loading &&
+      videoInfoUrl === pendingUrl &&
+      vodDurationSec > 0 &&
+      trimEndSec > trimStartSec;
+    if (!infoReady && waitedMs < PREVIEW_OPEN_INFO_DEADLINE_MS) return;
     autoOpenPreviewPendingRef.current = null;
-    if (vodDurationSec <= 0 || trimEndSec <= trimStartSec) return;
     void openPreview();
   }, [loading, videoInfoUrl, url, vodDurationSec, trimEndSec, trimStartSec, openPreview, autoOpenPreviewTick]);
 
@@ -6137,6 +6175,8 @@ export default function App() {
     // the metric could never include the click segment the law is about.
     notePreviewGesture();
     autoOpenPreviewPendingRef.current = vodUrl.trim();
+    // The preview may wait this long for metadata before opening without it.
+    autoOpenPreviewClickedAtRef.current = Date.now();
     setAutoOpenPreviewTick((t) => t + 1);
     setUrl(vodUrl);
     setChannelVodPanelOpen(true);

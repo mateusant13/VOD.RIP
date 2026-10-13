@@ -84,6 +84,10 @@ _PANEL_HARD_TIMEOUT_SEC = max(
     float(os.environ.get("VODRIP_PANEL_TIMEOUT_SEC", "15") or "15"),
 )
 
+# Strong refs to in-flight backfill kicks: a Future with no reference may be
+# collected before it runs, and these are deliberately NOT awaited.
+_PANEL_KICKS_PENDING: set = set()
+
 
 def _preview_user_message(exc: Exception, url=None) -> str:
     msg = str(exc)
@@ -275,19 +279,30 @@ async def preview_panel(
         try:
             from routers.archive import kick_preview_backfill
 
+            # FIRE AND FORGET. This is a KICK - it starts a background chat
+            # backfill; the panel payload does not contain its result.
+            #
+            # Measured 2026-10-13: it was AWAITED under a 15 s timeout, and the
+            # UI polls this endpoint continuously. Four concurrent panel requests
+            # therefore parked all four PANEL_EXECUTOR workers for up to 15 s each,
+            # every later poll queued behind them, and the log showed the exact
+            # sequence "preview chat backfill kick timed out for twitch/2792122816
+            # after 15.0s" immediately followed by ECONNRESET and then ECONNREFUSED
+            # - the API dying on top of a preview that had already opened
+            # successfully (click->open 416 ms, server_ms 1844).
+            #
+            # Awaiting a side effect on the request path is the same defect as the
+            # awaited mark_channel_priority that made the channel fetch take 280 s.
             kick_future = loop.run_in_executor(
                 PANEL_EXECUTOR,
                 lambda: kick_preview_backfill(
                     p, video_id, offset_sec=offset_sec, loop=loop
                 ),
             )
-            await asyncio.wait_for(kick_future, timeout=_PANEL_HARD_TIMEOUT_SEC)
-        except asyncio.TimeoutError:
-            logger.warning(
-                "preview chat backfill kick timed out for twitch/%s after %.1fs",
-                video_id,
-                _PANEL_HARD_TIMEOUT_SEC,
-            )
+            # Keep a strong reference so the Future is not collected mid-flight,
+            # and log a failure without ever blocking the panel response on it.
+            _PANEL_KICKS_PENDING.add(kick_future)
+            kick_future.add_done_callback(_PANEL_KICKS_PENDING.discard)
         except Exception:
             logger.debug("preview chat backfill kick failed", exc_info=True)
     panel_future = loop.run_in_executor(
