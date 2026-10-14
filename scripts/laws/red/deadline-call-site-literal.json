@@ -1,0 +1,42 @@
+{
+  "law": "preview-deadline-call-sites-resolve-to-table",
+  "why": "Each mutation re-spells one wired deadline call site back into its literal, which is exactly the defect this law names: a message authored at a call site instead of resolved as a KEY from PREVIEW_DEADLINE_MESSAGE_KEYS.  Every mutated site was wired on 2026-10-10, so each expect is the real occurrence count of the wired expression in the current tree - if a future refactor moves a call site, a count pin will drift and this red arm will refuse to apply rather than silently measuring nothing.  The two LivePlayerPopup sites are identical text, so ONE mutation with expect=2 reverts both.",
+  "measured": "post-wiring tree, 2026-10-10; CRLF normalised to LF the way the checker reads it",
+  "mutations": [
+    {
+      "file": "src/App.tsx",
+      "find": "setError(t(deadline.messageKey));",
+      "put": "setError(t('Preview took too long — try again'));",
+      "expect": 1,
+      "site": "App.tsx armPreviewStartTimeout guard (was src/App.tsx:1780)"
+    },
+    {
+      "file": "src/App.tsx",
+      "find": "throw new Error(t(deadline.messageKey));",
+      "put": "throw new Error(t('Preview took too long — try again'));",
+      "expect": 1,
+      "site": "App.tsx wait_mux_timeout throw (was src/App.tsx:2006)"
+    },
+    {
+      "file": "src/App.tsx",
+      "find": "setError(aborted ? t(deadline.messageKey) : (err.message || t('Preview failed')));",
+      "put": "setError(aborted ? t('Preview took too long — try again') : (err.message || t('Preview failed')));",
+      "expect": 1,
+      "site": "App.tsx create-abort catch (was src/App.tsx:2038)"
+    },
+    {
+      "file": "src/ChannelExplorePopup.tsx",
+      "find": "setError(t(deadline.messageKey));",
+      "put": "setError(t('Preview took too long — try again'));",
+      "expect": 1,
+      "site": "ChannelExplorePopup session guard (was src/ChannelExplorePopup.tsx:637)"
+    },
+    {
+      "file": "src/components/LivePlayerPopup.tsx",
+      "find": "setError(t(deadline.messageKey));",
+      "put": "setError(t('No response from server'));",
+      "expect": 2,
+      "site": "LivePlayerPopup both stalled-create sites (were 1581 and 1628)"
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "law": "preview-ceiling-order-first-output-under-stage-total",
+  "why": "Each mutation pushes one stage's FIRST-OUTPUT ceiling above that stage's TOTAL ceiling, which is exactly the defect this law names.  Nothing else in the file changes: both entries stay stage names in the union, both stay positive milliseconds, and every other check in the law keeps passing - so the red arm cannot pass by breaking something OTHER rules catch.  The two mutations are deliberately DISTINCT stages, because a law that only checked the first key it found would report PASS after a single inverted stage, and this red arm makes that defect visible.  expect is the real occurrence count of each entry in the current tree, so a later edit to either number refuses to apply rather than silently measuring nothing.",
+  "measured": "src/previewRetry.ts, current tree; first-output session 45_000 and playback 20_000, each exactly once",
+  "mutations": [
+    {
+      "file": "src/previewRetry.ts",
+      "find": "  session: 45_000,",
+      "put": "  session: 80_000,",
+      "expect": 1,
+      "site": "PREVIEW_FIRST_OUTPUT_CEILING_MS entry for session (45_000 -> 80_000, above its 75_000 total)"
+    },
+    {
+      "file": "src/previewRetry.ts",
+      "find": "  playback: 20_000,",
+      "put": "  playback: 65_000,",
+      "expect": 1,
+      "site": "PREVIEW_FIRST_OUTPUT_CEILING_MS entry for playback (20_000 -> 65_000, above its 60_000 total)"
+    }
+  ]
+}

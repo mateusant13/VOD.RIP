@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "laws": [
+    {
+      "name": "preview-deadline-call-sites-resolve-to-table",
+      "description": "Every site that fires a preview-start deadline resolves its user-visible wording from PREVIEW_DEADLINE_MESSAGE_KEYS by asking for a KEY; no call site spells a deadline sentence, and the guard is either constructed and consulted or absent.",
+      "cmd": [
+        "<python>",
+        "scripts/laws/check_preview_deadline_key.py"
+      ],
+      "expect_rc": 0,
+      "red_input": "red/deadline-call-site-literal.json",
+      "timeout_s": 20
+    },
+    {
+      "name": "probe-concurrent-platforms-printout-is-measured",
+      "description": "The concurrent-platforms check is real and honest: probe.py declares it, the offline run samples it, the printed doc equals what the trusted probe_core says about the SAME samples, every platform arm is recorded, and three unreachable arms are reported as not_measured - never as a pass with empty percentiles.",
+      "cmd": [
+        "<python>",
+        "scripts/laws/check_probe_concurrent_platforms.py"
+      ],
+      "expect_rc": 0,
+      "red_input": "red/concurrent-platforms-empty-window-passes.json",
+      "timeout_s": 180
+    },
+    {
+      "name": "preview-ceiling-order-first-output-under-stage-total",
+      "description": "For every preview-retry stage the FIRST-OUTPUT ceiling is at or under that stage's TOTAL ceiling: both ceiling tables in src/previewRetry.ts are declared exactly once, carry the same stage keys, hold literal positive millisecond values, and are read by previewDeadlineFire. A first-output ceiling above its total would fire the total first, collapsing the silence/timeout distinction into one deadline while still showing an error and still passing every healthy probe.",
+      "cmd": [
+        "<python>",
+        "scripts/laws/check_preview_ceiling_order.py"
+      ],
+      "expect_rc": 0,
+      "red_input": "red/preview-ceiling-first-output-above-total.json",
+      "timeout_s": 20
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "law": "probe-concurrent-platforms-printout-is-measured",
+  "why": "The whole value of this law is the shape \"every arm unreachable, therefore not measured, therefore not a pass\". This mutation deletes the guard that carries that shape: the branch that turns an empty measured set into NOT_MEASURED is deactivated, so a window where three platform arms each refused the connection falls through to the success branch and prints PASS with n_measured=0 and p50_ms=null. That is the failure a green probe hides: an outage reported as healthy, with no percentiles to contradict it.",
+  "measured": "scripts/observability/probe_core.py: summarise() guards non-empty-but-unreachable windows before it grades anything; the offline arm takes the guard, so the green printout says not_measured.",
+  "mutations": [
+    {
+      "file": "scripts/observability/probe_core.py",
+      "find": "    elif not measured:",
+      "put": "    elif not measured and False:",
+      "expect": 1,
+      "comment": "deactivate the all-unreachable guard so an empty window reaches the PASS branch"
+    }
+  ]
+}

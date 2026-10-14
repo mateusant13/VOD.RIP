@@ -124,3 +124,10 @@ icon.ico
 public/assets/
 backend/tests/_chat_history_scratch.db
 backend/tests/._chat_history_scratch.db.*
+
+# powershell/output accidents
+$null/
+%SystemDrive%/
+__pycache__/
+*.pyc
+
