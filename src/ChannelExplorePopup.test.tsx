@@ -72,6 +72,32 @@ function stubFetch(opts: {
   );
 }
 
+/**
+ * ONE GET /api/settings on mount, not two.
+ *
+ * These were two independent useEffects, each firing its own
+ * GET /api/settings. Measured 2026-10-14 by counting in-flight /api/ requests
+ * at the instant the preview session POST left the browser:
+ *
+ *   rep1  [/panel?limit=20000, /chat/emotes, /settings, /settings, /timing] = 5
+ *   rep2  [/session/cookies/status, /panel?limit=20000, /settings, /settings, /timing] = 5
+ *   rep3-5 [/panel?limit=20000, /settings, /settings, /timing] = 4
+ *
+ * A browser allows 6 connections per HTTP/1.1 origin, and the session POST was
+ * the 6th — it sat in the queue behind /api/preview/panel instead of going out.
+ * The app own timing: session_created server_ms=172, session_ready open_ms=10470.
+ *
+ * RED before the fix: this test failed with 2 calls.
+ */
+it("fetches /api/settings once on mount, not once per flag", () => {
+  stubFetch({});
+  renderPopup();
+  const calls = (globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls
+    .map((c) => String(c[0]))
+    .filter((u) => u === "/api/settings");
+  expect(calls.length).toBe(1);
+});
+
 function renderPopup() {
   return render(
     <ChannelExplorePopup

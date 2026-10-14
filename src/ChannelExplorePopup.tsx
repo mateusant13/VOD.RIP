@@ -366,24 +366,36 @@ export default function ChannelExplorePopup({
     };
     return registerPreviewPlayback(pause);
   }, []);
-  /** Experimental AI flag — off by default; the ask row renders only when
-   *  the user enabled the feature + saved a key in Settings. */
+  /** Experimental AI flag (off by default) + "save subtitles with
+   *  downloads" (on by default) — read in ONE request, not two.
+   *
+   *  These were two independent useEffects, each firing its own
+   *  GET /api/settings on mount. Measured 2026-10-14 by counting in-flight
+   *  /api/ requests at the instant the preview session POST left the browser:
+   *
+   *    rep1  [/panel?limit=20000, /chat/emotes, /settings, /settings, /timing] = 5
+   *    rep2  [/session/cookies/status, /panel?limit=20000, /settings, /settings, /timing] = 5
+   *    rep3-5 [/panel?limit=20000, /settings, /settings, /timing] = 4
+   *
+   *  A browser allows 6 connections per HTTP/1.1 origin, and the session POST
+   *  was the 6th: it sat in the queue behind /api/preview/panel (the chat
+   *  fetch) instead of going out. The app own timing shows the server doing
+   *  172 ms of the work while the client waited 10,470 ms.
+   *
+   *  One read instead of two frees a slot and removes a duplicate round-trip.
+   *  The two flags are independent, so one failure keeps both defaults. */
   useEffect(() => {
     let alive = true;
-    apiGet<{ experimental_ai_enabled?: boolean }>('/api/settings')
-      .then((s) => { if (alive) setAiEnabled(s.experimental_ai_enabled === true); })
-      .catch(() => { /* backend unreachable → feature stays hidden */ });
-    return () => { alive = false; };
-  }, []);
-  /** "Save subtitles with downloads" — on by default, but the user's explicit
-   *  OFF must reach the mini editor's cut too (the main window already honours
-   *  it), so the cut cannot smuggle an .srt past a setting the user turned off.
-   *  Read once on mount, same shape as the AI flag above. */
-  useEffect(() => {
-    let alive = true;
-    apiGet<{ download_transcript_sidecar?: boolean }>('/api/settings')
-      .then((s) => { if (alive) setTranscriptSidecar(s.download_transcript_sidecar !== false); })
-      .catch(() => { /* backend unreachable → keep the default (on) */ });
+    apiGet<{
+      experimental_ai_enabled?: boolean;
+      download_transcript_sidecar?: boolean;
+    }>('/api/settings')
+      .then((s) => {
+        if (!alive) return;
+        setAiEnabled(s.experimental_ai_enabled === true);
+        setTranscriptSidecar(s.download_transcript_sidecar !== false);
+      })
+      .catch(() => { /* backend unreachable → AI hidden, sidecar keeps its default */ });
     return () => { alive = false; };
   }, []);
   /** One RAG question: local archive search + one LLM call (backend). */
