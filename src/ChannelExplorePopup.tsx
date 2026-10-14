@@ -1564,22 +1564,33 @@ export default function ChannelExplorePopup({
         testBandwidth: false,
         ...twitchAdBlockHlsConfig({ onAdRotation }),
         startPosition: trimTimelineRef.current ? 0 : (pendingSeekSecRef.current ?? 0),
-        // START AT THE LOWEST MANIFEST LEVEL.
+        // START AT THE LOWEST LEVEL.
         //
-        // Measured 2026-10-13, and this is the whole of the 23 s the owner
-        // experiences. The master playlist lists 1920x1080 FIRST
-        // (BANDWIDTH=6395936) and hls.js defaults to the first level, so the
-        // very first segment fetched was 5,779,496 bytes. The HLS chain itself
-        // is not slow: master 0.00 s, child playlist 0.33 s, segment 1.24 s -
-        // the cost is the SIZE of the first segment, which must fully arrive
-        // before a frame can be shown. The app own timing events put the whole
-        // overshoot in one phase: session_ready 3579 ms -> canplay 26842 ms.
+        // CORRECTION, 2026-10-14. The comment that used to sit here claimed
+        // hls.js "defaults to the first level" and that reordering the master to
+        // lowest-first would fix a 5.7 MB first segment. The sizes are real but
+        // the causal half is FALSE: hls.js sorts levels by bitrate internally,
+        // so it already starts on the lowest level whatever the listing order.
         //
-        // startLevel: 0 is already set in LivePlayerPopup.tsx:1195 and
-        // TwitchClipPopup.tsx:441, and previewPlayerUtils.pinHlsToLowestLevel
-        // exists for exactly this. The channel popup - the one used for channel
-        // previews - was missing it. ABR ramps up on its own afterwards; this
-        // only decides which level the FIRST fragment comes from.
+        // A/B over 10 browser reps with the same harness, on this VOD:
+        //   master highest-first (extract order) -> median 2.74s, 4/10 <= 3s
+        //   master lowest-first  (my "fix")       -> median 8.23s, 1/10 <= 3s
+        // Reverted in f5f35ee. Reordering did not move the start level; it
+        // cost 3x.
+        //
+        // What IS true: per-level first segments differ 12.6x (1080p 5,779,496 B
+        // vs 160p 458,720 B), so the lowest level is the one that matters for a
+        // first frame - and hls.js already picks it.
+        //
+        // Where the time actually goes, measured in the API log of the same
+        // session: session_created server_ms=172, session_ready open_ms=10470.
+        // The server does its work in 172 ms. The overshoot is NOT the session,
+        // NOT the proxy (bypassing it did not help) and NOT the first-segment
+        // size. It is between the click and the server, and it is still open.
+        //
+        // Kept because it matches LivePlayerPopup.tsx:1195 and
+        // TwitchClipPopup.tsx:441 and is harmless. Do NOT read it as the fix
+        // for the latency - it is not.
         startLevel: 0,
       });
       hlsRef.current = hls;
