@@ -3261,7 +3261,7 @@ def _build_synthetic_master_playlist(
     #
     # Start on the smallest and let ABR climb: a preview is about the first
     # frame, not about the bitrate of the first two seconds.
-    for fmt in sorted(variants, key=lambda f: int(f.get("height") or 0)):
+    for fmt in variants:
         height = int(fmt.get("height") or 0)
         if not height:
             continue
