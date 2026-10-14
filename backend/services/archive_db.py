@@ -464,6 +464,11 @@ _snapshot_stats = {"hits": 0, "misses": 0}
 _read_ops = 0
 _read_ops_lock = threading.Lock()
 
+# Opt-in slow-read diagnostic, in MILLISECONDS. Unset or 0 disables it, which
+# is the default: query() then takes the fast path above and never touches a
+# clock. Set VODRIP_SLOW_QUERY_MS=250 to log every read that slow or worse.
+_SLOW_QUERY_MS = int(os.environ.get("VODRIP_SLOW_QUERY_MS") or 0)
+
 
 def _snapshot_get(key: str, ttl: float, producer):
     """Return a cached value for *key*, or produce and cache it.
@@ -1803,7 +1808,27 @@ def query(sql: str, params: Any = ()) -> list[sqlite3.Row]:
     global _read_ops
     with _read_ops_lock:
         _read_ops += 1
-    return _get_read_conn().execute(sql, _bind(params)).fetchall()
+    if not _SLOW_QUERY_MS:
+        return _get_read_conn().execute(sql, _bind(params)).fetchall()
+    # Opt-in diagnostic, OFF by default (VODRIP_SLOW_QUERY_MS unset or 0).
+    #
+    # Why it exists: measured 2026-10-14 with py-spy sampling the API every
+    # 100 ms while a preview was clicked in a real browser. In the 24.8 s rep,
+    # 10 distinct threads were inside archive_db.query at the same time,
+    # versus 6 in the 4-5 s reps - so read latency tracked the click latency
+    # and nothing else I measured did. This is the knob that turns that
+    # correlation into a number, and it costs nothing when unset.
+    _t0 = time.perf_counter()
+    try:
+        return _get_read_conn().execute(sql, _bind(params)).fetchall()
+    finally:
+        _dt = (time.perf_counter() - _t0) * 1000.0
+        if _dt >= _SLOW_QUERY_MS:
+            logger.warning(
+                "slow read %.1fms (>=%dms) thread=%s sql=%s",
+                _dt, _SLOW_QUERY_MS, threading.current_thread().name,
+                " ".join(sql.split())[:160],
+            )
 
 
 # --- videos ---------------------------------------------------------------
