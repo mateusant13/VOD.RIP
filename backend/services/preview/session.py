@@ -3241,7 +3241,27 @@ def _build_synthetic_master_playlist(
         ):
             return _build_youtube_synthetic_hls_master(session, variants, audio_fmt)
     lines = ["#EXTM3U", "#EXT-X-VERSION:6", "#EXT-X-INDEPENDENT-SEGMENTS"]
-    for fmt in variants:
+    # LOWEST QUALITY FIRST.
+    #
+    # Measured 2026-10-14: the extract returns variants highest-first, so the
+    # master listed 1920x1080 at index 0 and hls.js started on it. The first
+    # segment of every level is one whole WINDOW_HLS_INITIAL_CHUNK_SEC chunk
+    # muxed at that quality, and the browser cannot raise loadedmetadata until
+    # that chunk has fully arrived:
+    #
+    #   level0 1080p  6,395,936 bps -> first segment  5,779,496 B
+    #   level1  720p  3,418,918 bps -> first segment  2,797,816 B
+    #   level2  480p  1,465,727 bps -> first segment    813,852 B
+    #   level3  360p    744,652 bps -> first segment    723,048 B
+    #   level4  160p    293,328 bps -> first segment    458,720 B
+    #
+    # Traced in a real browser run: video:loadstart -> video:loadedmetadata took
+    # 5.042 s, and the whole remaining path (loadedmetadata -> canplay ->
+    # playing) was 0.066 s. That 5 s is the 1080p chunk arriving.
+    #
+    # Start on the smallest and let ABR climb: a preview is about the first
+    # frame, not about the bitrate of the first two seconds.
+    for fmt in sorted(variants, key=lambda f: int(f.get("height") or 0)):
         height = int(fmt.get("height") or 0)
         if not height:
             continue
