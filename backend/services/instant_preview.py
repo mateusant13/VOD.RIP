@@ -33,6 +33,27 @@ _SLUG_KEYS = {"twitch": "twitchSlug", "kick": "kickSlug", "youtube": "youtubeSlu
 _worker_thread: Optional[threading.Thread] = None
 _worker_lock = threading.Lock()
 
+# --- cache ceiling -----------------------------------------------------------
+# Measured read-only on this box, 2026-10-13, from <data_dir>/previews
+# (H:\VOD.RIP-data\previews, the live archive root):
+#   66 preview files = 320,615,319 bytes (305.8 MiB); median file 4.7 MiB;
+#   largest single file 6,913,258 bytes (a 2560x1440 VOD sliced at 1080p60).
+#   29 of those 66 files (144,735,411 bytes = 138.0 MiB) belonged to channels
+#   that are NOT in saved_channels any more, and nothing ever reclaimed them:
+#   the only deletion path was remove_channel_previews(), which the settings
+#   route calls for the one channel it is deleting right now.
+# The ceiling is therefore a TOTAL over the directory, not a per-channel count:
+# one channel owns exactly one mp4 (a newer VOD overwrites the same path), so a
+# per-channel count can only ever be 1 and would be a law that cannot fail.
+# 200 MiB sits ABOVE the measured live set (37 live channels = 167.7 MiB at
+# ~4.6 MiB each) and BELOW the measured bloated directory, so the first sweep
+# after this lands reclaims dead weight instead of a live preview.
+PREVIEW_CACHE_MAX_BYTES = 200 * 1024 * 1024
+# Room to land one more preview before the next sweep. Two files at the
+# measured largest size (6.9 MiB) fit inside it, so the pass that fills the
+# directory is not the pass that empties it.
+PREVIEW_CACHE_KEEP_FREE_BYTES = 16 * 1024 * 1024
+
 
 def previews_dir() -> Path:
     """Root dir for instant preview files — the shared data root (disk_hygiene.data_dir)."""
@@ -162,6 +183,102 @@ def _download_range(url: str, output_path: Path, start_sec: float, end_sec: floa
     )
 
 
+def _drop_orphan_previews(known: set) -> int:
+    """Delete previews whose channel is no longer saved, and count the bytes.
+
+    MEASURED (read-only, 2026-10-13, H:\VOD.RIP-data\previews): 29 of the 66
+    files there — 144,735,411 bytes = 138.0 MiB — belong to channel ids that
+    are NOT in saved_channels. The only deletion path before this was
+    remove_channel_previews(), which the settings route calls for the one
+    channel it is deleting right now, so any other removal (an indexed
+    channel being forgotten, a settings file rolled back) left its 4-6 MiB
+    payload behind forever. LRU alone cannot fix that: a channel deleted
+    yesterday has a newer mtime than a quiet live channel nobody has
+    refreshed in a month, so the ceiling would eat the live one first.
+    """
+    d = previews_dir()
+    if not d.is_dir():
+        return 0
+    freed = 0
+    for jp in list(d.glob("*.json")):
+        cid = jp.stem
+        if cid in known:
+            continue
+        mp4 = d / f"{cid}.mp4"
+        for path in (jp, mp4):
+            try:
+                if path.is_file():
+                    freed += path.stat().st_size
+                    path.unlink()
+            except OSError:
+                logger.debug("orphan preview cleanup failed for %s", path, exc_info=True)
+    for mp4 in list(d.glob("*.mp4")):
+        if mp4.stem in known:
+            continue
+        try:
+            if mp4.is_file():
+                freed += mp4.stat().st_size
+                mp4.unlink()
+        except OSError:
+            logger.debug("orphan mp4 cleanup failed for %s", mp4, exc_info=True)
+    if freed:
+        logger.info("previews cache: dropped %d orphan bytes (%d channels kept)", freed, len(known))
+    return freed
+
+
+def _enforce_preview_cache_ceiling(keep: Optional[Path] = None) -> int:
+    """Bound the previews directory to PREVIEW_CACHE_MAX_BYTES, LRU first.
+
+    A preview is one mp4 + its json sidecar, so the pair is evicted together
+    (an mp4 with no sidecar is invisible to GET /api/previews/status; a
+    sidecar with no mp4 advertises a media_url that 404s). Least-recently-used
+    by mtime goes first. *keep* names the pair the caller just produced, so a
+    refresh that lands above the ceiling still serves itself.
+
+    Best-effort end to end: a file that cannot be unlinked is skipped, never
+    raised, because this runs on the scheduler's background thread.
+    """
+    d = previews_dir()
+    if not d.is_dir():
+        return 0
+    keep_mp4 = Path(keep) if keep is not None else None
+    pairs: list[tuple[float, Path, Path, int]] = []
+    total = 0
+    for jp in d.glob("*.json"):
+        cid = jp.stem
+        mp4 = d / f"{cid}.mp4"
+        if not mp4.is_file():
+            continue  # dangling sidecar: no media, counts for nothing
+        try:
+            size = jp.stat().st_size + mp4.stat().st_size
+            mtime = mp4.stat().st_mtime
+        except OSError:
+            continue
+        pairs.append((mtime, mp4, jp, size))
+        total += size
+    target = PREVIEW_CACHE_MAX_BYTES - PREVIEW_CACHE_KEEP_FREE_BYTES
+    if total <= target:
+        return 0
+    freed = 0
+    for _mtime, mp4, jp, size in sorted(pairs, key=lambda item: item[0]):
+        if total - freed <= target:
+            break
+        if keep_mp4 is not None and mp4 == keep_mp4:
+            continue
+        for path in (mp4, jp):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                logger.debug("preview eviction failed for %s", path, exc_info=True)
+        freed += size
+    if freed:
+        logger.info(
+            "previews cache: evicted %d bytes to stay under %d (dir was %d)",
+            freed, PREVIEW_CACHE_MAX_BYTES, total,
+        )
+    return freed
+
+
 # ---------------------------------------------------------------------------
 # Pass
 # ---------------------------------------------------------------------------
@@ -190,12 +307,15 @@ def _probe_id(latest: dict) -> Optional[str]:
     )
 
 
-def _refresh_channel(channel: dict, channel_id: str) -> None:
+def _refresh_channel(channel: dict, channel_id: str) -> Optional[Path]:
+    """Refresh one channel's preview; returns the mp4 it wrote, else None.
+    The caller passes that path to the ceiling sweep as *keep*: the preview
+    the user is about to read must not be the one evicted."""
     platform = pick_platform(channel)
     if platform is None:
-        return  # no slug on any platform — nothing to preview
+        return None  # no slug on any platform — nothing to preview
     if platform == "youtube" and _youtube_gate_active():
-        return  # bot-gate freeze — never hit YouTube while frozen (worker rule)
+        return None  # bot-gate freeze — never hit YouTube while frozen (worker rule)
     # PROBE GATE: the newest-VOD metadata fetch is the probe, and the FFmpeg
     # slice follows it. With no proof of a new VOD since the last check, the
     # whole pass is skipped and the per-channel backoff advances, so a quiet
@@ -203,9 +323,9 @@ def _refresh_channel(channel: dict, channel_id: str) -> None:
     from services import probe_gate, rate_budget
 
     if rate_budget.in_backoff(platform) or rate_budget.auto_exhausted(platform):
-        return  # budget dry — the next pass (cadence-stretched) will retry
+        return None  # budget dry — the next pass (cadence-stretched) will retry
     if not probe_gate.should_probe(platform, channel_id):
-        return
+        return None
     latest = _fetch_latest_vod(channel, platform)
     if not latest:
         probe_gate.note_probe(platform, channel_id, found_new=False)
@@ -214,7 +334,7 @@ def _refresh_channel(channel: dict, channel_id: str) -> None:
         probe_gate.note_probe(
             platform, channel_id, found_new=False, latest_id=_probe_id(latest)
         )
-        return  # same VOD already previewed — no re-download
+        return None  # same VOD already previewed — no re-download
     mp4_path, json_path = _preview_paths(channel_id)
     try:
         _download_range(latest["vod_url"], mp4_path, 0.0, PREVIEW_DURATION_SEC)
@@ -242,11 +362,20 @@ def _refresh_channel(channel: dict, channel_id: str) -> None:
         "instant preview %s: %s %s (first %.0fs)",
         channel_id, latest["platform"], latest["vod_url"], PREVIEW_DURATION_SEC,
     )
+    return mp4_path
 
 
 def run_pass(channels) -> None:
     """Best-effort pass over every saved channel. Any failure skips the
     channel and retries on the next pass — never raises out of the loop."""
+    known = {str(ch.get("id") or "").strip() for ch in (channels or []) if isinstance(ch, dict)}
+    known.discard("")
+    # 1. Reclaim what no saved channel owns any more — the measured leak.
+    _drop_orphan_previews(known)
+    # 2. Bound the directory BEFORE the downloads: the pass must not write
+    #    into an over-ceiling directory and then evict what it just produced.
+    _enforce_preview_cache_ceiling()
+    fresh: Optional[Path] = None
     for ch in channels or []:
         if not isinstance(ch, dict):
             continue
@@ -254,10 +383,15 @@ def run_pass(channels) -> None:
         if not cid:
             continue
         try:
-            _refresh_channel(ch, cid)
+            written = _refresh_channel(ch, cid)
+            if written is not None:
+                fresh = written
         except Exception as exc:  # noqa: BLE001 — one channel never blocks the rest
             logger.info("instant preview %s skipped: %s", cid, exc)
             _note_gate_if_youtube(exc)
+    # 3. One more sweep catches the previews this pass just added — but never
+    #    the one it just wrote, which the caller is about to read.
+    _enforce_preview_cache_ceiling(keep=fresh)
 
 
 def refresh_async(channels=None) -> None:

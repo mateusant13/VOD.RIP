@@ -2,6 +2,7 @@
 Preview routes — preview sessions for HLS/MP4 playback.
 """
 
+from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import logging
 import os
@@ -83,6 +84,17 @@ _PANEL_HARD_TIMEOUT_SEC = max(
     5.0,
     float(os.environ.get("VODRIP_PANEL_TIMEOUT_SEC", "15") or "15"),
 )
+
+# Dedicated pool for the fire-and-forget priority-transcribe bumps.
+#
+# NOT INFO_EXECUTOR: each bump writes to SQLite and can wait the full
+# busy_timeout, so sharing the response pool let 24 pending bumps queue the
+# preview response behind themselves (measured 2026-10-13; the earlier half of
+# this defect was "create 16s, response 59s", recorded in the comment at
+# _bump_transcribe below).
+_BUMP_POOL = ThreadPoolExecutor(max_workers=3, thread_name_prefix="prio-bump")
+# Strong refs so a Future is never collected mid-flight.
+_BUMP_PENDING: set = set()
 
 # Strong refs to in-flight backfill kicks: a Future with no reference may be
 # collected before it runs, and these are deliberately NOT awaited.
@@ -606,7 +618,31 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
                     exc_info=True,
                 )
 
-        asyncio.get_running_loop().run_in_executor(INFO_EXECUTOR, _bump_transcribe)
+        # ON A POOL OF ITS OWN, not INFO_EXECUTOR.
+        #
+        # Measured 2026-10-13 with py-spy while the API was unresponsive and my
+        # driver was creating a preview session every 1.5 s. Every INFO_EXECUTOR
+        # worker was parked on:
+        #
+        #   Thread "info_0".."info_4" (idle):
+        #       execute (services/archive_db.py:1787)
+        #       _priority_transcribe_for_preview (routers/preview.py:511)
+        #       _bump_transcribe (routers/preview.py:601)
+        #
+        # while "boot-maintenance" held the write lock in dedupe_messages. The fire
+        # and forget above is right, but it shares INFO_EXECUTOR with the response
+        # itself (line 611 below, _preview_session_response), so 24 pending bumps
+        # - each able to wait the full 10 s busy_timeout - queue the response behind
+        # them. The comment above already records the earlier symptom of this same
+        # defect ("create 16s, response 59s"); this is its second half.
+        #
+        # A dedicated 3-worker pool means the bump can starve, and the preview
+        # the user asked for still answers immediately.
+        _bump_fut = asyncio.get_running_loop().run_in_executor(
+            _BUMP_POOL, _bump_transcribe
+        )
+        _BUMP_PENDING.add(_bump_fut)
+        _bump_fut.add_done_callback(_BUMP_PENDING.discard)
 
         response = await asyncio.get_running_loop().run_in_executor(
             INFO_EXECUTOR, lambda: _preview_session_response(session, resolve_ms),
@@ -620,6 +656,22 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
         logger.warning("preview session rejected url=%s: %s", preview_url[:100], e)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        # LOG IT FIRST. Before this line the generic handler swallowed the exception
+        # type and message entirely, so a 500 "Preview failed — try again." carried no
+        # signal about its own cause. Measured 2026-10-13: 10 consecutive
+        # POST /api/preview/session 500s in the log, no traceback anywhere, while the
+        # SAME create_session() call returned a valid session in a fresh process. The
+        # defect is not that this handler is broad - it must be - it is that it was
+        # silent, which made the difference between the live process and a fresh one
+        # unobservable. exc_info=True is one line and turns this failure class into
+        # something diagnosable instead of a loop of guesses.
+        logger.warning(
+            "preview session create failed url=%s: %s: %s",
+            preview_url[:100],
+            type(e).__name__,
+            str(e)[:400],
+            exc_info=True,
+        )
         # A Twitch VOD that Twitch itself reports as having no playable source
         # is TERMINAL, and must not be dressed as "try again": the client
         # retries that wording twice, so a dead VOD cost 3 POSTs x ~13-19s

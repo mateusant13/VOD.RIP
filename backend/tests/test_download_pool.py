@@ -158,3 +158,64 @@ def test_max_chunk_sec_is_60():
     assert at._MAX_CHUNK_SEC == 60.0, (
         f"_MAX_CHUNK_SEC must be 60.0, got {at._MAX_CHUNK_SEC}"
     )
+
+# ---------------------------------------------------------------------------
+# 3. The rationale must name a number the code honours (red arm)
+# ---------------------------------------------------------------------------
+
+import re  # noqa: E402
+
+_RATIONALE_RE = re.compile(r"# --- download I/O pool.*?(?=^_download_pool:)", re.S | re.M)
+_SIZE_CLAIM_RE = re.compile(r"\b(\d+)\s*(?:threads|workers)\b")
+
+
+@_skip_no_pool
+def test_download_pool_rationale_size_is_honoured():
+    """RED ARM: every pool width the rationale claims must be a width the code can build.
+
+    Measured 2026-10-13 on this host: _get_download_pool() builds the pool with
+    services.resource_governor._POOL_SIZE (8) whenever the governor module imports
+    — and it does import here (_GOVERNOR_AVAILABLE=True, pool._max_workers=8).
+    _DOWNLOAD_POOL_SIZE (4) is only the no-governor fallback.  A rationale that
+    claims a flat "4 threads" therefore contradicts the built pool by 2x, which is
+    exactly the drift this test pins.
+    """
+    src = Path(at.__file__).read_text(encoding="utf-8")
+    m = _RATIONALE_RE.search(src)
+    assert m, "download I/O pool rationale block not found"
+    claimed = {int(x) for x in _SIZE_CLAIM_RE.findall(m.group(0))}
+    assert claimed, "rationale must state a numeric pool width"
+    built = at._get_download_pool()._max_workers
+    assert built in claimed, (
+        "rationale claims pool width(s) " + str(sorted(claimed))
+        + " but _get_download_pool() built " + str(built)
+        + " — the comment and the code disagree"
+    )
+
+
+@_skip_no_pool
+def test_download_pool_rationale_unit_is_the_job_cap_not_lanes():
+    """RED ARM: the rationale must justify the width by the JOB cap, not by lanes.
+
+    Each running job submits exactly ONE prefetch (archive_transcribe.py:5566/5571),
+    so in-flight downloads are bounded by
+    queue_policy.transcribe_job_concurrency(), never by len(_worker_plan()).
+    backend/logs/worker.log: 104/104 worker starts ran transcribe_job_cap=1 with
+    2/3/4 lanes — the lane count moved while the cap did not, and the pool never
+    held more than 1 download.  A rationale that sizes the pool by the lane budget
+    is therefore reasoning from the wrong unit.
+    """
+    from services import queue_policy
+
+    src = Path(at.__file__).read_text(encoding="utf-8")
+    m = _RATIONALE_RE.search(src)
+    assert m
+    block = m.group(0)
+    assert "transcribe_job_concurrency" in block, (
+        "rationale must name queue_policy.transcribe_job_concurrency() as the unit "
+        "that bounds in-flight downloads"
+    )
+    # and the claim must be true: the cap really does bound the downloads
+    cap = queue_policy.transcribe_job_concurrency()
+    lanes = len(at._worker_plan())
+    assert at._get_download_pool()._max_workers >= max(1, min(cap if cap else lanes, lanes))

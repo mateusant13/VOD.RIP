@@ -544,8 +544,24 @@ async def _app_lifespan(_app: FastAPI):
                     _SYNC_WARM_URL_CAP_SEC,
                 )
 
-        # ponytail: 2 workers to avoid tripping YouTube bot-gate on startup
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="yt-sync-warm") as pool:
+        # ponytail: 6 workers = one URL per wave slot, so the whole wave is a
+        # single round. MEASURED 2026-10-13 on this box, real YouTube, governor
+        # ceiling pinned to the live boot value 6.8 rpm (harness:
+        # tmp/_gateprobe/battery4.py, wave = the 6 URLs the live settings.json
+        # actually selects): max_workers=2 -> mean 32.9 s wall, every round pays
+        # the governor's 12.61 s one-token pace again and URLs breach the 15 s
+        # cap; max_workers=6 -> mean 11.8 s wall, 0-1 cap hits. 4 sits between
+        # (mean 24.1 s), so 6 is the depth that actually reaches the floor.
+        # The bot-gate this comment used to fear did NOT fire at ANY depth:
+        # 19 wave runs / 114 warms / 1299 InnerTube /player POSTs at 2, 4 and 6
+        # workers produced ZERO gate arms and ZERO warm bot-gate pauses. The
+        # gate is a unanimous LOGIN_REQUIRED wall across >=3 client profiles
+        # (services/youtube_innertube.py:1227), not a burst signal: all 128
+        # 'bot_gate' rows in H:\\VOD.RIP-data\\archive.db.rate_limit_events had
+        # in_flight=0 and recent_requests<=6. 6 stays under WARM_WORK_SEMAPHORE
+        # (8), so the global heavy-work cap still holds, and user-click paths
+        # never take that semaphore -- clicks cannot queue behind this wave.
+        with ThreadPoolExecutor(max_workers=6, thread_name_prefix="yt-sync-warm") as pool:
             list(pool.map(_warm_one, first_urls))
 
     def _collect_saved_youtube_urls(saved_channels) -> list:
