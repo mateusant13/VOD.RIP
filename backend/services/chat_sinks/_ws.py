@@ -23,6 +23,22 @@ from services._version import USER_AGENT
 MAX_FRAME_SIZE = 1 << 20  # 1 MiB — generous for Pusher chat events
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
+# ONE TLS context for the whole process, built at import.
+#
+# ssl.create_default_context() enumerates the ENTIRE Windows certificate store
+# while holding the GIL. Called per connection it stalled the event loop for
+# seconds: measured 2026-10-14 by probing /api/health every 20 ms while a
+# preview was being clicked in the browser -
+#   rep fast   1.98s -> health max  0.352s,  0 probes over 0.5 s
+#   rep slow  20.82s -> health max  2.924s, 10 probes over 0.5 s
+# and py-spy caught the archive-scheduler thread sitting in this sink
+# (twitch_gql_service._gql_request -> read (ssl.py:1166)).
+#
+# Same defect already fixed in services/http_opener.py and
+# services/twitch_gql_service.py: the guard existed, this call site did not
+# have it.
+_TLS_CONTEXT = ssl.create_default_context()
+
 
 class WSClosed(Exception):
     """Connection closed (or close frame received)."""
@@ -63,8 +79,21 @@ class WSClient:
         sock = socket.create_connection((self._host, self._port), timeout=self._timeout)
         try:
             if self._tls:
-                ctx = ssl.create_default_context()
-                sock = ctx.wrap_socket(sock, server_hostname=self._host)
+                # SHARED context, built ONCE at import.
+                #
+                # ssl.create_default_context() enumerates the ENTIRE Windows
+                # certificate store while holding the GIL. Called per connection
+                # it stalled the event loop for seconds - measured 2026-10-14 by
+                # probing /api/health every 20 ms while a preview was clicked:
+                #   rep fast   1.98s -> health max 0.352s, 0 stalls
+                #   rep slow  20.82s -> health max 2.924s, 10 stalls
+                # py-spy caught the archive-scheduler thread inside this sink
+                # (twitch_gql_service._gql_request -> read (ssl.py:1166)).
+                #
+                # This is the same defect already fixed in services/http_opener.py
+                # and services/twitch_gql_service.py - the guard existed, the call
+                # site did not have it.
+                sock = _TLS_CONTEXT.wrap_socket(sock, server_hostname=self._host)
             key = base64.b64encode(os.urandom(16)).decode()
             host_hdr = self._host if self._port in (80, 443) else f"{self._host}:{self._port}"
             req = (
