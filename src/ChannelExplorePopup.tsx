@@ -10,6 +10,7 @@ import { archiveVideoIdFromUrl } from './archiveScope';
 import TwitchClipPopup from './components/TwitchClipPopup';
 import { useI18n } from './i18n';
 import { usePlugin } from './lib/plugins';
+import EnablePluginPrompt from './components/EnablePluginPrompt';
 import TwitchLogoIcon from './components/TwitchLogoIcon';
 import ArchiveSearchPopup from './components/ArchiveSearchPopup';
 import PreviewChatPanel, { readPreviewChatPanelWidth } from './components/PreviewChatPanel';
@@ -2211,6 +2212,15 @@ function ChannelExplorePopupInner({
                 ) : null}
               </div>
             ) : null}
+          </div>
+        ) : null}
+        {/* ai-ask OFF: the owner rule is that a button needing a plugin must SAY
+            so ("botoes que necessitam de plugins pra fazer algo, deve aparecer
+            uma mensagem pedindo pra habilitar o plugin"). The panel above leaves
+            the screen; this replaces it with the prompt, naming the cost. */}
+        {!fullscreen && aiEnabled && vod.channel && !aiAskOn ? (
+          <div className="shrink-0">
+            <EnablePluginPrompt pluginId="ai-ask" variant="strip" />
           </div>
         ) : null}
         <div

@@ -155,6 +155,31 @@ describe("ChannelExplorePopup AI ask", () => {
     expect(screen.queryByLabelText("ai ask question")).not.toBeInTheDocument();
   });
 
+  // The owner: "botoes que necessitam de plugins pra fazer algo, deve aparecer
+  // uma mensagem pedindo pra habilitar o plugin". With ai-ask OFF the panel used
+  // to vanish and the user never learned the feature existed or how to get it.
+  it("an ai-ask OFF shows the enable prompt instead of hiding the feature", async () => {
+    setPlugins({ ...ALL_PLUGINS_ON, "ai-ask": false });
+    stubFetch({ aiEnabled: true }); // the OTHER gate is satisfied on purpose
+    renderPopup();
+    await waitFor(() => expect(screen.getByText("Channel VOD explore")).toBeInTheDocument());
+    // the prompt is present and its Enable button targets ai-ask
+    expect(document.querySelector('[data-enable-plugin="ai-ask"]')).not.toBeNull();
+    expect(
+      document.querySelector('[data-enable-plugin-button="ai-ask"]'),
+    ).not.toBeNull();
+    // and the real row is not merely hidden: it is not rendered
+    expect(screen.queryByText("Ask about this channel")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("ai ask question")).not.toBeInTheDocument();
+  });
+
+  it("an ai-ask ON shows the row and NO prompt", async () => {
+    stubFetch({ aiEnabled: true });
+    renderPopup();
+    await waitFor(() => expect(screen.getByText("Ask about this channel")).toBeInTheDocument());
+    expect(document.querySelector('[data-enable-plugin="ai-ask"]')).toBeNull();
+  });
+
   it("shows the ask row when enabled and posts the question to /api/ai/ask", async () => {
     stubFetch({ aiEnabled: true });
     renderPopup();
