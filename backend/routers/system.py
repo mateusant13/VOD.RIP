@@ -150,14 +150,6 @@ _DEVICE_UNREACHABLE = (
     "unknown: the per-job device is recorded in the archive worker process "
     "and is not persisted, so the API cannot read it"
 )
-# The int8 parakeet is deliberately kept on disk as a revert path. It is not
-# a runtime choice - a revert is a constant change - so its presence says
-# nothing about what will run, and this note says so where it is reported.
-_INT8_PARAKEET_DIR = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
-_INT8_FALLBACK_NOTE = (
-    "kept on disk as a revert path, not selectable at runtime - a revert is "
-    "a constant change, so this says nothing about what will run"
-)
 
 
 def _counter(snap: dict, key: str) -> Optional[int]:
@@ -433,9 +425,6 @@ def _engine_runtime_status() -> dict:
         ),
         "sherpa_onnx": None,
         "sherpa_onnx_reason": _UNKNOWN_CHECK,
-        "int8_fallback_on_disk": None,
-        "int8_fallback_dir": None,
-        "int8_fallback_note": _INT8_FALLBACK_NOTE,
         "device": {"known": False, "value": None, "reason": _DEVICE_UNREACHABLE},
     }
     try:
@@ -482,13 +471,6 @@ def _engine_runtime_status() -> dict:
         out["missing_files"] = sorted(
             f for f in lc._PARAAKEET_FILES if not (expected / f).is_file()
         )
-        int8 = root / _INT8_PARAKEET_DIR
-        on_disk = int8.is_dir()
-        out["int8_fallback_on_disk"] = on_disk
-        out["int8_fallback_dir"] = str(int8) if on_disk else None
-    else:
-        out["int8_fallback_on_disk"] = None
-        out["int8_fallback_dir"] = None
     return out
 
 

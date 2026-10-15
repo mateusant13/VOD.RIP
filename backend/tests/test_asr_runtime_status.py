@@ -47,15 +47,17 @@ def _weights_dir(root: Path, *, complete: bool = True) -> Path:
     return d
 
 
-def _parakeet_cache(root: Path, *, files=_PARAKEET_FILES, int8: bool = False) -> Path:
-    """A sherpa model cache holding the Redux model (and optionally int8)."""
+def _parakeet_cache(root: Path, *, files=_PARAKEET_FILES) -> Path:
+    """A sherpa model cache holding the Redux model.
+
+    No int8 sibling: parakeet Redux is the only model the project ships, and
+    the int8 quantisation of the SAME base model was removed on 2026-10-15 as
+    redundant, along with the status fields that reported it.
+    """
     cache = root / "parakeet-models" / "sherpa-onnx-nemo-parakeet-redux"
     cache.mkdir(parents=True, exist_ok=True)
     for name in files:
         (cache / name).write_bytes(b"y" * 16)
-    if int8:
-        (root / "parakeet-models"
-         / "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8").mkdir(parents=True)
     return root / "parakeet-models"
 
 
@@ -381,37 +383,6 @@ def test_model_selection_is_a_constant_not_a_knob(hermetic, client):
 
     assert "no runtime knob" in engine["model_selection"]
 
-
-def test_int8_revert_on_disk_is_reported_without_claiming_it_will_run(
-    hermetic, client, monkeypatch,
-):
-    """The int8 model is deliberately kept on disk. Its presence is a fact
-    about the disk and NOT a statement about what will transcribe."""
-    cache = _parakeet_cache(hermetic, int8=True)
-    monkeypatch.setenv("VODRIP_SHERRPA_CACHE", str(cache))
-
-    engine = _get(client)["engine"]
-
-    assert engine["int8_fallback_on_disk"] is True
-    assert engine["int8_fallback_dir"] == str(
-        cache / "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
-    )
-    assert engine["model"] == "Codyfederer/sherpa-onnx-nemo-parakeet-redux"
-    assert "not selectable at runtime" in engine["int8_fallback_note"]
-
-
-def test_absent_int8_revert_is_a_real_false_not_unknown(
-    hermetic, client, monkeypatch,
-):
-    """A checked-and-absent file is a measurement. Only an unreadable check
-    is unknown."""
-    cache = _parakeet_cache(hermetic, int8=False)
-    monkeypatch.setenv("VODRIP_SHERRPA_CACHE", str(cache))
-
-    engine = _get(client)["engine"]
-
-    assert engine["int8_fallback_on_disk"] is False
-    assert engine["int8_fallback_dir"] is None
 
 
 def test_the_missing_model_file_is_named(hermetic, client, monkeypatch):

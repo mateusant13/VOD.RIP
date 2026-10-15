@@ -106,10 +106,13 @@ _PHOTON_VENV_NAME = "photon-venv"
 # and warned about when it is what got picked: tooling on this box has reaped
 # scratch directories under G:\Temp before.
 _SANDBOX_VENVS = (r"G:\Temp\photonprobe\venv",)
-# The one populated HF cache on this box, and the only place
-# moondream/parakeet-redux exists. Kept in the list (rather than renamed into
-# the durable path) so no existing model directory is moved. See hf_home().
-_POPULATED_HF_CACHES = (r"G:\VOD.RIP-models\photonprobe-hf",)
+# EMPTY, and that is the point: the weights live in the durable path
+# (<AI-models folder>/photon-hf), which hf_home() already prefers, so no
+# fallback is needed. It held the probe lane G:\VOD.RIP-models\photonprobe-hf
+# while that was the only copy on the box; that tree was removed as orphaned
+# model data on 2026-10-15 and the 170 MB ternary safetensors were re-fetched
+# into the durable path. Verified: weights_status() -> {"ok": true}.
+_POPULATED_HF_CACHES: tuple = ()
 
 # kestrel's loader contract for this model family: config + tokenizer +
 # weights. ternary.json is required whenever the repo publishes it, because
@@ -482,11 +485,10 @@ def hf_home() -> Path:
         the same helper and the same onward-drive convention as every other
         weight in the project. First, so a configured models folder is
         always obeyed;
-      * the probe lane's ``G:\\VOD.RIP-models\\photonprobe-hf`` — a STABLE
-        model root on the drive AGENTS.md designates for model data, and the
-        only place moondream/parakeet-redux is actually on disk. It stays in
-        the list (renaming it would mean moving someone else's model
-        directory) and is what the weights are read from today.
+      * the compatibility candidates in ``_POPULATED_HF_CACHES`` — empty today.
+        It held the probe lane tree while that was the only copy on the box.
+        Once the weights were re-fetched into the durable path above, a
+        fallback could only point at a directory that no longer exists.
 
     Order matters and is deliberate: read from the cache that exists, write
     new state to the durable one. This is the whole of the first-run timeout

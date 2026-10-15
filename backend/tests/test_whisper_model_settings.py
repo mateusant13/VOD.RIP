@@ -151,10 +151,20 @@ def test_parakeet_cache_lives_under_models_root(monkeypatch, tmp_path):
 def test_fixed_engine_model_is_parakeet():
     """The engine model id is the fixed sherpa parakeet redux repo — no
     faster-whisper id anywhere near the default."""
-    # Pinned to the ONE parakeet the app ships. Redux is the ternary
-    # re-quantisation of parakeet-tdt-0.6b-v3 (same architecture, tokenizer
-    # and 25 languages; 178 MB vs ~1.2 GB). Pinned so a silent model swap
-    # cannot land; the no-faster-whisper intent below is unchanged.
+    # Pinned to the ONE parakeet the app ships. Redux is a re-quantisation of
+    # parakeet-tdt-0.6b-v3 (same architecture, tokenizer and 25 languages).
+    # SIZES CORRECTED 2026-10-15 against the artifacts themselves, because the
+    # old "178 MB ternary" line described a DIFFERENT file:
+    #   * what sherpa-onnx runs is 4-bit, not ternary - 193 MatMulNBits nodes,
+    #     every one bits=4, block_size=128 (measured on encoder.onnx), and it
+    #     occupies 397 MB on disk (encoder 327.9 + decoder 45.1 + joiner 24.1).
+    #     The upstream tarball is 161 MB compressed and unpacks to 397 MB, so
+    #     our copy is byte-for-byte the published artifact, not a fattened one.
+    #   * the ternary/170 MB figure belongs to the OPT-IN Photon accelerator,
+    #     whose weights are moondream/parakeet-redux: model.safetensors 169.5 MB
+    #     + tokenizer 1.1 MB + ternary.json. Same base model, other engine.
+    # One engine, one model id. Pinned so a silent swap cannot land; the
+    # no-faster-whisper intent below is unchanged.
     assert PARAKEET_MODEL == "Codyfederer/sherpa-onnx-nemo-parakeet-redux"
     assert "parakeet" in PARAKEET_MODEL.lower(), (
         "the ASR default must still be a parakeet model"
