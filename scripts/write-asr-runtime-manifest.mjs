@@ -1,5 +1,5 @@
 import { createHash } from 'crypto';
-import { existsSync, readFileSync, readdirSync, writeFileSync } from 'fs';
+import { createReadStream, existsSync, readFileSync, readdirSync, writeFileSync } from 'fs';
 import { join, relative, resolve } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -44,8 +44,20 @@ if (missing.length) {
   process.exit(0);
 }
 
-function sha256(path) {
-  return createHash('sha256').update(readFileSync(path)).digest('hex');
+// STREAMED, and that is the whole bug this file had.
+//
+// readFileSync() throws ERR_FS_FILE_TOO_LARGE above 2 GiB on Node 20 -
+// "File size (2150340321) is greater than 2 GiB" - and the GPU ASR runtime
+// archive is 2.15 GB, so this function could never hash it. Every release
+// tag from v1.0.54 on failed here: the runtime WAS built, the zip WAS
+// created, and the manifest step died on the hash. Three wrong theories
+// preceded this (a missing runtime, a stderr channel, a missing guard)
+// because the job log needs auth to read and the local run cannot reproduce
+// a 2 GiB file. A stream has no size ceiling.
+async function sha256(path) {
+  const h = createHash('sha256');
+  for await (const chunk of createReadStream(path)) h.update(chunk);
+  return h.digest('hex');
 }
 function filesUnder(dir) {
   const files = [];
@@ -58,9 +70,14 @@ function filesUnder(dir) {
 }
 
 const files = Object.fromEntries(
-  filesUnder(runtimeDir)
-    .map((path) => [relative(runtimeDir, path).replaceAll('\\', '/'), sha256(path)])
-    .sort(([a], [b]) => a.localeCompare(b)),
+  (
+    await Promise.all(
+      filesUnder(runtimeDir).map(async (path) => [
+        relative(runtimeDir, path).replaceAll('\\', '/'),
+        await sha256(path),
+      ])
+    )
+  ).sort(([a], [b]) => a.localeCompare(b)),
 );
 const repository = process.env.GITHUB_REPOSITORY || 'mateusant13/VOD.RIP';
 const tag = process.env.GITHUB_REF_NAME || `v${version}`;
@@ -69,7 +86,7 @@ const manifest = {
   version,
   executable: 'VOD-RIP-ASR.exe',
   archive_url: `https://github.com/${repository}/releases/download/${tag}/${archiveName}`,
-  archive_sha256: sha256(archivePath),
+  archive_sha256: await sha256(archivePath),
   files,
 };
 writeFileSync(outputPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
