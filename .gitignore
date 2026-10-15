@@ -11,6 +11,8 @@ installer/staging/
 installer/MicrosoftEdgeWebview2Setup.exe
 # Generated build artifact copied from dist/ during npm run build-copy
 backend/static/index.html
+# Copied from dist/ by build-copy alongside index.html
+backend/static/assets/
 
 # Packaged desktop app (build locally via npm run build-dist or CI release)
 VOD-RIP.EXE

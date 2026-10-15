@@ -10,7 +10,7 @@
     "dev:api": "cd backend && python run.py",
     "dev:all": "npm run verify:install && node scripts/dev-all.mjs",
     "build": "npm run verify:install && vite build",
-    "build-copy": "npm run verify:install && vite build && node -e \"const fs=require('fs');const d='backend/static';fs.mkdirSync(d,{recursive:true});fs.copyFileSync('dist/index.html',d+'/index.html')\"",
+    "build-copy": "npm run verify:install && vite build && node -e \"const fs=require('fs');const d='backend/static';fs.mkdirSync(d,{recursive:true});fs.copyFileSync('dist/index.html',d+'/index.html');if(fs.existsSync('dist/assets'))fs.cpSync('dist/assets',d+'/assets',{recursive:true})\"",
     "preview": "npm run verify:install && vite preview",
     "verify:install": "node scripts/check-node-install.mjs",
     "typecheck": "node scripts/check-node-install.mjs && tsc --noEmit -p tsconfig.json",

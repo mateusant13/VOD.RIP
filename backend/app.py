@@ -1258,6 +1258,15 @@ _INDEX_CACHE: Dict[str, Any] = {"key": None, "etag": "", "html": ""}
 static_dir = Path(__file__).parent / "static"
 if static_dir.exists():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+    # index.html asks for /assets/icon.ico and /assets/icon.png. In dev Vite
+    # serves those from public/, but the frozen app has no Vite: / served the
+    # bundle and /static was mounted, so EVERY launch logged two 404s for the
+    # favicon (measured 2026-10-15 on the installed bundle). Mounting the same
+    # directory at /assets makes the links resolve where they are written -
+    # index.html stays untouched and dev is unaffected.
+    _assets_dir = static_dir / "assets"
+    if _assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=str(_assets_dir)), name="assets")
 
 # Include routers
 app.include_router(settings.router)
