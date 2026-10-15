@@ -43,6 +43,77 @@ export interface ConcurrencyLane {
  * first-served. A limit below 1 is meaningless, so it is floored to 1 rather
  * than silently disabling the work.
  */
+/**
+ * SHARED budget across every background lane.
+ *
+ * A per-lane ceiling is not enough, and the measurement that shows it:
+ * poll ceiling 2 + sync ceiling 3 + warm ceiling 4 = up to 9 requests held
+ * by the app, against a browser that allows 6 connections per origin. The
+ * preview player then queues behind its own app.
+ *
+ * Measured on the FROZEN app (no vite proxy, UI and API on one origin - the
+ * real user path), tmp/ab_frozen.txt, 6 reps:
+ *   inflight at click  2  ->  playable  795 / 807 / 942 ms   3/3 under 3 s
+ *   inflight at click  4  ->  playable 3322 ms
+ *   inflight at click  6  ->  playable 5913 / 6326 ms
+ *
+ * The click itself is cheap (click -> fetch issued ~500 ms, 40 ms of JS in
+ * the click window) and the server is fast (session_created 110-219 ms), so
+ * what costs seconds is waiting for a socket. The budget is therefore
+ * global, not per lane: the app may hold at most this many of the browser
+ * connections whatever mix of waves is running. 3 leaves 3 of 6 for the
+ * player, which needs 2-3 (session, master, segment).
+ */
+const DEFAULT_SHARED_BUDGET = 3;
+let _sharedBudget = DEFAULT_SHARED_BUDGET;
+let _sharedActive = 0;
+const _sharedWaiting: Array<() => void> = [];
+
+function sharedAcquire(budget: number): Promise<void> {
+  if (_sharedWaiting.length === 0 && _sharedActive < budget) {
+    _sharedActive += 1;
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => { _sharedWaiting.push(resolve); });
+}
+
+function sharedRelease(): void {
+  const next = _sharedWaiting.shift();
+  if (next) {
+    next(); // the slot transfers, the count is unchanged
+    return;
+  }
+  _sharedActive -= 1;
+}
+
+/** Current shared usage - the number a measurement should read. */
+export function sharedInFlight(): number {
+  return _sharedActive;
+}
+
+/**
+ * Measurement seam, read from the window the same way App.tsx reads the
+ * per-lane ceilings: window.__VODRIP_BG_LIMITS__ = { shared: N }. A paired
+ * A/B writes it before the app loads so both arms run on one page, and it
+ * works inside the frozen bundle too (which has no module server to import
+ * across - that was tried first and failed).
+ */
+function _seamShared(): number | null {
+  const w = window as unknown as { __VODRIP_BG_LIMITS__?: { shared?: unknown; poll?: unknown } };
+  const raw = w.__VODRIP_BG_LIMITS__;
+  if (!raw) return null;
+  // An A/B control arm raises a per-lane ceiling to 512 to remove THAT gate.
+  // It must also remove the shared one, or the control arm measures the
+  // shared gate instead of "no gate at all" - which is exactly the bug this
+  // fixes, reintroduced as a measurement artefact.
+  if (Number(raw.poll) >= 512) return 1e9;
+  const v = Number(raw.shared);
+  return Number.isFinite(v) && v > 0 ? v : null;
+}
+
+export function __setSharedBudgetForTests(n: number): void {
+  _sharedBudget = n > 0 ? Math.floor(n) : DEFAULT_SHARED_BUDGET;
+}
 export function createConcurrencyLane(limit: number): ConcurrencyLane {
   const ceiling = Number.isFinite(limit) && limit >= 1 ? Math.floor(limit) : 1;
   let active = 0;
@@ -78,7 +149,11 @@ export function createConcurrencyLane(limit: number): ConcurrencyLane {
     peakInFlight: () => peak,
     resetPeak: () => { peak = active; },
     run<T>(task: () => Promise<T>): Promise<T> {
-      return acquire().then(() => task().finally(release));
+      // Two gates, shared first: the app total budget, then this lane
+      // ceiling. Releasing in reverse keeps both counts exact.
+      return sharedAcquire(_seamShared() ?? _sharedBudget)
+        .then(() => acquire())
+        .then(() => task().finally(() => { release(); sharedRelease(); }));
     },
   };
 }
