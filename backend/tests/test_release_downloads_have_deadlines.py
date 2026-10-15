@@ -60,3 +60,33 @@ def test_a_failed_download_fails_loudly_instead_of_proceeding():
         " bundles it and ISCC would fail later with a less clear message"
     )
     assert "Test-Path $out" in body, "the file must be verified after download"
+
+
+def test_the_release_never_hands_an_oversized_file_to_the_uploader():
+    """A >2 GiB asset cannot be a GitHub Release asset, and the glob thing fails.
+
+    Measured 2026-10-15, run 38781402476. release-build finally SUCCEEDED (the
+    2 GiB readFileSync fix and the sequential hash both worked), the release job
+    created the release, uploaded four assets, and then died on the fifth:
+
+      Validation Failed: {"resource":"ReleaseAsset","code":"custom",
+       "field":"size","message":"size must be less than 2147483648"}
+
+    The GPU ASR runtime archive is 2.15 GB. It can NEVER be a Release asset.
+    Because `files: release/*` included it, the failure aborted the publish and
+    left a DRAFT - the app was built, packaged and uploaded, and invisible.
+
+    RED ARM: put `files: release/*` back and this fails.
+    """
+    text = WORKFLOW.read_text(encoding="utf-8")
+    after_release_action = text.split("softprops/action-gh-release", 1)[1]
+    block = after_release_action.split("\n      - name:", 1)[0]
+    code = "\n".join(
+        l for l in block.splitlines() if not l.strip().startswith("#")
+    )
+    assert "files: release/*" not in code, (
+        "a glob hands the 2.15 GB runtime archive to the uploader, which cannot"
+        " accept it, and the whole publish is lost"
+    )
+    assert "release/VOD.RIP-*-Setup.exe" in code, "the app must be named explicitly"
+    assert "release/VOD.RIP-*-win-x64.zip" in code, "the base zip must be named"

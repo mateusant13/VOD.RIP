@@ -264,7 +264,24 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: release/*
+          # NOT release/*. A GitHub Release asset cannot exceed 2 GiB and the
+          # GPU ASR runtime archive is 2.15 GB, so the glob handed the action a
+          # file it can never accept:
+          #   Validation Failed: {"field":"size","message":"size must be less
+          #    than 2147483648"}
+          # On v1.0.60 that aborted the publish AFTER four assets had uploaded,
+          # leaving a DRAFT nobody could see - the app was built, signed and
+          # uploaded, and still invisible. Naming the files instead means the
+          # base always publishes.
+          #
+          # The runtime has no home on a GitHub Release at 2.15 GB. Splitting it
+          # under 2 GiB parts, or hosting it elsewhere, is an owner decision;
+          # until then it ships as a workflow artifact only and the release
+          # carries the app.
+          files: |
+            release/SHA256SUMS.txt
+            release/VOD.RIP-*-win-x64.zip
+            release/VOD.RIP-*-Setup.exe
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

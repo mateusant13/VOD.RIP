@@ -1,7 +1,7 @@
 {
   "name": "vod-rip",
   "private": true,
-  "version": "1.0.60",
+  "version": "1.0.61",
   "type": "module",
   "scripts": {
     "dev": "npm run verify:install && node scripts/dev-all.mjs",
