@@ -112,3 +112,19 @@ warm/batch does not slow it (0.14-0.25 s), and the server own log agrees
 THE LEVER for <=3 s is therefore the 1.43 s click-to-fetch, and the cause to
 attack is main-thread work in the click path - not connection pooling, not the
 backend, not the sync ceiling (already measured as not a lever: 2c04df2).
+
+### The long tasks, sized
+
+Long tasks attributed (tmp/ab_lt.mjs, same harness):
+  645 ms @1106   |  606 ms @18838   |  584 ms @2283   |  494 ms @5136
+
+Half-second main-thread blocks. Two or three of those landing inside the
+click path is exactly the 1.4-1.8 s click-to-fetch. INSTRUMENT LIMIT, stated
+so the next round does not chase it: containerName/containerType come back
+"unknown" in this Chromium build, so the tasks are sized but not named. To
+name them, the next step is a CDP Profiler trace over the click window, not
+another PerformanceObserver pass.
+
+Recurring number across every run this round:
+  click -> session fetch issued   1368-1828 ms   (median ~1450 ms)
+  longtask total                  5176-5540 ms within 2 reps
