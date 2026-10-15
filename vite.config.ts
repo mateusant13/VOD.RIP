@@ -103,6 +103,21 @@ export default defineConfig({
           ...base,
           proxyTimeout: 8_000,
         },
+        // Preview/player control lane — the requests that OPEN a preview.
+        //
+        // Measured 2026-10-15: POST /api/preview/session answers in
+        // 0.12-0.44s (6/6 direct, max 0.44s). The same POST through this
+        // proxy was hanging until the 45s harness limit, reporting
+        // session=null, because it fell into the no-timeout "/api" lane
+        // below — the 2026-09-13 failure mode: an upstream that accepts but
+        // never answers leaves these pending FOREVER and the UI never
+        // paints. 8s is ~18x the measured max and still bounded, so a wedged
+        // upstream costs a 500 instead of a dead tab.
+        // Matched BEFORE "/api" (insertion order) so it wins for these URLs.
+        "^/api/preview/(?:session|invalidate|warm(?:/batch)?|seek|quality)([?].*)?$": {
+          ...base,
+          proxyTimeout: 8_000,
+        },
         // Everything else (SSE streams with 15s backend keepalives, HLS/MP4
         // proxies, yt-dlp extraction, folder pickers, scans) keeps the old
         // no-timeout behavior — a fixed cap would sever legitimate long calls.

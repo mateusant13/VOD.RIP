@@ -47,3 +47,35 @@ one, and the honest statement is "median between 2.2s and 11.1s".
 
 A PAIRED run of the sync ceiling, on the same page, with the same tab-open
 sequence as measurement B. That is the experiment that separates the two.
+
+## 2026-10-15, round 2 — the proxy had no timeout, and it is fixed
+
+POST /api/preview/session fell into the no-timeout "/api" proxy lane in
+vite.config.ts (the same class as the 2026-09-13 CLOSE_WAIT incident: an
+upstream that accepts but never answers leaves the proxied fetch pending
+FOREVER). The narrow fail-fast lane covered settings/info/health but NOT the
+requests that OPEN a preview.
+
+Measured direct vs proxied, same URL, after adding a lane:
+  direct  POST /api/preview/session  0.12-0.44 s  (6/6)
+  proxied POST /api/preview/session  0.58-1.33 s  (5/5)
+
+So the proxy costs ~0.7 s and is now bounded at 8 s instead of hanging.
+
+## And where the remaining click time actually goes (8 real reps)
+
+  playable  5388  7352  7921  15854  16156  20057  22961  (+1 timeout45s)
+  session   2797  1276  1537   2520   4031    5539  6660
+
+The session POST swings 1.3-6.7 s while the same call direct is 0.12-0.44 s.
+The difference is the app own background wave: the harness still fires the
+39-channel live poll, which holds the browser ~6 per-origin connections.
+The poll lane (ceiling 2, commit 5423441) caps the LIVE wave; what is not
+capped is the 39-channel INCREMENTAL SYNC, whose ceiling A/B measured 3 to
+be the right value (2c04df2) and which this harness re-fires every rep by
+opening CONFIGURACOES -> CANAIS.
+
+HONEST STATE: click -> playable is 5.4-23.0 s in this harness, NOT under 3 s.
+The one leg that IS proven fast and stable is the direct session POST. The
+remaining cost is connection-queue contention from the app own traffic, and
+the sync ceiling was already measured as not the lever.
