@@ -14,6 +14,24 @@ import shutil
 import subprocess as sp
 import sys
 import tempfile
+
+
+# All throwaway scratch (fragments, mux staging) must land on the same drive
+# cache_root() picks - the drive with the most free space. Using the system
+# temp instead broke downloads on this box: G:\Temp is on a full drive, so
+# yt-dlp died with [Errno 28] No space left on device mid-download.
+def _tmpdir(prefix: str) -> str:
+    """mkdtemp pinned to cache_root() so scratch never lands on a full drive."""
+    try:
+        from services.settings import cache_root
+
+        root = cache_root()
+        if root is not None:
+            root.mkdir(parents=True, exist_ok=True)
+            return tempfile.mkdtemp(prefix=prefix, dir=str(root))
+    except Exception:
+        pass
+    return tempfile.mkdtemp(prefix=prefix)
 import threading
 import time
 import uuid
@@ -2566,7 +2584,7 @@ def download_hls_media_clip(
     # cancel even if ffmpeg is killed mid-encode) and we want to register
     # ownership so concurrent downloads in the same output folder never
     # accidentally wipe each other's temp dirs.
-    tmpdir = tempfile.mkdtemp(prefix="hls_clip_", dir=out_parent or None)
+    tmpdir = _tmpdir(prefix="hls_clip_", dir=out_parent or None)
     if register_temp_dir:
         try:
             register_temp_dir(tmpdir)
@@ -2742,7 +2760,7 @@ def _download_progressive_clip(
     media_rng = _googlevideo_byte_range(media_url, start_sec, end_sec)
     if media_rng is not None:
         try:
-            tmpdir = tempfile.mkdtemp(prefix="prog_clip_")
+            tmpdir = _tmpdir(prefix="prog_clip_")
             media_input = os.path.join(tmpdir, "in.mp4")
             ss = _fetch_googlevideo_window_local(
                 media_url, start_sec, end_sec, headers, media_input, cancel_event,
@@ -3198,7 +3216,7 @@ def _fetch_googlevideo_range(
         # large background jobs (full-VOD warm). Each worker still does resilient
         # 1MB sub-chunks so transient CDN errors are handled inside the slice.
         try:
-            tmpdir = tempfile.mkdtemp(prefix="gv_par_")
+            tmpdir = _tmpdir(prefix="gv_par_")
             try:
                 per_worker = total // workers
                 part_files = [os.path.join(tmpdir, f"part_{i}") for i in range(workers)]
@@ -3306,7 +3324,7 @@ def _concat_googlevideo_init_media(
 ) -> None:
     """Deep seek: init box + media byte window (concat) — avoids 16MB-from-zero CDN cap."""
     mb0, mb1 = media
-    tmp = tempfile.mkdtemp(prefix="gv_deep_")
+    tmp = _tmpdir(prefix="gv_deep_")
     try:
         init_p = os.path.join(tmp, "init.mp4")
         media_p = os.path.join(tmp, "media.mp4")
@@ -3525,7 +3543,7 @@ def _download_muxed_dash_clip(
     used_local = False
 
     if v_range and a_range:
-        tmpdir = tempfile.mkdtemp(prefix="dash_clip_")
+        tmpdir = _tmpdir(prefix="dash_clip_")
         v_local = os.path.join(tmpdir, "v.mp4")
         a_local = os.path.join(tmpdir, "a.m4a")
         if progress_hook:
@@ -4124,7 +4142,7 @@ def _ytdlp_audio_section_download(
     """ponytail: yt-dlp section + extract when DASH audio URL unavailable."""
     from yt_dlp.utils import download_range_func
 
-    tmpdir = tempfile.mkdtemp(prefix="ytdlp_aud_")
+    tmpdir = _tmpdir(prefix="ytdlp_aud_")
     try:
         out_tmpl = os.path.join(tmpdir, "clip.%(ext)s")
         ydl_opts = dict(opts)
@@ -4393,7 +4411,7 @@ def ytdlp_section_mux_to_ts(
     from yt_dlp import YoutubeDL
     from yt_dlp.utils import download_range_func
 
-    tmpdir = tempfile.mkdtemp(prefix="ytdlp_seg_")
+    tmpdir = _tmpdir(prefix="ytdlp_seg_")
     try:
         base = os.path.join(tmpdir, "clip")
         opts = youtube_preview_ytdl_opts(url, cookies_file=cookies_file)
