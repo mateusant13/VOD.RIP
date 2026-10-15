@@ -81,6 +81,38 @@ a = Analysis(
         "ctranslate2",
         "onnxruntime",
         "tokenizers",
+        # Measured 2026-10-15 (xref-VOD-RIP.html of the pre-fix build): the
+        # module graph follows TRANSITIVE imports the base never makes:
+        #   services.archive_transcribe -> huggingface_hub ->
+        #   huggingface_hub._webhooks_server -> gradio -> gradio.pipelines ->
+        #   transformers -> {torchvision, torchao, timm, datasets, accelerate,
+        #   faiss, soynlp, babel, spacy, cv2, av, pandas, pyarrow, skimage}
+        # torch's lib DLLs also ride in via binary-dependency analysis of
+        # torchvision's _C.pyd, so excluding "torch" alone was NOT enough.
+        #   services.archive_events -> librosa -> {sklearn, numba, llvmlite}
+        # Every one of these is a function-level import in the backend (or an
+        # unused transitive), so the base app boots and degrades without them;
+        # vod-rip-asr.spec still ships them in the optional ASR runtime.
+        "huggingface_hub._webhooks_server",
+        "gradio",
+        "transformers",
+        "datasets",
+        "accelerate",
+        "torchvision",
+        "torchao",
+        "timm",
+        "faiss",
+        "librosa",
+        "soynlp",
+        "pandas",
+        "pyarrow",
+        "sklearn",
+        "numba",
+        "llvmlite",
+        "spacy",
+        "cv2",
+        "av",
+        "babel",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

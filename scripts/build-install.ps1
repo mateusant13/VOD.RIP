@@ -139,21 +139,21 @@ function Set-BuildJunction([string]$Link, [string]$Target, [string]$Label) {
         } else {
             # A real directory left by a pre-change build: MOVE its content to
             # the H: target first, verify the move, and only then swap the
-            # junction in. robocopy is qualified through SystemRoot so a
-            # restricted PATH cannot turn a failed copy into a silent delete;
-            # its exit code (>= 8 means error) is checked, and the target must
-            # hold at least as many files as the source had.
+            # junction in. robocopy is called exactly like the install step
+            # below does (same exit-code contract: >= 8 is an error, 0/1 are
+            # fine), and the target must end up holding at least as many files
+            # as the source had, so a failed copy can never turn the next line
+            # into a delete.
             Write-Host ("  " + $Label).PadRight(9) + ": migrating existing $Link -> $Target"
-            $rc = Join-Path $env:SystemRoot 'System32\robocopy.exe'
-            if (-not (Test-Path -LiteralPath $rc)) { $rc = 'robocopy.exe' }
             $before = (Get-ChildItem -LiteralPath $Link -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count
-            & $rc $Link $Target /E /MOVE /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
+            robocopy $Link $Target /E /MOVE /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
             if ($LASTEXITCODE -ge 8) { Fail "migrating $Link to $Target failed (robocopy $LASTEXITCODE)" }
             $after = (Get-ChildItem -LiteralPath $Target -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count
             if ($after -lt $before) {
                 Fail "migrating $Link to $Target copied $after/$before files - aborting before the swap"
             }
-            Write-Host ("  " + $Label).PadRight(9) + ": migrated $before files ($([math]::Round(((Get-ChildItem -LiteralPath $Target -Recurse -File -EA SilentlyContinue | Measure-Object -Property Length -Sum).Sum)/1MB,1)) MB)"
+            $migMB = [math]::Round(((Get-ChildItem -LiteralPath $Target -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum) / 1MB, 1)
+            Write-Host ("  " + $Label).PadRight(9) + ": migrated $before files ($migMB MB)"
             if (Test-Path -LiteralPath $Link) { Remove-Item -LiteralPath $Link -Recurse -Force }
         }
     }
