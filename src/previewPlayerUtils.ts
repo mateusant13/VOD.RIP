@@ -2,6 +2,7 @@ import Hls from 'hls.js';
 import { ApiError, apiPost } from './hooks/useApiClient';
 import { detectUrlPlatform, isClipUrl } from './channelUtils';
 import type { PreviewSessionResponse, PreviewSessionStatusResponse } from './types';
+import { beginPreviewPriorityWindow } from './lib/backgroundBudget';
 
 /** Warm response cache — skip recently-warmed URLs to avoid redundant POSTs. */
 const _warmCache = new Map<string, number>();
@@ -89,6 +90,12 @@ export async function createPreviewSessionWithRetry(
   // In-flight dedup: concurrent calls with the same body share one POST.
   // Handles React StrictMode double-invoke and user double-clicks.
   const key = JSON.stringify(body);
+  // Make room before asking for a socket, not after. The create is the first
+  // of three requests the player needs (create, manifest, first segment), and
+  // the browser queues FIFO - if the background waves own the sockets when this
+  // starts, this request waits behind them no matter how fast the server is.
+  // The window is self-closing, so it cannot silence the lanes permanently.
+  beginPreviewPriorityWindow();
   return _dedupInflight(_sessionCreateInflight, key, async (): Promise<PreviewSessionResponse> => {
     let lastErr: unknown;
     for (let attempt = 0; attempt <= _PREVIEW_CREATE_RETRIES; attempt++) {

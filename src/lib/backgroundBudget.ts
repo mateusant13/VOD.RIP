@@ -111,6 +111,43 @@ function _seamShared(): number | null {
   return Number.isFinite(v) && v > 0 ? v : null;
 }
 
+/**
+ * PRIORITY WINDOW for the preview.
+ *
+ * A capped budget is not enough on its own. Measured on the frozen app
+ * (tmp/ab_frozen.txt): with inflight 2 at the click the preview plays in
+ * 795-942 ms, and with inflight 6 it takes 5913-6326 ms. The browser has
+ * 6 sockets per origin and queues FIFO, so the preview own requests sit
+ * behind the background waves even when the budget is capped - the cap
+ * limits how many the app HOLDS, not how long they are held.
+ *
+ * So for the length of the session create (plus the manifest/segment that
+ * follows it) the background waves step aside entirely: the app holds at
+ * most one socket, which leaves 5 for the player. This is the difference
+ * between "the preview is fast when the app happens to be quiet" and "the
+ * preview is fast because the app made room for it".
+ *
+ * Bounded, not a hold: the window closes itself, so a stuck preview cannot
+ * silence the background lanes forever.
+ */
+const PRIORITY_WINDOW_MS = 2500;
+let _priorityUntil = 0;
+
+/** Open a window in which the background waves hold at most one socket. */
+export function beginPreviewPriorityWindow(ms: number = PRIORITY_WINDOW_MS): void {
+  _priorityUntil = Math.max(_priorityUntil, Date.now() + ms);
+}
+
+/** True while a preview is opening - the measurement reads this. */
+export function previewPriorityActive(): boolean {
+  return Date.now() < _priorityUntil;
+}
+
+function _priorityBudget(): number {
+  const w = window as unknown as { __VODRIP_BG_LIMITS__?: { noprio?: unknown } };
+  if (w.__VODRIP_BG_LIMITS__ && w.__VODRIP_BG_LIMITS__.noprio) return _seamShared() ?? _sharedBudget;
+  return previewPriorityActive() ? 1 : (_seamShared() ?? _sharedBudget);
+}
 export function __setSharedBudgetForTests(n: number): void {
   _sharedBudget = n > 0 ? Math.floor(n) : DEFAULT_SHARED_BUDGET;
 }
@@ -151,7 +188,7 @@ export function createConcurrencyLane(limit: number): ConcurrencyLane {
     run<T>(task: () => Promise<T>): Promise<T> {
       // Two gates, shared first: the app total budget, then this lane
       // ceiling. Releasing in reverse keeps both counts exact.
-      return sharedAcquire(_seamShared() ?? _sharedBudget)
+      return sharedAcquire(_priorityBudget())
         .then(() => acquire())
         .then(() => task().finally(() => { release(); sharedRelease(); }));
     },

@@ -165,3 +165,36 @@ suspect: client cheap (455 ms), server fast (session_created 110-219 ms), and
 
 MEASUREMENT RULE, expensive kind: a harness against dev measures dev, not the
 product. Production is the target from here.
+
+## 2026-10-15, round 5 — the variance is AFTER the session POST, not in it
+
+Two arms on the frozen app, poll and sync identical, only the priority
+window differing (tmp/ab_prio.txt):
+
+  OFF (no priority)  median 3917 ms  [846, 862, 3917, 7095, 8197]
+  ON                 median 3499 ms  [736, 846, 862, 1027, 2959, 3499,
+                                          3917, 7095, 8197, 11149]
+
+The distributions OVERLAP: both arms contain the same fast reps (736-1027 ms)
+and the same slow ones (7095-11149 ms). So the priority window does not
+separate, and this round does not claim it does.
+
+WHAT THE SAME DATA DOES LOCALISE, and it moves the target again:
+
+  rep  session(proxied)  playable   after-session cost
+  r6        160 ms         736 ms        576 ms
+  r9        450 ms        1027 ms        577 ms
+  r1        266 ms       11149 ms      10883 ms
+  r2        795 ms        2959 ms       2164 ms
+  r3       1773 ms        3917 ms       2144 ms
+
+The session POST is NOT the variable leg. When it is fast, the preview still
+takes 10.9 s - and when it is slow the extra time is small. The 1.0-10.9 s
+lives AFTER the session: hls master fetch -> hls.js parse -> first segment
+-> canplay. Earlier runs sized those legs individually (master 375-4420 ms,
+segment 392-2710 ms), which fits: the whole post-session chain varies by 10x
+while the session POST varies by 7x and never dominates.
+
+NEXT TARGET, stated so the round after this one does not repeat: instrument
+the manifest and segment fetches separately on the frozen app - which of the
+two varies, and whether the manifest is re-fetched per rep.
