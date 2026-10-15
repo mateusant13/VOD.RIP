@@ -580,6 +580,16 @@ async def latest_errors(limit: int = Query(20, ge=1, le=500)) -> dict:
     return {"errors": get_error_ring(limit)}
 
 
+# Bound on the /api/health probe, in SECONDS.
+#
+# Must stay well under the dev supervisor probe timeout (2.5s,
+# scripts/dev-all.mjs:215) - the supervisor kills the API after three
+# consecutive misses, so a liveness answer that can take longer than the
+# probe timeout is a self-inflicted outage. 1.0s leaves 2.5x headroom and
+# sits far above the p50 (15ms) and p99 of a healthy probe.
+_HEALTH_PROBE_BUDGET_SEC = 1.0
+
+
 @router.get("/api/health")
 async def health():
     """Aggregate liveness for external supervisors (dev-all, launcher watchdog).
@@ -636,11 +646,32 @@ async def health():
             subs_pot = None
         return pending, worker, background, activity_age, subs_pot
 
-    pending, worker, background, activity_age, subs_pot = (
-        await asyncio.get_running_loop().run_in_executor(
-            HEALTH_EXECUTOR, _probe,
+    # LIVENESS MUST NOT DEPEND ON READINESS.
+    #
+    # Measured 2026-10-14: 5 of 40 probes of this endpoint timed out (a 12.5%
+    # failure rate, latencies p50 15 ms but max 1.85 s, 3 probes over 1 s),
+    # because _probe() runs four sqlite reads plus a JSONL parse in ONE worker
+    # thread. Those reads can block for the full sqlite busy_timeout (10 s),
+    # which is 4x the dev supervisor's own 2.5 s probe timeout
+    # (scripts/dev-all.mjs:215). Three missed probes in a row and the
+    # watchdog taskkills a LIVE api mid-request - the very failure class
+    # HEALTH_EXECUTOR was created to prevent, reintroduced one layer up.
+    #
+    # The supervisor only needs the 200; every field here is already
+    # best-effort and documented to degrade to None/False. So bound the
+    # probe and answer either way: a slow diagnostic degrades, it no longer
+    # takes the liveness answer down with it.
+    try:
+        pending, worker, background, activity_age, subs_pot = await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(HEALTH_EXECUTOR, _probe),
+            timeout=_HEALTH_PROBE_BUDGET_SEC,
         )
-    )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "health probe exceeded %.1fs - answering with degraded fields",
+            _HEALTH_PROBE_BUDGET_SEC,
+        )
+        pending, worker, background, activity_age, subs_pot = None, False, False, None, None
     return {
         "ok": True,
         "name": "VOD.RIP",
