@@ -161,7 +161,17 @@ jobs:
             Write-Warning "No ASR runtime at $runtime — skipping ASR zip (base still built)"
           }
 
+      # Guarded on the artifact, exactly like the packaging step above. Two
+      # tags (v1.0.54, v1.0.55) died on an unguarded version of this step:
+      # the script threw (v1.0.54), then a rewritten script that exits 0 with
+      # the warning on stdout STILL failed the step (v1.0.55) for a reason
+      # never proven - the pwsh wrapper semantics around a native command.
+      # So stop depending on those semantics for the ABSENT case: when there
+      # is no runtime to describe, the step does not run at all. When there
+      # IS one, it runs and must succeed, because a manifest for a real
+      # archive is what the installer verifies against.
       - name: Write ASR runtime manifest
+        if: hashFiles('dist/runtimes/asr/**/VOD-RIP-ASR.exe') != ''
         shell: pwsh
         run: |
           $ver = "${{ github.ref_name }}".TrimStart('v')
