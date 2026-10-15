@@ -22,6 +22,7 @@ vi.mock('./hooks/useApiClient', () => ({
 }));
 
 import { PreviewTiming, notePreviewGesture } from './previewTiming';
+import { __setTimingLaneForTests } from './previewTiming';
 
 type Emitted = { event: string; detail?: string; open_ms?: number };
 const events = (): Emitted[] => apiPost.mock.calls.map((c) => c[1] as Emitted);
@@ -31,6 +32,21 @@ let now = 1000;
 vi.spyOn(performance, 'now').mockImplementation(() => now);
 
 beforeEach(() => {
+  // Production emits telemetry through a FIFO lane so it can never hold one
+  // of the browser's 6 per-origin connections while the preview needs it.
+  // These tests assert on what a click EMITTED, in the same tick, so they
+  // install an immediate lane: same accounting, no queue.
+  let peak = 0;
+  __setTimingLaneForTests({
+    run: <T>(fn: () => Promise<T>): Promise<T> => {
+      peak += 1;
+      return fn().finally(() => { peak -= 1; });
+    },
+    limit: 1,
+    inFlight: () => peak,
+    peakInFlight: () => peak,
+    resetPeak: () => {},
+  });
   now = 1000;
   // _gestureStartMs is module-global and consumed by markOpen; drain any
   // leftover so these tests stay order-independent.

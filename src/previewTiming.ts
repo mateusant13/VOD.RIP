@@ -1,4 +1,5 @@
 import { apiPost } from './hooks/useApiClient';
+import { createConcurrencyLane, type ConcurrencyLane } from './lib/backgroundBudget';
 
 export type PreviewTimingSurface = 'main' | 'explore';
 
@@ -12,9 +13,37 @@ type TimingPayload = {
   detail?: string;
 };
 
-/** Fire-and-forget — surfaces in uvicorn console via POST /api/preview/timing. */
+/**
+ * Telemetry is emitted through a lane of ceiling 1, NOT fire-and-forget.
+ *
+ * "Fire-and-forget" was the intent, and it was wrong in the way that matters.
+ * Each POST is a real fetch, and a browser allows ~6 connections per origin.
+ * Emitting telemetry on the click path spent those sockets on the measurement.
+ *
+ * Measured 2026-10-15 (tmp/ab_phases.txt, 6 reps, click -> playable): the
+ * slowest single request in the click path was POST /api/preview/timing in 3 of
+ * 6 reps - 4070 ms, 4093 ms and 2501 ms - beside the hls manifest it was
+ * competing with for a socket. The request that exists to report the latency
+ * was itself a leading contributor to it.
+ *
+ * A lane of ceiling 1 keeps the telemetry (these numbers are how the latency
+ * was found in the first place) while making it structurally impossible for it
+ * to contend with the preview. Absent telemetry is a diagnostic gap; telemetry
+ * that slows what it measures is a thermometer that cools the room.
+ *
+ * Injectable so the module own tests stay synchronous: they assert what a
+ * click emitted, in the same tick, and install an immediate lane.
+ */
+let _timingLane: ConcurrencyLane = createConcurrencyLane(1);
+
+export function __setTimingLaneForTests(lane: ConcurrencyLane): void {
+  _timingLane = lane;
+}
+
 function emitTiming(payload: TimingPayload): void {
-  void apiPost<{ ok: boolean }>('/api/preview/timing', payload).catch(() => {});
+  // void: the click path never waits for the upload.
+  void _timingLane.run(() => apiPost<{ ok: boolean }>('/api/preview/timing', payload))
+    .catch(() => {});
 }
 
 /** Gesture start (pointerdown/click) captured before React mount so the
