@@ -284,3 +284,87 @@ not a steady-state one, and it is the remaining target.
 **Never measure latency with `VODRIP_NO_DAEMONS=1`.** It is not a lighter app, it
 is a different app: the server stops answering under load while the process stays
 alive, which looks exactly like an app defect and is not one.
+
+
+---
+
+## Round 8 — what the four slow reps are actually made of
+
+With `VODRIP_NO_DAEMONS` UNSET (see round 7), 12 reps, six previews, this is the
+per-request breakdown the harness prints. Read it as two separate defects, not one:
+
+| rep | playable | session | hls/master.m3u8 |
+|---|---|---|---|
+| 0 |  5245 ms |  2969 ms |   817 ms |
+| 1 | 37728 ms |  5289 ms | **10004 ms** |
+| 2 | 46468 ms | 16210 ms | **10004 ms** |
+| 3 | 13108 ms | 11822 ms |    17 ms |
+| 4 |  1537 ms |   250 ms |     9 ms |
+| 5 |  2490 ms |  1029 ms |     6 ms |
+| 6 |  2182 ms |   359 ms |   337 ms |
+| 7 |  2485 ms |  1365 ms |     9 ms |
+| 8 |  1550 ms |   339 ms |     7 ms |
+| 9 |  1474 ms |   395 ms |     6 ms |
+| 10 | 2485 ms |  1094 ms |    11 ms |
+| 11 | 1847 ms |   458 ms |     6 ms |
+
+**Defect A - a cold `session` costs 3-16 s and then drops to 250-1400 ms.** Reps 4
+onward are all under 2.5 s total, so steady state is met. The cold cost is the
+session POST without a warm resolve.
+
+**Defect B - `hls/master.m3u8` takes EXACTLY 10004 ms, twice, and 6-9 ms every
+other time.** Two requests at 10.004 s is not a natural network duration; a round
+number that repeats is a timeout or a fixed retry, and it should be found in the
+code before anything else is blamed.
+
+Also visible and worth its own look: the `panel/twitch/...` requests in reps 1 and
+2 arrive SERIALISED - each starts only after the previous one returns - and run
+4923, 8726, 6731, 4505, 2010 ms in rep 1. Six previews each polling the panel is
+the connection-pool pressure measured in earlier rounds; with the panel limit now
+at 2000 these are still slow, so the limit was not their cost either.
+
+### The remaining target, precisely
+
+1. Find the 10004 ms: grep the HLS master fetch for a 10 s timeout or retry.
+2. Warm the session before the first click, or make the first session POST cheap.
+3. Everything after rep 3 is already <= 2.49 s across 8 consecutive reps.
+
+### The 10 004 ms is very likely the SQLite busy_timeout — leading hypothesis
+
+Found by grepping for a round 10 s in the services layer:
+
+```python
+# backend/services/archive_db.py:527-530
+conn = sqlite3.connect(str(path), timeout=10.0, check_same_thread=False)
+conn.execute("PRAGMA busy_timeout=10000")
+```
+
+and the module documents this exact failure mode at `archive_db.py:658`:
+
+    WAL-busy write holds _lock while sqlite spins busy_timeout (10s) — so ...
+
+So the reading is: the `hls/master.m3u8` request reads `archive.db`, a concurrent
+WRITE holds the lock, and the read spins for the FULL `busy_timeout` before either
+succeeding or giving up. 10 004 ms is 10 000 ms of waiting plus 4 ms of work, and
+it appears exactly twice, which is what a fixed timeout looks like.
+
+NOT PROVEN, and labelled as such: I have not yet shown the write that holds the
+lock, nor instrumented the read to confirm it parks in `busy_timeout`. The two
+facts on record are (a) the duration is 10 004 ms to the millisecond, and (b) the
+only 10 s constant on that path is the busy_timeout. That is a strong lead, not a
+measurement.
+
+The same mechanism would explain the cold `session` too, since the session POST
+also reads the archive, and it is why the cost collapses to 250-1400 ms once the
+startup writers have settled.
+
+### How to confirm or kill it
+
+1. Instrument the master handler to record how long it waits on the DB handle
+   versus how long it spends doing work after acquiring it. If the 10 s is in the
+   wait, this is confirmed.
+2. Find the concurrent writer at that moment. The startup warm wave writes; so do
+   the archive daemons. A/B the master fetch with the wave off versus on.
+3. If confirmed, the fix is not "lower the timeout" — that converts a slow success
+   into a fast failure. It is to stop the reader and the writer contending, or to
+   serve the master from cache while a write is in flight.
