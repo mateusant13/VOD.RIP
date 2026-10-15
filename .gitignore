@@ -131,3 +131,28 @@ $null/
 __pycache__/
 *.pyc
 
+# ── Machine-local governor state (belongs to Steady Watcher in I:\!watcher) ──
+# docs/workspace.md:92 and runs/p4-vodrip-status.md:65 already said this file
+# must NOT be committed; it was tracked anyway. Nothing in this repo writes it.
+.steady-watcher.json
+
+# ── Generated agent-continuity view (compact-view.mjs regenerates every run) ──
+# The file header itself says "GENERATED ... Do not hand-edit".
+control/optchat/view.txt
+
+# ── Investigation scratch: finished probes, tickets and status notes ──
+# The convention (docs/unified-procedure.md:64) keeps CARDS, not the artifacts
+# of finished runs, and the repo already flagged TICKET-* as machine-local.
+runs/*.md
+
+# ── Raw agent stdout/stderr captures and network dumps ──
+.omp/prompts/*.out
+.omp/prompts/*.err
+.scout/*.network-response
+
+# ── ConsultGPT audit consent log (local, per-machine) ──
+.consultgpt/audit/
+
+# ── Stray one-off reports that no code reads ──
+audit-report.md
+llms.txt
