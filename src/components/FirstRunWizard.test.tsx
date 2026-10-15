@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import FirstRunWizard from './FirstRunWizard';
 import { resetOnboarding } from '../lib/featureFlags';
-import { isPluginEnabled } from '../lib/plugins';
+import { isPluginEnabled, PLUGINS, ALWAYS_ON } from '../lib/plugins';
 import { getLanguage, setLanguage } from '../i18n';
 
 const savedLang = getLanguage();
@@ -65,66 +65,92 @@ describe('FirstRunWizard — seletor de plugins (pt-BR)', () => {
     expect(screen.queryByText(HEADING)).not.toBeInTheDocument();
   });
 
-  it('lista cada plugin com nome, descrição e o selo "consome mais energia" nos pesados', () => {
+  it('lista os 4 plugins pesados com nome, descrição e custo legível', () => {
     stubApi();
     render(<FirstRunWizard />);
-    expect(screen.getByRole('checkbox', { name: 'Canais' })).toBeInTheDocument();
-    expect(screen.getByRole('checkbox', { name: 'Transcrição' })).toBeInTheDocument();
-    // 4 pesados no catálogo: transcrição, legendas ao vivo, prévia ao vivo, IA.
-    expect(screen.getAllByText('Consome mais energia')).toHaveLength(4);
-    expect(screen.getByText('Acompanhe canais salvos, veja o que saiu novo e arquive VODs.')).toBeInTheDocument();
-    // RED ARM: render CostBadge without the cost check and the light rows
-    // below also show the heavy seal (count above stops being 4).
-    expect(screen.getAllByText('Leve').length).toBeGreaterThan(0);
+    // O catálogo deixou de ter 12 plugins: só os 4 que custam algo são plugins.
+    expect(PLUGINS).toHaveLength(4);
+    for (const name of ['Transcrição', 'Prévia ao vivo', 'Legendas ao vivo', 'Perguntar à IA']) {
+      expect(screen.getByRole('checkbox', { name })).toBeInTheDocument();
+    }
+    expect(screen.getByText('Escreve o que foi dito nos VODs arquivados para você pesquisar depois.')).toBeInTheDocument();
+    // Custo por linha: MB < 1024 fica em MB; senão GB com 1 casa.
+    // RED ARM: remova o toFixed(1) do formatMb e "2.0 GB" deixa de casar.
+    expect(screen.getByTestId('wizard-cost-transcribe')).toHaveTextContent('397 MB em disco · 2.0 GB de VRAM');
+    expect(screen.getByTestId('wizard-cost-live-preview')).toHaveTextContent('0 MB em disco · 400 MB de VRAM');
   });
 
-  it('trava os plugins do núcleo ligados', () => {
+  it("troca o número por 'incluso (mesmo modelo)' quando shares_with já está ligado", async () => {
     stubApi();
     render(<FirstRunWizard />);
-    const core = screen.getByRole('checkbox', { name: 'Canais' }) as HTMLInputElement;
-    expect(core.checked).toBe(true);
-    expect(core.disabled).toBe(true);
-    expect(screen.getAllByText('Sempre ligado').length).toBe(2);
+    // Só a legenda ligada: ela é a dona do modelo e mostra o número.
+    await click(screen.getByRole('checkbox', { name: 'Legendas ao vivo' }));
+    expect(screen.getByTestId('wizard-cost-live-subtitles')).toHaveTextContent('397 MB em disco · 2.0 GB de VRAM');
+    // Ligar a transcrição (MESMO modelo) troca a repetição por "incluso".
+    // RED ARM: ignore shares_with na linha de custo e o 397 MB reaparece aqui.
+    await click(screen.getByRole('checkbox', { name: 'Transcrição' }));
+    expect(screen.getByTestId('wizard-cost-live-subtitles')).toHaveTextContent('incluso (mesmo modelo)');
   });
 
   it('cada toggle chama POST /api/plugins', async () => {
     const fn = stubApi();
     render(<FirstRunWizard />);
-    const box = screen.getByRole('checkbox', { name: 'Busca no arquivo' }) as HTMLInputElement;
-    expect(box.checked).toBe(true);
+    const box = screen.getByRole('checkbox', { name: 'Perguntar à IA' }) as HTMLInputElement;
+    expect(box.checked).toBe(false);
     await click(box);
     // RED ARM: make the row's onChange only set local state (no setPluginEnabled)
     // and this POST never happens.
     await waitFor(() =>
-      expect(pluginPosts(fn)).toEqual([{ id: 'archive-search', enabled: false }]),
+      expect(pluginPosts(fn)).toEqual([{ id: 'ai-ask', enabled: true }]),
     );
   });
 
-  it('"SÓ O ESSENCIAL" liga só o núcleo', async () => {
+  it('"SÓ O ESSENCIAL" desliga todos os plugins (o app always-on fica)', async () => {
     const fn = stubApi();
     render(<FirstRunWizard />);
     await click(screen.getByRole('button', { name: /só o essencial/i }));
-    await waitFor(() => expect(isPluginEnabled('transcribe')).toBe(false));
+    await waitFor(() => expect(pluginPosts(fn)).toHaveLength(4));
+    expect(pluginPosts(fn).every((p) => p.enabled === false)).toBe(true);
+    for (const p of PLUGINS) expect(isPluginEnabled(p.id)).toBe(false);
+    // O que NÃO é plugin continua ligado — é o app.
     expect(isPluginEnabled('channels')).toBe(true);
     expect(isPluginEnabled('link-download')).toBe(true);
-    expect(isPluginEnabled('archive-search')).toBe(false);
-    // RED ARM: point the "essencial" button at anything but coreOnlyPatch() and
-    // these two assertions disagree with the POSTs below.
-    const posted = pluginPosts(fn);
-    // 12 plugins - 2 núcleo: o núcleo é sempre ligado, não gera POST.
-    expect(posted).toHaveLength(10);
-    expect(posted.every((p) => p.enabled === false)).toBe(true);
-    expect(posted.map((p) => p.id)).not.toContain('channels');
   });
 
   it('"TUDO" liga todos, pesados incluídos', async () => {
     const fn = stubApi();
     render(<FirstRunWizard />);
     await click(screen.getByRole('button', { name: /^tudo$/i }));
-    await waitFor(() => expect(isPluginEnabled('transcribe')).toBe(true));
+    await waitFor(() => expect(pluginPosts(fn)).toHaveLength(4));
     expect(pluginPosts(fn).every((p) => p.enabled === true)).toBe(true);
-    // 12 plugins - 2 core = 10 POSTs (core never posts).
-    expect(pluginPosts(fn)).toHaveLength(10);
+    for (const p of PLUGINS) expect(isPluginEnabled(p.id)).toBe(true);
+  });
+
+  it('resume o total do selecionado sem contar o mesmo modelo duas vezes', async () => {
+    stubApi();
+    render(<FirstRunWizard />);
+    // Nada ligado -> total zerado.
+    expect(screen.getByTestId('wizard-totals')).toHaveTextContent('0 MB em disco · 0 MB de VRAM');
+    // Transcrever e legendar usam o MESMO modelo de 397 MB / 2.0 GB de VRAM.
+    // Os presets fecham o modal, então o total vivo é observado por toggle.
+    await click(screen.getByRole('checkbox', { name: 'Transcrição' }));
+    await click(screen.getByRole('checkbox', { name: 'Legendas ao vivo' }));
+    // RED ARM: soma ingênua (sem shares_with) dobraria para 794 MB / 4.0 GB.
+    const totals = screen.getByTestId('wizard-totals');
+    expect(totals).toHaveTextContent('397 MB em disco · 2.0 GB de VRAM');
+    expect(totals).not.toHaveTextContent('794 MB');
+    expect(totals).not.toHaveTextContent('4.0 GB');
+  });
+
+  it('lista os 8 alwaysOn como "Sempre ligado", sem toggle', () => {
+    stubApi();
+    render(<FirstRunWizard />);
+    const box = screen.getByTestId('wizard-always-on');
+    for (const a of ALWAYS_ON) expect(box).toHaveTextContent(a.name);
+    expect(ALWAYS_ON).toHaveLength(8);
+    // Sem toggle: os ids always-on não viram checkbox.
+    expect(box.querySelectorAll('input')).toHaveLength(0);
+    for (const a of ALWAYS_ON) expect(screen.queryByRole('checkbox', { name: a.name })).not.toBeInTheDocument();
   });
 
   it('"SALVAR E CONTINUAR" fecha o modal e arma o flag de onboarding', async () => {

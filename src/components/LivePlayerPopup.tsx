@@ -50,6 +50,7 @@ import {
 } from '../livePlayerLevels';
 import LiveChatPanel, { LIVE_CHAT_PANEL_W } from './LiveChatPanel';
 import { usePlugin } from '../lib/plugins';
+import { EnablePluginPrompt } from './EnablePluginPrompt';
 import TwitchLogoIcon from './TwitchLogoIcon';
 import TwitchClipPopup from './TwitchClipPopup';
 import { previewRetryAfterError, previewDeadlineVerdict, type PreviewRetryState } from '../previewRetry';
@@ -288,17 +289,32 @@ export function __resetLivePlayerRegistryForTests(): void {
 /**
  * Plugin gate for `live-preview`.
  *
- * A DISABLED plugin removes the player from the screen — it does not leave a
- * dead surface behind. Returning null from the WRAPPER (never from inside the
- * body) is what makes that real: the body is a separate component, so while
- * the plugin is off it is UNMOUNTED and none of its effects run — no HLS
- * session POST, no caption SSE, no chat EventSource, no live-quality registry
- * slot. Splitting it also keeps the hook order legal: the wrapper always calls
+ * A DISABLED plugin removes the PLAYER from the screen, but not the knowledge
+ * that the feature exists: the wrapper returns an EnablePluginPrompt instead,
+ * so the user can switch it on from where they tried to use it. Returning
+ * early from the WRAPPER (never from inside the body) is what keeps the body
+ * UNMOUNTED while the plugin is off — none of its effects run: no HLS session
+ * POST, no caption SSE, no chat EventSource, no live-quality registry slot.
+ * Splitting it also keeps the hook order legal: the wrapper always calls
  * exactly one hook, so switching the plugin back on mounts a fresh body
  * instead of adding hooks to an existing render.
  */
 export function LivePlayerPopup(props: LivePlayerPopupProps) {
-  if (!usePlugin('live-preview')) return null;
+  if (!usePlugin('live-preview')) {
+    return createPortal(
+      <div
+        className="fixed left-1/2 top-24 -translate-x-1/2"
+        style={{ zIndex: props.zIndex ?? LIVE_POPUP_ACTIVE_Z }}
+      >
+        <EnablePluginPrompt
+          pluginId="live-preview"
+          onDismiss={props.onClose}
+          className="w-[320px] max-w-[90vw]"
+        />
+      </div>,
+      document.body,
+    );
+  }
   return <LivePlayerPopupBody {...props} />;
 }
 
@@ -2925,6 +2941,18 @@ function LivePlayerPopupBody({ entry, entries, channelName, onClose, channelSlug
                 </button>
               </div>
             </div>
+          </div>
+        )}
+
+        {/* 'live-subtitles' OFF: the overlay would vanish, so its own slot
+            asks to be enabled instead — the CC toggle stays (availability is
+            the parakeet gate's job, not the plugin's). */}
+        {!liveSubtitlesOn && captionsAvailable && (
+          <div
+            data-live-subtitles-prompt
+            className="pointer-events-auto absolute inset-x-0 bottom-16 z-[5] flex justify-center px-4"
+          >
+            <EnablePluginPrompt pluginId="live-subtitles" variant="strip" className="max-w-[95%]" />
           </div>
         )}
 

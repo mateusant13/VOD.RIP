@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import type * as PreviewPlayerUtils from '../previewPlayerUtils';
+import { createPreviewSessionWithRetry } from '../previewPlayerUtils';
 import TwitchClipPopup, { CLIP_PANEL_MIN_H, CLIP_PANEL_MIN_W } from './TwitchClipPopup';
 
 // The popup POSTs a preview session on mount — fail it fast so the component
@@ -22,10 +23,10 @@ const captureProto = HTMLElement.prototype as unknown as {
   releasePointerCapture?: () => void;
 };
 /**
- * Plugin store seeding. The mini-preview is gated by usePlugin('twitch-clip'),
- * which reads the 'vodrip.plugins' localStorage key and falls back to the
- * catalog's defaultOn (true). Seed it explicitly so a future default change
- * cannot silently empty this file.
+ * Plugin store seeding. 'twitch-clip' is ALWAYS_ON after the 2026-10-15 split
+ * (PLUGINS is only the four heavy tools), so usePlugin('twitch-clip') answers
+ * TRUE for it no matter what this key says. The key is still written so a test
+ * can store it false and prove the new rule.
  */
 const PLUGINS_LS_KEY = 'vodrip.plugins';
 
@@ -208,14 +209,17 @@ describe('TwitchClipPopup hover volume', () => {
     expect(Number(slider.value)).toBe(0);
   });
 
-  // The gate. Without the usePlugin('twitch-clip') check in TwitchClipPopup.tsx
-  // the popup would still mount (and still POST a preview session) with the
-  // plugin switched off.
-  it('twitch-clip plugin OFF renders nothing and never opens a session', async () => {
+  // 'twitch-clip' is ALWAYS_ON now: storing it false in the plugin store must
+  // NOT gate the mini-preview. The popup still mounts and still opens the
+  // preview session (the mocked createPreviewSessionWithRetry is the observable).
+  // RED ARM: reintroduce a gate in TwitchClipPopup.tsx that reads the stored
+  // value ('twitch-clip' === false -> null) and the panel leaves the DOM.
+  it("renders and still opens a preview session even while 'twitch-clip' is stored as false, because it is ALWAYS ON", async () => {
     setPlugins({ 'twitch-clip': false });
     renderPopup();
     await Promise.resolve();
-    expect(document.querySelector('[data-twitch-clip-popup]')).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Create clip' })).toBeNull();
+    expect(document.querySelector('[data-twitch-clip-popup]')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Create clip' })).toBeInTheDocument();
+    expect(vi.mocked(createPreviewSessionWithRetry)).toHaveBeenCalled();
   });
 });

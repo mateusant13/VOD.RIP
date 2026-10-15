@@ -2493,13 +2493,18 @@ describe('deepPollIsTerminal', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Plugin gate — a DISABLED archive-search plugin removes the panel from the
-// screen on EVERY path that mounts it. This component is mounted by App (two
-// variants), ChannelExplorePopup, LivePlayerPopup and LocalFilePopup, so the
-// gate has to live inside the component itself.
+// ALWAYS_ON rule — 'archive-search' is NOT a plugin any more (only the four
+// heavy tools are). usePlugin('archive-search') answers TRUE for an id outside
+// the catalogue, so storing it false cannot remove the panel on ANY path that
+// mounts it (App's two variants, ChannelExplorePopup, LivePlayerPopup and
+// LocalFilePopup).
+//
+// RED ARM: reintroduce a gate in ArchiveSearchPopup.tsx that reads the stored
+// value for 'archive-search' and the case below fails — the dialog disappears
+// on both variants.
 // ---------------------------------------------------------------------------
 describe('ArchiveSearchPopup plugin gate', () => {
-  it('archive-search OFF renders no dialog (floating AND embedded variants)', () => {
+  it('renders a dialog (floating AND embedded) even while archive-search is stored as false, because it is ALWAYS ON', () => {
     mockFetch();
     setPlugins({ 'archive-search': false });
 
@@ -2510,11 +2515,10 @@ describe('ArchiveSearchPopup plugin gate', () => {
       <ArchiveSearchPopup zIndex={0} embedded onClose={() => {}} onOpenHit={() => {}} />,
     );
 
-    expect(floating.container.querySelector('[role="dialog"]')).toBeNull();
-    expect(embedded.container.querySelector('[role="dialog"]')).toBeNull();
-    // No resize handles either — the whole body is unmounted.
-    expect(floating.container.querySelectorAll('[data-panel-resize]')).toHaveLength(0);
-    expect(embedded.container.querySelectorAll('[data-panel-resize]')).toHaveLength(0);
+    expect(floating.container.querySelector('[role="dialog"]')).toBeTruthy();
+    expect(embedded.container.querySelector('[role="dialog"]')).toBeTruthy();
+    // The body is mounted, not gated away: the resize handles are back.
+    expect(floating.container.querySelectorAll('[data-panel-resize]').length).toBeGreaterThan(0);
   });
 
   it('archive-search ON still renders (the gate is not always-on)', () => {

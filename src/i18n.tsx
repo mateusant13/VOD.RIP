@@ -830,12 +830,31 @@ const ptBR: Record<string, string> = {
     'Plugins são as ferramentas extras. As que consomem mais energia começam desligadas — ligue quando precisar, aqui ou em Configurações → Plugins.',
   'Always on': 'Sempre ligado',
   'plugins.onCount': '{on} de {total} ligados',
+  // Custos por plugin (Settings → Plugins + seletor de primeira execução).
+  '{size} on disk': '{size} em disco',
+  '{size} of VRAM': '{size} de VRAM',
+  'included (same model)': 'incluso (mesmo modelo)',
+  'Selected total': 'Total selecionado',
+  // ── EnablePluginPrompt (a plugin-off surface asks to be enabled) ──
+  'plugins.prompt.title': '{name} está desligado',
+  'plugins.prompt.body': 'Esta função precisa deste plugin. Ligue-o para usar.',
+  'plugins.enable': 'Habilitar',
+  'plugins.cost.disk': 'Disco: {size}',
+  'plugins.cost.vram': 'VRAM: {size}',
+  'plugins.cost.none': 'Sem download e sem uso de GPU.',
 }
 
 // botGate.* and progress.* keys are namespaced (not English sentences), so
 // they need explicit English entries — every other key falls back to the key itself.
 const en: Record<string, string> = {
   'plugins.onCount': '{on} of {total} on',
+  // EnablePluginPrompt (namespaced, so the English source is explicit here).
+  'plugins.prompt.title': '{name} is off',
+  'plugins.prompt.body': 'This feature needs this plugin. Turn it on to use it.',
+  'plugins.enable': 'Enable',
+  'plugins.cost.disk': 'Disk: {size}',
+  'plugins.cost.vram': 'VRAM: {size}',
+  'plugins.cost.none': 'No download and no GPU use.',
   'progress.title': 'Background jobs',
   'progress.kind.transcribe': 'Transcription',
   'progress.kind.chat': 'Chat backfill',
@@ -1688,6 +1707,18 @@ const es: Record<string, string> = {
     'Los plugins son las herramientas extra. Las que consumen más energía empiezan apagadas: actívalas cuando las necesites, aquí o en Ajustes → Plugins.',
   'Always on': 'Siempre activo',
   'plugins.onCount': '{on} de {total} activos',
+  // Custos por plugin (Ajustes → Plugins + selector de primera ejecución).
+  '{size} on disk': '{size} en disco',
+  '{size} of VRAM': '{size} de VRAM',
+  'included (same model)': 'incluido (mismo modelo)',
+  'Selected total': 'Total seleccionado',
+  // ── EnablePluginPrompt (una superficie apagada pide activarse) ──
+  'plugins.prompt.title': '{name} está apagado',
+  'plugins.prompt.body': 'Esta función necesita este plugin. Actívalo para usar.',
+  'plugins.enable': 'Activar',
+  'plugins.cost.disk': 'Disco: {size}',
+  'plugins.cost.vram': 'VRAM: {size}',
+  'plugins.cost.none': 'Sin descarga y sin uso de GPU.',
 }
 // botGate.* and progress.* keys are namespaced (not English sentences), so
 // they need explicit English entries — every other key falls back to the key itself.

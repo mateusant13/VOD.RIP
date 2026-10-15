@@ -2248,15 +2248,22 @@ describe('LivePlayerPopup plugin gates', () => {
     return FakeEventSource.instances.filter((es) => es.url.includes('/api/live/captions'));
   }
 
-  it('live-preview OFF renders NOTHING and never opens a session (body unmounted)', () => {
+  it('live-preview OFF removes the player but asks to enable it, and never opens a session', () => {
     const fetchMock = mockFetch();
     setPlugins({ ...PLAYER_PLUGINS_ON, 'live-preview': false });
     renderPopup();
 
-    // The whole player is gone — no chrome, no video, no transport.
+    // The whole player is gone — no chrome, no video, no transport…
     expect(document.querySelector('[data-live-popup]')).toBeNull();
     expect(document.querySelector('[data-live-transport]')).toBeNull();
     expect(document.querySelector('video')).toBeNull();
+
+    // …but the surface does not silently vanish: the prompt names the plugin
+    // and offers the switch. A gate that returns null would fail here.
+    const prompt = document.querySelector('[data-enable-plugin="live-preview"]');
+    expect(prompt).toBeTruthy();
+    expect(prompt?.textContent ?? '').toContain('Prévia ao vivo is off');
+    expect(screen.getByRole('button', { name: 'Enable' })).toBeTruthy();
 
     // Stronger than "not rendered": the body is UNMOUNTED, so its mount
     // effect never ran — no HLS session was created on the backend.
@@ -2293,20 +2300,28 @@ describe('LivePlayerPopup plugin gates', () => {
 
     expect(screen.queryByText('legenda proibida')).toBeNull();
     expect(document.querySelector('[data-live-captions-overlay]')).toBeNull();
+
+    // The overlay slot is not empty either: it asks for the plugin (name +
+    // Enable) in place of the overlay, so the feature stays discoverable.
+    const prompt = document.querySelector('[data-live-subtitles-prompt]');
+    expect(prompt).toBeTruthy();
+    expect(prompt?.textContent ?? '').toContain('Legendas ao vivo is off');
+    expect(prompt?.querySelector('[data-enable-plugin="live-subtitles"]')).toBeTruthy();
   });
 
-  it('live-chat OFF removes the chat toggle AND the docked panel', async () => {
+  it('live-chat is ALWAYS_ON — a stored false never removes the chat surface', async () => {
     mockFetch();
     setPlugins({ ...PLAYER_PLUGINS_ON, 'live-chat': false });
     renderPopup();
     await screen.findByTitle('Fullscreen');
 
-    // The kick entry has a chat source, so with the plugin ON the panel is
-    // mounted (see "preloads chat EventSources on live open"). With it OFF
-    // neither the header button nor the panel exists.
-    expect(document.querySelector('.live-popup-chat')).toBeNull();
-    expect(screen.queryByTitle('Live chat')).toBeNull();
-    expect(screen.queryByTitle('Close live chat')).toBeNull();
-    expect(document.querySelector('[data-live-chat-panel]')).toBeNull();
+    // 'live-chat' is NOT in the plugin catalog anymore (the backend moved it to
+    // ALWAYS_ON and src/lib/plugins.tsx mirrors that), so usePlugin resolves
+    // TRUE and the gate renders even with a stale stored false — REGRA-NUCLEO:
+    // an id that is not a plugin is always on. The kick entry has a chat
+    // source, so the header toggle AND the docked panel are mounted.
+    expect(document.querySelector('.live-popup-chat')).toBeTruthy();
+    expect(screen.getByTitle('Live chat')).toBeTruthy();
+    expect(document.querySelector('[data-live-chat-panel]')).toBeTruthy();
   });
 });

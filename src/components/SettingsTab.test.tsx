@@ -1,8 +1,12 @@
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { useState } from "react";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import SettingsTab from "./SettingsTab";
+import { getLanguage, setLanguage } from "../i18n";
 import type { AppSettings, UpdateInfo } from "../types";
+
+/** i18n is module-global; restore it so a pt-BR test cannot leak into the next. */
+const savedLang = getLanguage();
 
 const BASE: AppSettings = {
   download_folder: "C:\\Downloads",
@@ -88,6 +92,10 @@ beforeEach(() => {
   // GET /api/plugins. Clearing it keeps every test on the registry defaults
   // (transcribe off, ai-ask off) instead of inheriting the previous test's.
   localStorage.clear();
+});
+
+afterEach(() => {
+  act(() => setLanguage(savedLang));
 });
 
 /** Override the registry defaults with an explicit on/off map, the same way
@@ -314,7 +322,9 @@ describe("SettingsTab", () => {
     render(<Harness />);
     expandCard("Plugins");
     // Every plugin id is a labelled toggle.
-    for (const id of ["link-download", "channels", "transcribe", "archive-search", "ai-ask"]) {
+    // Only the four HEAVY tools are plugins now; the eight always-on surfaces
+    // have no toggle (asserted in the "Sempre ligado" test below).
+    for (const id of ["transcribe", "live-preview", "live-subtitles", "ai-ask"]) {
       expect(screen.getByLabelText(id)).toBeInTheDocument();
     }
     // RED ARM: drop the counter from the SettingsCard `right` slot and this
@@ -326,18 +336,20 @@ describe("SettingsTab", () => {
     stubFetch();
     render(<Harness />);
     expandCard("Plugins");
-    const before = (screen.getByLabelText("archive-search") as HTMLInputElement).checked;
-    fireEvent.click(screen.getByLabelText("archive-search"));
+    // ai-ask is a real catalog plugin; archive-search is always-on now and
+    // has no toggle to click.
+    const before = (screen.getByLabelText("ai-ask") as HTMLInputElement).checked;
+    fireEvent.click(screen.getByLabelText("ai-ask"));
     // RED ARM: make the Plugins toggle only set local React state and this
     // POST never happens.
     await waitFor(() => {
       const posts = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls
         .filter(([url]) => String(url) === "/api/plugins")
         .map(([, init]) => JSON.parse(String((init as RequestInit).body)));
-      expect(posts).toEqual([{ id: "archive-search", enabled: !before }]);
+      expect(posts).toEqual([{ id: "ai-ask", enabled: !before }]);
     });
     // The local store flipped too — the row re-renders from it.
-    expect((screen.getByLabelText("archive-search") as HTMLInputElement).checked).toBe(!before);
+    expect((screen.getByLabelText("ai-ask") as HTMLInputElement).checked).toBe(!before);
   });
 
   // ── Plugin-gated sections ──────────────────────────────────────────────────
@@ -388,5 +400,94 @@ describe("SettingsTab", () => {
     // And turning it off removes it again.
     fireEvent.click(screen.getByLabelText("transcribe"));
     await waitFor(() => expect(screen.queryByText("Transcription")).not.toBeInTheDocument());
+  });
+
+  // ── Custos dos plugins (regra do dono: disco/VRAM legíveis + ordem) ──────
+  it("mostra o custo legível por plugin (MB < 1024; senão GB com 1 casa)", () => {
+    stubFetch();
+    act(() => setLanguage("pt-BR"));
+    setPlugins({ transcribe: true });
+    render(<Harness />);
+    expandCard("Plugins");
+    // 397 MB fica em MB; 2048 MB vira "2.0 GB" (1 casa, não "2 GB").
+    // RED ARM: remova o toFixed(1) do formatMb e este teste falha.
+    expect(screen.getByTestId("plugin-cost-transcribe")).toHaveTextContent(
+      "397 MB em disco · 2.0 GB de VRAM",
+    );
+    expect(screen.getByTestId("plugin-cost-live-preview")).toHaveTextContent(
+      "0 MB em disco · 400 MB de VRAM",
+    );
+  });
+
+  it("troca o número por 'incluso (mesmo modelo)' quando shares_with já está ligado", () => {
+    stubFetch();
+    act(() => setLanguage("pt-BR"));
+    setPlugins({ transcribe: false, "live-subtitles": true });
+    render(<Harness />);
+    expandCard("Plugins");
+    // Só legendas ligadas: ela é a dona do modelo e mostra o número.
+    expect(screen.getByTestId("plugin-cost-live-subtitles")).toHaveTextContent(
+      "397 MB em disco · 2.0 GB de VRAM",
+    );
+    // Ligar a transcrição (mesmo modelo) troca a repetição por "incluso".
+    // RED ARM: ignore shares_with e o número de 397 MB reaparece.
+    fireEvent.click(screen.getByLabelText("transcribe"));
+    expect(screen.getByTestId("plugin-cost-live-subtitles")).toHaveTextContent(
+      "incluso (mesmo modelo)",
+    );
+  });
+
+  it("resume o total do selecionado sem contar o mesmo modelo duas vezes", () => {
+    stubFetch();
+    act(() => setLanguage("pt-BR"));
+    setPlugins({ transcribe: true, "live-subtitles": true });
+    render(<Harness />);
+    expandCard("Plugins");
+    const totals = screen.getByTestId("plugins-totals");
+    expect(totals).toHaveTextContent("397 MB em disco · 2.0 GB de VRAM");
+    // RED ARM: some os plugins sem honrar shares_with e estes dois aparecem.
+    expect(totals).not.toHaveTextContent("794 MB");
+    expect(totals).not.toHaveTextContent("4.0 GB");
+  });
+
+  it("lista os 8 alwaysOn como 'Sempre ligado', sem toggle", () => {
+    stubFetch();
+    act(() => setLanguage("pt-BR"));
+    render(<Harness />);
+    expandCard("Plugins");
+    const box = screen.getByTestId("plugins-always-on");
+    for (const name of [
+      "Baixar por link", "Canais", "Explorar canais", "Editor de clipes",
+      "Clipes do Twitch", "Busca no arquivo", "Arquivo local", "Chat ao vivo",
+    ]) {
+      expect(box).toHaveTextContent(name);
+    }
+    // Sem toggle: nenhum id always-on vira checkbox.
+    expect(box.querySelectorAll("input")).toHaveLength(0);
+    expect(screen.queryByLabelText("channels")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("link-download")).not.toBeInTheDocument();
+  });
+
+  it("não reordena a lista: a ordem que o backend manda é a que aparece", () => {
+    stubFetch();
+    // Catálogo invertido de propósito. Se a UI reordenasse por conta própria
+    // (orderPlugins), o DOM voltaria à ordem do espelho e este teste falharia.
+    // RED ARM: enrole a lista em orderPlugins(plugins) e a ordem muda.
+    localStorage.setItem("vodrip.plugins.catalog", JSON.stringify([
+      { id: "ai-ask", name: "Perguntar à IA", blurb: "b", settingsKey: "plugin_ai_ask", disk_mb: 0, vram_mb: 0, ram_mb: 128, shares_with: "", recommended: false, defaultOn: false, cost: "pesado" },
+      { id: "live-subtitles", name: "Legendas ao vivo", blurb: "b", settingsKey: "plugin_live_subtitles", disk_mb: 397, vram_mb: 2048, ram_mb: 1536, shares_with: "transcribe", recommended: false, defaultOn: false, cost: "pesado" },
+      { id: "live-preview", name: "Prévia ao vivo", blurb: "b", settingsKey: "plugin_live_preview", disk_mb: 0, vram_mb: 400, ram_mb: 600, shares_with: "", recommended: true, defaultOn: false, cost: "pesado" },
+      { id: "transcribe", name: "Transcrição", blurb: "b", settingsKey: "plugin_transcribe", disk_mb: 397, vram_mb: 2048, ram_mb: 2560, shares_with: "", recommended: true, defaultOn: false, cost: "pesado" },
+    ]));
+    render(<Harness />);
+    expandCard("Plugins");
+    const ids = [...document.querySelectorAll("[data-testid^='plugin-cost-']")]
+      .map((el) => el.getAttribute("data-testid"));
+    expect(ids).toEqual([
+      "plugin-cost-ai-ask",
+      "plugin-cost-live-subtitles",
+      "plugin-cost-live-preview",
+      "plugin-cost-transcribe",
+    ]);
   });
 });

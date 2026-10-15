@@ -16,7 +16,7 @@ import { resetAll as resetFirstTimeFlags } from '../lib/firstTime';
 import { useI18n, type Lang } from '../i18n';
 import type { AppSettings, UpdateInfo } from '../types';
 import { previewDownloadTree, type DownloadLayout } from '../downloadLayout';
-import { PluginGate, setPluginEnabled, usePlugins } from '../lib/plugins';
+import { ALWAYS_ON, PluginGate, bundleCost, setPluginEnabled, usePlugins, type PluginState } from '../lib/plugins';
 type Props = {
   settings: AppSettings;
   setSettings: Dispatch<SetStateAction<AppSettings>>;
@@ -101,6 +101,33 @@ function SettingsCard({
   );
 }
 
+/** Custo legível, na regra do dono: abaixo de 1024 MB mostra MB inteiro; a
+ *  partir disso, GB com 1 casa (2048 -> "2.0 GB", 397 -> "397 MB"). */
+function formatMb(mb: number): string {
+  return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`;
+}
+
+/** O custo de UM plugin. Quando `shares_with` nomeia outro plugin JÁ LIGADO o
+ *  modelo é o mesmo: mostrar o número de novo faria o dono somar 397 MB duas
+ *  vezes, então a linha vira "incluso (mesmo modelo)". */
+function PluginCostLine({ plugin, enabledIds }: { plugin: PluginState; enabledIds: Set<string> }) {
+  const { t } = useI18n();
+  if (plugin.shares_with && enabledIds.has(plugin.shares_with)) {
+    return (
+      <span className="text-[10px] font-mono text-emerald-400" data-testid={`plugin-cost-${plugin.id}`}>
+        {t('included (same model)')}
+      </span>
+    );
+  }
+  return (
+    <span className="text-[10px] font-mono text-zinc-500" data-testid={`plugin-cost-${plugin.id}`}>
+      {t('{size} on disk', { size: formatMb(plugin.disk_mb ?? 0) })}
+      {' · '}
+      {t('{size} of VRAM', { size: formatMb(plugin.vram_mb ?? 0) })}
+    </span>
+  );
+}
+
 export default function SettingsTab({
   settings,
   setSettings,
@@ -123,6 +150,12 @@ export default function SettingsTab({
   /** Plugin list + per-plugin enabled flags (localStorage cache, synced from
    *  GET /api/plugins on App mount). Replaces the old feature toggles. */
   const plugins = usePlugins();
+
+  /** Ids ligados — alimenta a linha "incluso (mesmo modelo)" e o resumo.
+   *  bundleCost honra shares_with: transcribe + legendas ao vivo custam UM
+   *  modelo de 397 MB, não dois. */
+  const enabledIds = new Set(plugins.filter((p) => p.enabled).map((p) => p.id));
+  const totals = bundleCost(enabledIds);
 
   /** Accordion: every card starts collapsed; expanding one never closes the
    *  others (independent chevron toggles, state keyed by card id). */
@@ -511,17 +544,41 @@ export default function SettingsTab({
         onToggle={() => toggleCard('plugins')}
       >
         <p className="text-[11px] font-mono text-zinc-500">{t('Plugins are the extra tools. The heavy ones start off — turn them on whenever you need them, here or in Settings → Plugins.')}</p>
-        <div className="flex flex-col gap-2 mt-2">
+        {/* A ordem é a que o backend mandou (ligados -> recomendados -> mais
+            barato -> id): NÃO reordenar aqui. */}
+        <div className="flex flex-col gap-3 mt-2">
           {plugins.map(p => (
-            <Toggle
-              key={p.id}
-              label={`${p.name} — ${p.blurb}`}
-              info={p.cost === 'pesado' ? t('Uses more power') : t('Light')}
-              checked={p.enabled}
-              onChange={c => { void setPluginEnabled(p.id, c); }}
-              ariaLabel={p.id}
-            />
+            <div key={p.id} className="flex flex-col gap-0.5">
+              <Toggle
+                label={p.name}
+                checked={p.enabled}
+                onChange={c => { void setPluginEnabled(p.id, c); }}
+                ariaLabel={p.id}
+              />
+              <span className="text-[10px] font-mono text-zinc-500">{p.blurb}</span>
+              <PluginCostLine plugin={p} enabledIds={enabledIds} />
+            </div>
           ))}
+        </div>
+        {/* Resumo do selecionado: total de disco e VRAM. */}
+        <div className="flex items-center justify-between gap-2 mt-1" data-testid="plugins-totals">
+          <span className="text-[10px] font-black uppercase tracking-wide text-zinc-500">{t('Selected total')}</span>
+          <span className="text-[10px] font-mono text-zinc-300 tabular-nums">
+            {t('{size} on disk', { size: formatMb(totals.disk_mb) })}
+            {' · '}
+            {t('{size} of VRAM', { size: formatMb(totals.vram_mb) })}
+          </span>
+        </div>
+        {/* "Sempre ligado": as 8 superfícies que SÃO o app — sem toggle. */}
+        <div className="mt-2 pt-2 border-t-2 border-zinc-800" data-testid="plugins-always-on">
+          <div className="text-[10px] font-black uppercase tracking-wide text-zinc-500">{t('Always on')}</div>
+          <div className="flex flex-wrap gap-1.5 mt-1.5">
+            {ALWAYS_ON.map(a => (
+              <span key={a.id} title={a.blurb} className="text-[10px] font-mono px-1.5 py-0.5 border border-zinc-700 text-zinc-400">
+                {a.name}
+              </span>
+            ))}
+          </div>
         </div>
       </SettingsCard>
 

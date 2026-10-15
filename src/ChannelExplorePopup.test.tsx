@@ -123,7 +123,10 @@ beforeEach(() => {
   localStorage.clear();
 });
 
-/** The plugin ids this popup is gated by, all switched ON. */
+/** localStorage seed for the popup's gates, everything switched ON. Only
+ *  'ai-ask' is still a real plugin; 'channel-explore', 'clip-editor' and
+ *  'live-chat' are ALWAYS_ON, and the tests below store them false to prove
+ *  that a stored false no longer gates them. */
 const ALL_PLUGINS_ON: Record<string, boolean> = {
   "channel-explore": true,
   "clip-editor": true,
@@ -344,22 +347,28 @@ describe("ChannelExplorePopup hover volume", () => {
 });
 
 /**
- * Plugin gates — a plugin that is OFF takes its surface out of this popup
- * entirely (the owner's rule: it disappears from the screen, it does not leave
- * a dead control behind). Plugin ids come from src/lib/plugins.tsx, which
- * mirrors backend/services/plugin_registry.py.
+ * Plugin gates — the 2026-10-15 model: PLUGINS is ONLY the four heavy tools
+ * (transcribe, live-preview, live-subtitles, ai-ask). 'channel-explore',
+ * 'clip-editor' and 'live-chat' are ALWAYS_ON surfaces, and usePlugin() answers
+ * TRUE for any id outside the catalogue, so storing one of those ids as false
+ * cannot suppress anything — the surface renders anyway. These tests pin that
+ * rule: they FAIL if a gate starts honouring the stored false again (the
+ * regression that would make an ALWAYS_ON surface vanish).
  *
- * RED ARM for each: drop the matching gate in ChannelExplorePopup.tsx and the
- * "off" case below fails, because the block is still in the DOM.
+ * RED ARM: reintroduce a gate in ChannelExplorePopup.tsx that reads the stored
+ * value for one of those ids and the matching "renders even while ... false"
+ * case below fails, because the block leaves the DOM.
+ *
+ * 'ai-ask' is one of the four real plugins, so its gate still removes the row —
+ * kept here as the contrast proving not every gate became a no-op.
  */
 describe("ChannelExplorePopup plugin gates", () => {
-  it("does not open at all while 'channel-explore' is off", async () => {
+  it("renders even while 'channel-explore' is stored as false, because it is ALWAYS ON", async () => {
     stubFetch();
     setPlugins({ ...ALL_PLUGINS_ON, "channel-explore": false });
     const { container } = renderPopup();
-    // Give effects a chance to run: a null render must stay null.
-    await waitFor(() => expect(container.innerHTML).toBe(""));
-    expect(screen.queryByText("Channel VOD explore")).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText("Channel VOD explore")).toBeInTheDocument());
+    expect(container.innerHTML).not.toBe("");
   });
 
   it("opens while 'channel-explore' is on", async () => {
@@ -369,12 +378,12 @@ describe("ChannelExplorePopup plugin gates", () => {
     await waitFor(() => expect(screen.getByText("Channel VOD explore")).toBeInTheDocument());
   });
 
-  it("hides the mini editor while 'clip-editor' is off", async () => {
+  it("renders the mini editor even while 'clip-editor' is stored as false, because it is ALWAYS ON", async () => {
     stubFetch();
     setPlugins({ ...ALL_PLUGINS_ON, "clip-editor": false });
     renderPopup();
     await waitFor(() => expect(screen.getByText("Channel VOD explore")).toBeInTheDocument());
-    expect(document.querySelector("[data-preview-mini-editor]")).toBeNull();
+    expect(document.querySelector("[data-preview-mini-editor]")).toBeTruthy();
   });
 
   it("shows the mini editor while 'clip-editor' is on", async () => {
@@ -394,13 +403,13 @@ describe("ChannelExplorePopup plugin gates", () => {
     expect(screen.queryByLabelText("ai ask question")).not.toBeInTheDocument();
   });
 
-  it("hides the CHAT button and the chat panel while 'live-chat' is off", async () => {
+  it("renders the CHAT button and the chat panel even while 'live-chat' is stored as false, because it is ALWAYS ON", async () => {
     stubFetch();
     setPlugins({ ...ALL_PLUGINS_ON, "live-chat": false });
     renderPopup();
     await waitFor(() => expect(screen.getByText("Channel VOD explore")).toBeInTheDocument());
-    expect(screen.queryByTitle("Open preview chat panel")).not.toBeInTheDocument();
-    expect(document.querySelector("[data-preview-chat-panel]")).toBeNull();
+    expect(screen.getByTitle("Open preview chat panel")).toBeInTheDocument();
+    expect(document.querySelector("[data-preview-chat-panel]")).toBeTruthy();
   });
 
   it("shows the CHAT button and mounts the chat panel while 'live-chat' is on", async () => {

@@ -32,10 +32,10 @@ const captureProto = HTMLElement.prototype as unknown as {
   releasePointerCapture?: () => void;
 };
 /**
- * Plugin store seeding. The local player is gated by usePlugin('local-file'),
- * which reads the 'vodrip.plugins' localStorage key and falls back to the
- * catalog's defaultOn (true). Seed it explicitly so a future default change
- * cannot silently empty this file.
+ * Plugin store seeding. 'local-file' is ALWAYS_ON after the 2026-10-15 split
+ * (PLUGINS is only the four heavy tools), so usePlugin('local-file') answers
+ * TRUE for it no matter what this key says. The key is still written so a test
+ * can store it false and prove the new rule.
  */
 const PLUGINS_LS_KEY = 'vodrip.plugins';
 
@@ -126,13 +126,16 @@ describe('LocalFilePopup', () => {
     expect(panel.style.top).toBe('520px'); // vertical edge untouched
   });
 
-  // The gate. Without the usePlugin('local-file') check in LocalFilePopup.tsx
-  // the panel would still mount (video element and all) with the plugin off.
-  it('local-file plugin OFF renders nothing at all', () => {
+  // 'local-file' is ALWAYS_ON now: storing it false in the plugin store must
+  // NOT gate the player. This test fails if a gate starts honouring that
+  // stored false again (the regression that would empty this file).
+  // RED ARM: reintroduce a gate in LocalFilePopup.tsx that reads the stored
+  // value ('local-file' === false -> null) and the panel leaves the DOM.
+  it('renders even while local-file is stored as false, because it is ALWAYS ON', () => {
     setPlugins({ 'local-file': false });
     const { container } = renderPopup();
-    expect(container.querySelector('div.fixed')).toBeNull();
-    expect(container.querySelector('video')).toBeNull();
-    expect(document.querySelectorAll('[data-panel-resize]')).toHaveLength(0);
+    expect(container.querySelector('div.fixed')).not.toBeNull();
+    expect(container.querySelector('video')).not.toBeNull();
+    expect(document.querySelectorAll('[data-panel-resize]')).toHaveLength(8);
   });
 });
