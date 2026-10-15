@@ -204,6 +204,14 @@ class AppSettings(BaseModel):
     # Opt-in feature registry — persisted to settings.json (see services/feature_registry.py).
     # Keys are feature ids from FEATURE_MANIFEST; absent keys fall back to manifest defaults.
     features: Optional[Dict[str, bool]] = None
+    # Opt-in plugin registry — persisted to settings.json (see services/plugin_registry.py).
+    # Keys are the plugins' settingsKey ("plugin_<id>"); absent keys fall back
+    # to the registry rule (core ON / light ON / heavy OFF, or the legacy
+    # feature flag for the four aliased plugins). A real model FIELD, not a
+    # loose top-level key: measured, a flat top-level key is dropped by this
+    # strict model on the next save, so a plugin toggle stored that way would
+    # silently revert itself.
+    plugins: Optional[Dict[str, bool]] = None
     # Window-active runtime policy: controls behavior when window is
     # minimized or closed (hidden to tray). Keys: 'when_minimized',
     # 'when_closed'. Values: 'normal' (default), 'reduced', 'off'.
@@ -276,6 +284,7 @@ class SettingsUpdate(BaseModel):
     ai_api_key: Optional[str] = None
     caption_low_latency: Optional[bool] = None
     features: Optional[Dict[str, bool]] = None
+    plugins: Optional[Dict[str, bool]] = None
     window_policy: Optional[Dict[str, str]] = None
 class OpenFolderRequest(BaseModel):
     path: str

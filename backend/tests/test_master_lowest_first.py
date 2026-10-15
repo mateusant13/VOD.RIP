@@ -29,7 +29,7 @@ def test_the_master_emits_variants_in_extract_order_not_a_sort():
     tail = body.find("\ndef ", 1)
     body = body[: tail if tail != -1 else len(body)]
     assert "sorted(variants" not in body, (
-        "the master is sorted again - that order measured 8.23s median versus
+        "the master is sorted again - that order measured 8.23s median versus "
         "2.74s for extract order; hls.js already starts on the lowest level"
     )
 

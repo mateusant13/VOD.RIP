@@ -1,6 +1,6 @@
 import { type Dispatch, type ReactNode, type SetStateAction, useEffect, useState } from 'react';
 import {
-  Activity, AlertTriangle, CheckCircle2, ChevronDown, FolderOpen, HardDrive, Languages, Loader2, Mic, RefreshCw, Settings2, ShieldCheck, Sparkles, StopCircle,
+  Activity, AlertTriangle, CheckCircle2, ChevronDown, FolderOpen, HardDrive, Languages, Loader2, Mic, Puzzle, RefreshCw, Settings2, ShieldCheck, Sparkles, StopCircle,
   type LucideIcon,
 } from 'lucide-react';
 import FieldCaption from './FieldCaption';
@@ -16,9 +16,7 @@ import { resetAll as resetFirstTimeFlags } from '../lib/firstTime';
 import { useI18n, type Lang } from '../i18n';
 import type { AppSettings, UpdateInfo } from '../types';
 import { previewDownloadTree, type DownloadLayout } from '../downloadLayout';
-import { FEATURE_MANIFEST } from '../lib/featureManifest';
-import { getEnabledFeatures } from '../lib/featureFlags';
-import { notifyFeatureChange } from '../hooks/useFeature';
+import { setPluginEnabled, usePlugins } from '../lib/plugins';
 type Props = {
   settings: AppSettings;
   setSettings: Dispatch<SetStateAction<AppSettings>>;
@@ -122,6 +120,9 @@ export default function SettingsTab({
   const [savedSig, setSavedSig] = useState(() => settingsSignature(settings));
   const dirty = settingsSignature(settings) !== savedSig;
   const { lang, setLang, t } = useI18n();
+  /** Plugin list + per-plugin enabled flags (localStorage cache, synced from
+   *  GET /api/plugins on App mount). Replaces the old feature toggles. */
+  const plugins = usePlugins();
 
   /** Accordion: every card starts collapsed; expanding one never closes the
    *  others (independent chevron toggles, state keyed by card id). */
@@ -486,32 +487,31 @@ export default function SettingsTab({
       </SettingsCard>
 
       <SettingsCard
-        icon={Sparkles}
-        title={t('Features')}
-        open={!!openCards.features}
-        onToggle={() => toggleCard('features')}
+        icon={Puzzle}
+        title={t('Plugins')}
+        right={
+          <span className="text-[11px] font-mono text-zinc-400 tabular-nums shrink-0 pr-1" data-testid="plugins-count">
+            {t('plugins.onCount', {
+              on: plugins.filter(p => p.enabled).length,
+              total: plugins.length,
+            })}
+          </span>
+        }
+        open={!!openCards.plugins}
+        onToggle={() => toggleCard('plugins')}
       >
-        <p className="text-[11px] font-mono text-zinc-500">{t('Toggle heavy features (OFF by default). Changes persist to Settings and reload preserves them.')}</p>
+        <p className="text-[11px] font-mono text-zinc-500">{t('Plugins are the extra tools. The heavy ones start off — turn them on whenever you need them, here or in Settings → Plugins.')}</p>
         <div className="flex flex-col gap-2 mt-2">
-          {FEATURE_MANIFEST.map(f => {
-            const enabled = !!(getEnabledFeatures()[f.id]);
-            return (
-              <Toggle
-                key={f.id}
-                label={`${f.id} — ${t(f.description)}`}
-                info={f.cost === 'heavy' ? t('HEAVY — GPU/model/threads') : t('LIGHT')}
-                checked={enabled}
-                onChange={c => {
-                  const cur = getEnabledFeatures(); cur[f.id]=c;
-                  try { localStorage.setItem('vodrip.features', JSON.stringify(cur)); } catch {}
-                  void apiPost('/api/settings/features', { features: cur }).catch(()=>{});
-                  setSettings(s => ({ ...s, features: cur } as AppSettings));
-                  notifyFeatureChange();
-                }}
-                ariaLabel={f.id}
-              />
-            );
-          })}
+          {plugins.map(p => (
+            <Toggle
+              key={p.id}
+              label={`${p.name} — ${p.blurb}`}
+              info={p.cost === 'pesado' ? t('Uses more power') : t('Light')}
+              checked={p.enabled}
+              onChange={c => { void setPluginEnabled(p.id, c); }}
+              ariaLabel={p.id}
+            />
+          ))}
         </div>
       </SettingsCard>
 

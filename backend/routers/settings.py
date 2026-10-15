@@ -455,6 +455,19 @@ def _apply_settings_update(update: SettingsUpdate) -> AppSettings:
             current.features = cur
         except Exception:
             current.features = dict(update.features or {})
+    if update.plugins is not None:
+        # Same unknown-key filter the features branch above uses, keyed by the
+        # plugin registry's settingsKeys. Kept as its own branch so the two
+        # registries stay independent (no feature->plugin conversion here).
+        try:
+            from services.plugin_registry import _BY_KEY as _plugin_keys
+            cur = dict(current.plugins or {})
+            for k, v in (update.plugins or {}).items():
+                if k in _plugin_keys:
+                    cur[k] = bool(v)
+            current.plugins = cur
+        except Exception:
+            current.plugins = dict(update.plugins or {})
     # save() is a CAS merge: what landed on disk may carry a key a concurrent
     # writer committed (see services/settings.py). Return that, not the local
     # pre-merge view, so the AppSettings response reports what is actually
@@ -484,6 +497,43 @@ async def put_features(body: dict):
     # set_features_bulk() is settings_mgr.get() + save() — blocking IO.
     updated = await asyncio.to_thread(set_features_bulk, {k: bool(v) for k, v in feats.items()})
     return {"features": updated, "manifest": get_manifest()}
+
+def _plugins_payload() -> dict:
+    """GET/POST /api/plugins response shape — the contract the UI codes against."""
+    from services.plugin_registry import enabled_map, get_manifest
+
+    enabled = enabled_map()
+    return {
+        "plugins": [{**d, "enabled": bool(enabled.get(d["id"], False))} for d in get_manifest()],
+        "enabled": [pid for pid, on in enabled.items() if on],
+    }
+
+
+@router.get("/api/plugins")
+async def get_plugins():
+    # enabled_map() reads settings_mgr.get() (in-memory copy under the manager
+    # lock; the first call may probe ffmpeg) — worker thread.
+    return await asyncio.to_thread(_plugins_payload)
+
+
+@router.post("/api/plugins")
+async def post_plugin(body: dict):
+    """{id, enabled} -> persist one toggle. Core plugins refuse to turn off
+    (services.plugin_registry.set_plugin raises ValueError -> 400)."""
+    from services.plugin_registry import set_plugin
+
+    pid = body.get("id") if isinstance(body, dict) else None
+    enabled = body.get("enabled") if isinstance(body, dict) else None
+    if not isinstance(pid, str) or not pid.strip():
+        raise HTTPException(status_code=400, detail="id (plugin id string) required")
+    if not isinstance(enabled, bool):
+        raise HTTPException(status_code=400, detail="enabled (boolean) required")
+    # set_plugin() is settings_mgr.get() + save() — blocking IO.
+    try:
+        await asyncio.to_thread(set_plugin, pid.strip(), enabled)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await asyncio.to_thread(_plugins_payload)
 
 
 @router.get("/api/settings/recommended")

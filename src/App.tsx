@@ -39,6 +39,7 @@ import PreviewQualityMenu from './PreviewQualityMenu';
 import { LivePlayerPopup } from './components/LivePlayerPopup';
 import FirstRunWizard from './components/FirstRunWizard';
 import { syncFromBackend } from './lib/featureFlags';
+import { syncPluginsFromBackend, tabsForPlugins, usePlugin } from './lib/plugins';
 import { LiveBadge } from './components/LiveBadge';
 import { liveArchiveContext, appendLivePopup } from './livePlayerLevels';
 import {
@@ -450,6 +451,14 @@ export const PREVIEW_CHAT_DEFAULT_OPEN = false;
 export default function App() {
   const viewportTier = useViewportTier();
   useEffect(() => { void syncFromBackend(); }, []);
+  // Backend plugins are the source of truth; 404 (route not deployed) leaves
+  // the mirrored catalog in localStorage in charge. Same contract as features.
+  useEffect(() => { void syncPluginsFromBackend(); }, []);
+  // A disabled plugin hides its main-nav entry instead of greying it out.
+  const archiveSearchPluginOn = usePlugin('archive-search');
+  /** Subscribes so the tab bar re-renders the moment the plugin is switched
+   *  off in Settings (tabsForPlugins itself reads the same store). */
+  const channelsPluginOn = usePlugin('channels');
   // presence heartbeat: foreground 80% / background 40%
   useEffect(() => {
     let hb: number | null = null;
@@ -6330,15 +6339,28 @@ export default function App() {
   const showUrlInMainCard = tab === 'url' && !urlPanelAside && !urlTabBarHidden;
   const urlMainCompact = showUrlInMainCard && Boolean(videoInfo);
   const mainCardHeaderCompact = triplePanelLayout || urlMainCompact;
-  const visibleTabs: Tab[] = urlPanelAside || urlTabBarHidden
-    ? ['channels', 'queue', 'settings']
-    : ['url', 'channels', 'queue', 'settings'];
+  // Plugin-gated nav: a plugin that is off removes its tab entirely, so a
+  // surface the user switched off never shows a dead button.
+  const visibleTabs: Tab[] = useMemo(
+    () => tabsForPlugins<Tab>(
+      urlPanelAside || urlTabBarHidden
+        ? ['channels', 'queue', 'settings']
+        : ['url', 'channels', 'queue', 'settings'],
+    ),
+    [urlPanelAside, urlTabBarHidden, channelsPluginOn],
+  );
 
   useEffect(() => {
     if ((urlPanelAside || urlTabBarHidden) && tab === 'url') {
       setTab('channels');
     }
   }, [urlPanelAside, urlTabBarHidden, tab]);
+
+  // A tab whose plugin was switched off while it was selected must not stay
+  // selected — fall back to the first tab still on screen.
+  useEffect(() => {
+    if (!visibleTabs.includes(tab)) setTab(visibleTabs[0] ?? 'settings');
+  }, [visibleTabs, tab]);
 
   const urlFetched = Boolean(videoInfo);
   const extractBtnHoverClass = urlPanelAside && !previewOpen
@@ -7343,6 +7365,9 @@ export default function App() {
             )}
           </div>
           <div className={`flex gap-1 shrink-0 ${mainCardHeaderCompact ? 'mt-1' : 'mt-2'}`}>
+            {/* Plugin-gated: with 'archive-search' off the entry point is
+                gone from the header entirely, not just disabled. */}
+            {archiveSearchPluginOn && (
             <button
               type="button"
               onClick={() => {
@@ -7363,6 +7388,7 @@ export default function App() {
               <Search size={10} className="shrink-0" />
               {t('SEARCH CHAT')}
             </button>
+            )}
             <div className="w-2 h-2 bg-[#53fc18] rounded-full animate-pulse" />
             <div className="w-2 h-2 bg-[#9146FF] rounded-full animate-pulse" style={{ animationDelay: '0.5s' }} />
             <div className="w-2 h-2 bg-[#F03030] rounded-full animate-pulse" style={{ animationDelay: '1s' }} />

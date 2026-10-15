@@ -223,7 +223,8 @@ describe("SettingsTab", () => {
     expect(last.textContent).toContain("Danger Zone");
     expect(last.textContent).not.toContain("Cookie Bridge");
     const secondToLast = sections[sections.length - 2];
-    expect(secondToLast.textContent).toContain("Features");
+    // The old "Features" card is now "Plugins" (same slot, plugin toggles).
+    expect(secondToLast.textContent).toContain("Plugins");
     expect(secondToLast.textContent).not.toContain("Cookie Bridge");
     const thirdToLast = sections[sections.length - 3];
     expect(thirdToLast.textContent).toContain("Experimental");
@@ -283,5 +284,37 @@ describe("SettingsTab", () => {
     });
     // After saving, the placeholder reflects the stored key.
     expect(screen.getByLabelText("ai api key")).toHaveAttribute("placeholder", "••••••••");
+  });
+
+  // ── Plugins section ──────────────────────────────────────────────────────
+  it("renders a Plugins card listing every plugin with an active counter", () => {
+    stubFetch();
+    render(<Harness />);
+    expandCard("Plugins");
+    // Every plugin id is a labelled toggle.
+    for (const id of ["link-download", "channels", "transcribe", "archive-search", "ai-ask"]) {
+      expect(screen.getByLabelText(id)).toBeInTheDocument();
+    }
+    // RED ARM: drop the counter from the SettingsCard `right` slot and this
+    // fails (it is the "N of M on" the owner reads at a glance).
+    expect(screen.getByTestId("plugins-count").textContent).toMatch(/\d+ (of|de) \d+/);
+  });
+
+  it("a plugin toggle in Settings writes through to POST /api/plugins", async () => {
+    stubFetch();
+    render(<Harness />);
+    expandCard("Plugins");
+    const before = (screen.getByLabelText("archive-search") as HTMLInputElement).checked;
+    fireEvent.click(screen.getByLabelText("archive-search"));
+    // RED ARM: make the Plugins toggle only set local React state and this
+    // POST never happens.
+    await waitFor(() => {
+      const posts = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls
+        .filter(([url]) => String(url) === "/api/plugins")
+        .map(([, init]) => JSON.parse(String((init as RequestInit).body)));
+      expect(posts).toEqual([{ id: "archive-search", enabled: !before }]);
+    });
+    // The local store flipped too — the row re-renders from it.
+    expect((screen.getByLabelText("archive-search") as HTMLInputElement).checked).toBe(!before);
   });
 });

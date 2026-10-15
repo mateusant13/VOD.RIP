@@ -824,11 +824,18 @@ const ptBR: Record<string, string> = {
   'The archive returned only part of this timeline — matches outside the loaded rows are not searchable here.':
     'O arquivo retornou apenas parte desta linha do tempo — correspondências fora das linhas carregadas não podem ser buscadas aqui.',
   '—': '—',
+  // ── Plugins (first-run picker + Settings → Plugins) ──
+  'Plugins': 'Plugins',
+  'Plugins are the extra tools. The heavy ones start off — turn them on whenever you need them, here or in Settings → Plugins.':
+    'Plugins são as ferramentas extras. As que consomem mais energia começam desligadas — ligue quando precisar, aqui ou em Configurações → Plugins.',
+  'Always on': 'Sempre ligado',
+  'plugins.onCount': '{on} de {total} ligados',
 }
 
 // botGate.* and progress.* keys are namespaced (not English sentences), so
 // they need explicit English entries — every other key falls back to the key itself.
 const en: Record<string, string> = {
+  'plugins.onCount': '{on} of {total} on',
   'progress.title': 'Background jobs',
   'progress.kind.transcribe': 'Transcription',
   'progress.kind.chat': 'Chat backfill',
@@ -1675,6 +1682,12 @@ const es: Record<string, string> = {
   'The archive returned only part of this timeline — matches outside the loaded rows are not searchable here.':
     'El archivo devolvió solo parte de esta línea de tiempo: las coincidencias fuera de las filas cargadas no se pueden buscar aquí.',
   '—': '—',
+  // ── Plugins (first-run picker + Settings → Plugins) ──
+  'Plugins': 'Plugins',
+  'Plugins are the extra tools. The heavy ones start off — turn them on whenever you need them, here or in Settings → Plugins.':
+    'Los plugins son las herramientas extra. Las que consumen más energía empiezan apagadas: actívalas cuando las necesites, aquí o en Ajustes → Plugins.',
+  'Always on': 'Siempre activo',
+  'plugins.onCount': '{on} de {total} activos',
 }
 // botGate.* and progress.* keys are namespaced (not English sentences), so
 // they need explicit English entries — every other key falls back to the key itself.
