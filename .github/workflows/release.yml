@@ -144,12 +144,43 @@ jobs:
         run: |
           npm run build-asr-runtime
 
+      # TIMEOUT AND RETRY, because this step HUNG THE WHOLE RELEASE.
+      #
+      # Measured 2026-10-15, run 38779549411: release-build sat on THIS step
+      # for 35+ minutes with every later step still "pending", including the
+      # manifest step I had just fixed. Invoke-WebRequest has NO default
+      # timeout in PowerShell 7, and go.microsoft.com is a fwlink redirector
+      # that does not always answer - so the job waits forever and the run
+      # never concludes, which looks exactly like a slow build.
+      #
+      # This also explains why the earlier failures looked inconsistent: this
+      # download SUCCEEDED in v1.0.54/55/57/58 (letting them reach the manifest
+      # step and fail there) and simply did not answer for v1.0.59. A release
+      # step with no deadline turns a flaky CDN into an eternal job.
       - name: Download Microsoft WebView2 bootstrapper
         shell: pwsh
         run: |
-          Invoke-WebRequest `
-            -Uri "https://go.microsoft.com/fwlink/?linkid=2124703" `
-            -OutFile installer\MicrosoftEdgeWebview2Setup.exe
+          $out = "installer\MicrosoftEdgeWebview2Setup.exe"
+          $uri = "https://go.microsoft.com/fwlink/?linkid=2124703"
+          $ok = $false
+          foreach ($attempt in 1..3) {
+            try {
+              Write-Host "attempt $attempt : downloading WebView2 bootstrapper"
+              # -TimeoutSec is per attempt. The default is infinite.
+              Invoke-WebRequest -Uri $uri -OutFile $out -TimeoutSec 90
+              $ok = $true
+              break
+            } catch {
+              Write-Warning "attempt $attempt failed: $($_.Exception.Message)"
+              Start-Sleep -Seconds (5 * $attempt)
+            }
+          }
+          if (-not $ok -or -not (Test-Path $out) -or (Get-Item $out).Length -lt 1MB) {
+            # Fail LOUDLY and FAST rather than hanging. The installer bundles
+            # this file, so a missing or truncated one must not reach ISCC.
+            throw "WebView2 bootstrapper unavailable after 3 attempts"
+          }
+          Write-Host ("WebView2 bootstrapper: {0:N0} bytes" -f (Get-Item $out).Length)
 
       - name: Package Windows zip
         shell: pwsh
