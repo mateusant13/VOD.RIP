@@ -74,6 +74,30 @@ a = Analysis(
         # numpy is REQUIRED here (torch / sherpa / onnxruntime / silero), so it
         # is deliberately NOT excluded.
         "pandas",
+        # Measured 2026-10-15: without these the runtime bundle was 8 850 MB.
+        # They arrive only through the same transitive chain the base spec
+        # documents (services.archive_transcribe -> huggingface_hub ->
+        # huggingface_hub._webhooks_server -> gradio -> transformers -> ...),
+        # and nothing in backend/ imports them for ASR. Everything the runtime
+        # actually needs stays: torch, torchaudio, sherpa_onnx, ctranslate2,
+        # onnxruntime, panns_inference, silero_vad, librosa (+ numba/llvmlite/
+        # sklearn), soundfile.
+        "huggingface_hub._webhooks_server",
+        "gradio",
+        "transformers",
+        "datasets",
+        "accelerate",
+        "torchvision",
+        "torchao",
+        "timm",
+        "faiss",
+        "soynlp",
+        "pyarrow",
+        "spacy",
+        "cv2",
+        "av",
+        "babel",
+        "skimage",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

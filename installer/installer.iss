@@ -63,9 +63,29 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
 
+[Types]
+; The first entry is the DEFAULT setup type. The light type excludes the ASR
+; runtime, so nothing heavy is installed unless the user actively picks the
+; full type or checks the ASR component box on the components page.
+Name: "light"; Description: "Light install (recommended) - base app only: downloads, raw captions, lexical search. No on-device speech recognition."
+Name: "full"; Description: "Full install - base app plus the optional on-device speech recognition runtime, which downloads and installs during setup (~1.5 GB; GPU-accelerated when a compatible GPU is present)."
+
+[Components]
+; The heavy on-device ASR runtime is NOT bundled in the installer. The base
+; app (staging\*) is the light CPU build: web UI, downloads, orchestration and
+; raw captions. This optional component records the user's explicit opt-in and
+; then downloads, sha256-verifies and extracts the versioned runtime archive
+; (scripts/install-asr-runtime.ps1 mirrors the app's own install contract:
+; HTTPS only, per-file checksums, traversal-safe extraction, marker file).
+; Nothing heavy is installed unless the user selects the full type or ticks
+; this box - the default type excludes it.
+Name: "asr"; Description: "On-device speech recognition (ASR) runtime - downloads ~1.5 GB during install (GPU-accelerated when a compatible GPU is present); enables VOD transcription, live captions and semantic search. VOD.RIP works fully without it: downloads, raw captions and lexical search stay on the light base."; Types: full; Flags: checkablealone
+
 [Files]
 Source: "staging\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "MicrosoftEdgeWebview2Setup.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
+; Ships only with the ASR component; the [Run] entry below invokes it.
+Source: "..\scripts\install-asr-runtime.ps1"; DestDir: "{app}\scripts"; Components: asr
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"
@@ -87,6 +107,13 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 ; skipped if the install finishes before the user clicks Install.
 [Run]
 Filename: "{tmp}\MicrosoftEdgeWebview2Setup.exe"; Parameters: "/silent /install"; StatusMsg: "Installing Microsoft WebView2 Runtime (one-time, may take a minute)..."; Check: not IsWebView2Installed(); Flags: waituntilterminated
+; The optional ASR runtime: only runs when the user checked the component.
+; The script downloads the versioned archive over HTTPS, verifies every
+; checksum against the release manifest, extracts to a per-user writable
+; path and writes the .runtime.json marker the app reads. No pip, no
+; elevation. A failure aborts this entry with a clear message and leaves the
+; light base install fully usable (the app can retry from Settings).
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\install-asr-runtime.ps1"""; StatusMsg: "Downloading and verifying the ASR runtime (this may take several minutes; the base app is already installed)..."; Components: asr; Flags: waituntilterminated runhidden
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#StringChange(AppName, '&', '&&')}}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
 
 [Code]
@@ -212,6 +239,39 @@ begin
   if not IsWebView2Installed() then
     WaitForWebView2Install(60);
   Result := '';
+end;
+
+procedure RemoveAsrRuntimePayload();
+{ The ASR runtime is NOT tracked by the Inno file list: it is downloaded and
+  extracted at install time by scripts/install-asr-runtime.ps1, which ships
+  only with the optional ASR component. The presence of that script under the
+  application directory is therefore the reliable marker that the component
+  was selected. We remove the pinned env var first (the script sets
+  VODRIP_ASR_RUNTIME_DIR only when it had to fall back to the per-user default
+  location) and then the payload directory it names, plus that default
+  location. All checks are guarded: an absent value or directory is a no-op,
+  and a runtime installed in-app later is simply recreated on demand. }
+var
+  AsrDir: String;
+  DefaultDir: String;
+begin
+  if not FileExists(ExpandConstant('{app}\scripts\install-asr-runtime.ps1')) then
+    Exit;
+  if RegQueryStringValue(HKCU, 'Environment', 'VODRIP_ASR_RUNTIME_DIR', AsrDir) then
+  begin
+    RegDeleteValue(HKCU, 'Environment', 'VODRIP_ASR_RUNTIME_DIR');
+    if (AsrDir <> '') and DirExists(AsrDir) then
+      DelTree(AsrDir, True, True, True);
+  end;
+  DefaultDir := ExpandConstant('{localappdata}\VOD.RIP\asr-runtime');
+  if DirExists(DefaultDir) then
+    DelTree(DefaultDir, True, True, True);
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+    RemoveAsrRuntimePayload();
 end;
 
 {
