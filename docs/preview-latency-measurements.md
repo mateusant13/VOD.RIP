@@ -128,3 +128,40 @@ another PerformanceObserver pass.
 Recurring number across every run this round:
   click -> session fetch issued   1368-1828 ms   (median ~1450 ms)
   longtask total                  5176-5540 ms within 2 reps
+
+## 2026-10-15, round 4 — my measurement was measuring the DEV BUILD
+
+Every browser number this session came from the Vite DEV server. The
+production bundle has no `jsxDEV` (verified absent from dist/index.html), and
+the difference is the whole story:
+
+                          dev build      production build
+  click -> fetch issued   1430 ms        436-460 ms  (~455 ms)
+  longtask total          7082-31500 ms  679-2465 ms
+  JS in the click window  692 ms         18-40 ms
+  top self-hit function   jsxDEV 1007    (idle)
+
+About 1 SECOND of the click-to-fetch and ~20 s of accumulated long tasks were
+the instrument, not the product: the React DEV JSX runtime building elements
+with validation. b095771 and 25095f2 were real but inflated by a third; the
+half-second long tasks were 34x worse in dev than in production.
+
+THE GARGALLO MOVED WITH THE CLIENT. With the client delay gone, the session
+POST through the proxy is the dominant leg:
+
+  rep   playable   session(proxied)   inflight at click
+  r2     12558 ms      3665 ms              6
+  r3     15302 ms      3275 ms              7
+  r4     15178 ms      4776 ms             10
+  r5      7025 ms      1857 ms              6
+
+The same POST direct is 0.13-0.26 s (6/6) and 0.58-1.33 s through an idle
+proxy (5/5). With the app own traffic holding the browser ~6 per-origin
+connections - and 6 IS the browser ceiling - the preview request queues.
+
+So the connection-queue hypothesis is back and is now the ONLY remaining
+suspect: client cheap (455 ms), server fast (session_created 110-219 ms), and
+1.8-4.8 s appears exactly when inflight sits at the 6 ceiling.
+
+MEASUREMENT RULE, expensive kind: a harness against dev measures dev, not the
+product. Production is the target from here.
