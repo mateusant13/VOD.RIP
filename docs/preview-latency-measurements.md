@@ -76,6 +76,31 @@ be the right value (2c04df2) and which this harness re-fires every rep by
 opening CONFIGURACOES -> CANAIS.
 
 HONEST STATE: click -> playable is 5.4-23.0 s in this harness, NOT under 3 s.
-The one leg that IS proven fast and stable is the direct session POST. The
-remaining cost is connection-queue contention from the app own traffic, and
-the sync ceiling was already measured as not the lever.
+
+## 2026-10-15, round 3 — three hypotheses tested, all three REFUTED
+
+Every route on the click path is fast and stable when measured directly:
+
+  panel    0.04-0.07 s   (6/6)
+  session  0.13-0.26 s   (6/6)
+  session  0.58-1.33 s   (5/5) THROUGH the vite proxy
+
+And the contention hypotheses do not hold:
+
+  session with 39 background /live fetches in flight  0.13-0.21 s  (6/6)
+  session with a warm/batch of 4 YouTube URLs running 0.14-0.25 s  (4/4)
+
+So the 1.3-6.7 s the BROWSER measures for the same session POST is not the
+backend, not the connection queue, and not the warm batch. Three suspected
+causes were measured and refuted in one sitting, which is worth more than
+the guess they replaced: the remaining cost is somewhere between the click
+handler and the first fetch, in the browser.
+
+WHAT THAT MEANS FOR THE NEXT ROUND. Stop measuring the backend - it is
+already fast. The next instrument is a trace of the CLIENT between the click
+and the session fetch: main-thread busy time, React commit, and whether the
+fetch is even issued in the same tick as the click. The one number that
+already points here: in the fast rep the session POST starts at +0ms and
+finishes in 2.8s; in the slow rep it starts at +0ms and takes 6.7s with
+three other preview requests in flight. Same backend, same tick, 2.4x
+difference - so the variable is in the page, not the server.
