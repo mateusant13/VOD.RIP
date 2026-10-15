@@ -205,7 +205,13 @@ def _parse_prefer_height_query(request: Request) -> Optional[int]:
     return height if height > 0 else None
 
 
-_PANEL_LIMIT_DEFAULT = 20_000
+# 20_000 was the default AND the ceiling, so a caller that named no limit pulled
+# 20 000 rows per timeline. Measured 2026-10-15 on shipped v1.0.60 with six live
+# previews: six of these in flight, 29-42 s each, holding every browser
+# connection slot so no preview ever reached playable. The client now asks for
+# 2_000 and the default matches it; the CEILING stays 20_000 so an explicit ask
+# for a dense archive is still honoured.
+_PANEL_LIMIT_DEFAULT = 2_000
 _PANEL_LIMIT_MAX = 20_000
 _PANEL_AUDIO_EVENTS_MAX = 20_000
 _PANEL_VIDEO_ID_MAX = 256

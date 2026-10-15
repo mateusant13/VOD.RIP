@@ -142,8 +142,36 @@ const PANEL_DEFAULT_W = 320;
 const PANEL_W_KEY = 'vodrip.preview.chatPanelWidth';
 /** Width the collapsed strip occupies (matches the w-7 button). */
 const PANEL_STRIP_W = 28;
-/** Matches the backend cap; dense archives are reported as chat_truncated. */
-const PANEL_LIMIT = 20_000;
+/** Rows requested per timeline.
+ *
+ * WAS 20_000, and its comment said "matches the backend cap". That is exactly
+ * what broke live previews.
+ *
+ * Measured 2026-10-15 on the shipped v1.0.60 with six live previews open:
+ *
+ *   playable = null (45 s timeout)
+ *     +-10870ms init  + 42351ms dur  /api/preview/panel/twitch/...?limit=20000
+ *     +      0ms init  + 33521ms dur  session
+ *     +   2824ms init  + 32251ms dur  /api/preview/panel/...?limit=20000
+ *     +   2829ms init  + 32741ms dur  /api/preview/panel/...?limit=20000
+ *     +   2830ms init  + 34253ms dur  /api/preview/panel/...?limit=20000
+ *     +   5341ms init  + 31756ms dur  /api/preview/panel/...?limit=20000
+ *     +   7841ms init  + 29277ms dur  /api/preview/panel/...?limit=20000
+ *
+ * Six requests of 20 000 rows each, 29-42 SECONDS apiece, all in flight at once.
+ * They hold every browser connection slot, so the session request and the media
+ * segments queue behind them and NO preview ever reaches playable - the six
+ * spinners the owner photographed.
+ *
+ * The waste was absurd on its own terms: the live chat window keeps 300 rows
+ * (LiveChatPanel MAX_ROWS), so 19 700 of the 20 000 were parsed, serialised,
+ * shipped and discarded, on every poll, per preview.
+ *
+ * 2 000 still fills the transcript tab far past what a screen shows and still
+ * reports truncation for a genuinely dense archive, at a tenth of the payload.
+ * The backend cap is unchanged, so a caller that really wants more can ask.
+ */
+const PANEL_LIMIT = 2_000;
 /** While a Twitch backfill is 'running' the panel refreshes at this rate
  *  (the backend bounds each response to a playhead window, so polling stays
  *  cheap and chat appears progressively instead of after the whole run). */
