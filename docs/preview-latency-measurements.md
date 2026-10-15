@@ -230,3 +230,57 @@ had inflight <= 4. The remaining work is to keep inflight low at the click,
 which is the shared budget (e465b5e) plus the priority window (0bd6a07) -
 neither of which has a proved win, and both of which now have the measurement
 that says what they are for.
+
+---
+
+## Round 7 — the VODRIP_NO_DAEMONS trap, and the first honest numbers
+
+**Every failing measurement in rounds 100-106 was taken with
+`VODRIP_NO_DAEMONS=1` set.** That is a debug flag, and it changes the behaviour
+of the server. The user never sets it. So the failures were mine, not the app's.
+
+The arms, same frozen build, same box, same harness, ONE variable:
+
+| arm | warm wave | VODRIP_NO_DAEMONS | result |
+|---|---|---|---|
+| frozen | on  | **set** | server stops answering; panel 25 s / 11.7 s / 2 s errors |
+| frozen | off | **set** | server stable 220 s |
+| source | on  | unset | server stable 190 s; panel 0.02 s |
+| **frozen** | **on** | **unset** | **server stable 190 s; panel 0.04-0.17 s** |
+
+The warm wave is a hiccup (health drops out at t+20s once, then recovers), not a
+killer. The flag is the killer.
+
+### The A/B with six live previews, real conditions
+
+Frozen v1.0.60+panel-fix, SIX previews, `VODRIP_NO_DAEMONS` **unset**, CYCLES=6,
+12 reps, two connection-budget arms (sync2 vs sync3):
+
+| rep | playable | outcome |
+|---|---|---|
+| 0  |  5245 ms | playing |
+| 1  | 37728 ms | playing |
+| 2  | 46468 ms | playing |
+| 3  | 13108 ms | playing |
+| 4  |  1537 ms | playing |
+| 5  |  2490 ms | playing |
+| 6  |  2182 ms | playing |
+| 7  |  2485 ms | playing |
+| 8  |  1550 ms | playing |
+| 9  |  1474 ms | playing |
+| 10 |  2485 ms | playing |
+| 11 |  1847 ms | playing |
+
+**12 of 12 played**, against **11 of 11 timeouts** in the same harness with the
+flag set. After the first-load reps (0-3, which include session, player and window
+warm-up), **8 of 8 consecutive reps are <= 2.49 s**.
+
+Stated plainly rather than smoothed: the first four reps of a cold session are
+NOT under 3 s. Reps 1 and 2 are 37.7 s and 46.5 s. That is the first-load cost,
+not a steady-state one, and it is the remaining target.
+
+### The rule this leaves behind
+
+**Never measure latency with `VODRIP_NO_DAEMONS=1`.** It is not a lighter app, it
+is a different app: the server stops answering under load while the process stays
+alive, which looks exactly like an app defect and is not one.
