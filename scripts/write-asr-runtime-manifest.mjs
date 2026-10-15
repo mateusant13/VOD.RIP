@@ -9,8 +9,33 @@ if (!version) throw new Error('usage: node scripts/write-asr-runtime-manifest.mj
 const runtimeDir = join(root, 'dist', 'runtimes', 'asr', version);
 const archivePath = join(root, 'release', `VOD-RIP-ASR-${version}-win-x64.zip`);
 const outputPath = join(root, 'release', 'VOD-RIP-ASR-manifest.json');
-if (!existsSync(runtimeDir) || !existsSync(archivePath)) {
-  throw new Error(`missing ASR runtime or archive for ${version}`);
+// A MISSING RUNTIME IS NOT A FAILED RELEASE.
+//
+// This step used to throw, and on 2026-10-15 that killed the whole v1.0.54
+// release: `build-asr-runtime` ran, produced nothing at
+// dist/runtimes/asr/<ver>, the packaging step above correctly WARNED and
+// skipped ("No ASR runtime at ... - skipping ASR zip (base still built)"),
+// and then this file threw on the artifact the previous step had just
+// announced it would not create. The release job failed and the
+// `release` job - which needs it - was skipped, so no GitHub Release was
+// published for a version that was otherwise complete.
+//
+// The workflow already states the intent ("base still built"). So the
+// absent runtime is reported the same way the step above reports it, and
+// the release ships the base plus its installer. What must NOT happen is
+// a manifest describing an archive that does not exist: that is the
+// corrupt state an installer would trust.
+const missing = [!existsSync(runtimeDir) && runtimeDir, !existsSync(archivePath) && archivePath]
+  .filter(Boolean);
+if (missing.length) {
+  console.warn(
+    `WARNING: no ASR runtime for ${version} - skipping the manifest, the base still ships.`
+  );
+  for (const m of missing) console.warn(`  absent: ${m}`);
+  console.warn(
+    "The opt-in ASR runtime must be built before tagging if this release is meant to offer it."
+  );
+  process.exit(0);
 }
 
 function sha256(path) {
