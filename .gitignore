@@ -169,3 +169,30 @@ runs/*.md
 # ── Stray one-off reports that no code reads ──
 audit-report.md
 llms.txt
+
+# ── One-off acceptance drivers and diagnostic scripts ──
+# Removed 2026-10-15 after auditing every tracked non-source file for external
+# references. These had ZERO: manual acceptance runs whose value is now in the
+# tests (crash_cycle_driver.py even said "take 3"), and PowerShell probes from
+# past sessions (check_chkdsk2.ps1, who_cuda2.ps1 - the 2 suffix is the tell).
+backend/*_driver.py
+backend/e2e_twitch_transcribe.py
+backend/selfcheck_channel_priority.py
+backend/scripts/check_*.ps1
+backend/scripts/crash_*.ps1
+backend/scripts/who_cuda*.ps1
+backend/scripts/monitor_resources.ps1
+backend/scripts/snapshot_resources.ps1
+backend/scripts/schedule_memtest.ps1
+backend/scripts/run_spotfix.ps1
+backend/scripts/python_procs.ps1
+backend/scripts/compare_clip_sync.py
+backend/scripts/cookie_auto_install.ps1
+
+# ── Unreferenced dev tooling ──
+# page-trace-extension was a browser extension nothing invoked; the only grep
+# hits were background.js as a FILENAME inside the cookie extension docs.
+tools/page-trace-extension/
+tools/tmp_scratch_archive.py
+tools/tests/
+vite.profile.config.ts
