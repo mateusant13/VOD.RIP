@@ -490,4 +490,54 @@ describe("SettingsTab", () => {
       "plugin-cost-transcribe",
     ]);
   });
+
+  // ── The OFF case: a plugin card must SAY how to enable it ────────────────
+  // The owner: "botoes que necessitam de plugins pra fazer algo, deve
+  // aparecer uma mensagem pedindo pra habilitar o plugin". Before this, OFF
+  // rendered nothing and the feature was undiscoverable.
+
+  it("transcribe OFF shows the enable prompt, and the section is really gone", () => {
+    stubFetch();
+    setPlugins({ transcribe: false });
+    render(<Harness />);
+    const prompt = document.querySelector('[data-enable-plugin="transcribe"]');
+    expect(prompt).not.toBeNull();
+    // it names the cost, so the user knows what enabling costs
+    expect(prompt!.querySelector("[data-plugin-cost]")!.textContent).toMatch(/397 MB/);
+    // and the Enable button targets THIS plugin
+    expect(
+      document.querySelector('[data-enable-plugin-button="transcribe"]'),
+    ).not.toBeNull();
+    // The real section is absent, asserted on something that EXISTS in it.
+    // A selector that matches nothing anywhere would make this line vacuous:
+    // the check has to name a control the ON path really renders, and
+    // "default captions language" is that control (the ON test above uses it).
+    expect(screen.queryByLabelText("default captions language")).not.toBeInTheDocument();
+    // and expanding the card name cannot reveal it either
+    expect(screen.queryByText("Transcription")).not.toBeInTheDocument();
+  });
+
+  it("ai-ask OFF shows the prompt and the Experimental controls are gone", () => {
+    stubFetch();
+    setPlugins({ "ai-ask": false });
+    render(<Harness />);
+    expect(document.querySelector('[data-enable-plugin="ai-ask"]')).not.toBeNull();
+    expect(
+      document.querySelector('[data-enable-plugin-button="ai-ask"]'),
+    ).not.toBeNull();
+    // the card controls are not merely hidden: they are not rendered
+    expect(screen.queryByLabelText("experimental ai enabled")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("ai api key")).not.toBeInTheDocument();
+  });
+
+  it("a plugin ON renders the section and NO prompt", () => {
+    stubFetch();
+    setPlugins({ transcribe: true, "ai-ask": true });
+    render(<Harness />);
+    expect(document.querySelector('[data-enable-plugin="transcribe"]')).toBeNull();
+    expect(document.querySelector('[data-enable-plugin="ai-ask"]')).toBeNull();
+    // sanity: the enabling path did not cost us the real cards
+    expect(screen.getByText("Transcription")).toBeInTheDocument();
+  });
+
 });

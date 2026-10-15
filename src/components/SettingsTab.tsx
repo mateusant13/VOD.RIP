@@ -16,7 +16,8 @@ import { resetAll as resetFirstTimeFlags } from '../lib/firstTime';
 import { useI18n, type Lang } from '../i18n';
 import type { AppSettings, UpdateInfo } from '../types';
 import { previewDownloadTree, type DownloadLayout } from '../downloadLayout';
-import { ALWAYS_ON, PluginGate, bundleCost, setPluginEnabled, usePlugins, type PluginState } from '../lib/plugins';
+import { ALWAYS_ON, bundleCost, pluginEnabled, setPluginEnabled, usePlugins, type PluginState } from '../lib/plugins';
+import EnablePluginPrompt from './EnablePluginPrompt';
 type Props = {
   settings: AppSettings;
   setSettings: Dispatch<SetStateAction<AppSettings>>;
@@ -435,10 +436,13 @@ export default function SettingsTab({
 
       {/* ── Transcription ─────────────────────────────────────────
           Plugin 'transcribe' (backend/services/plugin_registry.py). Off by
-          default, so the card must LEAVE the screen rather than sit there as
-          a dead switch — the owner's "plugin desligado = a coisa some da
-          tela" rule. Turn it back on in the Plugins card below. */}
-      <PluginGate id="transcribe">
+          default. The card does not sit there as a dead switch, and it does
+          not silently vanish either: the owner asked for a button that needs
+          a plugin to SAY SO ("botoes que necessitam de plugins pra fazer
+          algo, deve aparecer uma mensagem pedindo pra habilitar o plugin").
+          So OFF renders EnablePluginPrompt with the cost and an Enable
+          button, and ON renders the real section. */}
+      {pluginEnabled('transcribe') ? (
         <SettingsCard
           icon={Mic}
           title={t('Transcription')}
@@ -451,7 +455,9 @@ export default function SettingsTab({
             onSaved={(s) => setSavedSig(settingsSignature(s))}
           />
         </SettingsCard>
-      </PluginGate>
+      ) : (
+          <EnablePluginPrompt pluginId="transcribe" />
+        )}
 
       {/* ── Disk & Storage ──────────────────────────────────────── */}
       <SettingsCard
@@ -484,8 +490,9 @@ export default function SettingsTab({
 
       {/* ── Experimental ────────────────────────────────────────
           Plugin 'ai-ask' (the AI search & answers feature is the whole card).
-          Off by default → the card leaves the screen, like Transcription. */}
-      <PluginGate id="ai-ask">
+          Off by default, and OFF renders the enable prompt rather than a
+          disappearing card — same rule as Transcription above. */}
+      {pluginEnabled('ai-ask') ? (
         <SettingsCard
           icon={Sparkles}
           title={t('Experimental')}
@@ -527,7 +534,9 @@ export default function SettingsTab({
             </span>
           ) : null}
         </SettingsCard>
-      </PluginGate>
+      ) : (
+          <EnablePluginPrompt pluginId="ai-ask" />
+        )}
 
       <SettingsCard
         icon={Puzzle}
