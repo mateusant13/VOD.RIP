@@ -195,6 +195,38 @@ lives AFTER the session: hls master fetch -> hls.js parse -> first segment
 segment 392-2710 ms), which fits: the whole post-session chain varies by 10x
 while the session POST varies by 7x and never dominates.
 
-NEXT TARGET, stated so the round after this one does not repeat: instrument
-the manifest and segment fetches separately on the frozen app - which of the
-two varies, and whether the manifest is re-fetched per rep.
+## 2026-10-15, round 6 — the manifest chain is NOT the problem, and it is measured
+
+Per-leg instrumentation on the frozen app (tmp/ab_hls.mjs, tmp/ab_hls.txt,
+15 reps). Queue wait matched BY URL, not by index - index pairing was the bug
+that produced the nonsense negative queue numbers in earlier rounds.
+
+  leg       median    max    count   queue wait
+  playable   1686    3278      -          -
+  session     707    2376      1         null
+  master       99     978      1         null
+  segment     104     977      1         null
+  panel       447    2376      -          -
+
+So the manifest is ONE fetch and the segment is ONE fetch, both fast, and
+NEITHER waits for a socket (queue = null for every one of the 15 reps). The
+"hls master -> parse -> segment -> canplay chain" that round 5 blamed is not a
+chain: there is no cascade, no re-fetch, and no queue. What varies is the
+session POST and the panel fetch, and both track the background load:
+
+  inflight at click   playable                          session
+  0-4  (n=11)        493-1788 (10/11 under 3s)          140-1299
+  5-10 (n=1)         3083                              663
+  11-40 (n=3)        2549-3278                         850-2376
+
+The one slow rep inside the low bucket (3120 ms) had session=707 ms but
+master=350 ms and segment=404 ms - its own two worst legs, so it is a different
+tail, not the same one.
+
+CONCLUSION for the goal: the click path is CHEAP and MEASURED to be cheap. The
+cost is entirely how much of the browser 6 sockets the app own background waves
+hold when the user clicks. 11 of 15 reps landed under 3 s and 10 of those 11
+had inflight <= 4. The remaining work is to keep inflight low at the click,
+which is the shared budget (e465b5e) plus the priority window (0bd6a07) -
+neither of which has a proved win, and both of which now have the measurement
+that says what they are for.
