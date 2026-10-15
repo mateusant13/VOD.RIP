@@ -55,3 +55,22 @@ def test_the_icons_exist_in_public():
         assert (REPO / "public" / "assets" / name).is_file(), (
             "public/assets/%s is what Vite copies into dist/assets" % name
         )
+
+
+def test_the_spec_ships_the_whole_static_dir():
+    """RED: pinning index.html alone drops assets/ at the PyInstaller stage.
+
+    This is the link that was actually broken. build-copy DID produce
+    backend/static/assets/, app.py DID mount /assets, and the installed bundle
+    still had no icons - because vod-rip.spec listed
+    (STATIC_DIR / "index.html", "static") and PyInstaller shipped exactly that
+    one file. Fixing the copy and the mount without this changed nothing
+    observable, which is what the second build proved.
+    """
+    spec = (REPO / "vod-rip.spec").read_text(encoding="utf-8")
+    assert '(str(H.STATIC_DIR), "static")' in spec, (
+        "the spec must ship the whole static dir, not just index.html"
+    )
+    assert 'H.STATIC_DIR / "index.html"' not in spec, (
+        "the single-file entry is the bug: assets/ never reaches the bundle"
+    )

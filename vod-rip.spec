@@ -48,7 +48,13 @@ a = Analysis(
     pathex=[str(H.BACKEND_DIR)],
     binaries=H.ffmpeg_binaries() + H.bundled_node_binaries(),
     datas=[
-        (str(H.STATIC_DIR / "index.html"), "static"),
+            # The WHOLE static dir, not just index.html. Measured 2026-10-15 on the
+    # installed bundle: index.html asks for /assets/icon.ico and /assets/icon.png
+    # and both 404ed on every launch, because build-copy puts them in
+    # backend/static/assets and the spec shipped only the index. Vite serves
+    # public/ at the root in dev, so nothing showed this until the frozen app
+    # was opened.
+    (str(H.STATIC_DIR), "static"),
         (str(H.ICON_ICO), "."),
     ] + ([(
         str(H.ICON_ICNS), ".",
