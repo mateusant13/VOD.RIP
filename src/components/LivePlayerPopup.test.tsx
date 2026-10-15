@@ -186,6 +186,30 @@ function mockFetchWithLiveSrc() {
   return fn;
 }
 
+/**
+ * Plugin store seeding. The player's three plugin surfaces (live-preview,
+ * live-subtitles, live-chat) are gated by usePlugin, which reads the
+ * 'vodrip.plugins' localStorage key and falls back to the catalog's
+ * defaultOn. live-preview and live-subtitles default OFF, so every test that
+ * renders the player MUST seed them on or the body never mounts.
+ */
+const PLUGINS_LS_KEY = 'vodrip.plugins';
+
+/** Overwrite the stored plugin map (ids absent from the patch fall back to
+ *  the catalog default). Call BEFORE render — the store caches on the
+ *  serialized state, so a write changes the key and the next read re-derives. */
+function setPlugins(patch: Record<string, boolean>) {
+  localStorage.setItem(PLUGINS_LS_KEY, JSON.stringify(patch));
+}
+
+/** Every plugin this player renders, ON — the "nothing is gated away"
+ *  baseline the pre-existing tests were written against. */
+const PLAYER_PLUGINS_ON: Record<string, boolean> = {
+  'live-preview': true,
+  'live-subtitles': true,
+  'live-chat': true,
+};
+
 function renderPopup() {
   return render(
     <LivePlayerPopup
@@ -220,11 +244,17 @@ beforeEach(() => {
   // jsdom's play() is unimplemented (returns undefined) — the popup calls
   // `video.play().catch(...)`, which would throw in jsdom only.
   HTMLMediaElement.prototype.play = vi.fn(() => Promise.resolve()) as unknown as typeof HTMLMediaElement.prototype.play;
+  // The player's own plugins ON by default (see setPlugins) — a test that
+  // exercises a specific gate overrides its entry before rendering.
+  setPlugins({ ...PLAYER_PLUGINS_ON });
   mockFetch();
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  // Never leak a plugin state into the next test (the store is module-global
+  // and reads localStorage on every snapshot).
+  localStorage.removeItem(PLUGINS_LS_KEY);
 });
 
 describe('LivePlayerPopup fullscreen', () => {
@@ -2202,5 +2232,81 @@ describe('LivePlayerPopup not-found channel', () => {
 
     expect(screen.queryByPlaceholderText('Kick or YouTube name')).toBeNull();
     expect(onNotFoundChannel).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Plugin gates — a DISABLED plugin removes its surface from the screen.
+//
+// Each test seeds the plugin store OFF, renders the SAME props the rest of
+// this file uses, and asserts the surface is absent. These are the tests that
+// would fail without the gate in LivePlayerPopup.tsx.
+// ---------------------------------------------------------------------------
+describe('LivePlayerPopup plugin gates', () => {
+  /** Caption SSE only (the chat streams share FakeEventSource.instances). */
+  function captionEsOnly() {
+    return FakeEventSource.instances.filter((es) => es.url.includes('/api/live/captions'));
+  }
+
+  it('live-preview OFF renders NOTHING and never opens a session (body unmounted)', () => {
+    const fetchMock = mockFetch();
+    setPlugins({ ...PLAYER_PLUGINS_ON, 'live-preview': false });
+    renderPopup();
+
+    // The whole player is gone — no chrome, no video, no transport.
+    expect(document.querySelector('[data-live-popup]')).toBeNull();
+    expect(document.querySelector('[data-live-transport]')).toBeNull();
+    expect(document.querySelector('video')).toBeNull();
+
+    // Stronger than "not rendered": the body is UNMOUNTED, so its mount
+    // effect never ran — no HLS session was created on the backend.
+    const sessionPosts = fetchMock.mock.calls.filter(([u]) => String(u).includes('/api/preview/live'));
+    expect(sessionPosts).toHaveLength(0);
+  });
+
+  it('live-preview ON still renders the player (the gate is not always-on)', async () => {
+    setPlugins({ ...PLAYER_PLUGINS_ON });
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+    expect(document.querySelector('[data-live-popup]')).toBeTruthy();
+  });
+
+  it('live-subtitles OFF: the caption stream still opens but NO overlay is ever shown', async () => {
+    mockFetch();
+    vi.stubGlobal('EventSource', FakeEventSource);
+    FakeEventSource.instances = [];
+    setPlugins({ ...PLAYER_PLUGINS_ON, 'live-subtitles': false });
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+
+    // The CC control still shows (availability is the parakeet gate's job,
+    // not the plugin's) — only the OVERLAY is plugin-gated.
+    await screen.findByTitle('Hide captions');
+    await waitFor(() => expect(captionEsOnly()).toHaveLength(1));
+    const es = captionEsOnly()[0];
+
+    // A caption the video clock HAS reached renders immediately — the same
+    // fire+assert the ungated tests above use (they prove the overlay DOES
+    // appear with the plugin on). Advancing the clock here instead would make
+    // the block STALE, and it would never render even with the gate removed.
+    act(() => { es.fire('caption', JSON.stringify({ text: 'legenda proibida', start: 1, end: 4 })); });
+
+    expect(screen.queryByText('legenda proibida')).toBeNull();
+    expect(document.querySelector('[data-live-captions-overlay]')).toBeNull();
+  });
+
+  it('live-chat OFF removes the chat toggle AND the docked panel', async () => {
+    mockFetch();
+    setPlugins({ ...PLAYER_PLUGINS_ON, 'live-chat': false });
+    renderPopup();
+    await screen.findByTitle('Fullscreen');
+
+    // The kick entry has a chat source, so with the plugin ON the panel is
+    // mounted (see "preloads chat EventSources on live open"). With it OFF
+    // neither the header button nor the panel exists.
+    expect(document.querySelector('.live-popup-chat')).toBeNull();
+    expect(screen.queryByTitle('Live chat')).toBeNull();
+    expect(screen.queryByTitle('Close live chat')).toBeNull();
+    expect(document.querySelector('[data-live-chat-panel]')).toBeNull();
   });
 });

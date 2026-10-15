@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 import { act, configure, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import ArchiveSearchPopup, { deepPollIsTerminal } from './ArchiveSearchPopup';
@@ -43,6 +43,18 @@ const SAVED: SavedChannel = {
   clipVideos: [],
   updatedAt: '2026-08-01T00:00:00Z',
 };
+
+/**
+ * Plugin store seeding. The search panel is gated by usePlugin('archive-search'),
+ * which reads the 'vodrip.plugins' localStorage key and falls back to the
+ * catalog's defaultOn (true). Seed it explicitly so a future default change
+ * cannot silently empty this file.
+ */
+const PLUGINS_LS_KEY = 'vodrip.plugins';
+
+function setPlugins(patch: Record<string, boolean>) {
+  localStorage.setItem(PLUGINS_LS_KEY, JSON.stringify(patch));
+}
 
 function mockFetch(
   hits: unknown[] = [],
@@ -160,10 +172,17 @@ async function expectQuiet(fn: () => void, ms = SEARCH_DEBOUNCE_MS - 1) {
   }
 }
 
+beforeEach(() => {
+  // The search panel is plugin-gated; ON by default so the pre-existing
+  // assertions below run ungated. A gate test overrides it explicitly.
+  setPlugins({ 'archive-search': true });
+});
+
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.useRealTimers(); // deep tests fake the clock — never leak it
   setLanguage('en'); // the i18n module state is global — never leak a language into the next test
+  localStorage.removeItem(PLUGINS_LS_KEY); // never leak a plugin state into the next test
 });
 
 describe('ArchiveSearchPopup', () => {
@@ -2470,5 +2489,40 @@ describe('deepPollIsTerminal', () => {
   it('plain Error (network/timeout hint from apiFetch) is transient', () => {
     expect(deepPollIsTerminal(new Error('API not reachable. Quit VOD.RIP from the tray and reopen the app.'))).toBe(false);
     expect(deepPollIsTerminal('not even an error')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Plugin gate — a DISABLED archive-search plugin removes the panel from the
+// screen on EVERY path that mounts it. This component is mounted by App (two
+// variants), ChannelExplorePopup, LivePlayerPopup and LocalFilePopup, so the
+// gate has to live inside the component itself.
+// ---------------------------------------------------------------------------
+describe('ArchiveSearchPopup plugin gate', () => {
+  it('archive-search OFF renders no dialog (floating AND embedded variants)', () => {
+    mockFetch();
+    setPlugins({ 'archive-search': false });
+
+    const floating = render(
+      <ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />,
+    );
+    const embedded = render(
+      <ArchiveSearchPopup zIndex={0} embedded onClose={() => {}} onOpenHit={() => {}} />,
+    );
+
+    expect(floating.container.querySelector('[role="dialog"]')).toBeNull();
+    expect(embedded.container.querySelector('[role="dialog"]')).toBeNull();
+    // No resize handles either — the whole body is unmounted.
+    expect(floating.container.querySelectorAll('[data-panel-resize]')).toHaveLength(0);
+    expect(embedded.container.querySelectorAll('[data-panel-resize]')).toHaveLength(0);
+  });
+
+  it('archive-search ON still renders (the gate is not always-on)', () => {
+    mockFetch();
+    setPlugins({ 'archive-search': true });
+    const { container } = render(
+      <ArchiveSearchPopup zIndex={10} onClose={() => {}} onOpenHit={() => {}} />,
+    );
+    expect(container.querySelector('[role="dialog"]')).toBeTruthy();
   });
 });

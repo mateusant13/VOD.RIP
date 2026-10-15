@@ -9,6 +9,7 @@ import {
 import { Search, X } from 'lucide-react';
 import ArchiveSearchPopup from './components/ArchiveSearchPopup';
 import { useI18n } from './i18n';
+import { usePlugin } from './lib/plugins';
 import type { ArchiveSearchHit, ArchiveVideoRow } from './archiveSearchUtils';
 import type { PanelSize, SavedChannel } from './types';
 import {
@@ -71,7 +72,21 @@ type Props = {
   savedChannels?: SavedChannel[];
 };
 
-export default function LocalFilePopup({
+/**
+ * Plugin gate for `local-file`.
+ *
+ * A DISABLED plugin removes the local player from the screen — and, because
+ * the body is a separate component, UNMOUNTS it: no media element, no drag or
+ * resize listeners, no docked search panel. The wrapper's hook count never
+ * changes, so switching the plugin back on mounts a fresh body instead of
+ * growing the hook list of an existing render.
+ */
+export default function LocalFilePopup(props: Props) {
+  if (!usePlugin('local-file')) return null;
+  return <LocalFilePopupBody {...props} />;
+}
+
+function LocalFilePopupBody({
   item,
   zIndex,
   stackIndex,

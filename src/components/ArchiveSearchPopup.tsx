@@ -61,6 +61,7 @@ import { ageParkedCount } from '../captionsPark';
 import { resolveChatColor } from '../chatColors';
 import { seekToTimestamp } from '../seekToTimestamp';
 import { useI18n } from '../i18n';
+import { usePlugin } from '../lib/plugins';
 import type { SavedChannel } from '../types';
 import PlatformVodIcon from './PlatformVodIcon';
 
@@ -195,7 +196,22 @@ function videoTitle(video: ArchiveVideoRow | undefined, hit: ArchiveSearchHit): 
   return t !== 'Untitled' ? t : hit.video_id;
 }
 
-export function ArchiveSearchPopup({ zIndex, onClose, onOpenHit, onSeekHit, onSeekOffset, embedded = false, scope, savedChannels, initialPos, initialChannel, onBringToFront }: ArchiveSearchPopupProps) {
+/**
+ * Plugin gate for `archive-search`.
+ *
+ * A DISABLED plugin removes the search panel from the screen on EVERY path
+ * that mounts it — App's floating/search variants, ChannelExplorePopup, the
+ * live player and the local-file player all render this component, and the
+ * body is a separate component so it is UNMOUNTED while the plugin is off: no
+ * debounced fetches, no pollers, no listeners. The wrapper's hook count never
+ * changes, so switching the plugin back on mounts a fresh body.
+ */
+export function ArchiveSearchPopup(props: ArchiveSearchPopupProps) {
+  if (!usePlugin('archive-search')) return null;
+  return <ArchiveSearchPopupBody {...props} />;
+}
+
+function ArchiveSearchPopupBody({ zIndex, onClose, onOpenHit, onSeekHit, onSeekOffset, embedded = false, scope, savedChannels, initialPos, initialChannel, onBringToFront }: ArchiveSearchPopupProps) {
   const { t } = useI18n();
   const containerRef = useRef<HTMLDivElement>(null);
   const posRef = useRef<PanelPos | null>(null);

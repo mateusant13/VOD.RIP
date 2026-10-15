@@ -84,11 +84,25 @@ function Harness({
 
 beforeEach(() => {
   vi.unstubAllGlobals();
+  // Plugin flags live in the same localStorage the app syncs from
+  // GET /api/plugins. Clearing it keeps every test on the registry defaults
+  // (transcribe off, ai-ask off) instead of inheriting the previous test's.
+  localStorage.clear();
 });
+
+/** Override the registry defaults with an explicit on/off map, the same way
+ *  a synced GET /api/plugins would (plugins.tsx storedState). */
+function setPlugins(patch: Record<string, boolean>) {
+  localStorage.setItem("vodrip.plugins", JSON.stringify(patch));
+}
 
 describe("SettingsTab", () => {
   it("renders all grouped sections, collapsed by default", () => {
     stubFetch();
+    // Transcription and Experimental are plugin cards (transcribe / ai-ask);
+    // with them ON this list is the full set. The companion tests below pin
+    // what happens with them OFF.
+    setPlugins({ transcribe: true, "ai-ask": true });
     render(<Harness />);
     for (const title of ["General", "Transcription", "Disk & Storage", "Cookie Bridge", "Updates", "Experimental", "Danger Zone"]) {
       expect(screen.getByText(title)).toBeInTheDocument();
@@ -213,6 +227,9 @@ describe("SettingsTab", () => {
 
   it("moves Cookie Bridge to second-to-last once cookies are detected", async () => {
     stubFetch({ paired: true, enabled: true, platforms: { kick: { count: 3, lastGrabAt: null, expiredCount: 0 } } });
+    // The layout this pins includes the two plugin cards, so they are on here;
+    // the gated-out layout is asserted in the plugin tests below.
+    setPlugins({ transcribe: true, "ai-ask": true });
     render(<Harness />);
     expandCard("Cookie Bridge");
     await screen.findByText(/paired/);
@@ -240,6 +257,8 @@ describe("SettingsTab", () => {
 
   it("renders the Experimental AI card with the toggle off by default", () => {
     stubFetch();
+    // The card is gated by the ai-ask plugin.
+    setPlugins({ "ai-ask": true });
     render(<Harness />);
     expandCard("Experimental");
     expect(screen.getByLabelText("experimental ai enabled")).not.toBeChecked();
@@ -251,6 +270,7 @@ describe("SettingsTab", () => {
 
   it("shows the bullet placeholder when a key is set (never the key itself)", () => {
     stubFetch();
+    setPlugins({ "ai-ask": true });
     render(<Harness initial={{ ...BASE, ai_api_key_set: true }} />);
     expandCard("Experimental");
     expect(screen.getByLabelText("ai api key")).toHaveAttribute("placeholder", "••••••••");
@@ -259,6 +279,7 @@ describe("SettingsTab", () => {
 
   it("shows an inline error when the toggle is on without a key", () => {
     stubFetch();
+    setPlugins({ "ai-ask": true });
     render(<Harness />);
     expandCard("Experimental");
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
@@ -272,6 +293,7 @@ describe("SettingsTab", () => {
 
   it("posts a typed AI key (write-only) and marks it set", async () => {
     stubFetch();
+    setPlugins({ "ai-ask": true });
     render(<Harness />);
     expandCard("Experimental");
     fireEvent.change(screen.getByLabelText("ai api key"), { target: { value: "sk-abc-123" } });
@@ -316,5 +338,55 @@ describe("SettingsTab", () => {
     });
     // The local store flipped too — the row re-renders from it.
     expect((screen.getByLabelText("archive-search") as HTMLInputElement).checked).toBe(!before);
+  });
+
+  // ── Plugin-gated sections ──────────────────────────────────────────────────
+  // RED ARM for all three: delete the <PluginGate> wrappers in SettingsTab.tsx
+  // (render the two cards unconditionally) and the first two fail on the OFF
+  // case; the third fails on both the OFF render and the toggle round-trip.
+  it("hides the Transcription and Experimental cards when their plugin is off", () => {
+    stubFetch();
+    setPlugins({ transcribe: false, "ai-ask": false });
+    render(<Harness />);
+    // The cards are GONE, not collapsed: the registry defaults already put
+    // both plugins off on a fresh install.
+    expect(screen.queryByText("Transcription")).not.toBeInTheDocument();
+    expect(screen.queryByText("Experimental")).not.toBeInTheDocument();
+    // Their controls exist nowhere, not merely hidden inside a collapsed card.
+    expect(screen.queryByLabelText("default captions language")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("experimental ai enabled")).not.toBeInTheDocument();
+    // Only the plugin surfaces disappear — the rest of Settings stays.
+    expect(screen.getByText("General")).toBeInTheDocument();
+    expect(screen.getByText("Disk & Storage")).toBeInTheDocument();
+    expect(screen.getByText("Danger Zone")).toBeInTheDocument();
+  });
+
+  it("shows the Transcription and Experimental cards when their plugin is on", () => {
+    stubFetch();
+    setPlugins({ transcribe: true, "ai-ask": true });
+    render(<Harness />);
+    expect(screen.getByText("Transcription")).toBeInTheDocument();
+    expandCard("Transcription");
+    expect(screen.getByLabelText("default captions language")).toBeInTheDocument();
+    expect(screen.getByText("Experimental")).toBeInTheDocument();
+    expandCard("Experimental");
+    expect(screen.getByLabelText("experimental ai enabled")).toBeInTheDocument();
+  });
+
+  it("a plugin toggle in the Plugins card makes its section appear and disappear", async () => {
+    stubFetch();
+    // Defaults: transcribe off — the card must not be there.
+    render(<Harness />);
+    expect(screen.queryByText("Transcription")).not.toBeInTheDocument();
+    expandCard("Plugins");
+    fireEvent.click(screen.getByLabelText("transcribe"));
+    // Turning it on renders the section immediately — Settings > Plugins is
+    // where the owner summons the section back.
+    await waitFor(() => expect(screen.getByText("Transcription")).toBeInTheDocument());
+    expandCard("Transcription");
+    expect(screen.getByLabelText("default captions language")).toBeInTheDocument();
+    // And turning it off removes it again.
+    fireEvent.click(screen.getByLabelText("transcribe"));
+    await waitFor(() => expect(screen.queryByText("Transcription")).not.toBeInTheDocument());
   });
 });

@@ -21,7 +21,20 @@ const captureProto = HTMLElement.prototype as unknown as {
   setPointerCapture?: () => void;
   releasePointerCapture?: () => void;
 };
+/**
+ * Plugin store seeding. The mini-preview is gated by usePlugin('twitch-clip'),
+ * which reads the 'vodrip.plugins' localStorage key and falls back to the
+ * catalog's defaultOn (true). Seed it explicitly so a future default change
+ * cannot silently empty this file.
+ */
+const PLUGINS_LS_KEY = 'vodrip.plugins';
+
+function setPlugins(patch: Record<string, boolean>) {
+  localStorage.setItem(PLUGINS_LS_KEY, JSON.stringify(patch));
+}
+
 beforeEach(() => {
+  setPlugins({ 'twitch-clip': true });
   if (!captureProto.setPointerCapture) {
     captureProto.setPointerCapture = () => {};
   }
@@ -193,5 +206,16 @@ describe('TwitchClipPopup hover volume', () => {
     const slider = volWrapper.querySelector("input[type='range']") as HTMLInputElement;
     expect(slider).toBeTruthy();
     expect(Number(slider.value)).toBe(0);
+  });
+
+  // The gate. Without the usePlugin('twitch-clip') check in TwitchClipPopup.tsx
+  // the popup would still mount (and still POST a preview session) with the
+  // plugin switched off.
+  it('twitch-clip plugin OFF renders nothing and never opens a session', async () => {
+    setPlugins({ 'twitch-clip': false });
+    renderPopup();
+    await Promise.resolve();
+    expect(document.querySelector('[data-twitch-clip-popup]')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Create clip' })).toBeNull();
   });
 });

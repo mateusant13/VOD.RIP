@@ -117,9 +117,33 @@ function renderPopup() {
 
 beforeEach(() => {
   vi.unstubAllGlobals();
+  // The plugin store (src/lib/plugins.tsx) keeps its per-plugin booleans in
+  // localStorage under 'vodrip.plugins'. Clearing it here keeps one test's
+  // plugin choice from leaking into the next one.
+  localStorage.clear();
 });
 
+/** The plugin ids this popup is gated by, all switched ON. */
+const ALL_PLUGINS_ON: Record<string, boolean> = {
+  "channel-explore": true,
+  "clip-editor": true,
+  "ai-ask": true,
+  "live-chat": true,
+};
+
+/** Write the plugin store's localStorage copy before rendering. Ids missing
+ *  from the patch fall back to their catalog defaultOn. */
+function setPlugins(patch: Record<string, boolean>) {
+  localStorage.setItem("vodrip.plugins", JSON.stringify(patch));
+}
+
 describe("ChannelExplorePopup AI ask", () => {
+  // The row needs BOTH gates: the ai-ask plugin ON and the backend
+  // experimental_ai_enabled setting ON.
+  beforeEach(() => {
+    setPlugins({ ...ALL_PLUGINS_ON });
+  });
+
   it("hides the ask row when the experimental AI toggle is off", async () => {
     stubFetch({ aiEnabled: false });
     renderPopup();
@@ -316,5 +340,75 @@ describe("ChannelExplorePopup hover volume", () => {
     const slider = volWrapper.querySelector("input[type='range']") as HTMLInputElement;
     expect(slider).toBeTruthy();
     expect(Number(slider.value)).toBe(0);
+  });
+});
+
+/**
+ * Plugin gates — a plugin that is OFF takes its surface out of this popup
+ * entirely (the owner's rule: it disappears from the screen, it does not leave
+ * a dead control behind). Plugin ids come from src/lib/plugins.tsx, which
+ * mirrors backend/services/plugin_registry.py.
+ *
+ * RED ARM for each: drop the matching gate in ChannelExplorePopup.tsx and the
+ * "off" case below fails, because the block is still in the DOM.
+ */
+describe("ChannelExplorePopup plugin gates", () => {
+  it("does not open at all while 'channel-explore' is off", async () => {
+    stubFetch();
+    setPlugins({ ...ALL_PLUGINS_ON, "channel-explore": false });
+    const { container } = renderPopup();
+    // Give effects a chance to run: a null render must stay null.
+    await waitFor(() => expect(container.innerHTML).toBe(""));
+    expect(screen.queryByText("Channel VOD explore")).not.toBeInTheDocument();
+  });
+
+  it("opens while 'channel-explore' is on", async () => {
+    stubFetch();
+    setPlugins({ ...ALL_PLUGINS_ON });
+    renderPopup();
+    await waitFor(() => expect(screen.getByText("Channel VOD explore")).toBeInTheDocument());
+  });
+
+  it("hides the mini editor while 'clip-editor' is off", async () => {
+    stubFetch();
+    setPlugins({ ...ALL_PLUGINS_ON, "clip-editor": false });
+    renderPopup();
+    await waitFor(() => expect(screen.getByText("Channel VOD explore")).toBeInTheDocument());
+    expect(document.querySelector("[data-preview-mini-editor]")).toBeNull();
+  });
+
+  it("shows the mini editor while 'clip-editor' is on", async () => {
+    stubFetch();
+    setPlugins({ ...ALL_PLUGINS_ON });
+    renderPopup();
+    await waitFor(() => expect(screen.getByText("Channel VOD explore")).toBeInTheDocument());
+    expect(document.querySelector("[data-preview-mini-editor]")).toBeTruthy();
+  });
+
+  it("hides the ask row while 'ai-ask' is off even when the setting is on", async () => {
+    stubFetch({ aiEnabled: true });
+    setPlugins({ ...ALL_PLUGINS_ON, "ai-ask": false });
+    renderPopup();
+    await waitFor(() => expect(screen.getByText("Channel VOD explore")).toBeInTheDocument());
+    expect(screen.queryByText("Ask about this channel")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("ai ask question")).not.toBeInTheDocument();
+  });
+
+  it("hides the CHAT button and the chat panel while 'live-chat' is off", async () => {
+    stubFetch();
+    setPlugins({ ...ALL_PLUGINS_ON, "live-chat": false });
+    renderPopup();
+    await waitFor(() => expect(screen.getByText("Channel VOD explore")).toBeInTheDocument());
+    expect(screen.queryByTitle("Open preview chat panel")).not.toBeInTheDocument();
+    expect(document.querySelector("[data-preview-chat-panel]")).toBeNull();
+  });
+
+  it("shows the CHAT button and mounts the chat panel while 'live-chat' is on", async () => {
+    stubFetch();
+    setPlugins({ ...ALL_PLUGINS_ON });
+    renderPopup();
+    await waitFor(() => expect(screen.getByText("Channel VOD explore")).toBeInTheDocument());
+    expect(screen.getByTitle("Open preview chat panel")).toBeInTheDocument();
+    expect(document.querySelector("[data-preview-chat-panel]")).toBeTruthy();
   });
 });

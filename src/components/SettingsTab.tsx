@@ -16,7 +16,7 @@ import { resetAll as resetFirstTimeFlags } from '../lib/firstTime';
 import { useI18n, type Lang } from '../i18n';
 import type { AppSettings, UpdateInfo } from '../types';
 import { previewDownloadTree, type DownloadLayout } from '../downloadLayout';
-import { setPluginEnabled, usePlugins } from '../lib/plugins';
+import { PluginGate, setPluginEnabled, usePlugins } from '../lib/plugins';
 type Props = {
   settings: AppSettings;
   setSettings: Dispatch<SetStateAction<AppSettings>>;
@@ -400,19 +400,25 @@ export default function SettingsTab({
         />
       </SettingsCard>
 
-      {/* ── Transcription ───────────────────────────────────────── */}
-      <SettingsCard
-        icon={Mic}
-        title={t('Transcription')}
-        open={!!openCards.transcription}
-        onToggle={() => toggleCard('transcription')}
-      >
-        <TranscriptionSection
-          settings={settings}
-          setSettings={setSettings}
-          onSaved={(s) => setSavedSig(settingsSignature(s))}
-        />
-      </SettingsCard>
+      {/* ── Transcription ─────────────────────────────────────────
+          Plugin 'transcribe' (backend/services/plugin_registry.py). Off by
+          default, so the card must LEAVE the screen rather than sit there as
+          a dead switch — the owner's "plugin desligado = a coisa some da
+          tela" rule. Turn it back on in the Plugins card below. */}
+      <PluginGate id="transcribe">
+        <SettingsCard
+          icon={Mic}
+          title={t('Transcription')}
+          open={!!openCards.transcription}
+          onToggle={() => toggleCard('transcription')}
+        >
+          <TranscriptionSection
+            settings={settings}
+            setSettings={setSettings}
+            onSaved={(s) => setSavedSig(settingsSignature(s))}
+          />
+        </SettingsCard>
+      </PluginGate>
 
       {/* ── Disk & Storage ──────────────────────────────────────── */}
       <SettingsCard
@@ -443,48 +449,52 @@ export default function SettingsTab({
       {/* ── Cookie Bridge (detected → above Save) ── */}
       {needsCookieSetup ? null : cookieCard}
 
-      {/* ── Experimental ──────────────────────────────────────── */}
-      <SettingsCard
-        icon={Sparkles}
-        title={t('Experimental')}
-        open={!!openCards.experimental}
-        onToggle={() => toggleCard('experimental')}
-      >
-        <Toggle
-          label={t('Experimental: AI search & answers')}
-          info={t('Ask questions about archived channels. Answers come only from the local archive (chat + transcripts) using your own OpenAI-compatible API key.')}
-          checked={settings.experimental_ai_enabled === true}
-          onChange={(c) => setSettings({ ...settings, experimental_ai_enabled: c })}
-          ariaLabel="experimental ai enabled"
-        />
-        <div className="flex flex-col gap-1.5">
-          <FieldCaption noWrap>{t('AI API key (OpenAI-compatible)')}</FieldCaption>
-          <input
-            type="password"
-            value={aiKey}
-            onChange={(e) => { setAiKey(e.target.value); setAiKeyDirty(true); }}
-            placeholder={settings.ai_api_key_set ? '••••••••' : ''}
-            autoComplete="off"
-            aria-label="ai api key"
-            className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-xs focus:outline-none focus:border-white"
+      {/* ── Experimental ────────────────────────────────────────
+          Plugin 'ai-ask' (the AI search & answers feature is the whole card).
+          Off by default → the card leaves the screen, like Transcription. */}
+      <PluginGate id="ai-ask">
+        <SettingsCard
+          icon={Sparkles}
+          title={t('Experimental')}
+          open={!!openCards.experimental}
+          onToggle={() => toggleCard('experimental')}
+        >
+          <Toggle
+            label={t('Experimental: AI search & answers')}
+            info={t('Ask questions about archived channels. Answers come only from the local archive (chat + transcripts) using your own OpenAI-compatible API key.')}
+            checked={settings.experimental_ai_enabled === true}
+            onChange={(c) => setSettings({ ...settings, experimental_ai_enabled: c })}
+            ariaLabel="experimental ai enabled"
           />
-          {settings.ai_api_key_set ? (
-            <span className="text-[10px] font-mono text-zinc-500">
-              {t('A key is set — the stored key is never shown. Type a new key to replace it, or clear the field and save to remove it.')}
+          <div className="flex flex-col gap-1.5">
+            <FieldCaption noWrap>{t('AI API key (OpenAI-compatible)')}</FieldCaption>
+            <input
+              type="password"
+              value={aiKey}
+              onChange={(e) => { setAiKey(e.target.value); setAiKeyDirty(true); }}
+              placeholder={settings.ai_api_key_set ? '••••••••' : ''}
+              autoComplete="off"
+              aria-label="ai api key"
+              className="w-full bg-zinc-950 border-2 border-zinc-800 text-white font-mono py-2 px-2.5 text-xs focus:outline-none focus:border-white"
+            />
+            {settings.ai_api_key_set ? (
+              <span className="text-[10px] font-mono text-zinc-500">
+                {t('A key is set — the stored key is never shown. Type a new key to replace it, or clear the field and save to remove it.')}
+              </span>
+            ) : null}
+          </div>
+          {settings.experimental_ai_enabled === true && !settings.ai_api_key_set && !aiKey.trim() ? (
+            <span className="text-[11px] font-mono text-red-400" role="alert">
+              {t('Add an AI API key first — the feature cannot run without one.')}
             </span>
           ) : null}
-        </div>
-        {settings.experimental_ai_enabled === true && !settings.ai_api_key_set && !aiKey.trim() ? (
-          <span className="text-[11px] font-mono text-red-400" role="alert">
-            {t('Add an AI API key first — the feature cannot run without one.')}
-          </span>
-        ) : null}
-        {aiKeyError ? (
-          <span className="text-[11px] font-mono text-red-400" role="alert">
-            {aiKeyError}
-          </span>
-        ) : null}
-      </SettingsCard>
+          {aiKeyError ? (
+            <span className="text-[11px] font-mono text-red-400" role="alert">
+              {aiKeyError}
+            </span>
+          ) : null}
+        </SettingsCard>
+      </PluginGate>
 
       <SettingsCard
         icon={Puzzle}

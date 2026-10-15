@@ -30,6 +30,7 @@ import Hls from 'hls.js';
 import { Loader2, Pause, Play, RefreshCw, Volume2, VolumeX, X } from 'lucide-react';
 import { apiDelete, apiGet, apiPost } from '../hooks/useApiClient';
 import { useI18n } from '../i18n';
+import { usePlugin } from '../lib/plugins';
 import {
   TWITCH_CLIP_MAX_SEC,
   TWITCH_CLIP_MIN_SEC,
@@ -147,7 +148,21 @@ interface TwitchClipPopupProps {
   }) => void;
 }
 
-export default function TwitchClipPopup({
+/**
+ * Plugin gate for `twitch-clip`.
+ *
+ * A DISABLED plugin removes the mini-preview from the screen — and, because
+ * the body is a separate component, UNMOUNTS it: no preview session POST, no
+ * hls.js instance, no timers. The wrapper's hook count never changes, so
+ * switching the plugin back on mounts a fresh body instead of growing the
+ * hook list of an existing render.
+ */
+export default function TwitchClipPopup(props: TwitchClipPopupProps) {
+  if (!usePlugin('twitch-clip')) return null;
+  return <TwitchClipPopupBody {...props} />;
+}
+
+function TwitchClipPopupBody({
   url,
   broadcasterLogin,
   vodId,

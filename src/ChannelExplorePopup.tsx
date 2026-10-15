@@ -9,6 +9,7 @@ import { apiGet, apiPost, apiDelete } from './hooks/useApiClient';
 import { archiveVideoIdFromUrl } from './archiveScope';
 import TwitchClipPopup from './components/TwitchClipPopup';
 import { useI18n } from './i18n';
+import { usePlugin } from './lib/plugins';
 import TwitchLogoIcon from './components/TwitchLogoIcon';
 import ArchiveSearchPopup from './components/ArchiveSearchPopup';
 import PreviewChatPanel, { readPreviewChatPanelWidth } from './components/PreviewChatPanel';
@@ -167,7 +168,7 @@ function shouldIgnorePlayerKeyEvent(e: KeyboardEvent): boolean {
   return false;
 }
 
-export default function ChannelExplorePopup({
+function ChannelExplorePopupInner({
   id,
   vod,
   zIndex,
@@ -1769,6 +1770,17 @@ export default function ChannelExplorePopup({
 
   const fsCtrlBtn = platformPreviewCtrlBtn(platform, true);
 
+  // Plugin gates — src/lib/plugins.tsx mirrors backend/services/plugin_registry.py.
+  // A plugin that is OFF takes its surface out of THIS window entirely: the
+  // owner's rule is that the thing disappears from the screen, not that it
+  // leaves a dead control behind. 'channel-explore' gates the whole window
+  // and is read by the default-export wrapper at the bottom of this file.
+  // Declared BEFORE timelineUi: that value is built eagerly during render,
+  // so reading a plugin flag after it would be a use-before-declaration.
+  const clipEditorOn = usePlugin('clip-editor');
+  const aiAskOn = usePlugin('ai-ask');
+  const liveChatOn = usePlugin('live-chat');
+
   const timelineUi = (
     <>
     <div className="flex items-center gap-1.5 w-full shrink-0 flex-wrap">
@@ -1792,6 +1804,7 @@ export default function ChannelExplorePopup({
     {/* The in-preview MINI EDITOR: pick a range, then clip it to Twitch or cut
         and download it without leaving this window. Rendered inside timelineUi
         so it appears in BOTH the normal and the fullscreen preview. */}
+    {clipEditorOn && (
     <PreviewMiniEditor
       url={vod.url}
       title={vod.title}
@@ -1810,6 +1823,7 @@ export default function ChannelExplorePopup({
       includeTranscript={transcriptSidecar}
       fullscreen={fullscreen}
     />
+    )}
     </>
   );
 
@@ -2080,6 +2094,7 @@ export default function ChannelExplorePopup({
                   {t('Search this video')}
                 </button>
               )}
+              {liveChatOn && (
               <button
                 type="button"
                 onClick={() => setChatOpen((o) => !o)}
@@ -2094,6 +2109,7 @@ export default function ChannelExplorePopup({
                 <MessageSquare size={10} className="shrink-0" />
                 {chatOpen ? t('Close chat') : t('Chat')}
               </button>
+              )}
               <button
                 type="button"
                 onClick={() => onClose()}
@@ -2106,7 +2122,7 @@ export default function ChannelExplorePopup({
             </div>
           </div>
         )}
-        {!fullscreen && aiEnabled && vod.channel ? (
+        {!fullscreen && aiEnabled && vod.channel && aiAskOn ? (
           <div className="shrink-0 border-2 border-zinc-800 bg-zinc-950/60">
             <button
               type="button"
@@ -2430,7 +2446,7 @@ export default function ChannelExplorePopup({
           </>
         )}
           </div>
-          {!fullscreen && (
+          {!fullscreen && liveChatOn && (
             <PreviewChatPanel
               platform={platform}
               videoId={vod.videoId ?? null}
@@ -2536,4 +2552,19 @@ export default function ChannelExplorePopup({
       )}
     </div>
   );
+}
+
+/**
+ * Plugin gate for the whole window: 'Explorar canais' OFF → nothing mounts
+ * at all — no player, no preview session, no fetches. The inner component
+ * keeps every hook it already had; only the default export wraps it, so the
+ * hook order inside is untouched.
+ *
+ * RED ARM: make this return the inner component unconditionally and
+ * "does not open at all while 'channel-explore' is off" in
+ * ChannelExplorePopup.test.tsx fails.
+ */
+export default function ChannelExplorePopup(props: ChannelExplorePopupProps) {
+  const channelExploreOn = usePlugin('channel-explore');
+  return channelExploreOn ? <ChannelExplorePopupInner {...props} /> : null;
 }

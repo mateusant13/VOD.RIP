@@ -49,6 +49,7 @@ import {
   type LivePanelAspectClamp,
 } from '../livePlayerLevels';
 import LiveChatPanel, { LIVE_CHAT_PANEL_W } from './LiveChatPanel';
+import { usePlugin } from '../lib/plugins';
 import TwitchLogoIcon from './TwitchLogoIcon';
 import TwitchClipPopup from './TwitchClipPopup';
 import { previewRetryAfterError, previewDeadlineVerdict, type PreviewRetryState } from '../previewRetry';
@@ -284,8 +285,31 @@ export function __resetLivePlayerRegistryForTests(): void {
   liveQualityCount = 0;
 }
 
-export function LivePlayerPopup({ entry, entries, channelName, onClose, channelSlug, channel, vodUrl, onOpenHit, onNotFoundChannel, savedChannels, cascadeIndex = 0, zIndex, onBringToFront, liveSessionPrefetchRef, popupId, frameMode = false, frameSnapRect = null, onUnsnap }: LivePlayerPopupProps) {
+/**
+ * Plugin gate for `live-preview`.
+ *
+ * A DISABLED plugin removes the player from the screen — it does not leave a
+ * dead surface behind. Returning null from the WRAPPER (never from inside the
+ * body) is what makes that real: the body is a separate component, so while
+ * the plugin is off it is UNMOUNTED and none of its effects run — no HLS
+ * session POST, no caption SSE, no chat EventSource, no live-quality registry
+ * slot. Splitting it also keeps the hook order legal: the wrapper always calls
+ * exactly one hook, so switching the plugin back on mounts a fresh body
+ * instead of adding hooks to an existing render.
+ */
+export function LivePlayerPopup(props: LivePlayerPopupProps) {
+  if (!usePlugin('live-preview')) return null;
+  return <LivePlayerPopupBody {...props} />;
+}
+
+function LivePlayerPopupBody({ entry, entries, channelName, onClose, channelSlug, channel, vodUrl, onOpenHit, onNotFoundChannel, savedChannels, cascadeIndex = 0, zIndex, onBringToFront, liveSessionPrefetchRef, popupId, frameMode = false, frameSnapRect = null, onUnsnap }: LivePlayerPopupProps) {
   const { t } = useI18n();
+  // Plugin gates for the two surfaces INSIDE the player. Each one removes its
+  // control from the screen when its plugin is off (the owner's "plugin
+  // desligado = a coisa some da tela", never a greyed-out button). Declared
+  // here, next to the other state, so they stay unconditional hooks.
+  const liveChatOn = usePlugin('live-chat');
+  const liveSubtitlesOn = usePlugin('live-subtitles');
   const videoRef = useRef<HTMLVideoElement>(null);
   const popupRef = useRef<HTMLDivElement>(null);
   const railRef = useRef<HTMLInputElement>(null);
@@ -2488,21 +2512,25 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
               {searchOpen ? t('CLOSE SEARCH') : t('SEARCH ARCHIVE')}
             </button>
           )}
-          {/* Live chat dock toggle — same chrome language as SEARCH ARCHIVE. */}
-          <button
-            type="button"
-            onClick={toggleChat}
-            aria-pressed={chatOpen}
-            className={`live-popup-chat flex items-center gap-1 border-2 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
-              chatOpen
-                ? 'bg-white text-black border-white'
-                : 'border-zinc-700 bg-zinc-800/60 text-zinc-300 hover:border-white hover:text-white'
-            }`}
-            title={chatOpen ? t('Close live chat') : t('Live chat')}
-          >
-            <MessageSquare size={10} className="shrink-0" />
-            {chatOpen ? t('Close live chat') : t('Live chat')}
-          </button>
+          {/* Live chat dock toggle — same chrome language as SEARCH ARCHIVE.
+              live-chat OFF removes this button AND the docked panel it opens
+              (the panel below carries the same gate). */}
+          {liveChatOn && (
+            <button
+              type="button"
+              onClick={toggleChat}
+              aria-pressed={chatOpen}
+              className={`live-popup-chat flex items-center gap-1 border-2 px-1.5 py-0.5 text-[8px] font-mono uppercase tracking-widest font-bold transition-colors ${
+                chatOpen
+                  ? 'bg-white text-black border-white'
+                  : 'border-zinc-700 bg-zinc-800/60 text-zinc-300 hover:border-white hover:text-white'
+              }`}
+              title={chatOpen ? t('Close live chat') : t('Live chat')}
+            >
+              <MessageSquare size={10} className="shrink-0" />
+              {chatOpen ? t('Close live chat') : t('Live chat')}
+            </button>
+          )}
           <button
             className="live-popup-close text-zinc-500 hover:text-white p-1 shrink-0"
             onClick={handleClose}
@@ -2903,7 +2931,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
         {/* Live captions overlay — draggable inside the video area. The
             entire overlay is pointer-events-auto for drag; the text
             stopPropagation prevents stealing video click-to-pause. */}
-        {captionsHeard && captionsEnabled && caption && !error && (
+        {liveSubtitlesOn && captionsHeard && captionsEnabled && caption && !error && (
           <div
             data-live-captions-overlay
             className="pointer-events-auto absolute inset-x-0 bottom-16 z-[5] flex justify-center px-4 select-none"
@@ -2952,7 +2980,7 @@ export function LivePlayerPopup({ entry, entries, channelName, onClose, channelS
       {/* Docked live chat — always mounted when chat sources exist (preloads
           EventSource + /api/chat/history on live open); visually hidden
           when chatOpen is false so the EventSource starts immediately. */}
-      {!isFullscreen && chatSources.length > 0 && (
+      {liveChatOn && !isFullscreen && chatSources.length > 0 && (
         <div
           className={chatOpen ? 'flex min-h-0 overflow-hidden shrink-0' : 'hidden w-0 overflow-hidden'}
           style={chatOpen ? { width: LIVE_CHAT_PANEL_W, minHeight: 0, overflow: 'hidden' } : { position: 'absolute', height: 0, width: 0, overflow: 'hidden' }}

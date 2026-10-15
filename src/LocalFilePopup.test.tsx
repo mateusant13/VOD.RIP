@@ -31,7 +31,20 @@ const captureProto = HTMLElement.prototype as unknown as {
   setPointerCapture?: () => void;
   releasePointerCapture?: () => void;
 };
+/**
+ * Plugin store seeding. The local player is gated by usePlugin('local-file'),
+ * which reads the 'vodrip.plugins' localStorage key and falls back to the
+ * catalog's defaultOn (true). Seed it explicitly so a future default change
+ * cannot silently empty this file.
+ */
+const PLUGINS_LS_KEY = 'vodrip.plugins';
+
+function setPlugins(patch: Record<string, boolean>) {
+  localStorage.setItem(PLUGINS_LS_KEY, JSON.stringify(patch));
+}
+
 beforeEach(() => {
+  setPlugins({ 'local-file': true });
   if (!captureProto.setPointerCapture) {
     captureProto.setPointerCapture = () => {};
   }
@@ -111,5 +124,15 @@ describe('LocalFilePopup', () => {
     // Panel slid west by the same 50px — the east edge (left + width) is fixed.
     expect(panel.style.left).toBe('640px'); // 690 + (288 - 338)
     expect(panel.style.top).toBe('520px'); // vertical edge untouched
+  });
+
+  // The gate. Without the usePlugin('local-file') check in LocalFilePopup.tsx
+  // the panel would still mount (video element and all) with the plugin off.
+  it('local-file plugin OFF renders nothing at all', () => {
+    setPlugins({ 'local-file': false });
+    const { container } = renderPopup();
+    expect(container.querySelector('div.fixed')).toBeNull();
+    expect(container.querySelector('video')).toBeNull();
+    expect(document.querySelectorAll('[data-panel-resize]')).toHaveLength(0);
   });
 });
