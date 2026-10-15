@@ -28,11 +28,17 @@ const outputPath = join(root, 'release', 'VOD-RIP-ASR-manifest.json');
 const missing = [!existsSync(runtimeDir) && runtimeDir, !existsSync(archivePath) && archivePath]
   .filter(Boolean);
 if (missing.length) {
-  console.warn(
+  // STDOUT, not stderr, and that is deliberate: this script is invoked from
+  // `shell: pwsh` on GitHub Actions, and whether a native command's stderr is
+  // fatal depends on the caller's ErrorActionPreference and how the runner
+  // inlines the script. A warning about a normal outcome must not depend on
+  // that. v1.0.55 failed this step with the previous console.warn version, so
+  // the channel is part of the contract now and the test pins it.
+  console.log(
     `WARNING: no ASR runtime for ${version} - skipping the manifest, the base still ships.`
   );
-  for (const m of missing) console.warn(`  absent: ${m}`);
-  console.warn(
+  for (const m of missing) console.log(`  absent: ${m}`);
+  console.log(
     "The opt-in ASR runtime must be built before tagging if this release is meant to offer it."
   );
   process.exit(0);

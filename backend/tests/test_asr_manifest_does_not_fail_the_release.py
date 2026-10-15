@@ -50,7 +50,13 @@ def test_missing_runtime_is_a_warning_not_a_failure():
             "an absent ASR runtime must not fail the release; got exit %d\n%s\n%s"
             % (proc.returncode, proc.stdout[-400:], proc.stderr[-400:])
         )
-        assert "skipping the manifest" in (proc.stdout + proc.stderr).lower()
+        # STDOUT, specifically. v1.0.55 exited 0 from this script and the GitHub
+        # Actions step still failed; the one difference from the version that
+        # worked locally is that the message went to stderr. Pinning the channel
+        # is what makes this test able to catch that.
+        assert "skipping the manifest" in proc.stdout.lower(), (
+            "the warning must go to STDOUT; stderr is what the CI step choked on"
+        )
         # and it must NOT invent a manifest for an archive that does not exist
         assert not MANIFEST.exists(), (
             "a manifest describing a missing archive is the corrupt state an"
