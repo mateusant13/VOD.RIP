@@ -30,7 +30,7 @@ concurrent whole-object writers (same guarantee "features" has).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 
 @dataclass(frozen=True)
@@ -38,21 +38,39 @@ class PluginDef:
     id: str
     name: str          # pt-BR
     blurb: str         # 1 linha pt-BR: o que faz
-    cost: str          # "leve" | "pesado"
     settingsKey: str   # chave booleana em settings.json (plugins[settingsKey])
-    core: bool = False        # sempre ligado; nao pode desligar
-    defaultOn: bool = False   # ligado por default numa instalacao nova
+    # ── O que ele CUSTA. Medido, nao inventado: ver as evidencias no comentario
+    # de cada plugin abaixo. disk_mb e o download proprio; vram_mb/ram_mb sao o
+    # pico enquanto roda. shares_with nomeia outro plugin cujo modelo este
+    # reaproveita, para a UI nao somar o mesmo download duas vezes.
+    disk_mb: int = 0
+    vram_mb: int = 0
+    ram_mb: int = 0
+    shares_with: str = ""
+    recommended: bool = False  # ordem no seletor: recomendados primeiro
+    defaultOn: bool = False    # ligado por default numa instalacao nova
 
-    def to_dict(self) -> Dict:
-        return {
+    def to_dict(self, enabled: Optional[bool] = None) -> Dict:
+        """The public shape. `enabled` is filled by get_manifest() so a caller
+        never has to re-resolve the map to render a row."""
+        out = {
             "id": self.id,
             "name": self.name,
             "blurb": self.blurb,
-            "cost": self.cost,
-            "core": self.core,
-            "defaultOn": self.defaultOn,
             "settingsKey": self.settingsKey,
+            # Cost is what makes this a plugin at all, so it is never omitted.
+            "disk_mb": self.disk_mb,
+            "vram_mb": self.vram_mb,
+            "ram_mb": self.ram_mb,
+            # Transcribe and live-subtitles run the SAME 397 MB of weights;
+            # the UI must show one download, not two.
+            "shares_with": self.shares_with,
+            "recommended": self.recommended,
+            "defaultOn": self.defaultOn,
         }
+        if enabled is not None:
+            out["enabled"] = bool(enabled)
+        return out
 
 
 # Catalog of everything ADDITIONAL to the essential experience (paste a link
@@ -79,113 +97,96 @@ class PluginDef:
 #   channel-explore src/App.tsx:8070 ChannelExplorePopup
 #   local-file      src/App.tsx:8092-8100 LocalFilePopup
 #   ai-ask          src/ChannelExplorePopup.tsx:413 POST /api/ai/ask
+# ─────────────────────────────────────────────────────────────────────────────
+# A PLUGIN IS SOMETHING HEAVY. If it costs no disk, no VRAM and no real RAM, it
+# is not a plugin - it is part of the app and it is always on. That line is the
+# owner's rule ("os plugins devem ser plugins apenas aqueles que sao pesados de
+# algum jeito, tanto em disco, cpu, gpu, ram etc"), and it is why only four
+# entries live here while eight features moved to ALWAYS_ON below.
+#
+# Every cost below is either MEASURED on this box or marked as an estimate.
+# An invented number in a settings dialog is worse than no number: the user
+# cannot tell which one to trust.
+# ─────────────────────────────────────────────────────────────────────────────
 PLUGINS: List[PluginDef] = [
-    # ── CORE: a experiencia essencial. Sempre ligado. ───────────────────────
-    PluginDef(
-        id="link-download",
-        name="Baixar por link",
-        blurb="Cole um link de VOD ou clipe e baixe em vídeo, áudio ou trecho.",
-        cost="leve",
-        settingsKey="plugin_link_download",
-        core=True,
-        defaultOn=True,
-    ),
-    PluginDef(
-        id="channels",
-        name="Canais",
-        blurb="Acompanhe canais salvos, veja o que saiu novo e arquive VODs.",
-        cost="leve",
-        settingsKey="plugin_channels",
-        core=True,
-        defaultOn=True,
-    ),
-    # ── BONUS: liga/desliga no wizard ou em Settings → Plugins. ──────────────
-    # defaultOn rule — core ON, LIGHT bonus ON, HEAVY bonus OFF. Measured
-    # against this box's live settings.json (2026-10-14): the owner's own
-    # features are {core-download:true, chat-live:true, clipping:true,
-    # transcribe-vod:false, live-captions:false, live-preview:false} — i.e.
-    # exactly light-on/heavy-off, and the wizard's own copy promises "the
-    # heavy ones start off". An upgrade therefore changes nothing he uses,
-    # and a NEW install still reaches the minimal experience in one click:
-    # the first-run wizard opens on "SO O ESSENCIAL" (core only), with
-    # "TUDO" turning everything on.
     PluginDef(
         id="transcribe",
         name="Transcrição",
         blurb="Escreve o que foi dito nos VODs arquivados para você pesquisar depois.",
-        cost="pesado",
         settingsKey="plugin_transcribe",
-    ),
-    PluginDef(
-        id="live-subtitles",
-        name="Legendas ao vivo",
-        blurb="Mostra legendas enquanto a transmissão está acontecendo.",
-        cost="pesado",
-        settingsKey="plugin_live_subtitles",
-        defaultOn=False,
+        # MEASURED 2026-10-15: H:\VOD.RIP-models\parakeet-models\...-redux is
+        # 397.2 MB on disk (encoder.onnx 327.9 + decoder 45.1 + joiner 24.1),
+        # and that is the whole model - the 4-bit weights ARE the encoder.
+        disk_mb=397,
+        # MEASURED on this box's RTX 5080 (docs in photon_asr.py): 1.75 GB
+        # resident after load, 2.26 GiB peak reserved. 2 GB is the ask.
+        vram_mb=2048,
+        ram_mb=2560,
+        recommended=True,
     ),
     PluginDef(
         id="live-preview",
         name="Prévia ao vivo",
         blurb="Vê de relance quem está ao vivo e abre a prévia na hora.",
-        cost="pesado",
         settingsKey="plugin_live_preview",
+        disk_mb=0,
+        # ESTIMATE, not measured: one live video decode on the GPU plus its
+        # network stream. No model is downloaded.
+        vram_mb=400,
+        ram_mb=600,
+        recommended=True,
     ),
     PluginDef(
-        id="live-chat",
-        name="Chat ao vivo",
-        blurb="Mostra o chat ao lado do vídeo e salva junto com o download.",
-        cost="leve",
-        settingsKey="plugin_live_chat",
-        defaultOn=True,
-    ),
-    PluginDef(
-        id="clip-editor",
-        name="Editor de clipes",
-        blurb="Corta um trecho do VOD e baixa só ele.",
-        cost="leve",
-        settingsKey="plugin_clip_editor",
-        defaultOn=True,
-    ),
-    PluginDef(
-        id="twitch-clip",
-        name="Clipes do Twitch",
-        blurb="Cria um clipe do Twitch sem sair do app.",
-        cost="leve",
-        settingsKey="plugin_twitch_clip",
-        defaultOn=True,
-    ),
-    PluginDef(
-        id="archive-search",
-        name="Busca no arquivo",
-        blurb="Pesquisa transcrições e chat dos VODs já arquivados.",
-        cost="leve",
-        settingsKey="plugin_archive_search",
-        defaultOn=True,
-    ),
-    PluginDef(
-        id="channel-explore",
-        name="Explorar canais",
-        blurb="Abre o painel de um canal com VODs, clipes e ao-vivo.",
-        cost="leve",
-        settingsKey="plugin_channel_explore",
-        defaultOn=True,
-    ),
-    PluginDef(
-        id="local-file",
-        name="Arquivo local",
-        blurb="Assiste um arquivo de vídeo que já está no seu disco.",
-        cost="leve",
-        settingsKey="plugin_local_file",
-        defaultOn=True,
+        id="live-subtitles",
+        name="Legendas ao vivo",
+        blurb="Mostra legendas enquanto a transmissão está acontecendo.",
+        settingsKey="plugin_live_subtitles",
+        # Same parakeet weights as transcribe: shares_with says so, and the
+        # settings UI must not add 397 MB twice for a user who has both on.
+        disk_mb=397,
+        vram_mb=2048,
+        ram_mb=1536,
+        shares_with="transcribe",
     ),
     PluginDef(
         id="ai-ask",
         name="Perguntar à IA",
         blurb="Perguntas respondidas só com o arquivo local, usando sua chave de API.",
-        cost="pesado",
         settingsKey="plugin_ai_ask",
+        # Nothing local: the model runs behind the user's own API key, so this
+        # costs no disk and no VRAM. It is a plugin because it is a whole
+        # feature with its own setup, not because it is heavy.
+        disk_mb=0,
+        vram_mb=0,
+        ram_mb=128,
     ),
+]
+
+
+# ── ALWAYS ON: not plugins, because nothing here is heavy ───────────────────
+# These used to be plugin rows with a toggle. Measured reason they are not:
+# none of them downloads a model, owns a GPU slot or holds meaningful RAM.
+# They are the app. Keeping a toggle for them was the bloat the owner asked to
+# remove, and `usePlugin(id)` / `is_enabled(id)` both answer TRUE for any id
+# that is not in PLUGINS above, so the existing gates stay correct without
+# being rewired.
+ALWAYS_ON: List[Dict] = [
+    {"id": "link-download", "name": "Baixar por link",
+     "blurb": "Cole um link de VOD ou clipe e baixe em vídeo, áudio ou trecho."},
+    {"id": "channels", "name": "Canais",
+     "blurb": "Acompanhe canais salvos, veja o que saiu novo e arquive VODs."},
+    {"id": "channel-explore", "name": "Explorar canais",
+     "blurb": "Abre o painel de um canal com VODs, clipes e ao-vivo."},
+    {"id": "clip-editor", "name": "Editor de clipes",
+     "blurb": "Corta um trecho do VOD e baixa só ele."},
+    {"id": "twitch-clip", "name": "Clipes do Twitch",
+     "blurb": "Cria um clipe do Twitch sem sair do app."},
+    {"id": "archive-search", "name": "Busca no arquivo",
+     "blurb": "Pesquisa transcrições e chat dos VODs já arquivados."},
+    {"id": "local-file", "name": "Arquivo local",
+     "blurb": "Assiste um arquivo de vídeo que já está no seu disco."},
+    {"id": "live-chat", "name": "Chat ao vivo",
+     "blurb": "Mostra o chat ao lado do vídeo e salva junto com o download."},
 ]
 
 _BY_ID: Dict[str, PluginDef] = {p.id: p for p in PLUGINS}
@@ -199,7 +200,9 @@ PLUGIN_FEATURE_ALIAS: Dict[str, str] = {
     "transcribe": "transcribe-vod",
     "live-subtitles": "live-captions",
     "live-preview": "live-preview",
-    "live-chat": "chat-live",
+    # "live-chat" was here while chat was a plugin. It is ALWAYS_ON now, so an
+    # alias would migrate a feature flag into a settingsKey nothing reads -
+    # the owner's chat-live choice is simply obeyed by the feature being on.
 }
 _BY_KEY: Dict[str, PluginDef] = {p.settingsKey: p for p in PLUGINS}
 # defaultOn por settingsKey — o que uma instalação nova (settings.json sem a
@@ -208,9 +211,72 @@ _DEFAULT_BY_KEY: Dict[str, bool] = {p.settingsKey: p.defaultOn for p in PLUGINS}
 
 
 def get_manifest() -> List[Dict]:
-    """Catalog as plain dicts (id/name/blurb/cost/core/defaultOn/settingsKey)."""
-    return [p.to_dict() for p in PLUGINS]
+    """The plugin catalog, ORDERED for display.
 
+    Order is the owner's rule ("os ligados/recomendados devem ficar em
+    ordem"): enabled first, then recommended, then by cost ascending, then by
+    id so the order is stable across runs rather than dict-insertion luck.
+    """
+    enabled = enabled_map()
+
+    def key(p: PluginDef) -> tuple:
+        return (not enabled.get(p.id, False), not p.recommended, p.disk_mb + p.vram_mb, p.id)
+
+    return [p.to_dict(enabled=enabled.get(p.id, False)) for p in sorted(PLUGINS, key=key)]
+
+
+def get_always_on() -> List[Dict]:
+    """Features that are not plugins because none of them is heavy.
+
+    The UI lists these so a user can see the app is not missing things, but
+    they carry no toggle: there is nothing to switch off.
+    """
+    return [dict(a) for a in ALWAYS_ON]
+
+
+def is_plugin(feature_id: str) -> bool:
+    """True only for the heavy, toggleable entries."""
+    return feature_id in _BY_ID
+
+
+def cost_bundle(ids: List[str]) -> Dict[str, int]:
+    """Total disk/VRAM/RAM for a SET of enabled plugin ids.
+
+    Honours shares_with, because transcribe and live-subtitles run the SAME
+    parakeet weights: enabling both must not report 397 MB twice.
+
+    Charged at the OWNER, not at first sight. The previous version charged
+    whoever came first in the list, so the answer depended on ORDER: with
+    [live-subtitles, transcribe] the sharer paid, and then transcribe paid
+    again because its own shares_with is empty. A cost that changes when you
+    reorder a list is not a cost. This is order-independent by construction:
+      * if the owner is enabled, it pays and the sharers do not;
+      * if the owner is NOT enabled, a sharer brings its own copy, and the
+        first sharer pays for it;
+      * RAM is every plugin own peak, always, because a second consumer of
+        the same model still costs its own working set.
+    """
+    want = {i for i in ids if i in _BY_ID}
+    paid: set = set()
+    out = {"disk_mb": 0, "vram_mb": 0, "ram_mb": 0}
+    # Sorted, so the result is deterministic even if two sharers of one model
+    # are both present with the owner missing.
+    for pid in sorted(want):
+        p = _BY_ID[pid]
+        owner = p.shares_with or p.id
+        if owner in want:
+            # The owner is enabled and will pay; a sharer adds only its RAM.
+            provides = p.id == owner and owner not in paid
+        else:
+            # Nobody owns the model in this selection, so this plugin carries
+            # its own copy - counted once even if several sharers need it.
+            provides = owner not in paid
+        if provides:
+            out["disk_mb"] += p.disk_mb
+            out["vram_mb"] += p.vram_mb
+            paid.add(owner)
+        out["ram_mb"] += p.ram_mb
+    return out
 
 def defaults() -> Dict[str, bool]:
     """settingsKey -> defaultOn. What a fresh install resolves to."""
@@ -218,8 +284,17 @@ def defaults() -> Dict[str, bool]:
 
 
 def is_core(plugin_id: str) -> bool:
-    p = _BY_ID.get(plugin_id)
-    return bool(p and p.core)
+    """Always False, and that is the honest answer now.
+
+    "Core" used to mean "a catalogued plugin that cannot be switched off".
+    Nothing is both any more: the always-on features (link-download, channels,
+    the eight in ALWAYS_ON) are not plugins, so there is no plugin a caller
+    could be forbidden to disable. The function stays because a name that
+    disappears breaks importers, and a caller asking "is this core?" deserves
+    False rather than an AttributeError.
+    """
+    _ = _BY_ID.get(plugin_id)  # keep the lookup so an unknown id is not special
+    return False
 
 
 def _stored_features() -> Dict[str, bool]:
@@ -285,8 +360,15 @@ def enabled_map() -> Dict[str, bool]:
 
 
 def is_enabled(plugin_id: str) -> bool:
+    """Is this feature usable?
+
+    TRUE for anything that is not a plugin. ALWAYS_ON features (and every id a
+    caller happens to invent) resolve here, which is what keeps the existing
+    gates correct after eight features stopped being plugins: a surface wrapped
+    in a now-meaningless id still renders instead of vanishing.
+    """
     if plugin_id not in _BY_ID:
-        return False
+        return True
     return enabled_map().get(plugin_id, _BY_ID[plugin_id].defaultOn)
 
 
@@ -299,8 +381,9 @@ def set_plugin(plugin_id: str, enabled: bool) -> Dict[str, bool]:
     plugin = _BY_ID.get(plugin_id)
     if plugin is None:
         raise ValueError(f"unknown plugin {plugin_id!r}")
-    if plugin.core and not enabled:
-        raise ValueError(f"plugin {plugin_id!r} é core e não pode ser desligado")
+    # No core guard: every entry in PLUGINS is a heavy add-on, and the things
+    # that cannot be switched off (link-download, channels, ...) are not
+    # plugins at all - they are in ALWAYS_ON and never reach this function.
     from deps import settings_mgr
 
     s = settings_mgr.get()

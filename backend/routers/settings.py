@@ -499,12 +499,31 @@ async def put_features(body: dict):
     return {"features": updated, "manifest": get_manifest()}
 
 def _plugins_payload() -> dict:
-    """GET/POST /api/plugins response shape — the contract the UI codes against."""
-    from services.plugin_registry import enabled_map, get_manifest
+    """GET/POST /api/plugins response shape — the contract the UI codes against.
+
+    Three lists, because the model changed on 2026-10-15:
+      * ``plugins`` - the HEAVY, toggleable ones, ordered for display
+        (enabled first, then recommended, then cheapest). Each carries its
+        disk_mb / vram_mb / ram_mb so the UI never has to hardcode a cost.
+      * ``alwaysOn`` - features that are not plugins because nothing about them
+        is heavy. No toggle: there is nothing to switch off.
+      * ``totals`` - what the CURRENT selection costs, honouring the model
+        transcribe and live-subtitles share, so 397 MB is not counted twice.
+    """
+    from services.plugin_registry import (
+        cost_bundle,
+        enabled_map,
+        get_always_on,
+        get_manifest,
+    )
 
     enabled = enabled_map()
+    plugin_rows = get_manifest()
+    on_ids = [d["id"] for d in plugin_rows if d.get("enabled")]
     return {
-        "plugins": [{**d, "enabled": bool(enabled.get(d["id"], False))} for d in get_manifest()],
+        "plugins": plugin_rows,
+        "alwaysOn": get_always_on(),
+        "totals": cost_bundle(on_ids),
         "enabled": [pid for pid, on in enabled.items() if on],
     }
 
