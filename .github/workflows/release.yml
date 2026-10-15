@@ -31,8 +31,19 @@ jobs:
           pip install -r backend/requirements.txt
           pip install pytest pytest-asyncio
           npm ci
+      # Self-diagnosing on purpose. This step has failed on every one of the 40
+      # runs the GitHub API returned - zero successes - while the SAME command
+      # passes locally (exit 0, 177/177 packages, 10848 files). The job log
+      # needs auth to read, so the failure has been opaque; --json prints the
+      # exact missing package, the .bin state and the file count, which is what
+      # makes the next red run diagnosable instead of mysterious.
       - name: Verify node_modules is complete
-        run: npm run verify:install
+        run: |
+          npm run verify:install || {
+            echo "::error::node_modules incomplete - diagnosis follows"
+            node scripts/check-node-install.mjs --json
+            exit 1
+          }
       - name: Type-check frontend
         # `npm run typecheck` runs the guard first and then the LOCAL tsc shim.
         # Do NOT use `npx tsc` here: with node_modules/.bin missing, npx fetches
