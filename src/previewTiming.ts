@@ -34,16 +34,72 @@ type TimingPayload = {
  * Injectable so the module own tests stay synchronous: they assert what a
  * click emitted, in the same tick, and install an immediate lane.
  */
+/**
+ * Telemetry: ONE coalesced POST per flush, through a FIFO lane.
+ *
+ * Measured 2026-10-15, three generations of the same defect:
+ *
+ *  gen 1 - emitTiming called apiPost directly ("fire-and-forget"). The
+ *    slowest request in the click path was POST /api/preview/timing in 3 of 6
+ *    reps (4070 / 4093 / 2501 ms), sitting on a socket the hls manifest
+ *    needed. A browser allows ~6 connections per origin, so a best-effort
+ *    log line was competing with playback.
+ *
+ *  gen 2 - the same POSTs routed through a lane of ceiling 1. The requests
+ *    stopped contending (gone from the slowest list) but the VOLUME was still
+ *    there: 26 posts in 6 reps, 4-6 per click, 3.1-8.0 s of total duration.
+ *    A queue that serialises the problem is not a fix for it.
+ *
+ *  gen 3 (this) - buffer the events and flush ONE POST. markOpen, mark,
+ *    markFirstPlayable, markFailed, markSeekStart and markSeekPlayable all
+ *    append to one array; a microtask flush sends them together. The backend
+ *    already accepts a single event, and the log keeps every field because
+ *    the payload carries the events array.
+ *
+ * A click that produces six log lines now spends one socket once.
+ */
 let _timingLane: ConcurrencyLane = createConcurrencyLane(1);
+let _pending: TimingPayload[] = [];
+let _flushScheduled = false;
 
 export function __setTimingLaneForTests(lane: ConcurrencyLane): void {
   _timingLane = lane;
 }
 
+/** Drop anything buffered (tests call this to isolate a case). */
+/** Tests await this so a coalesced flush has actually been sent. */
+export async function __flushTimingForTests(): Promise<void> {
+  _flushScheduled = false;
+  const batch = _pending;
+  _pending = [];
+  if (!batch.length) return;
+  await _timingLane.run(() => apiPost<{ ok: boolean; accepted?: number }>(
+    '/api/preview/timing',
+    batch.length === 1 ? batch[0] : { events: batch },
+  ));
+}
+
+export function __resetTimingBufferForTests(): void {
+  _pending = [];
+  _flushScheduled = false;
+}
+
 function emitTiming(payload: TimingPayload): void {
-  // void: the click path never waits for the upload.
-  void _timingLane.run(() => apiPost<{ ok: boolean }>('/api/preview/timing', payload))
-    .catch(() => {});
+  _pending.push(payload);
+  if (_flushScheduled) return;
+  _flushScheduled = true;
+  // void: the click path never waits for the upload. A microtask so several
+  // marks in the same tick coalesce into ONE post.
+  void Promise.resolve().then(() => {
+    _flushScheduled = false;
+    const batch = _pending;
+    _pending = [];
+    if (!batch.length) return;
+    void _timingLane.run(() => apiPost<{ ok: boolean; accepted?: number }>(
+      '/api/preview/timing',
+      batch.length === 1 ? batch[0] : { events: batch },
+    )).catch(() => {});
+  });
 }
 
 /** Gesture start (pointerdown/click) captured before React mount so the

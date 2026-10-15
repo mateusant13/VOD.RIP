@@ -413,7 +413,24 @@ async def preview_warm_batch(req: PreviewBatchWarmRequest):
 
 @router.post("/api/preview/timing")
 async def preview_timing_event(req: PreviewTimingRequest):
-    """Client milestones — logged to dev console (npm run dev / uvicorn)."""
+    """Client milestones — logged to dev console (npm run dev / uvicorn).
+
+    Accepts either one flat event (an older client, and the shape the tests
+    pin) or a coalesced batch under `events` (what the client sends now, so a
+    click costs one socket instead of 4-6).
+    """
+    if req.events:
+        for ev in req.events:
+            log_preview_timing(
+                platform=ev.platform,
+                surface=ev.surface or "main",
+                event=ev.event or "unknown",
+                open_ms=ev.open_ms if ev.open_ms > 0 else None,
+                seek_ms=ev.seek_ms if ev.seek_ms > 0 else None,
+                session_id=ev.session_id,
+                detail=ev.detail,
+            )
+        return {"ok": True, "accepted": len(req.events)}
     log_preview_timing(
         platform=req.platform,
         surface=req.surface or "main",

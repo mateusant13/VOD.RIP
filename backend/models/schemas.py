@@ -378,7 +378,9 @@ class PreviewSeekRequest(BaseModel):
     position_sec: float = 0.0
 
 
-class PreviewTimingRequest(BaseModel):
+class PreviewTimingEvent(BaseModel):
+    """One client milestone. Kept flat so the log lines stay greppable."""
+
     platform: str = ""
     surface: str = "main"
     event: str = ""
@@ -386,6 +388,15 @@ class PreviewTimingRequest(BaseModel):
     open_ms: float = 0.0
     seek_ms: float = 0.0
     detail: str = ""
+
+
+class PreviewTimingRequest(PreviewTimingEvent):
+    # The client COALESCES its milestones into ONE post per flush instead of
+    # spending the browser's ~6 per-origin connections on 4-6 posts per click
+    # (measured 2026-10-15: 26 posts over 6 reps, 3.1-8.0s of duration, which
+    # is what stalled the click they were reporting on). A single event keeps
+    # its flat shape on the wire, so an old client still works unchanged.
+    events: List[PreviewTimingEvent] = Field(default_factory=list)
 
 
 

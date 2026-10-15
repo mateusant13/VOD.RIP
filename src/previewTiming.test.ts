@@ -22,10 +22,22 @@ vi.mock('./hooks/useApiClient', () => ({
 }));
 
 import { PreviewTiming, notePreviewGesture } from './previewTiming';
-import { __setTimingLaneForTests } from './previewTiming';
+import { __flushTimingForTests, __resetTimingBufferForTests, __setTimingLaneForTests } from './previewTiming';
 
 type Emitted = { event: string; detail?: string; open_ms?: number };
-const events = (): Emitted[] => apiPost.mock.calls.map((c) => c[1] as Emitted);
+/** Flatten what apiPost actually received.
+ *
+ * The client COALESCES its milestones: one click now sends either a single
+ * flat event or a batch `{ events: [...] }`, so a click costs one socket
+ * instead of 4-6 (measured: 26 posts over 6 reps, 3.1-8.0s of duration,
+ * all of it on the click path). These tests assert on the events a click
+ * EMITTED, which is the same accounting either way.
+ */
+const events = (): Emitted[] =>
+  apiPost.mock.calls.flatMap((c) => {
+    const body = c[1] as Emitted & { events?: Emitted[] };
+    return Array.isArray(body?.events) ? body.events : [body];
+  });
 const detailOf = (name: string): string => events().find((e) => e.event === name)?.detail ?? '';
 
 let now = 1000;
@@ -56,11 +68,12 @@ beforeEach(() => {
 });
 
 describe('preview timing honesty', () => {
-  it('never labels open→playable as click→playable when no gesture was captured', () => {
+  it('never labels open→playable as click→playable when no gesture was captured', async () => {
     const t = new PreviewTiming('youtube', 'main');
     t.markOpen('https://example/watch');
     now += 500;
     t.markFirstPlayable();
+    await __flushTimingForTests();
 
     const d = detailOf('full_path');
     expect(d).toContain('open→playable=500');
@@ -69,13 +82,14 @@ describe('preview timing honesty', () => {
     expect(d).toContain('click→open=unknown');
   });
 
-  it('includes the click segment when a gesture was captured', () => {
+  it('includes the click segment when a gesture was captured', async () => {
     notePreviewGesture(); // the click, at t=1000
     now = 1030;
     const t = new PreviewTiming('youtube', 'main');
     t.markOpen('https://example/watch');
     now = 2530;
     t.markFirstPlayable();
+    await __flushTimingForTests();
 
     const d = detailOf('full_path');
     expect(d).toContain('click→open=30');
@@ -84,13 +98,14 @@ describe('preview timing honesty', () => {
     expect(events().find((e) => e.event === 'full_path')?.open_ms).toBe(1530);
   });
 
-  it('emits a terminal event when the click never reached a playable frame', () => {
+  it('emits a terminal event when the click never reached a playable frame', async () => {
     notePreviewGesture();
     now = 1000;
     const t = new PreviewTiming('youtube', 'explore');
     t.markOpen('https://example/watch');
     now = 27000;
     t.markFailed('session: This video is unavailable.');
+    await __flushTimingForTests();
 
     const e = events().find((x) => x.event === 'preview_failed');
     expect(e).toBeDefined();
@@ -98,15 +113,17 @@ describe('preview timing honesty', () => {
     expect(e!.detail).toContain('reason=session: This video is unavailable.');
   });
 
-  it('does not call a post-playable stall a failed click', () => {
+  it('does not call a post-playable stall a failed click', async () => {
     const t = new PreviewTiming('youtube', 'main');
     t.markOpen('https://example/watch');
     t.markFirstPlayable();
+    await __flushTimingForTests();
     t.markFailed('playback');
+    await __flushTimingForTests();
     expect(events().some((e) => e.event === 'preview_failed')).toBe(false);
   });
 
-  it('tells a retry of the same open from a new click', () => {
+  it('tells a retry of the same open from a new click', async () => {
     const t = new PreviewTiming('youtube', 'explore');
     expect(t.isRetryOf('https://example/watch')).toBe(false);
     t.markOpen('https://example/watch');
@@ -114,7 +131,7 @@ describe('preview timing honesty', () => {
     expect(t.isRetryOf('https://example/other')).toBe(false);
   });
 
-  it('keeps the original click origin across a retry', () => {
+  it('keeps the original click origin across a retry', async () => {
     notePreviewGesture(); // click at t=1000
     now = 1100;
     const t = new PreviewTiming('youtube', 'explore');
@@ -125,6 +142,7 @@ describe('preview timing honesty', () => {
     expect(reused).toBe(t);
     now = 14100;
     reused.markFirstPlayable();
+    await __flushTimingForTests();
     expect(detailOf('full_path')).toContain('click→playable=13100ms');
   });
 });
