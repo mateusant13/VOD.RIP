@@ -230,14 +230,34 @@ jobs:
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
             /DAppVersion=$ver installer\installer.iss
 
+      # ONLY the files the release actually publishes.
+      #
+      # Measured 2026-10-15 by downloading v1.0.60 and checking every line of
+      # this file against the assets that were really there:
+      #   OK        VOD.RIP-1.0.60-Setup.exe
+      #   OK        VOD.RIP-1.0.60-win-x64.zip
+      #   AUSENTE   VOD-RIP-ASR-1.0.60-win-x64.zip
+      #   AUSENTE   VOD-RIP-ASR-manifest.json
+      # The glob listed the 2.15 GB ASR archive, which cannot be a Release asset
+      # at all, so the published checksum file advertised two artifacts that do
+      # not exist. A checksum for a file nobody can download is the same lie as
+      # a manifest for a missing archive - it just looks more official.
       - name: Write checksums
         shell: pwsh
         run: |
-          $files = Get-ChildItem release -File | Sort-Object Name
+          $files = Get-ChildItem release -File |
+            Where-Object { $_.Name -notlike "VOD-RIP-ASR-*" } |
+            Sort-Object Name
           $lines = $files | ForEach-Object {
             "$(Get-FileHash $_.FullName -Algorithm SHA256 | Select-Object -ExpandProperty Hash)  $($_.Name)"
           }
           $lines | Set-Content release\SHA256SUMS.txt
+          $skipped = Get-ChildItem release -File |
+            Where-Object { $_.Name -like "VOD-RIP-ASR-*" }
+          if ($skipped) {
+            Write-Warning ("not checksummed (too big for a Release asset): " +
+              ($skipped.Name -join ", "))
+          }
 
       - name: Upload Windows release assets
         uses: actions/upload-artifact@v4

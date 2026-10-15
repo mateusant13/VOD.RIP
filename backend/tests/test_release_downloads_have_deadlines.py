@@ -90,3 +90,30 @@ def test_the_release_never_hands_an_oversized_file_to_the_uploader():
     )
     assert "release/VOD.RIP-*-Setup.exe" in code, "the app must be named explicitly"
     assert "release/VOD.RIP-*-win-x64.zip" in code, "the base zip must be named"
+
+def test_the_checksum_file_only_advertises_what_is_published():
+    """A checksum for a file nobody can download is still a lie.
+
+    Measured 2026-10-15 by downloading v1.0.60 from the public release and
+    checking every line of SHA256SUMS.txt against the assets that were really
+    there:
+
+      OK        VOD.RIP-1.0.60-Setup.exe
+      OK        VOD.RIP-1.0.60-win-x64.zip
+      AUSENTE   VOD-RIP-ASR-1.0.60-win-x64.zip
+      AUSENTE   VOD-RIP-ASR-manifest.json
+
+    The two OK lines are the release proving itself - the artifacts a user
+    downloads hash to what the manifest claims. The two AUSENTE lines are the
+    workflow still describing the 2.15 GB runtime that cannot be a Release
+    asset. Same defect as the manifest I removed by hand, in a file that looks
+    even more official.
+
+    RED ARM: drop the -notlike filter and this fails.
+    """
+    body = _code(_step_body("Write checksums"))
+    assert "VOD-RIP-ASR-*" in body, (
+        "the checksum file must exclude the ASR runtime: it cannot be a Release"
+        " asset, so listing it advertises an artifact that does not exist"
+    )
+    assert "-notlike" in body, "the exclusion must be a filter on the file list"
