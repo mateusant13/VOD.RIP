@@ -229,11 +229,41 @@ Only three of these were documented before this table. The rest are live and und
 | `VODRIP_NO_CUDA_LIBS` | `archive_transcribe.py:1390` | force the CPU path even with a GPU |
 | `VODRIP_WHISPER_DEVICE` | `archive_transcribe.py:368` | pin the ASR device (supersedes auto-detect) |
 | `VODRIP_MAX_DOWNLOAD_BYTES` | `routers/downloads.py:71` | per-download size ceiling |
-| `VODRIP_NO_DAEMONS` | `app.py:128` | `1` = no background daemons (debug) |
+| `VODRIP_NO_DAEMONS` | `app.py:128` | `1` = no background daemons (debug). **NEVER use it to measure latency.** |
 | `VODRIP_TAKE_PORT` | `server_lifecycle.py:456` | take a busy API port instead of failing |
 | `VODRIP_SKIP_PORT_RELEASE` | `run.py:85` | skip the pre-bind port release |
 | `VODRIP_ALLOW_PIP_INSTALL` | `run.py:103` | allow the dev path to shell out to pip |
 
+### `VODRIP_NO_DAEMONS=1` is a MEASUREMENT TRAP (learned 2026-10-15, expensively)
+
+It is documented as "no background daemons (debug)". What it actually does is
+different in kind, and four rounds of diagnosis were built on the difference.
+
+Measured, same frozen build, same box, same harness, ONE variable:
+
+| warm wave | `VODRIP_NO_DAEMONS` | result |
+|---|---|---|
+| on  | **set** | server stops answering; process alive at 600+ MB with NO listener; connections refused |
+| off | **set** | server stable 220 s |
+| on (source) | unset | server stable 190 s; panel 0.02 s |
+| on (frozen) | **unset** | server stable 190 s; panel 0.04-0.17 s |
+
+Six live previews, A/B, 12 reps: **11 of 11 TIMEOUTS with the flag set, 12 of 12
+PLAYED without it.** With it unset and after the cold-load reps, 8 of 8 consecutive
+reps land at <= 2.49 s.
+
+So the flag does not make the app lighter, it makes it a DIFFERENT app: the HTTP
+listener dies under load while the process stays alive. That symptom is
+indistinguishable from a real app defect, and it produced these wrong conclusions
+in commits that are still in the history:
+
+- "the stale install does not boot" (rounds 100-101)
+- "six 20 000-row panel fetches stall every preview" (457a66c, walked back in d600e3b)
+- "the startup warm wave kills the server" (d600e3b, refuted in f43739e)
+
+**The rule: never measure latency, boot time, or server stability with this flag
+set.** Use it only when you deliberately want the daemons out of the way for a
+unit-level check.
 **One knob in the tree is RETIRED and does nothing:** `VODRIP_TRANSCRIBE_GPU_COPIES` is annotated `# DEPRECATED, IGNORED` at `archive_transcribe.py:115` and is read nowhere except the module self-check. Multi-copy ASR was removed; the budget is one shared-model CUDA slot. `todo.md` used to list it as a live dial — `backend/tests/test_env_knob_truthfulness.py` now fails if any doc advertises it as working, or if a live read path is reintroduced.
 
 Naming a knob in a doc is a claim the code must honour. Before documenting one, confirm the read exists; before trusting one, confirm it is not on this retired list.
