@@ -422,26 +422,32 @@ const ChannelRow = memo(function ChannelRow({
 
 // ─── APP ─────────────────────────────────────────────────────────────────────
 
-// Ceilings for the app's BACKGROUND request waves. The browser allows ~6
-// connections per origin, so uncapped background traffic does not merely run
-// in parallel — it queues the interactive path behind it in the browser's
-// connection pool. Measured on this box (2026-10-14): the live-status poll
-// fires 39 '/api/channels/{id}/live' requests in one Promise.all, each taking
-// 0.8-10s, which sustains ~45 fetches in flight and leaves the oldest one
-// still pending 10.8s after it was issued. The preview player then waits for a
-// free socket with an idle main thread. Two per lane leaves the rest of the
-// pool for the click the user actually made.
-const BACKGROUND_LANE_LIMITS = { poll: 2, sync: 2 } as const;
-
-type BackgroundLane = keyof typeof BACKGROUND_LANE_LIMITS;
+// Ceiling on how many live-status requests the poll wave may keep in flight.
+//
+// A browser allows ~6 connections per origin, so an uncapped wave does not
+// merely run in parallel — it queues the interactive path behind it in the
+// connection pool. Measured on this box (2026-10-14, 39 saved channels): the
+// poll fires 39 '/api/channels/{id}/live' requests in one Promise.all, each
+// taking 0.8-10s, sustaining ~40 fetches in flight with the oldest still
+// pending 10.8s after it was issued.
+//
+// Paired A/B, one page and one session, Latin-square rotated, `click ->
+// playable` (tmp/ab-bg-queue.mjs, tmp/ab-run3.txt):
+//   uncapped   median 17.7s  (n=3, 6.7-21.6s)  background in flight at click 36-40
+//   ceiling 3  median  3.4s  (n=3, 3.1-3.5s)   background in flight at click  3-10
+//   ceiling 2  median  2.2s  (n=3, 1.5-2.3s)   background in flight at click  2-3
+// Ceiling 2 beat ceiling 3 in all three cycles, so 2 is the measured value.
+// The same experiment showed NO gain from lowering the incremental sync's own
+// ceiling (3 -> 2, medians 3.0s vs 3.0s), so that limiter is left as it was.
+const LIVE_POLL_MAX_IN_FLIGHT = 2;
 
 // Measurement seam: a paired A/B runs both arms on one page by writing
-// window.__VODRIP_BG_LIMITS__ = { poll, sync } before the Channels tab opens.
-// Absent (production), the ceilings above are used verbatim.
-function backgroundLaneLimit(lane: BackgroundLane): number {
-  const raw = (window as unknown as { __VODRIP_BG_LIMITS__?: Partial<Record<BackgroundLane, unknown>> }).__VODRIP_BG_LIMITS__;
-  const value = raw ? Number(raw[lane]) : NaN;
-  return Number.isFinite(value) && value > 0 ? value : BACKGROUND_LANE_LIMITS[lane];
+// window.__VODRIP_BG_LIMITS__ = { poll } before the Channels tab opens.
+// Absent (production), the ceiling above is used verbatim.
+function livePollMaxInFlight(): number {
+  const raw = (window as unknown as { __VODRIP_BG_LIMITS__?: { poll?: unknown } }).__VODRIP_BG_LIMITS__;
+  const value = raw ? Number(raw.poll) : NaN;
+  return Number.isFinite(value) && value > 0 ? value : LIVE_POLL_MAX_IN_FLIGHT;
 }
 
 
@@ -2286,10 +2292,10 @@ export default function App() {
     let cancelled = false;
     let timeout: number | null = null;
     // Ceiling on how many live-status requests this poll wave may keep in
-    // flight (see BACKGROUND_LANE_LIMITS). Without it a 39-channel grid
+    // flight (see LIVE_POLL_MAX_IN_FLIGHT). Without it a 39-channel grid
     // fires 39 fetches in one Promise.all and queues the preview player's
     // own requests in the browser's connection pool for seconds.
-    const livePollLane: ConcurrencyLane = createConcurrencyLane(backgroundLaneLimit('poll'));
+    const livePollLane: ConcurrencyLane = createConcurrencyLane(livePollMaxInFlight());
     const FAST_POLL_MS = 3_000;
     const SLOW_POLL_MS = 30_000;
     const FAST_POLLS = 6;
@@ -5494,16 +5500,14 @@ export default function App() {
     // ponytail: cap the sync's concurrency (browser limits ~6 connections per
     // host) — firing the whole grid at once saturates the pool and starves
     // the preview player's manifest fetch past hls.js's 10s timeout. The grid
-    // fills in the background; the preview must never wait on it. Same lane
-    // helper as the live poll, so both waves have a measured ceiling.
-    const syncLane: ConcurrencyLane = createConcurrencyLane(backgroundLaneLimit('sync'));
+    // fills in the background; the preview must never wait on it.
     let cursor = 0;
     const runNext = (): void => {
       if (cursor >= tasks.length) return;
       const task = tasks[cursor++];
-      void syncLane.run(task).finally(runNext);
+      void Promise.resolve(task()).finally(runNext);
     };
-    for (let i = 0; i < syncLane.limit; i += 1) runNext();
+    for (let i = 0; i < Math.min(3, tasks.length); i += 1) runNext();
   }, [tab]);
 
   // Warm YouTube preview cache for the top N long-form URLs of every channel
