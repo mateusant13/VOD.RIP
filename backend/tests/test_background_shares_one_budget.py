@@ -36,9 +36,18 @@ def test_the_shared_budget_exists_and_is_bounded():
 
 
 def test_every_lane_acquires_the_shared_gate():
-    """RED: drop the shared acquire from run() and the waves no longer share."""
+    """RED: drop the shared acquire from run() and the waves no longer share.
+
+    The budget is read through _priorityBudget(), not straight from the
+    setting: the preview priority window (0bd6a07) lowers it to 1 while a
+    preview is opening. _priorityBudget() falls back to the seam and then to
+    the default, so pinning the call site alone would pin the wrong thing -
+    this test used to assert the older literal and went stale the moment the
+    window landed. Pin the chain, not one call.
+    """
     text = FILE.read_text(encoding="utf-8")
-    assert "sharedAcquire(_seamShared() ?? _sharedBudget)" in text
+    assert "sharedAcquire(_priorityBudget())" in text
+    assert "previewPriorityActive() ? 1 : (_seamShared() ?? _sharedBudget)" in text
     assert "task().finally(() => { release(); sharedRelease(); })" in text
 
 
