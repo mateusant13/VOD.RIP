@@ -19,6 +19,17 @@ VOD-RIP
 vod-rip.exe
 _internal/
 VOD.RIP.app/
+# Junction points that redirect build output to the H: build root, created by
+# scripts/build-install.ps1: repo\dist -> H:\VOD.RIP-build\_build\dist and
+# repo\build -> H:\VOD.RIP-build\_build\work (PyInstaller --distpath /
+# --workpath, vite outDir). The git-visible paths dist/ and build/ above cover
+# them; this note exists so nobody "fixes" a 0-byte repo/dist by committing
+# through it.
+# Root-level deploy from scripts/deploy-dist.mjs. On Windows this is staged to
+# H:\VOD.RIP-build\_deploy; the in-repo copies would be ~1.2 GB of accident
+# waiting for a 'git add -A'.
+/kick-overlay/
+/scripts/cookie_extension_auto_install.ps1
 assets/icon.iconset/
 nul
 

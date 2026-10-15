@@ -440,6 +440,7 @@ const ChannelRow = memo(function ChannelRow({
 // The same experiment showed NO gain from lowering the incremental sync's own
 // ceiling (3 -> 2, medians 3.0s vs 3.0s), so that limiter is left as it was.
 const LIVE_POLL_MAX_IN_FLIGHT = 2;
+const SYNC_MAX_IN_FLIGHT = 3;
 
 // Measurement seam: a paired A/B runs both arms on one page by writing
 // window.__VODRIP_BG_LIMITS__ = { poll } before the Channels tab opens.
@@ -448,6 +449,14 @@ function livePollMaxInFlight(): number {
   const raw = (window as unknown as { __VODRIP_BG_LIMITS__?: { poll?: unknown } }).__VODRIP_BG_LIMITS__;
   const value = raw ? Number(raw.poll) : NaN;
   return Number.isFinite(value) && value > 0 ? value : LIVE_POLL_MAX_IN_FLIGHT;
+}
+// Same seam for the incremental channel sync (App.tsx ~5500). The A/B that
+// settles whether the sync wave is what stalls the preview runs both arms
+// on one page; absent in production it resolves to SYNC_MAX_IN_FLIGHT.
+function syncMaxInFlight(): number {
+  const raw = (window as unknown as { __VODRIP_BG_LIMITS__?: { sync?: unknown } }).__VODRIP_BG_LIMITS__;
+  const value = raw ? Number(raw.sync) : NaN;
+  return Number.isFinite(value) && value > 0 ? value : SYNC_MAX_IN_FLIGHT;
 }
 
 
@@ -5507,7 +5516,7 @@ export default function App() {
       const task = tasks[cursor++];
       void Promise.resolve(task()).finally(runNext);
     };
-    for (let i = 0; i < Math.min(3, tasks.length); i += 1) runNext();
+    for (let i = 0; i < Math.min(syncMaxInFlight(), tasks.length); i += 1) runNext();
   }, [tab]);
 
   // Warm YouTube preview cache for the top N long-form URLs of every channel
