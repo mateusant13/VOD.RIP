@@ -368,3 +368,41 @@ startup writers have settled.
 3. If confirmed, the fix is not "lower the timeout" — that converts a slow success
    into a fast failure. It is to stop the reader and the writer contending, or to
    serve the master from cache while a write is in flight.
+
+### Narrowed: a FRESH THREAD first read, during the startup write window
+
+`archive_db.py:653-659` documents this exact mode, in the docstring of
+`_ensure_schema_ready`:
+
+    Fast path (no locks): once _schema_ready is True for the current path it is
+    never reset while that path stays active ... Without this, every fresh
+    thread first read serialises behind _lock - and a WAL-busy write holds _lock
+    while sqlite spins busy_timeout (10s) - so even off-loop readers would wedge
+    behind it (the dev-backend wedge).
+
+and `_get_read_conn()` states the mitigation: per-thread READ connections, so
+"concurrent reads never serialize on _lock and a long read never blocks the write
+path".
+
+So the mechanism the code names, and the one the measurement fits, is:
+
+  1. a thread whose FIRST read arrives while `_schema_ready` is not yet True for
+     the current path takes `_lock`;
+  2. a WAL-busy WRITE holds `_lock` while sqlite spins the 10 s `busy_timeout`;
+  3. the read waits the full 10 s, which is what the 10 004 ms samples are.
+
+This fits the shape of the data in a way the earlier version did not: the 10 s
+samples appear ONLY in reps 1-2, early, and never again. Once the schema is ready
+the fast path skips the lock entirely, so steady state cannot wedge this way. The
+cold `session` of 3-16 s is explained by the same first-read cost.
+
+STILL A HYPOTHESIS. It is now a hypothesis with a named code path and a stated
+mechanism, which is a different thing from a measurement. What would settle it:
+
+  * instrument the master handler to log whether it took `_lock`, and how long it
+    waited, versus the work after acquiring the connection;
+  * or log `_schema_ready` and the lock wait at the moment of the slow call.
+
+Either is a small, local change - no rebuild of the bundle needed if measured
+against the source build, which is already known to serve the same endpoint in
+0.02 s once warm.
