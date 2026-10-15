@@ -69,16 +69,26 @@ function filesUnder(dir) {
   return files;
 }
 
-const files = Object.fromEntries(
-  (
-    await Promise.all(
-      filesUnder(runtimeDir).map(async (path) => [
-        relative(runtimeDir, path).replaceAll('\\', '/'),
-        await sha256(path),
-      ])
-    )
-  ).sort(([a], [b]) => a.localeCompare(b)),
-);
+// SEQUENTIAL, one file at a time, and that is not a style choice.
+//
+// The stream fix above let this run on a 2.15 GB archive, and then the
+// Promise.all that collected the hashes opened EVERY file in the runtime at
+// once - the GPU runtime is a torch tree with thousands of files, so the
+// step died with:
+//
+//   [Error: EMFILE: too many open files, open
+//    '...\dist\runtimes\asr\1.0.58\_internal\torchaudio\models\wav2vec2\components.py']
+//
+// A hashing pass over a release artifact is not a hot path. One file at a
+// time costs a few seconds and cannot exhaust descriptors, whatever the
+// runner ulimit is set to. Concurrency here buys nothing and broke a release.
+const files = {};
+const entries = filesUnder(runtimeDir)
+  .map((path) => [relative(runtimeDir, path).replaceAll('\\', '/'), path])
+  .sort(([a], [b]) => a.localeCompare(b));
+for (const [name, path] of entries) {
+  files[name] = await sha256(path);
+}
 const repository = process.env.GITHUB_REPOSITORY || 'mateusant13/VOD.RIP';
 const tag = process.env.GITHUB_REF_NAME || `v${version}`;
 const archiveName = `VOD-RIP-ASR-${version}-win-x64.zip`;

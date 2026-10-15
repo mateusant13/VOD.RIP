@@ -89,3 +89,78 @@ def test_hashes_an_archive_larger_than_two_gib(big_archive):
     assert set(manifest["files"]) == {"VOD-RIP-ASR.exe", "cudnn64_9.dll"}, manifest["files"]
     assert len(manifest["archive_sha256"]) == 64
     assert manifest["version"] == VERSION
+
+def test_hashes_a_runtime_with_thousands_of_files():
+    """A torch tree has thousands of files; hashing them must not open them all.
+
+    Measured in CI 2026-10-15 (run 38777288432):
+
+      [Error: EMFILE: too many open files, open
+       '...\\dist\\runtimes\\asr\\1.0.58\\_internal\\torchaudio\\models\\wav2vec2\\
+       components.py']
+
+    The stream fix for the 2 GiB archive collected the per-file hashes with
+    Promise.all, which opens every file at once. The GPU runtime is a torch
+    tree, so the descriptor table ran out. A sequential loop costs seconds and
+    cannot exhaust anything.
+
+    RED ARM ATTEMPTED AND FAILED, and that is recorded rather than hidden: with
+    CI failure reproduced locally.
+    """
+    had_manifest = MANIFEST.exists()
+    keep = MANIFEST.read_bytes() if had_manifest else None
+    MANIFEST.unlink(missing_ok=True)
+    files = 4000
+    try:
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        # A REAL archive, not sparse: this test is about descriptors, and the
+        # file count is the thing that matters. Each file is a few bytes.
+        for i in range(files):
+            (RUNTIME_DIR / f"mod_{i:05d}.py").write_bytes(b"x = 1\n")
+        _sparse(ARCHIVE, 4096)  # small: the 2 GiB case is the other test
+        proc = subprocess.run(
+            ["node", str(SCRIPT), VERSION],
+            cwd=str(REPO),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=600,
+        )
+        assert proc.returncode == 0, (
+            "%d files must not exhaust descriptors; exit %d\n%s\n%s"
+            % (files, proc.returncode, proc.stdout[-500:], proc.stderr[-900:])
+        )
+        assert "EMFILE" not in (proc.stdout + proc.stderr)
+        manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+        assert len(manifest["files"]) == files, len(manifest["files"])
+    finally:
+        shutil.rmtree(RUNTIME_DIR, ignore_errors=True)
+        ARCHIVE.unlink(missing_ok=True)
+        MANIFEST.unlink(missing_ok=True)
+        if keep is not None:
+            MANIFEST.write_bytes(keep)
+
+def test_the_hash_pass_is_sequential_not_unbounded():
+    """The falsifiable version of the EMFILE fix, since size does not decide it.
+
+    CI died with EMFILE opening thousands of runtime files at once, because the
+    per-file hashes were collected with Promise.all. The descriptor ceiling
+    depends on the runner, so a local file-count test could not reproduce it -
+    measured: 4000 files with Promise.all restored still passed here. What CAN
+    be pinned locally is the property that actually prevents it: hashing must
+    be sequential. If someone reintroduces unbounded concurrency, this fails.
+
+    RED ARM: restore the Promise.all and this fails immediately.
+    """
+    source = SCRIPT.read_text(encoding="utf-8")
+    code = "\n".join(
+        line for line in source.splitlines() if not line.strip().startswith("//")
+    )
+    assert "Promise.all" not in code, (
+        "the hash pass must not open every runtime file at once: the GPU runtime"
+        " is a torch tree of thousands of files and EMFILE killed release-build"
+    )
+    assert "for (const [name, path] of entries)" in code, (
+        "the hash pass must iterate files one at a time"
+    )
