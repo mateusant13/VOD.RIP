@@ -77,30 +77,38 @@ opening CONFIGURACOES -> CANAIS.
 
 HONEST STATE: click -> playable is 5.4-23.0 s in this harness, NOT under 3 s.
 
-## 2026-10-15, round 3 — three hypotheses tested, all three REFUTED
+## 2026-10-15, round 3 — the answer: the main thread, not the network
 
-Every route on the click path is fast and stable when measured directly:
+Client instrumentation added between the click and the first fetch
+(tmp/ab_cli.mjs): a pointerdown/click stamp, a longtask observer, and the gap
+from click to the session fetch actually being issued.
 
-  panel    0.04-0.07 s   (6/6)
-  session  0.13-0.26 s   (6/6)
-  session  0.58-1.33 s   (5/5) THROUGH the vite proxy
+  rep  playable  session  click->fetch issued  longtask total
+  r0     9447     2321        1601 ms             7082 ms
+  r1     5077      437        1397 ms            11641 ms
+  r2    12439     3210        1717 ms            15842 ms
+  r3     8809      955        1430 ms            21495 ms
+  r4     7220     1155        1430 ms            27074 ms
+  r5    11241     1701        1368 ms            31500 ms
 
-And the contention hypotheses do not hold:
+TWO HARD FACTS.
 
-  session with 39 background /live fetches in flight  0.13-0.21 s  (6/6)
-  session with a warm/batch of 4 YouTube URLs running 0.14-0.25 s  (4/4)
+1. The app takes 1.37-1.72 s (median 1430 ms) after the click before it even
+ISSUES the session fetch. No network is involved in that gap - it is pure
+client work between the gesture and the first request. That single segment is
+roughly half of a 3 s budget.
 
-So the 1.3-6.7 s the BROWSER measures for the same session POST is not the
-backend, not the connection queue, and not the warm batch. Three suspected
-causes were measured and refuted in one sitting, which is worth more than
-the guess they replaced: the remaining cost is somewhere between the click
-handler and the first fetch, in the browser.
+2. Long tasks accumulate monotonically (7082 -> 31500 ms across six reps) and
+the page never settles. The background waves network concurrency was capped
+by the lane (5423441), but the work BETWEEN the responses runs on the main
+thread: 39 channels x (vods + clips + streams) merge and re-render.
 
-WHAT THAT MEANS FOR THE NEXT ROUND. Stop measuring the backend - it is
-already fast. The next instrument is a trace of the CLIENT between the click
-and the session fetch: main-thread busy time, React commit, and whether the
-fetch is even issued in the same tick as the click. The one number that
-already points here: in the fast rep the session POST starts at +0ms and
-finishes in 2.8s; in the slow rep it starts at +0ms and takes 6.7s with
-three other preview requests in flight. Same backend, same tick, 2.4x
-difference - so the variable is in the page, not the server.
+This invalidates the standing hypothesis of the whole session. The queue was
+never the problem: every route is fast direct (session 0.13-0.26 s, panel
+0.04-0.07 s), the 39-channel /live wave does not slow it (0.13-0.21 s), the
+warm/batch does not slow it (0.14-0.25 s), and the server own log agrees
+(session_created server_ms 110-219 ms).
+
+THE LEVER for <=3 s is therefore the 1.43 s click-to-fetch, and the cause to
+attack is main-thread work in the click path - not connection pooling, not the
+backend, not the sync ceiling (already measured as not a lever: 2c04df2).
