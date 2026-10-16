@@ -44,6 +44,7 @@ import {
   X,
 } from 'lucide-react';
 import { apiGet, apiPost } from '../hooks/useApiClient';
+import { createConcurrencyLane, type ConcurrencyLane } from '../lib/backgroundBudget';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { t, useI18n } from '../i18n';
 import { activePanelRowIndex } from '../previewPlayerUtils';
@@ -626,6 +627,35 @@ function EmptyState({ text, progress }: { text: string; progress?: number }) {
   );
 }
 
+/** Shared gate for every panel poll across every open preview.
+ *
+ * Measured 2026-10-16 on the frozen app, SIX previews opened at once
+ * (tmp/ab_concurrent.mjs, VODRIP_NO_DAEMONS unset, app healthy):
+ *
+ *   t+0.6s..t+19.5s   videos=6 ready=0 playing=0
+ *   t+44.4s           videos=5 ready=5 playing=1   (47 s, only one plays)
+ *   request log:      20+ panel/twitch/...?limit=2000 issued, still PENDING
+ *                     at capture end; /api/channels/.../live also PENDING.
+ *
+ * Every preview polls /api/preview/panel every 2.5 s, and each poll was a raw
+ * apiGet outside any budget. Six previews therefore keep up to six sockets hot
+ * with chat, against a browser limit of ~6 per origin, and the video segment
+ * requests never get a slot. Nothing plays.
+ *
+ * This lane routes each poll through the SHARED global budget (see the comment
+ * on DEFAULT_SHARED_BUDGET: at most 3 app-held sockets, leaving room for the
+ * player). The local ceiling of 2 keeps one panel wave from taking all three.
+ *
+ * NOT YET MEASURED END TO END: the harness runs against the frozen build,
+ * which still carries the old client. Rebuild + rerun the concurrent harness
+ * to confirm six previews now play.
+ */
+let _panelLane: ConcurrencyLane = createConcurrencyLane(2);
+
+export function __setPanelLaneForTests(lane: ConcurrencyLane): void {
+  _panelLane = lane;
+}
+
 export function PreviewChatPanel({
   platform,
   videoId,
@@ -770,9 +800,12 @@ export function PreviewChatPanel({
     let cancelled = false;
     setFetchState('loading');
     const offset = Math.max(0, currentTimeRef.current);
-    apiGet<PreviewPanelPayload>(
-      `/api/preview/panel/${payloadKey}?limit=${PANEL_LIMIT}&offset_sec=${offset}`,
-    )
+    _panelLane
+      .run(() =>
+        apiGet<PreviewPanelPayload>(
+          `/api/preview/panel/${payloadKey}?limit=${PANEL_LIMIT}&offset_sec=${offset}`,
+        ),
+      )
       .then((p) => {
         if (cancelled) return;
         const cache = payloadCacheRef.current;
