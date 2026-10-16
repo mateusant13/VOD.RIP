@@ -165,30 +165,46 @@ const rt = await page.evaluate(() => {
   return out;
 });
 console.log('');
-console.log('=== RESOURCE TIMING: fila vs servidor (as 18 mais lentas) ===');
+// FOUR phases, not two. The first version of this printed only
+// fetchStart-startTime as "queue" and responseStart-requestStart as "server",
+// and reported the queue as 0 ms on every request - which was wrong and nearly
+// became another wrong conclusion. A /api/preview/session with total 10211 ms
+// and server 839 ms left 9372 ms unaccounted for, and a 1 KB response cannot
+// spend 9 s transferring: the wait sits in fetchStart -> requestStart, which is
+// CONNECTION ACQUISITION, the phase the browser 6-per-origin limit shows up in.
+// It was simply not printed. All four now are:
+//   sched = fetchStart   - startTime     (scheduler / not-yet-started)
+//   conn  = requestStart - fetchStart    (waiting for a free connection) <- the queue
+//   srv   = responseStart- requestStart  (backend thinking)
+//   xfer  = responseEnd  - responseStart (transfer)
+console.log('=== RESOURCE TIMING: as 18 mais lentas, 4 fases ===');
 const byDur = [...rt].sort((a, b) => b.dur - a.dur).slice(0, 18);
-console.log('  fila(ms)  servidor(ms)  total(ms)  inicio(ms)  tam   url');
+console.log('  conn(ms)  srv(ms)  xfer(ms)  total(ms)  inicio(ms)  tam   url');
 for (const e of byDur) {
-    const queue = e.fetchStart - e.start;
-    const server = e.resStart - e.reqStart;
+    const conn = e.reqStart - e.fetchStart;
+    const srv = e.resStart - e.reqStart;
+    const xfer = e.resEnd - e.resStart;
     console.log(
-      '  ' + String(queue).padStart(7) + '  ' + String(server).padStart(11) +
-      '  ' + String(e.dur).padStart(8) + '  ' + String(e.start).padStart(9) +
+      '  ' + String(conn).padStart(8) + '  ' + String(srv).padStart(7) +
+      '  ' + String(xfer).padStart(8) + '  ' + String(e.dur).padStart(9) +
+      '  ' + String(e.start).padStart(10) +
       '  ' + String(Math.round(e.size / 1024)).padStart(5) + 'K  ' + e.n,
     );
   }
-const totQueue = rt.reduce((a, e) => a + (e.fetchStart - e.start), 0);
+const totQueue = rt.reduce((a, e) => a + Math.max(0, e.reqStart - e.fetchStart), 0);
 const totServer = rt.reduce((a, e) => a + Math.max(0, e.resStart - e.reqStart), 0);
+const totXfer = rt.reduce((a, e) => a + Math.max(0, e.resEnd - e.resStart), 0);
 const totDur = rt.reduce((a, e) => a + e.dur, 0);
 console.log('  ---------------------------------------------');
 console.log('  requisicoes medidas: ' + rt.length);
-console.log('  soma FILA:     ' + totQueue + ' ms');
-console.log('  soma SERVIDOR: ' + totServer + ' ms');
+console.log('  soma CONN (fila): ' + totQueue + ' ms');
+console.log('  soma SERVIDOR:    ' + totServer + ' ms');
+  console.log('  soma TRANSFER:    ' + totXfer + ' ms');
 console.log('  soma TOTAL:    ' + totDur + ' ms');
 // per-phase totals for the preview-relevant subset
 const pv = rt.filter((e) => /preview|hls/.test(e.n));
 console.log('  --- so preview/hls (' + pv.length + ') ---');
-console.log('    FILA:     ' + pv.reduce((a, e) => a + (e.fetchStart - e.start), 0) + ' ms');
+console.log('    CONN:     ' + pv.reduce((a, e) => a + Math.max(0, e.reqStart - e.fetchStart), 0) + ' ms');
 console.log('    SERVIDOR: ' + pv.reduce((a, e) => a + Math.max(0, e.resStart - e.reqStart), 0) + ' ms');
 // where the time sits relative to the click
 const clickAt = await page.evaluate(() => window.__TAP.clickAt || 0);
