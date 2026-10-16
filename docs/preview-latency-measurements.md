@@ -790,3 +790,82 @@ of hls.js MANIFEST_LOADING / LEVEL_LOADING / FRAG_LOADING / FRAG_BUFFERED events
 the 10-14 s can be attributed to a named hls.js phase instead of guessed at. Until
 that exists, the next fix would be another plausible story, and the last two of
 those cost a reverted commit each.
+
+
+---
+
+## Round 15 — four phases, and BOTH causes were real (my two-phase split was wrong)
+
+The corrected Resource Timing split prints all four phases, so an unaccounted
+interval cannot hide: sched + conn + srv + xfer must equal duration. First run with
+it, 6 concurrent previews, 182 requests:
+
+  soma CONN (fila): 140193 ms
+  soma SERVIDOR:    222233 ms
+  soma TRANSFER:      1453 ms
+
+The previous round headline was "soma FILA: 0 ms" - because that version measured
+`fetchStart - startTime`, which is the scheduler interval, not connection
+acquisition. The queue lives in `requestStart - fetchStart`, and it is 140 SECONDS
+of accumulated wait. The check that exposed it was arithmetic: a preview session
+with total 10211 ms and server 839 ms left 9372 ms unaccounted for on a 1 KB body.
+
+### The per-request breakdown, and the causal order
+
+  conn(ms)  srv(ms)  xfer  total   inicio   url
+       256    13488     1   13745    47414  /api/channel/videos
+      4831     7240    20   12091    22645  /api/channel/clips
+        39    11263     8   11310    11272  /api/channel/videos
+       415     9746     9   10170    34854  /api/channel/videos
+         2     9000     9    9011    13572  /api/channel/videos
+      5514     2615     1    8130    19345  /api/preview/session
+      5584     2543     2    8129    19347  /api/preview/session
+      5706     2420     2    8128    19348  /api/preview/session
+
+So, in order:
+
+  1. The channel calls get a connection almost immediately (conn 2-256 ms) and then
+     spend 9 000-13 488 ms in the SERVER (srv). They are the root.
+  2. Holding those slots, the three /api/preview/session POSTs wait 5 514-5 706 ms
+     for a connection (conn) and only 2 420-2 615 ms in the server.
+  3. 5.5 s + 2.5 s = 8.1 s per preview. That is the spinner.
+
+BOTH hypotheses were right, in a causal order I had been flattening into one:
+server slowness on the channel endpoints is the CAUSE, browser connection queueing
+is the CONSEQUENCE. Round 13 (bounding the fan-out) failed because it attacked the
+consequence; round 14 (server contention on the HLS mux) failed because it measured
+the wrong server call - the mux is genuinely fast, the CHANNEL scrape is not.
+
+### The three slow calls use three DIFFERENT cache keys
+
+From the full URLs at the channel open (@11 239-11 241 ms):
+
+  /api/channel/clips?platforms=Kick%2CTwitch...        5647 ms
+  /api/channel/videos?platforms=YouTube&content=...    2298 ms
+  /api/channel/videos?url=gaveta&limit=25&page...     11316 ms
+
+Different keys means each is a genuine cold scrape and none can dedupe against the
+others. `cacheBust` was checked and is innocent: App.tsx:5049 adds `&_t=` ONLY when
+opts.force is set, and the comment is explicit that non-forced refreshes must hit
+the backend cache. So these are real misses on real distinct keys.
+
+The ~20 `/api/channels/*/live` badge calls in the same window are all 6-12 ms. They
+were never the problem, which is why the objective two failed attempts - both of
+which throttled the live lane - could not have worked.
+
+### The fix target, and it is server-side
+
+`/api/channel/videos` spends 9-13.5 s inside the server on a cold key. Everything
+else follows from that. The candidates, none measured yet:
+
+  1. Stop the request path waiting for a full live scrape (stale-while-revalidate:
+     return the cached rows immediately and refresh behind the response).
+  2. Merge the platform fan-out into ONE request (`platforms=Kick,Twitch,YouTube`),
+     which the route already supports, so a channel open costs one slow scrape and
+     one connection instead of three.
+  3. Prefetch/warm the channel keys the user is likely to open.
+
+Option 2 is the smallest and the route already accepts it; option 1 addresses the
+9-13.5 s itself. Either gets a paired A/B on the concurrent probe, with the
+four-phase table as the read-out - the instrument that finally distinguishes
+cause from consequence.
