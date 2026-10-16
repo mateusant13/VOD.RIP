@@ -741,3 +741,52 @@ PRODUCED rather than slow to be DELIVERED. The measurement that separates them:
 time `GET /api/preview/hls/<sid>/master.m3u8` while three channel scrapes are in
 flight, against the same call on an idle server (28 ms measured). If it is slow
 under load, it is server contention and no client-side socket fix will help.
+
+
+---
+
+## Round 14 — every server link measures fast, so the 10-14 s is NOT a server call
+
+Following round 13 negative result, the server-contention hypothesis was tested
+directly, each link timed OCIOSO against CARREGADO (three cold `force=1` channel
+scrapes in flight):
+
+  master.m3u8         OCIOSO  2/3/3 ms      CARREGADO  4/3/27 ms      <- FLAT
+  variant playlist    OCIOSO  285/95/98 ms  CARREGADO  2292/176/143 ms
+  (14 556 B)
+  POST session        OCIOSO  685 ms        CARREGADO  1046-1703 ms
+
+Read together with round 10 telemetry - `session_ready` 1599-6727 ms, `canplay`
+11528-20727 ms - the picture is:
+
+  session           ~0.7-1.7 s
+  master            ~0.003-0.03 s
+  variant playlist  ~0.1-2.3 s
+  ---------------------------------
+  accounted for     ~1-4 s
+  observed gap      ~10-14 s   <-- NOT ACCOUNTED FOR BY ANY SERVER CALL
+
+So the server is not where the seconds are, in any single call I can measure. Two
+hypotheses of mine died this round and both deaths are worth more than the fixes
+would have been:
+
+  1. "three parallel cold channel scrapes hold four of six sockets" - bounding the
+     fan-out to two (round 13) did not move the number outside the noise, so socket
+     COUNT is at most a partial factor.
+  2. "the HLS mux competes with the scrapes for server resources" - the manifest is
+     2-27 ms loaded, identical to idle. Falsified.
+
+### Where that leaves it
+
+The remaining unmeasured surface is the CLIENT between `session_ready` and
+`canplay`: hls.js attach, level selection, `startFragPrefetch`, the MSE append, and
+the accumulated wait across the many small requests a preview makes. The one client
+constant that keeps appearing is `manifestLoadingTimeOut: 10000` (App.tsx:2662),
+which converts "not yet arrived" into "abort and retry" at exactly 10 s.
+
+THE NEXT MEASUREMENT, precise: instrument the client, not the server. The harness
+already taps `window.fetch` - it needs to also record, per preview, the timestamps
+of hls.js MANIFEST_LOADING / LEVEL_LOADING / FRAG_LOADING / FRAG_BUFFERED events, so
+the 10-14 s can be attributed to a named hls.js phase instead of guessed at. Until
+that exists, the next fix would be another plausible story, and the last two of
+those cost a reverted commit each.
