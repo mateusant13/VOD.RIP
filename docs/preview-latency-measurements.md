@@ -453,3 +453,62 @@ still needs its own measurement. The lane had a red-armed unit law and still los
 5-7x in the real path, because the unit law tested gating, not the priority
 interaction. A law that tests the mechanism you hoped for, rather than the one
 that matters, is the dressed-up version of "a test that cannot fail".
+
+
+---
+
+## Round 10 — six concurrent previews: the server is fast, the sockets are not
+
+First, an instrument defect of mine, caught by reading the code the measurement was
+about: the concurrent probe called a six-preview run a FAILURE because only one
+preview was playing. It is not a failure. `LivePlayerPopup.tsx:337` joins the
+shared preview-pause bus - "opening a live pauses every other preview" - with a
+test at `LivePlayerPopup.test.tsx:521`. With six open, EXACTLY ONE playing is the
+design, so `playing >= N` can never pass. The probe now scores on `ready >= N`
+(readyState 2, the spinner gone), which is what the owner photographed:
+"Carregando transmissao ao vivo..." is a loading state, not a paused one.
+Committed as ce5bb67.
+
+### The app own telemetry for six previews opened at once
+
+PREVIEW_TIMING from app.log, one line per event (surface=explore):
+
+  preview   session_ready   canplay     open->playable
+    1          1599 ms      11528 ms      11535 ms
+    2          3891 ms      17146 ms      17151 ms
+    3          5376 ms      17331 ms      17335 ms
+    4          5752 ms      20612 ms      20619 ms
+    5          6727 ms      20727 ms      20734 ms
+
+  session_created server_ms = 1046, 1641, 1703, 1469, 1547
+
+### The server is NOT the bottleneck, measured directly
+
+One session and its manifest, straight against the live API:
+
+  POST /api/preview/session                     685 ms
+  GET  /api/preview/hls/<sid>/master.m3u8        28 ms   (644 bytes)
+
+So the manifest is available in 28 ms while the first preview needs 11 528 ms to
+reach canplay, and its session_ready was 1 599 ms against a 685 ms server cost.
+The difference is time spent waiting for a BROWSER SOCKET, not for the server.
+
+### The 10 000 ms constant, named
+
+  src/App.tsx:2662                 manifestLoadingTimeOut: 10000
+  src/ChannelExplorePopup.tsx:1577 manifestLoadingTimeOut: 10000
+
+That is hls.js restating its own default. With the manifest reachable in 28 ms,
+the 10 s deadline is not being hit by slow server work - it fires on a request
+that never got a connection slot, aborts it, and retries. The retry is what lands
+at ~11.5 s, which is exactly the `hls/master.m3u8 = 10004 ms` sample seen in
+round 8 and dismissed there as a SQLite busy_timeout. It was this.
+
+### What this does NOT establish
+
+Which requests hold the sockets in the first ten seconds. The probe prints only
+the last 24 requests, and in this run those were the calm tail at t+69 s where
+everything completes in ~10 ms. Capturing the FIRST ten seconds needs the probe to
+keep the earliest requests, not the latest. Until that is read, the fix is not
+chosen - and the previous attempt to guess it (the panel lane, 7210443, reverted
+in 53a4147) cost a measured 5-7x regression for exactly that reason.

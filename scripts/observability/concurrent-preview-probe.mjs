@@ -125,5 +125,17 @@ console.log('  nota: playing=1 e o DESIGN (preview-pause bus); o alvo medido e r
 const reqs = await page.evaluate(() => window.__TAP.reqs.map(r => ({ p: r.url.replace(/^.*\/api\/preview\//,'').slice(0,44), s: r.t, e: r.done, st: r.status })));
 console.log('');
 console.log('=== requisicoes (ms desde o load) ===');
-for (const r of reqs.slice(-24)) console.log('  ' + String(Math.round(r.s)).padStart(7) + ' -> ' + (r.e === null ? '  pendente' : String(Math.round(r.e)).padStart(7)) + '  [' + r.st + ']  ' + r.p);
+// EARLIEST requests, not the latest. The previous version printed slice(-24),
+// which in a 70 s run showed only the calm tail where everything completes in
+// ~10 ms - the exact opposite of the window that matters. What holds sockets
+// during the first seconds is the question, so print the first 40 by start time.
+const first = [...reqs].sort((a, b) => a.s - b.s).slice(0, 40);
+console.log('');
+console.log('=== as PRIMEIRAS 40 requisicoes (a janela que decide) ===');
+for (const r of first) {
+  const dur = r.e === null ? '  pendente' : String(Math.round(r.e - r.s)).padStart(6) + ' ms';
+  console.log('  @' + String(Math.round(r.s)).padStart(7) + '  ' + dur + '  [' + r.st + ']  ' + r.p);
+}
+const stillPending = reqs.filter(r => r.e === null).length;
+console.log('  pendentes no fim: ' + stillPending + ' de ' + reqs.length);
 await browser.close();
