@@ -869,3 +869,48 @@ Option 2 is the smallest and the route already accepts it; option 1 addresses th
 9-13.5 s itself. Either gets a paired A/B on the concurrent probe, with the
 four-phase table as the read-out - the instrument that finally distinguishes
 cause from consequence.
+
+
+---
+
+## Round 16 — the app died on its own, and the timeline says the round-15 data is clean
+
+A per-platform measurement returned `URLError` on all four calls after ~2 s each.
+That is a connection REFUSAL, not a slow fetch, so those numbers measure a dead
+server and are discarded. Checking the timeline before trusting anything:
+
+  rt4.txt (the round-15 four-phase probe) written   08:36:42
+  app.log last line                                 08:41:57
+  7897                                              no listener
+  VOD-RIP.exe process                               gone
+
+So the app died about FIVE MINUTES AFTER the round-15 run finished, not during it.
+The four-phase attribution (conn 140 s / server 222 s, and the per-request table)
+therefore stands - it was collected against a live server. Worth stating because
+the opposite would have invalidated the finding, and the only way to know was to
+compare two timestamps.
+
+### Why the app dying matters to this objective
+
+The objective item (3) requires "o backend estavel sem intervencao". An app that
+stops serving with no error is not stable, and it has now been observed more than
+once this session: earlier rounds chased the same symptom and attributed it to
+VODRIP_NO_DAEMONS (documented in AGENTS.md as a measurement trap), then to a stale
+local install. This occurrence has NEITHER of those explanations - the flag was
+unset and the build is current - so it is a third, unexplained instance.
+
+The app.log tail before death shows ordinary work, no traceback:
+
+  08:41:54  twitch_gql_service: Usher fetch failed for 2877761397 - trying
+            cloudfront bypass
+  08:41:57  prefetch_cache: prefetch pass: fetched=4 fresh=30 failed=0
+
+and errors.jsonl shows only a yt-dlp path error and a cookie-bridge 403. Nothing
+that reads like a fatal condition.
+
+NOT INVESTIGATED YET, and deliberately not guessed at: whether the death is
+reproducible, and whether it is related to the six-preview load or to the Twitch
+usher/cloudfront fallback path that was running when it stopped. The next step is a
+restart plus a stability watch with no load, then the same watch under the
+concurrent probe - if it dies only under load, that is a lead; if it dies idle, it
+is a different bug entirely.
