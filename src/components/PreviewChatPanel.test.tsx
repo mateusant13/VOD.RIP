@@ -1,8 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render as rtlRender, screen, waitFor } from '@testing-library/react';
 import { useState } from 'react';
-import PreviewChatPanel, { __setPanelLaneForTests, type PreviewPanelPayload } from './PreviewChatPanel';
-import { createConcurrencyLane, type ConcurrencyLane } from '../lib/backgroundBudget';
+import PreviewChatPanel, { type PreviewPanelPayload } from './PreviewChatPanel';
 
 const PAYLOAD: PreviewPanelPayload = {
   transcript: [
@@ -152,13 +151,7 @@ describe('PreviewChatPanel', () => {
   it('fetches the panel payload and renders chat rows with a ×N spam badge', async () => {
     const fetchMock = mockPanelFetch(PAYLOAD);
     render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
-    // The fetch passes through the shared budget lane (two microtask hops), so
-    // await it rather than asserting synchronously. The semantic stays: the
-    // fetch leaves at session-create, NOT on canplay — this test never plays the
-    // video, so a canplay-gated fetch would time out and fail here.
-    await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalled();
-    });
+    expect(fetchMock).toHaveBeenCalled();
     expect(String(fetchMock.mock.calls[0][0])).toContain('/api/preview/panel/twitch/v1?limit=');
 
     await waitFor(() => {
@@ -186,12 +179,8 @@ describe('PreviewChatPanel', () => {
     render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
     // Session created → the archive payload fetches immediately; nothing the
     // panel fetches waits for canplay (the Twitch chat backfill must kick
-    // off before playback starts). Awaited rather than synchronous: the fetch
-    // passes through the shared budget lane (two microtask hops). The video is
-    // never started, so a canplay-gated fetch would time out and fail.
-    await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalled();
-    });
+    // off before playback starts).
+    expect(fetchMock).toHaveBeenCalled();
     expect(String(fetchMock.mock.calls[0][0])).toContain('/api/preview/panel/twitch/v1?limit=');
     await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
   });
@@ -1199,97 +1188,4 @@ describe('PreviewChatPanel', () => {
       vi.useRealTimers();
     }
   });
-
-// ── Panel-fetch concurrency budget ───────────────────────────────────────
-// Measured 2026-10-16 on the frozen app, SIX live previews open at once:
-// videos=6 ready=0 playing=0 for 20 s, and after 47 s only one played. The
-// request log showed the cause: every preview polled /api/preview/panel as a
-// RAW apiGet with no budget, so six previews held every browser connection
-// slot (~6 per origin) and the video segments queued behind chat forever:
-//   46065 -> pendente  /api/channels/.../live
-//   48115 -> pendente  panel/twitch/...?limit=2000
-//   48947 -> pendente  panel/twitch/...?limit=2000
-//   50618 -> pendente  panel/twitch/...?limit=2000
-//   51451 -> pendente  ... (every later poll, still pending)
-//
-// The panel fetch therefore runs through the SHARED global budget lane (at
-// most 3 app-held sockets, leaving 3 for the player). These tests pin that:
-describe('PreviewChatPanel panel-fetch budget', () => {
-  const REAL_LANE_LIMIT = 2;
-
-  afterEach(() => {
-    __setPanelLaneForTests(createConcurrencyLane(REAL_LANE_LIMIT));
-  });
-
-  it('holds the panel fetch until a budget slot opens', async () => {
-    let release!: () => void;
-    const gate = new Promise<void>((r) => {
-      release = r;
-    });
-    const seen: Array<() => unknown> = [];
-    const stuck: ConcurrencyLane = {
-      limit: 1,
-      inFlight: () => 1,
-      peakInFlight: () => 1,
-      resetPeak: () => {},
-      run: async (task) => {
-        seen.push(task);
-        await gate;
-        return task();
-      },
-    };
-    __setPanelLaneForTests(stuck);
-    const fetchMock = mockPanelFetch(PAYLOAD);
-    render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
-    // The mount effect ran and asked the lane for a slot, but the closed
-    // gate means the fetch itself must NOT have been issued.
-    await act(async () => {
-      await Promise.resolve();
-    });
-    expect(seen).toHaveLength(1);
-    expect(fetchMock).not.toHaveBeenCalled();
-    act(() => {
-      release();
-    });
-    await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-    });
-    expect(String(fetchMock.mock.calls[0][0])).toContain('/api/preview/panel/twitch/v1?limit=');
-  });
-
-  it('a saturated REAL lane holds one preview while another drains', async () => {
-    // Through the real run(): one slot, pre-occupied by a slow task that
-    // resolves later. The panel fetch must wait its turn, then fire.
-    const real = createConcurrencyLane(1);
-    let release!: () => void;
-    const gate = new Promise<void>((r) => {
-      release = r;
-    });
-    const holder = real.run(() => gate);
-    __setPanelLaneForTests(real);
-    const fetchMock = mockPanelFetch(PAYLOAD);
-    render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
-    await act(async () => {
-      await new Promise((r) => setTimeout(r, 30));
-    });
-    expect(fetchMock).not.toHaveBeenCalled();
-    release();
-    await holder;
-    await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-    });
-  });
-
-  it('the default lane still answers a plain poll', async () => {
-    // Guard against over-correction: with an idle budget the panel must
-    // fetch immediately, exactly as before the lane existed.
-    const fetchMock = mockPanelFetch(PAYLOAD);
-    render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
-    await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-    });
-    expect(String(fetchMock.mock.calls[0][0])).toContain('/api/preview/panel/twitch/v1?limit=');
-  });
-});
-
 });
