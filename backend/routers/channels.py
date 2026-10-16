@@ -605,33 +605,46 @@ async def channel_videos(
                 slug = kick_ch or channel
                 if not slug:
                     return [], None, False
-                try:
-                    vids = await asyncio.wait_for(
-                        loop.run_in_executor(
-                            CHANNEL_EXECUTOR,
-                            kick_list_channel_videos_sync,
-                            f"https://kick.com/{slug}/videos",
-                            fetch_limit,
-                        ),
-                        timeout=CHANNEL_VOD_FETCH_TIMEOUT_SEC,
+                # The list and the language clue are INDEPENDENT: the clue needs
+                # only the slug, never the list. They used to run SERIALLY, so every
+                # Kick channel fetch paid for both in sequence. Measured 2026-10-16
+                # (docs/preview-latency-measurements.md, round 17), warm and idle:
+                #
+                #   kick list_channel_videos_sync     1537 ms  -> 25 items
+                #   kick get_channel_language_sync    1473 ms  -> None
+                #
+                # 3.0 s serial, and 1.5 s of it was a call that returned NOTHING.
+                # YouTube already runs its clue concurrently with its /streams crawl
+                # (see the innertube probe comment below); Kick never did. Running
+                # them together makes the Kick path max(list, clue) instead of their
+                # sum, and the clue stays optional: a failure still yields clue=None
+                # and a list failure is still fatal, exactly as before.
+                list_fut = asyncio.wait_for(
+                    loop.run_in_executor(
+                        CHANNEL_EXECUTOR,
+                        kick_list_channel_videos_sync,
+                        f"https://kick.com/{slug}/videos",
+                        fetch_limit,
+                    ),
+                    timeout=CHANNEL_VOD_FETCH_TIMEOUT_SEC,
+                )
+                clue_fut = asyncio.wait_for(
+                    loop.run_in_executor(
+                        CHANNEL_EXECUTOR,
+                        kick_get_channel_language_sync,
+                        slug,
+                    ),
+                    timeout=CHANNEL_VOD_FETCH_TIMEOUT_SEC,
+                )
+                vids, clue = await asyncio.gather(list_fut, clue_fut, return_exceptions=True)
+                if isinstance(vids, BaseException):
+                    errors["Kick"] = (
+                        "VOD fetch timed out — try again"
+                        if isinstance(vids, asyncio.TimeoutError)
+                        else format_platform_error(vids)
                     )
-                except asyncio.TimeoutError:
-                    errors["Kick"] = "VOD fetch timed out — try again"
                     return [], None, False
-                except Exception as e:
-                # ponytail: best-effort — return []
-                    errors["Kick"] = format_platform_error(e)
-                    return [], None, False
-                try:
-                    clue = await asyncio.wait_for(
-                        loop.run_in_executor(
-                            CHANNEL_EXECUTOR,
-                            kick_get_channel_language_sync,
-                            slug,
-                        ),
-                        timeout=CHANNEL_VOD_FETCH_TIMEOUT_SEC,
-                    )
-                except Exception:
+                if isinstance(clue, BaseException):
                     clue = None
                 # Kick's v2 API is single-shot (no cursor): the service
                 # returns the newest fetch_limit rows, so len==fetch_limit
