@@ -43,6 +43,7 @@ import {
   Search,
   X,
 } from 'lucide-react';
+import { createConcurrencyLane, type ConcurrencyLane } from '../lib/backgroundBudget';
 import { apiGet, apiPost } from '../hooks/useApiClient';
 import { useDebouncedValue } from '../hooks/useDebouncedValue';
 import { t, useI18n } from '../i18n';
@@ -626,6 +627,10 @@ function EmptyState({ text, progress }: { text: string; progress?: number }) {
   );
 }
 
+/** Shared gate for every panel poll across every open preview (local ceiling 2,
+ *  global shared budget 3). */
+let _panelLane: ConcurrencyLane = createConcurrencyLane(2);
+export function __setPanelLaneForTests(lane: ConcurrencyLane): void { _panelLane = lane; }
 export function PreviewChatPanel({
   platform,
   videoId,
@@ -770,8 +775,10 @@ export function PreviewChatPanel({
     let cancelled = false;
     setFetchState('loading');
     const offset = Math.max(0, currentTimeRef.current);
-    apiGet<PreviewPanelPayload>(
-      `/api/preview/panel/${payloadKey}?limit=${PANEL_LIMIT}&offset_sec=${offset}`,
+    _panelLane.run(() =>
+      apiGet<PreviewPanelPayload>(
+        `/api/preview/panel/${payloadKey}?limit=${PANEL_LIMIT}&offset_sec=${offset}`,
+      ),
     )
       .then((p) => {
         if (cancelled) return;
