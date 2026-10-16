@@ -690,3 +690,54 @@ NOT IMPLEMENTED, deliberately. It gets a paired A/B on the concurrent probe
 time-to-ready before and after, same build lineage, same session. After 7210443
 was reverted in 53a4147 for a measured 5-7x regression, a plausible story is not
 enough to ship a fix on this path.
+
+
+---
+
+## Round 13 — the fan-out bound did NOT fix it, so it was reverted
+
+I implemented the round-12 fix target (bound the three-platform `Promise.all` at
+App.tsx:5295-5301 to two at a time) and measured it. It did not work, so it is not
+in the tree.
+
+The change: `vodTasks` became thunks, run by a 2-wide worker pool instead of
+`Promise.all`. tsc clean, 76 files / 1208 tests still green, and I verified the
+bound was really in the SERVED bundle before trusting any measurement
+(`const Ri=2` + thunks + `Array.from({length:Math.min(Ri,gr.length)}` inside
+_internal/static/index.html).
+
+Then the concurrent probe (6 previews at once, first line with readyState>=2):
+
+  BEFORE, 3 parallel scrapes:   t+9.9s (ready=4),  t+18.2s (ready=3)
+  AFTER,  bound to 2:           t+19.2s (ready=5),  t+7.0s (ready=5),  t+9.8s (ready=4)
+
+  before median 14.1 s   after median 9.8 s   -  but before spans 9.9-18.2 and
+  after spans 7.0-19.2. The ranges overlap almost completely, n is 2 vs 3, and the
+  within-arm spread is larger than the between-arm difference.
+
+That is NOT a conclusion. It is the same trap as the panel lane (7210443, reverted
+in 53a4147) and it gets the same treatment: an unproven change stays out. Reverted
+with `git checkout -- src/App.tsx`, verified back to `Promise.all(vodTasks)`.
+
+### The valuable part is the NEGATIVE result
+
+Bounding the fan-out did not move the number. That falsifies the round-11/12 story
+as a COMPLETE explanation: if the stall were simply "four of six sockets held for
+15-20 s by parallel channel scrapes", then dropping that to two vods plus one clips
+(three sockets, three free) should have shown something outside the noise. It did
+not.
+
+So socket COUNT is at most a partial factor. The remaining candidate, and the one
+the numbers actually point at, is server-side: the preview needs 10-14 s between
+`session_ready` and `canplay` (round 10 telemetry), the manifest is 28 ms when the
+server is idle, and `manifestLoadingTimeOut: 10000` keeps aborting a manifest that
+is not arriving - which is what a busy server looks like from the client, not what
+a queued socket looks like. Under the same load the channel scrapes are running,
+and they are CPU/executor heavy.
+
+Next hypothesis to test, stated as a hypothesis: the HLS mux for a preview competes
+for the same server resources as the channel scrapes, so the manifest is slow to be
+PRODUCED rather than slow to be DELIVERED. The measurement that separates them:
+time `GET /api/preview/hls/<sid>/master.m3u8` while three channel scrapes are in
+flight, against the same call on an idle server (28 ms measured). If it is slow
+under load, it is server contention and no client-side socket fix will help.
