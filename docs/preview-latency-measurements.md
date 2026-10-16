@@ -914,3 +914,87 @@ usher/cloudfront fallback path that was running when it stopped. The next step i
 restart plus a stability watch with no load, then the same watch under the
 concurrent probe - if it dies only under load, that is a lead; if it dies idle, it
 is a different bug entirely.
+
+
+---
+
+## Round 17 — I nearly published "enrich costs 6.1 s" from an UNPAIRED comparison
+
+Chasing where `/api/channel/videos` spends its 9-13.5 s of server time, I timed the
+two YouTube crawls the router performs:
+
+  videos playlist enrich=True     8358 ms   -> 25 items
+  streams playlist enrich=True    2150 ms   -> 25 items
+  videos playlist enrich=False    2256 ms   -> 25 items
+
+8358 - 2256 = 6102 ms, and `enrich=True` only adds `_enrich_with_rss_dates()` ->
+`_fetch_youtube_rss_rows()`, a single blocking HTTP call. It looked like a clean,
+surgical finding: 6.1 s of RSS enrichment on the request path, for `created_at` and
+`views` that the function own docstring calls best-effort ("Returns [] on any
+failure (best-effort, never blocks the listing)") - a docstring the measurement
+would have shown to be false.
+
+I measured the RSS endpoint directly before writing it up:
+
+  RSS rep1: 234 ms  24.5 KB
+  RSS rep2: 234 ms  24.5 KB
+  RSS rep3: 234 ms  24.5 KB
+
+234 ms, three times, consistent. That cannot be 6.1 s of the 8.4 s call. So the
+subtraction was measuring something else.
+
+WHAT IT ACTUALLY WAS: the three timings above came from SEPARATE, SEQUENTIAL runs -
+enrich=True first, then enrich=False. The first call can pay a cold path and the
+second can ride a warm one. That is an UNPAIRED comparison, which this project rules
+explicitly forbid ("sem A/B pareado nao ha conclusao"), and I was one sentence away
+from committing a 6.1 s claim built on it.
+
+FIXED BY MEASURING PROPERLY: enrich=True and enrich=False interleaved in one process,
+four pairs, so drift cancels and the per-pair delta is the read-out. Result in the
+next round entry.
+
+THE PATTERN, now three times in this session: the wrong answer came from a
+comparison that was not paired, or an instrument that measured a different interval
+than the one it was named for (stdout redirect vs app.log; playing>=N when playing=1
+is the design; fetchStart-startTime labelled "queue"). Each time the catch was
+arithmetic that did not add up or a control measurement that disagreed - never a
+re-run of the same measurement.
+
+### The paired result: ~1.1 s, not 6.1 s - and enrich is NOT the 9-13.5 s
+
+Four interleaved pairs, one process, same channel, same 25 items:
+
+  enrich=TRUE   mediana 3181 ms   vals=[3679, 2683, 4249, 2049]
+  enrich=FALSE  mediana 2084 ms   vals=[1984, 2183, 2208, 1746]
+  delta pareado por par: [1695, 499, 2041, 303]
+  delta MEDIANO:          1097 ms
+
+So the honest figure is ~1.1 s, not the 6.1 s the unpaired subtraction suggested.
+With the RSS endpoint measured at a flat 234 ms, the rest of the delta is the local
+XML parse of a 24.5 KB feed plus run-to-run variance. The per-pair spread
+(303-2041 ms) is itself wider than half the median, which is exactly why a single
+unpaired subtraction was never going to survive.
+
+CONCLUSION: enrich is a real but minor cost (~1.1 s on one of two YouTube crawls)
+and it is NOT the 9-13.5 s that `/api/channel/videos` spends server-side. It is
+recorded as a small candidate, not the cause. The docstring claim that the RSS fill
+"never blocks the listing" is still imprecise - it blocks by ~1.1 s, not 6.1 s -
+but that is a documentation nit, not the performance bug.
+
+The 9-13.5 s therefore remains UNATTRIBUTED, and the candidates that survive are the
+ones measured this round with the same rigour:
+
+  Kick list_channel_videos_sync      1537 ms   (25 items)
+  Kick get_channel_language_sync     1473 ms   -> returns None  <- pure waste
+  Twitch list_channel_videos_sync     329 ms   (2 items)
+  YouTube videos crawl                2084 ms   (enrich=False median)
+  YouTube streams crawl              2150 ms   (single sample, enrich=True)
+
+Those are the WARM, unloaded figures. Summing the serial parts of one platform -
+Kick 1537 + 1473 - gives 3.0 s; the router runs platforms in parallel, so the
+critical path is the slowest platform, not the sum. Nothing here reaches 9-13.5 s
+on its own, which means the gap is most likely CONTENTION: these same calls,
+measured under six-preview load with several channels in flight at once, against
+the CHANNEL_EXECUTOR pool. That is the next thing to measure, and it is measurable
+without any browser: fire N channel fetches concurrently against the source API and
+watch the per-call time as N rises.
