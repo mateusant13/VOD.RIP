@@ -406,3 +406,50 @@ mechanism, which is a different thing from a measurement. What would settle it:
 Either is a small, local change - no rebuild of the bundle needed if measured
 against the source build, which is already known to serve the same endpoint in
 0.02 s once warm.
+
+
+---
+
+## Round 9 — the panel lane regressed, and the paired rerun proves it
+
+Commit 7210443 routed the panel poll through the shared budget lane, motivated by
+the concurrent probe (six previews open, only one playing in 47 s). The rebuild
+carrying it measured, sequential harness, CYCLES=6, NO_DAEMONS unset:
+
+  WITH the lane (7210443):
+    sync3 median=13489 ms  vals=[17164,13489,7554,22384,13106,10148]
+    sync2 median=12957 ms  vals=[12679,18076,6082,15975,3163,12957]
+    reps <= 3 s: 0 of 12. session alone: 1893-13396 ms.
+
+vs the same harness on the build WITHOUT it (round 8: sync3 median 2485 ms,
+sync2 median 2490 ms, 8/8 consecutive <= 2.49 s).
+
+CONFESSING THE HOLE BEFORE CLOSING IT: the two runs overlapped a YouTube
+extract-failure storm (app.log: 50-70 `extract fail` vs ~300 ok,
+`preview_race_exhausted` / `all_fallbacks_exhausted`), so unpaired in time they
+could have blamed the storm instead of the lane. The paired repeat was therefore
+run: revert the lane (commit 53a4147), rebuild, same harness, same storm.
+
+  REVERTED, same storm:
+    sync3 median=1841 ms  vals=[null,2074,1841,2201,1785,1403]   (rep 0: 45 s timeout, first load)
+    sync2 median=2517 ms  vals=[16024,4529,2517,2059,1520,1881]  (rep 1: 16 s outlier)
+    11 of 12 playing. The healthy pattern is back, immediately.
+
+The storm was present in BOTH runs (measured before and during), so it does not
+explain a 5-7x reversal on revert. The regression was the lane, not the
+weather. The revert stands and is pushed.
+
+MECHANISM, still labelled hypothesis (never instrumented): the session POST is
+raw apiPost, but createPreviewSessionWithRetry() calls beginPreviewPriorityWindow(),
+which pulls the shared budget to 1 for the click window. Panel tasks on that same
+gate then hold the single priority slot while their fetch runs, and the session
+POST - unlaned, browser-FIFO - waits behind it. That would move the bottleneck
+from a background flood (unbudgeted raw polls) to a foreground gate (budgeted
+shared slot) during the very window reserved for the session. What is proven is
+only the paired reversal above.
+
+LESSON REPEATED FROM ROUND 7: the fix that "obviously follows" from a measurement
+still needs its own measurement. The lane had a red-armed unit law and still lost
+5-7x in the real path, because the unit law tested gating, not the priority
+interaction. A law that tests the mechanism you hoped for, rather than the one
+that matters, is the dressed-up version of "a test that cannot fail".
