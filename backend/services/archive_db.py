@@ -643,6 +643,11 @@ def _init_schema() -> None:
         _schema_ready = True
 
 
+# A lock wait this long is the 10 s wedge starting; warn at well under it so the
+# log shows the approach, not only the arrival.
+_SLOW_LOCK_WARN_MS = 250.0
+
+
 def _ensure_schema_ready() -> None:
     """Guarantee the shared write connection is open and schema-migrated.
 
@@ -659,7 +664,22 @@ def _ensure_schema_ready() -> None:
     even off-loop readers would wedge behind it (the dev-backend wedge)."""
     if _schema_ready and _conn_path == str(_db_path()):
         return
+    # MEASURE THE WEDGE. A fresh thread first read takes _lock, and a WAL-busy
+    # write holds _lock while sqlite spins the 10 s busy_timeout, so this call
+    # can park for the full timeout. Measured 2026-10-15 in the frozen v1.0.60:
+    # two /api/preview/hls/.../master.m3u8 requests took EXACTLY 10004 ms while
+    # every other one took 6-9 ms. Until now that wait left no trace anywhere,
+    # which is why it took a per-request breakdown to find at all.
+    _wait0 = time.perf_counter()
     with _lock:
+        _waited = (time.perf_counter() - _wait0) * 1000.0
+        if _waited >= _SLOW_LOCK_WARN_MS:
+            logger.warning(
+                "archive_db: _ensure_schema_ready waited %.0f ms for _lock "
+                "(thread first read behind a WAL-busy writer?) path=%s",
+                _waited,
+                _conn_path,
+            )
         with _init_lock:
             _init_schema()
 
