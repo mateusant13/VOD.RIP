@@ -1106,3 +1106,29 @@ effect is smaller than that phrasing suggests - with the clue at ~1473 ms and th
 at ~124 ms warm, max and sum differ by only ~124 ms. The fix is correct and was not
 wasted; the claim of its size was too generous, and the honest figure is in the paired
 table above (deltas 1228/1497/1471 ms, which is the CLUE, not the saving).
+
+
+---
+
+## Round 15(bis) — lane OK no codigo, regressado na medicao, e a razao e outra
+
+A mesma medicao, agora com a lane realmente no bundle:
+
+  ANTES da lane (conc_first probe, t+9.9s): videos=5 ready=4 (primeiro spinner some)
+  DEPOIS da lane (conc_after_after probe, t+10.7s): videos=5 ready=1 playing=1
+
+A queda (ready 4 -> 1) e o sinal de que o bound esta ativo: o lane enfileira as
+polls do painel e elas esperam enquanto os segments pegam os sockets. Nesse cenario
+os segments (que nao passam pelo lane, sao HLS nativos) perdem para as polls de pane
+que ahora esperam-slot-em-bloco.
+
+Entao a lane inverteu a prioridade. Em vez de des-apertar o click (session mole),
+ ela fez os segments esperar alem daquele 3s historicamente acordado.
+
+A intervencao certa e a CONTRARIA do que epgrama.md (ex-documentacao) dizia: tornar
+a lane mais folgada nos sockets (não apetadar) e adicionar a prioridade no CLICK
+window com sharedAcquire 1 em vez de _panelLane.run (supervisionando apenas o
+session POST, que ja e o que a priority window faz).
+
+A hipote se contrapoe a resultada observada: session_ready=1599 ms (2.3x o custo
+nua de session solo 685 ms). A discrepacia nao e de rede — e prioridade invertida.
