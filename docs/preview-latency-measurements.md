@@ -512,3 +512,181 @@ everything completes in ~10 ms. Capturing the FIRST ten seconds needs the probe 
 keep the earliest requests, not the latest. Until that is read, the fix is not
 chosen - and the previous attempt to guess it (the panel lane, 7210443, reverted
 in 53a4147) cost a measured 5-7x regression for exactly that reason.
+
+
+---
+
+## Round 11 — FOUND IT: one slow server endpoint holds the whole socket pool
+
+The probe now prints the FIRST 40 requests instead of the last 24, and that one
+change answered the question the last four rounds could not. Six previews opened at
+once, sorted by start time (ms since page load):
+
+  @     90      38 ms  warm/batch
+  @    159-162  ~30 ms  cookies/status, settings/features, presence, previews/status, downloads, settings
+  @  11252    9017 ms  /api/channel/videos?url=gaveta&limit=25
+  @  11254   16561 ms  /api/channel/clips?platforms=Kick%2CTwitch
+  @  11254   18764 ms  /api/channel/videos?platforms=YouTube&conten
+  @  11255    4221 ms  /api/channels/ch_msdzyuiq/live
+  @  12333    4118 ms  /api/channels/ch_msch69tg/live
+  @  15477    4021 ms  /api/channels/ch_mrafykd6/live
+  @  16460    4542 ms  /api/channels/ch_mst3y6nj/live
+  @  19075     262 ms  panel/twitch/2794478920?limit=2000
+  @  19078     824 ms  session        <-- THE PREVIEW SESSION STARTS 19 s AFTER THE CLICK
+
+The preview session POST does not even LEAVE until @19 078 ms. It is not slow - it
+is queued. And the requests ahead of it are the CHANNEL TAB own loading traffic.
+
+### Measured server-side, one request at a time, no concurrency at all
+
+  /api/channel/videos?url=gaveta&limit=25     15359 ms    11.3 KB
+  /api/channels/ch_msdzyuiq/live                  5 ms     0.0 KB
+  /api/channels/ch_mrafykd6/live                  4 ms     0.0 KB
+
+So `/api/channel/videos` takes 15.4 SECONDS with nothing else running, and returns
+only 11.3 KB. It is not a payload problem; the server is doing something slow before
+it answers. And `/api/channels/*/live` is 4-5 ms alone, so its 4-second times in the
+capture were pure QUEUEING behind the slow endpoint.
+
+THE CHAIN: opening a channel fires `/api/channel/videos` (15 s of server work). That
+one request holds a browser socket for 15 s. The preview session POST waits ~19 s for
+a slot. Then hls.js `manifestLoadingTimeOut: 10000` (App.tsx:2662) fires on the queued
+manifest, aborts, and retries - which is the ~11.5 s canplay in round 10.
+
+### Why every previous fix missed
+
+  * the panel lane (7210443, reverted 53a4147) - the panels were never the problem;
+    gating them added serialisation for nothing and cost a measured 5-7x regression.
+  * "hold the live poll" and "limit yield in channel sync" (the two attempts recorded
+    in the objective) - they throttled the LIVE STATUS requests, which are 4-5 ms on
+    the server. Throttling a 5 ms request cannot free a socket held for 15 s by a
+    different one.
+  * my own SQLite busy_timeout lead (round 8) - wrong attribution, corrected in
+    round 10.
+
+The socket is held by `/api/channel/videos`, and only by that.
+
+### The code already knew this endpoint is pathological
+
+  backend/routers/channels.py:21   # occupied the default pool while
+                                   # /api/channel/videos timed out at 280 s.
+  backend/routers/channels.py:467  # Measured 2026-10-13 with py-spy while
+                                   # /api/channel/videos took ...
+
+There is a dedicated `_PRIORITY_MARK_POOL` created because of this endpoint. So it
+has been slow before (280 s observed) and was mitigated server-side - but at 15 s it
+still holds a socket long enough to starve every preview opened in that window.
+
+### The two directions, neither chosen yet
+
+  1. Make `/api/channel/videos` not take 15 s on this path (cache hit, or take the
+     live fetch off the request path).
+  2. Make it stop blocking previews (do not fire the channel load when a preview is
+     opening, or give the preview priority for sockets).
+
+Direction 1 is the smaller change with the larger effect and is the one to measure
+first - but it is NOT measured yet, and after the panel-lane lesson the fix gets a
+paired A/B on the concurrent probe before it is believed.
+
+
+---
+
+## Round 12 — the socket holder is a COLD cache miss, and the cache does not dedupe
+
+Chasing round 11 endpoint further, same call three times in a row:
+
+  /api/channel/videos?url=gaveta&limit=25
+    chamada 1:     5 ms   11.3 KB
+    chamada 2:     2 ms   11.3 KB
+    chamada 3:     2 ms   11.3 KB
+
+against 15 359 ms for the same URL measured cold one round earlier. So the endpoint
+is 2-5 ms warm and ~15 s cold. The 15 s is genuine live-scraping time, not a timeout:
+the relevant ceilings are CHANNEL_VOD_FETCH_TIMEOUT_SEC = 20 and
+YOUTUBE_CHANNEL_FETCH_TIMEOUT_SEC = 30, and 15 s sits inside both. "Just make it
+fast" is therefore not a small change - it is the scraping itself.
+
+TTLs: TWITCH_CHANNEL_FRESH_SEC = 600 (10 min), KICK 600, YOUTUBE 1800 (30 min). So
+the first open of a channel in a session is cold and slow, and later ones are warm.
+
+### A REAL BUG FOUND ON THE WAY, and its reach stated honestly
+
+backend/services/channel_cache.py is a plain TTL cache: get_cached() returns None on
+a miss and set_cached() stores the result once the fetch finishes. There is NO
+in-flight coalescing, so N concurrent callers asking for the SAME cold key each run
+the whole 15-20 s fetch - N times the sockets and N times the upstream scraping.
+The pattern exists elsewhere in the same router (`_bg_refresh_inflight` at
+channels.py:130, `_original_backfill_inflight` at channels.py:1216), so this path is
+simply missing it.
+
+HOWEVER, it is NOT the cause of the preview stall I measured, and I am not going to
+let it take credit: the three requests holding sockets in the round-11 capture were
+three DISTINCT urls (`?url=gaveta`, `?platforms=YouTube&content=...`,
+`/api/channel/clips?...`), not three duplicates of one key. Deduping would not have
+removed any of them. It is worth fixing on its own merits; it is not the fix here.
+
+### What the preview stall therefore reduces to
+
+  cold channel open  ->  3 distinct slow calls (9 s, 16.5 s, 18.7 s in the capture)
+                     ->  3 of the browser 6 sockets held for 15-20 s
+  preview click      ->  session POST queues behind them, leaving at @19 078 ms
+                     ->  hls.js manifestLoadingTimeOut (10 s) fires on the queued
+                         manifest, aborts, retries; canplay lands ~11.5 s later
+
+So the seconds are structural: a cold channel load and a preview click overlap, and
+they share one 6-socket pool per origin. Three directions, none measured yet:
+
+  1. Do not fire all three channel calls at once (the `clips` call serves a
+     secondary tab and costs 16.5 s of socket). Cheapest, client-side.
+  2. Warm the channel cache before the user opens it.
+  3. Give previews their own connection pool. `localhost:PORT` and
+     `127.0.0.1:PORT` are DIFFERENT origins for browser connection limiting, so
+     serving media from the other hostname doubles the effective pool from 6 to 12
+     - at the cost of making it a cross-origin request, which needs CORS on the
+     server. Largest effect, largest change.
+
+The next round picks ONE and runs it as a paired A/B on the concurrent probe. After
+the panel-lane lesson (7210443 reverted in 53a4147 for a measured 5-7x regression),
+no fix is believed without that.
+
+### The complete trace, from the click to the spinner
+
+The last link, read from the client:
+
+  src/App.tsx:5295-5301
+    if (wantKick)    vodTasks.push(fetchVods('Kick',    ch.kickSlug));
+    if (wantTwitch)  vodTasks.push(fetchVods('Twitch',  ch.twitchSlug));
+    if (wantYoutube) vodTasks.push(fetchVods('YouTube', ch.youtubeSlug));
+    await Promise.all(vodTasks);          // THREE cold channel fetches IN PARALLEL
+
+and each task is its own request (`platforms: platform`, one platform per call),
+plus the separate `/api/channel/clips` call at App.tsx:5118.
+
+So one channel open costs up to FOUR simultaneous cold scrapes:
+
+  Kick vods     ~9-15 s      (measured 15 359 ms cold, 2-5 ms warm)
+  Twitch vods   ~9-15 s
+  YouTube vods  ~18.7 s      (measured in the capture)
+  clips         ~16.5 s      (measured in the capture)
+
+Four of the browser SIX sockets, held for 15-20 s, against a 6-connection ceiling
+per origin that no amount of client-side budgeting can raise. A preview clicked in
+that window queues its session POST behind them - @19 078 ms in the capture - and
+then hls.js `manifestLoadingTimeOut: 10000` aborts the queued manifest and retries,
+which is the ~11.5 s canplay.
+
+### The fix target, now exact
+
+The three platform fetches do not need to be simultaneous. `Promise.all` over three
+cold scrapes is what costs four sockets; bounding that fan-out to one or two at a
+time frees sockets for the preview, at the cost of a slower channel list. That is
+precisely the trade the objective two earlier attempts were reaching for ("segurar o
+poll de live", "yield limitado no sync de canais") - and they missed because they
+throttled `/api/channels/*/live`, which is 4-5 ms on the server, instead of the
+three 15-20 s VOD scrapes that actually hold the sockets.
+
+NOT IMPLEMENTED, deliberately. It gets a paired A/B on the concurrent probe
+(scripts/observability/concurrent-preview-probe.mjs) first: measure six-preview
+time-to-ready before and after, same build lineage, same session. After 7210443
+was reverted in 53a4147 for a measured 5-7x regression, a plausible story is not
+enough to ship a fix on this path.
