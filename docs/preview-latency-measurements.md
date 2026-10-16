@@ -1132,3 +1132,66 @@ session POST, que ja e o que a priority window faz).
 
 A hipote se contrapoe a resultada observada: session_ready=1599 ms (2.3x o custo
 nua de session solo 685 ms). A discrepacia nao e de rede — e prioridade invertida.
+
+
+---
+
+## Round 19 (closing) — a single change cannot fix it alone
+
+I had three hypotheses and I tried them in order of cheapness. Two are dead, one is
+still standing but unproven. The standing one is a code change; the dead ones are worth
+recording so they are not retried.
+
+### Dead - "fetch all platforms concurrently" (`Promise.all` over vodTasks)
+
+Measured 2026-10-16, round 13 entry above. Bound to two at a time: 7.0 s..19.2 s range
+against 9.9 s..18.2 s. Ranges overlap, n too small, no conclusion. Reverted.
+Screenshots or re-runs required to settle.
+
+### Dead - "make the panel bounded" (PreviewChatPanel lane, pausar pane while preview active)
+
+The lane I wired ran each poll through `sharedAcquire()` + a local ceiling of 2.
+Reverted in round 9 because sequential time went 2485ms → 13489ms (5.4x). The signal I
+almost ignored: *panic behaviour* — 11 of 12 reps were stuck in time-wait state. The panic
+loop itself deletes cache and clears any inference about the app's own connection pool
+efficiency.
+
+### Standing, unproven - "the channel fetch raced with the preview session" (round 12 parser fix)
+
+`channel/videos` (Kick, on a cold cache key) returns in 9-13.5 s where the same keys are
+warmed only after the first browser request. Eliminating `gaveta`-first would let the
+frontend go ahead and fire `preview/session` without waiting for the backend to warm,
+but the cost is a longer time for scroll-at-origin.
+
+### The exact fix I would propose (and which has not been measured) 
+
+    // in App.tsx around line 5295
+    const vodTasks: Promise<void>[] = [];
+    const vodJobs = [
+      wantKick   && (() => fetchVods('Kick', ch.kickSlug)),
+      wantTwitch && (() => fetchVods('Twitch', ch.twitchSlug)),
+      wantYoutube && (() => fetchVods('YouTube', ch.youtubeSlug)),
+    ].filter(Boolean) as Array<() => Promise<void>>;
+    // headroom: keep two platform fetches from overlapping with a click-driven
+    // preview session POST (which is raw apiPost, without the shared budget lane)
+    await serialise(vodJobs, { concurrency: 1 })
+
+or, alternatively @ the fetch level, AFTER confirming the gap is the parallel
+race condition (and not some server-side long-tail leftovers such as an 8s S3 bucket
+livestream backup thread), priority Mark pool isolation (which pairs with another
+thread already consuming one), beforeising the client to fall back to
+requestCache after `requestId` in conjunction with a `limit` block that
+terminates as soon as the UI gets a `refreshing` flag might give us an earlier
+stall-avoidance OR allow the socket that carries the preview session to enter the
+queue before the channel LIST nucleates.
+
+### What no effort can recover without a server rebuild (real answer: we can't measure it from here)
+
+The 9-13.5 s is almost entirely attributable to a cold cache miss on, for example,
+cf LOAD `gaveta` (Kick) where 600KB/s TLS bulk looks like nothing for an outer-cache
+but 15s when the backend has to do a full scrape. Whatever option (a) (b) (c) above,
+the first user after boot that opens a channel with a cold `channel` path will
+borrow between 9 and 14 s for a read page to populate. "Every preview toca em <=3s"
+can be held only when the user's channel list is NOT cold (i.e. its done with one click),
+and the search/filter UI is already set up from the same session's channel list, so
+the dependency on cold start isn't fully separable from the preview circuit itself.
