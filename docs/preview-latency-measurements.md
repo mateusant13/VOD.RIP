@@ -998,3 +998,111 @@ measured under six-preview load with several channels in flight at once, against
 the CHANNEL_EXECUTOR pool. That is the next thing to measure, and it is measurable
 without any browser: fire N channel fetches concurrently against the source API and
 watch the per-call time as N rises.
+
+
+---
+
+## Round 18 — REPRODUCED: a cold Kick channel blocks for 22.8 s, and the bug is an asymmetry
+
+Driving the REAL route in-process (httpx ASGITransport against `app`, no server, no
+browser, no window), one platform per request, `force=1` so every call is cold:
+
+  Kick    rep1    22798 ms   videos=25   refreshing=False   errs=[]
+  Kick    rep2     1629 ms   videos=25
+  Twitch  rep1     2005 ms   videos=25
+  Twitch  rep2     1933 ms   videos=25
+
+22.8 SECONDS on a cold Kick channel, 1.6 s on the next call. That is larger than the
+9-13.5 s measured earlier under six-preview load, and it is reproducible on demand
+with no browser involved at all - which finally makes this a fixable target instead
+of a load-dependent ghost.
+
+### The cause: YouTube cold is deliberately non-blocking; Kick and Twitch are not
+
+channels.py:964-977 builds the fetch plan:
+
+  for label in wanted:
+      have = len(_idx(label))
+      if have == 0 and label == "YouTube":
+          # Cold YouTube: a live crawl is slow + bot-gated (tens of seconds up to
+          # a hard timeout), so never block the browse on it. Serve the (empty)
+          # index now and let the background warm fill it.
+          continue                      # <- YouTube cold: NON-BLOCKING
+      if force_refresh or have == 0:
+          fetch_plan[label] = ...        # <- Kick/Twitch cold: BLOCKS
+
+So the author already identified exactly this hazard - "slow + bot-gated (tens of
+seconds up to a hard timeout)" - and guarded YouTube against it, while leaving Kick
+and Twitch on the blocking path. 22 798 ms reproduces the hazard the comment names.
+
+AND THE MACHINERY TO FIX IT ALREADY EXISTS AND IS COMPLETE. channels.py:1060-1097 is
+a background refresh that handles precisely this case:
+
+  # Cold (never-indexed) platforms need a full-depth warm so the whole list
+  # becomes reachable; indexed but stale ones only need the delta. Both run
+  # outside the request so the browse never blocks.
+  for grp, depth in (
+      ([l for l in bg_set if not _idx(l)], max(limit, CHANNEL_DELTA_LIMIT)),
+      ([l for l in bg_set if _idx(l)], CHANNEL_DELTA_LIMIT),
+  ):
+
+with `_bg_refresh_inflight` dedup, `_persist_platform` write-back, preview warming
+and the `refreshing: true` flag the frontend already honours (`if (data.refreshing)
+anyRefreshing = true`, App.tsx). Kick and Twitch simply never reach it when cold,
+because the plan sends them to the blocking fetch instead.
+
+### Not yet done, deliberately
+
+The change is to route cold Kick/Twitch through the same non-blocking path YouTube
+uses, so the first browse of a Kick channel returns the (empty) index plus
+`refreshing: true` and fills in behind. That is a REAL trade, not a free win: the
+user sees an empty list for a moment instead of waiting 22 s for a full one, which is
+the right trade for a preview-driven app but is a product decision, and it needs its
+own paired measurement (empty-then-filled vs 22 s-then-full) before shipping.
+
+### The Kick clue was also PARSING THE WRONG FIELD - measured, then fixed
+
+The route adds a stable ~1471 ms over the Kick service call, and the clue measured
+1473 ms standalone. Probing the raw payload explains where the seconds go AND found a
+second, independent bug:
+
+  gaules    user.language=None   data.language=None   livestream.language='Portuguese'
+  gaveta    user.language=None   data.language=None   livestream.language=None
+
+The parser read `user.get("language") or data.get("language")` - and Kick puts the
+value under `livestream`. So the WS-3 Kick clue returned None for EVERY channel while
+costing 384-1446 ms of network per channel fetch. Five real channels, zero values:
+
+  gaules 524  gaveta 958  casimito 931  baiano 1065  mount 1168   -> all None
+
+FIXED: the chain now also reads `livestream.language`. Re-measured against the live
+API after the change:
+
+  gaules 606 ms -> 'Portuguese'     (was None)
+  gaveta 999 ms -> None             (offline - correctly still None)
+  casimito 979 ms -> None,  baiano 384 ms -> None,  mount 1077 ms -> None
+  values: 1 of 5, and that 1 is the only channel live in the sample
+
+The offline cases stay None BY DESIGN, and that is worth stating rather than
+smoothing: `livestream` is populated only while a channel is live, so this clue is the
+CURRENT STREAM language, not a stable per-channel language. It is a situational signal.
+
+LAW + RED ARM: backend/tests/test_kick_language_clue_parsing.py, two tests - the
+livestream payload yields 'Portuguese', an empty livestream stays None. Red arm proven:
+dropping `_ls.get("language")` fails with `assert None == 'Portuguese'`, and the
+offline test still passes, which is the pair working as intended.
+
+WHAT THIS DOES **NOT** FIX, stated plainly: the ~1.0-1.4 s the clue costs on the
+critical path of every Kick channel fetch. Improving the parse makes the field
+correct; it does not make the call cheaper, and the call is `None` for every offline
+channel - which is most of them. The right next move is to stop blocking the browse
+on it (the clue is best-effort by its own docstring, and channels.py already has a
+background lane that handles cold platforms without blocking), not to tune its parsing
+further.
+
+ALSO CORRECTING MY OWN PREVIOUS COMMIT 7e4eb99: its message claims the concurrency
+fix makes the Kick path max(list, clue) instead of the sum. True, but the measured
+effect is smaller than that phrasing suggests - with the clue at ~1473 ms and the list
+at ~124 ms warm, max and sum differ by only ~124 ms. The fix is correct and was not
+wasted; the claim of its size was too generous, and the honest figure is in the paired
+table above (deltas 1228/1497/1471 ms, which is the CLUE, not the saving).

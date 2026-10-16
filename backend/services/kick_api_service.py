@@ -531,7 +531,20 @@ def get_channel_language_sync(slug: str, *, origin: str = "auto") -> Optional[st
     try:
         data = _get_json(f"/api/v2/channels/{slug}", f"{_BASE}/{slug}", origin=origin)
         user = data.get("user") if isinstance(data.get("user"), dict) else {}
-        lang = user.get("language") or data.get("language") or None
+        # Kick puts the language under livestream, NOT under user/channel root.
+        # Measured 2026-10-16 against the live API for six real channels:
+        #
+        #   gaules   livestream.language='Portuguese'  user.language=None
+        #   gaveta   livestream.language=None          user.language=None
+        #   (4 more offline channels: both None)
+        #
+        # so `user.language or data.language` returned None for EVERY channel,
+        # which is why the WS-3 Kick clue never produced a value. The field is
+        # the CURRENT STREAM language and is populated only while the channel is
+        # live (is_live=True), so reading it fixes the live case and leaves the
+        # offline case correctly None.
+        _ls = data.get("livestream") if isinstance(data.get("livestream"), dict) else {}
+        lang = user.get("language") or data.get("language") or _ls.get("language") or None
     except Exception:
         logger.debug("Kick channel language fetch failed for %s", slug, exc_info=True)
         lang = None
