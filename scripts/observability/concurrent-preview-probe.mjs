@@ -9,7 +9,16 @@
  * MEASURED 2026-10-16, frozen build, VODRIP_NO_DAEMONS UNSET (see AGENTS.md -
  * that flag invalidates any latency measurement), six previews at once:
  *
- *   t+0.6s..t+19.5s   videos=6 ready=0 playing=0
+ *   t+0.6s..t+19.5s   videos=6 ready=0 playing=0     <- all six spinners, 20 s
+ *   t+22.6s           videos=5 ready=1 playing=1
+ *   t+44.4s           videos=5 ready=5 playing=1
+ *
+ * THE METRIC IS ready, NOT playing. Opening a preview pauses every other one by
+ * design (LivePlayerPopup joins the shared preview-pause bus), so playing=1 with
+ * six open is CORRECT and the first version of this probe wrongly called it a
+ * failure. What the owner photographed is the SPINNER - "Carregando transmissao
+ * ao vivo..." - which is readyState < 2. So the number to move is the time until
+ * all N are ready: 20-26 s in the run above, against a 3 s target.
  *   t+44.4s           videos=5 ready=5 playing=1   (47 s, only ONE plays)
  *   request log:      20+ panel/twitch/...?limit=2000 PENDING at capture end
  *
@@ -99,13 +108,20 @@ for (let i = 0; i < Math.ceil(TIMEOUT / 500); i++) {
     return { videos: vs.length, ready: ready.length, playing: playing.length };
   });
   if (i % 6 === 0) console.log('  t+' + ((Date.now()-t0)/1000).toFixed(1) + 's videos=' + st.videos + ' ready=' + st.ready + ' playing=' + st.playing);
-  if (st.playing >= N) { result = { ok: true, ms: Date.now() - t0, ...st }; break; }
+  // SUCCESS = every preview reached readyState >= 2 (the spinner is gone).
+  // It is NOT "every preview is playing": opening a preview pauses every other
+  // one on purpose - LivePlayerPopup joins the shared preview-pause bus
+  // ("opening a live pauses every other preview", LivePlayerPopup.tsx:337, with
+  // a test at LivePlayerPopup.test.tsx:521). Exactly ONE playing is the DESIGN,
+  // so a playing>=N verdict measures the wrong thing and would never pass.
+  if (st.ready >= N) { result = { ok: true, ms: Date.now() - t0, ...st }; break; }
   if (i === Math.ceil(TIMEOUT/500) - 1) result = { ok: false, ms: Date.now() - t0, ...st };
 }
 console.log('');
 console.log('=== RESULTADO: ' + N + ' previas DE UMA VEZ ===');
-console.log('  playable todas: ' + (result.ok ? 'SIM' : 'NAO') + '  em ' + result.ms + ' ms');
-console.log('  videos=' + result.videos + ' ready=' + result.ready + ' playing=' + result.playing + ' (alvo ' + N + ')');
+console.log('  TODAS PRONTAS (readyState>=2, sem spinner): ' + (result.ok ? 'SIM' : 'NAO') + '  em ' + result.ms + ' ms');
+console.log('  videos=' + result.videos + ' ready=' + result.ready + ' playing=' + result.playing + ' (alvo ready ' + N + ')');
+console.log('  nota: playing=1 e o DESIGN (preview-pause bus); o alvo medido e ready=' + N + '.');
 const reqs = await page.evaluate(() => window.__TAP.reqs.map(r => ({ p: r.url.replace(/^.*\/api\/preview\//,'').slice(0,44), s: r.t, e: r.done, st: r.status })));
 console.log('');
 console.log('=== requisicoes (ms desde o load) ===');
