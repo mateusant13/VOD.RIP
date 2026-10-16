@@ -644,6 +644,15 @@ async def _app_lifespan(_app: FastAPI):
 
         # ponytail: 5/channel matches YOUTUBE_WARM_VOD_LIMIT; deeper scroll
         # triggers the frontend per-scroll batch warm.
+        #
+        # KEPT AT 5. Measured 2026-10-15 in app.log (NOT the stdout redirect,
+        # which carries only uvicorn access lines): "STARTUP_WAVE: wave 1 firing
+        # 20 URLs" - four channels x five. When YouTube extracts SUCCEED the wave
+        # is harmless (extract ok, snapshot ready, panel stays at 0.02 s). When
+        # they FAIL with preview_race_exhausted (wall_ms=24093) the same 20 URLs
+        # become a ~100 s storm. Cutting BATCH would fix the storm by giving up
+        # warm coverage on the videos the fast-start click actually wants, so the
+        # bound belongs on CONCURRENCY (WARM_WORK_SEMAPHORE), not on coverage.
         BATCH = 5
         MAX_WAVES = 1
         submitted = 0
