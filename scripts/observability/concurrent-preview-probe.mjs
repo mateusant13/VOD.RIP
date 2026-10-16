@@ -138,4 +138,65 @@ for (const r of first) {
 }
 const stillPending = reqs.filter(r => r.e === null).length;
 console.log('  pendentes no fim: ' + stillPending + ' de ' + reqs.length);
+// ── RESOURCE TIMING: attribute the seconds to a PHASE ─────────────────────
+// The fetch tap above records only start/end, which cannot separate "waited
+// for a socket" from "the server was slow". Resource Timing can, is
+// same-origin here (UI and API share 127.0.0.1:7897), so the full breakdown
+// is exposed without touching hls.js internals:
+//   queue  = fetchStart - startTime      (waiting for a connection slot)
+//   server = responseStart - requestStart (backend thinking)
+//   total  = duration
+// Whichever dominates names the phase, and that decides which fix is real.
+const rt = await page.evaluate(() => {
+  const out = [];
+  for (const e of performance.getEntriesByType('resource')) {
+    if (!/\/api\/(preview|channel|channels)/.test(e.name)) continue;
+    out.push({
+      n: e.name.replace(/^.*\/api\//, '/api/').split('?')[0].slice(0, 46),
+      start: Math.round(e.startTime),
+      fetchStart: Math.round(e.fetchStart),
+      reqStart: Math.round(e.requestStart),
+      resStart: Math.round(e.responseStart),
+      resEnd: Math.round(e.responseEnd),
+      dur: Math.round(e.duration),
+      size: e.transferSize || 0,
+    });
+  }
+  return out;
+});
+console.log('');
+console.log('=== RESOURCE TIMING: fila vs servidor (as 18 mais lentas) ===');
+const byDur = [...rt].sort((a, b) => b.dur - a.dur).slice(0, 18);
+console.log('  fila(ms)  servidor(ms)  total(ms)  inicio(ms)  tam   url');
+for (const e of byDur) {
+    const queue = e.fetchStart - e.start;
+    const server = e.resStart - e.reqStart;
+    console.log(
+      '  ' + String(queue).padStart(7) + '  ' + String(server).padStart(11) +
+      '  ' + String(e.dur).padStart(8) + '  ' + String(e.start).padStart(9) +
+      '  ' + String(Math.round(e.size / 1024)).padStart(5) + 'K  ' + e.n,
+    );
+  }
+const totQueue = rt.reduce((a, e) => a + (e.fetchStart - e.start), 0);
+const totServer = rt.reduce((a, e) => a + Math.max(0, e.resStart - e.reqStart), 0);
+const totDur = rt.reduce((a, e) => a + e.dur, 0);
+console.log('  ---------------------------------------------');
+console.log('  requisicoes medidas: ' + rt.length);
+console.log('  soma FILA:     ' + totQueue + ' ms');
+console.log('  soma SERVIDOR: ' + totServer + ' ms');
+console.log('  soma TOTAL:    ' + totDur + ' ms');
+// per-phase totals for the preview-relevant subset
+const pv = rt.filter((e) => /preview|hls/.test(e.n));
+console.log('  --- so preview/hls (' + pv.length + ') ---');
+console.log('    FILA:     ' + pv.reduce((a, e) => a + (e.fetchStart - e.start), 0) + ' ms');
+console.log('    SERVIDOR: ' + pv.reduce((a, e) => a + Math.max(0, e.resStart - e.reqStart), 0) + ' ms');
+// where the time sits relative to the click
+const clickAt = await page.evaluate(() => window.__TAP.clickAt || 0);
+console.log('    click em @' + Math.round(clickAt) + ' ms');
+const pvAfterClick = pv.filter((e) => e.start >= clickAt);
+if (pvAfterClick.length) {
+  const first = pvAfterClick.sort((a, b) => a.start - b.start)[0];
+  console.log('    primeira req preview pos-clique @' + Math.round(first.start) + ' (delta ' + Math.round(first.start - clickAt) + ' ms)');
+}
+
 await browser.close();
