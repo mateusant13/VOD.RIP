@@ -58,6 +58,14 @@ async function isPortListening(port) {
   return false;
 }
 
+/** First host in `hosts` that is actually LISTENING on `port` (null if none). */
+async function firstListeningHost(hosts, port) {
+  for (const host of hosts) {
+    if (await isPortListeningOn(host, port)) return host;
+  }
+  return null;
+}
+
 async function waitPortFree(port, timeoutMs = 12000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -1115,12 +1123,20 @@ async function main() {
   for (let i = 0; i < 240 && !(await viteHealthy(vitePort)); i++) {
     await sleep(500);
   }
+  // Vite may bind [::1] only on Windows (host:"localhost" resolves to ::1, so
+  // 127.0.0.1:5173 is REFUSED while localhost:5173 answers). A hardcoded IPv4
+  // target then fails every request and this warmup silently no-ops — and the
+  // browser pays the cold transform cost it exists to absorb. Ask which host
+  // Vite is actually on (same probe viteHealthy uses) and warm THAT one.
+  const warmHost =
+    (await firstListeningHost(["localhost", "127.0.0.1", "::1"], vitePort)) ||
+    "127.0.0.1";
   const warmTargets = [
-    `http://127.0.0.1:${vitePort}/`,
-    `http://127.0.0.1:${vitePort}/src/main.tsx`,
-    `http://127.0.0.1:${vitePort}/src/index.css`,
+    `http://${warmHost}:${vitePort}/`,
+    `http://${warmHost}:${vitePort}/src/main.tsx`,
+    `http://${warmHost}:${vitePort}/src/index.css`,
   ];
-  console.log("[dev] warming first-load modules\u2026");
+  console.log(`[dev] warming first-load modules (host ${warmHost})\u2026`);
   for (const u of warmTargets) {
     await new Promise((resolve) => {
       const req = http.get(u, (res) => {

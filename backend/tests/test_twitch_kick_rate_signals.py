@@ -146,7 +146,7 @@ def _burn(clock, platform, requests, seconds=60.0, source="auto"):
 def _twitch_body(monkeypatch, raw: bytes) -> None:
     """Answer every Twitch GQL POST with *raw* bytes."""
     monkeypatch.setattr(
-        twitch_gql_service.urllib.request, "urlopen",
+        twitch_gql_service._GQL_OPENER, "open",
         lambda req, timeout=None: _TwitchResp(raw),
     )
 
@@ -339,7 +339,7 @@ def test_twitch_500_writes_nothing(db, clock, monkeypatch):
             "https://gql.twitch.tv", 500, "Server Error", {}, io.BytesIO(b"boom"),
         )
 
-    monkeypatch.setattr(twitch_gql_service.urllib.request, "urlopen", _boom)
+    monkeypatch.setattr(twitch_gql_service._GQL_OPENER, "open", _boom)
     with pytest.raises(RuntimeError, match="HTTP 500"):
         twitch_gql_service._gql_request("query Q {}", {})
 

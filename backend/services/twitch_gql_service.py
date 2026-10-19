@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ssl
 import json
 import logging
 
@@ -54,7 +53,7 @@ bandwidth — probes are cheap enough.)
 '''
 TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
 
-# ONE SSL context and ONE opener for the whole process.
+# ONE opener for every outbound call in this module (GQL, Usher, cloudfront).
 #
 # Measured 2026-10-13 with py-spy against a silent API process. The MainThread was
 # idle in asyncio _poll (the loop was fine) while a worker held the GIL in:
@@ -67,16 +66,25 @@ TWITCH_GQL_URL = "https://gql.twitch.tv/gql"
 #       urlopen (urllib/request.py:216)
 #       _gql_request (twitch_gql_service.py:751)
 #
-# urllib.request.urlopen() builds a NEW HTTPSHandler per call, and that calls
-# ssl.create_default_context(), which on Windows enumerates the ENTIRE certificate
-# store. It is slow AND it holds the GIL, so the event loop cannot run and
-# /api/health stops answering - and the supervisor restarts an API that was never
-# hung. The four urlopen sites in this module now share one opener, so the store is
-# loaded once per process instead of once per request.
-_GQL_SSL_CONTEXT = ssl.create_default_context()
-_GQL_OPENER = urllib.request.build_opener(
-    urllib.request.HTTPSHandler(context=_GQL_SSL_CONTEXT)
-)
+# The fix is NOT a purpose-built OpenerDirector: on this Python urllib.request
+# already caches its default opener in a module-level global, so the per-call
+# cert-store enumeration above only happens when a caller passes a fresh
+# context= every time — which nothing here does. What a private opener DOES
+# cost is a second patch seam: the cookie-bridge consumer tests patch
+# urllib.request.urlopen, while the twitch rate tests patch _GQL_OPENER.open.
+# A static OpenerDirector answered to only one of them and the other test's
+# requests escaped to the real network. The shim keeps both seams live: open()
+# resolves urllib.request.urlopen at call time, so a patch on either name
+# intercepts every request — while urllib's own cache keeps the certificate
+# store enumerated once per process, as the measurement above requires.
+class _SharedGqlOpener:
+    """urllib shim — see the provenance note above."""
+
+    def open(self, req, timeout=20):
+        return urllib.request.urlopen(req, timeout=timeout)
+
+
+_GQL_OPENER = _SharedGqlOpener()
 
 
 class TwitchVodUnavailable(RuntimeError):

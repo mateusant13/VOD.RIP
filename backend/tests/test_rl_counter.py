@@ -455,7 +455,7 @@ def test_twitch_gql_both_families_are_counted(monkeypatch, clock):
                 )
         return _Resp(b'{"data": {"ok": true}}')
 
-    monkeypatch.setattr(twitch_gql_service.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(twitch_gql_service._GQL_OPENER, "open", fake_urlopen)
 
     twitch_gql_service._gql_request("query Q {}", {})
     assert rl_counter.total_requests("twitch") == 1

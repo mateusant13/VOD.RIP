@@ -700,6 +700,23 @@ _AUTO_INSTALL_STATE = {
     "finished_at": None,
 }
 
+
+def _mark_auto_install_done() -> None:
+    """Mirror the short-circuit verdict into the shared state.
+
+    The already-paired and extension-active paths answer installed:true without
+    running the driver. GET /status reports the raw worker fact and nothing
+    else (deliberately — a paired token alone is not proof of a successful
+    install), so without this mirror the status endpoint would keep reporting
+    installed:false for a bridge the response body just called already
+    installed. Both short-circuits below are positive evidence the extension
+    is live: a paired token, or a fresh cookie push from the extension.
+    """
+    with _AUTO_INSTALL_LOCK:
+        _AUTO_INSTALL_STATE["state"] = "done"
+        _AUTO_INSTALL_STATE["installed"] = True
+        _AUTO_INSTALL_STATE["finished_at"] = time.time()
+
 def _ext_src_override() -> Optional[Path]:
     """Env override for the unpacked extension folder (mirrors VODRIP_EXT_CRX)."""
     override = os.environ.get("VODRIP_EXT_SRC", "").strip()
@@ -959,6 +976,7 @@ async def session_cookies_auto_install(body: Optional[dict] = None):
     """Install the cookie bridge and, when requested, the Kick Overlay."""
     include_kick_overlay = bool(body and body.get("include_kick_overlay"))
     if _paired_token() and not include_kick_overlay:
+        _mark_auto_install_done()
         return {"ok": True, "installed": True, "alreadyInstalled": True, "state": "done"}
     # Extension running but bridge de-paired (token emptied while the extension
     # kept pushing): the extension re-pairs on its next cookie push (10-minute
@@ -975,6 +993,7 @@ async def session_cookies_auto_install(body: Optional[dict] = None):
             except (ValueError, TypeError):
                 age = float("inf")
             if age < 11 * 60 and not include_kick_overlay:
+                _mark_auto_install_done()
                 return {"ok": True, "installed": True, "alreadyInstalled": True, "state": "done"}
     except Exception:
         pass

@@ -167,15 +167,12 @@ CREATE TABLE IF NOT EXISTS transcripts (
 );
 CREATE INDEX IF NOT EXISTS idx_transcripts_video ON transcripts(platform, video_id, start_sec);
 
--- `lang` needs its own index. Measured 2026-10-13 on the live archive
--- (H:\VOD.RIP-data\archive.db, 3,372,472 transcript rows): _migrate_transcript_data
--- probes `WHERE t.lang IS NULL AND EXISTS(...)` and, with no index on lang, the
--- planner answered SCAN t - a FULL TABLE SCAN that took 83.93 s. That probe runs
--- inside _init_schema, which _ensure_schema_ready calls from _get_read_conn, i.e.
--- ON THE READ PATH, so the first reader paid 84 s and every other thread blocked
--- behind _init_lock. It is also what py-spy showed as an active thread inside a
--- plain `query` call while /api/health went unanswered.
-CREATE INDEX IF NOT EXISTS idx_transcripts_lang ON transcripts(lang);
+-- NOTE: idx_transcripts_lang is NOT created here in SCHEMA. A legacy
+-- transcripts table (no `lang` column) makes `CREATE INDEX ...
+-- ON transcripts(lang)` raise "no such column" during executescript(SCHEMA),
+-- which runs BEFORE the _ensure_* migrations. The index is created inside
+-- _ensure_lang_column instead, which guards on PRAGMA table_info and runs
+-- on every fresh open (so the live archive gets it too).
 
 CREATE VIRTUAL TABLE IF NOT EXISTS transcripts_fts USING fts5(
   text, content='transcripts', content_rowid='id');
@@ -629,7 +626,13 @@ def _init_schema() -> None:
         rebuilt = _migrate_fts_contentless(_conn)
         # One-time data migrations on transcripts (entity + lang backfill).
         # Runs after the FTS rebuild so the current trigger set re-indexes.
-        _migrate_transcript_data(_conn)
+        # Gated on user_version HERE, not inside the function: step (1) is a
+        # full-corpus leading-wildcard scan, so it is paid once per database at
+        # boot rather than on every process start. _migrate_transcript_data
+        # itself stays ungated (and idempotent) so a direct call made after boot
+        # still migrates legacy-shaped rows.
+        if _conn.execute("PRAGMA user_version").fetchone()[0] < _TRANSCRIPT_MIGRATION_VERSION:
+            _migrate_transcript_data(_conn)
         _conn.commit()
         if rebuilt:
             # Legacy index rebuilds leave the old FTS shadow-table pages on
@@ -803,11 +806,13 @@ _VIDEO_INDEX_SQL = (
     "CREATE INDEX IF NOT EXISTS idx_videos_canonical ON videos(canonical_key)",
 )
 
-# NOTE: idx_transcripts_lang is created by the SCHEMA block above, NOT here.
-# _init_schema runs executescript(SCHEMA) on every open (lines ~564/590), and
-# CREATE INDEX IF NOT EXISTS is idempotent, so an existing 7.5 GB archive gets
-# it too. A separate migration tuple was written first and removed: it was never
-# executed, and an unexecuted guard is a defect in this tree own terms.
+# NOTE: idx_transcripts_lang is created inside _ensure_lang_column, NOT here.
+# An earlier revision put a bare `CREATE INDEX ... ON transcripts(lang)` in the
+# SCHEMA constant; on a legacy DB whose transcripts table predates the lang
+# column, executescript(SCHEMA) raised "no such column: lang" and the module
+# self-check died at import (the index ran before any migration could add the
+# column). _ensure_lang_column runs on every fresh open and guards on
+# PRAGMA table_info, so both fresh and migrated archives get the index safely.
 
 
 def _ensure_kind_check_includes_stream(conn: sqlite3.Connection) -> None:
@@ -1032,10 +1037,26 @@ def _ensure_lang_column(conn: sqlite3.Connection) -> None:
     ('pt', 'en', or raw codes); search() filters on it. Additive only; NULL
     means "unknown — treated as PT content" (whisper rows without a
     detected language are Portuguese). PRAGMA table_info guard makes
-    repeated calls no-ops."""
+    repeated calls no-ops.
+
+    Also creates idx_transcripts_lang here (NOT in SCHEMA): a legacy table
+    without the column would make the unguarded CREATE INDEX raise "no such
+    column" during executescript(SCHEMA), which runs before this migration.
+    `lang` needs its own index. Measured 2026-10-13 on the live archive
+    (H:\\VOD.RIP-data\\archive.db, 3,372,472 transcript rows):
+    _migrate_transcript_data probes `WHERE t.lang IS NULL AND EXISTS(...)` and,
+    with no index on lang, the planner answered SCAN t - a FULL TABLE SCAN that
+    took 83.93 s. That probe runs inside _init_schema, which
+    _ensure_schema_ready calls from _get_read_conn, i.e. ON THE READ PATH, so
+    the first reader paid 84 s and every other thread blocked behind
+    _init_lock."""
     cols = {row[1] for row in conn.execute("PRAGMA table_info(transcripts)")}
     if "lang" not in cols:
         conn.execute("ALTER TABLE transcripts ADD COLUMN lang TEXT")
+    # Guarded index creation: only once the column actually exists (fresh DBs
+    # get it via the same path — the SCHEMA CREATE TABLE includes lang, so the
+    # PRAGMA guard passes and the index is created here on first open).
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_transcripts_lang ON transcripts(lang)")
 
 
 def _clean_legacy_transcript_text(text: str) -> str:
@@ -1083,10 +1104,8 @@ def _migrate_transcript_data(conn: sqlite3.Connection) -> None:
     either starts a clean connection (_init_schema's migration pass) or has
     already committed.
     """
-    # ONE TIME, EVER - recorded in PRAGMA user_version.
-    #
-    # Measured 2026-10-13 on the live archive (H:\VOD.RIP-data\archive.db,
-    # 3,372,472 transcript rows). Step (1) below is:
+    # The user_version gate that keeps this ONE TIME, EVER now lives in the
+    # CALLER (_init_schema), not here. Step (1) below is:
     #
     #     SELECT id, text FROM transcripts
     #     WHERE text LIKE '%&amp;%' OR text LIKE '%&lt;%' OR text LIKE '%&gt;%'
@@ -1101,11 +1120,15 @@ def _migrate_transcript_data(conn: sqlite3.Connection) -> None:
     #
     # Step (2) already had a cheap reader-only EXISTS probe before its write, and
     # the comment there says why. Step (1) did not. Rather than add a probe that
-    # still full-scans once per boot, the whole migration is now gated on a
+    # still full-scans once per boot, _init_schema gates the whole migration on a
     # persisted marker: PRAGMA user_version was 0 and unused, so it is the
     # migration ledger. The scan then costs one boot, not every boot.
-    if conn.execute("PRAGMA user_version").fetchone()[0] >= _TRANSCRIPT_MIGRATION_VERSION:
-        return
+    #
+    # The gate is deliberately NOT here: a direct call must still migrate. A
+    # caller that just inserted legacy-shaped rows (a test, or a repair path)
+    # gets them cleaned even after boot already marked the ledger done. Both
+    # steps are idempotent - step (1) only rewrites text that still differs,
+    # step (2) only touches lang IS NULL rows - so re-running is a cheap no-op.
     with conn:
         # (1) entity unescape + turn-marker strip.
         legacy = conn.execute(
@@ -1905,16 +1928,29 @@ def upsert_video(video: dict) -> None:
     _bump_content_ref("videos")
 
 
-def upsert_channel_video(video: dict) -> None:
-    """Upsert a channel-list metadata row WITHOUT touching archive fields.
+_CHANNEL_VIDEO_UPSERT_SQL = """INSERT INTO videos (platform, video_id, channel, title, started_at,
+   duration_sec, duration_string, views, thumbnail_url, kind,
+   original_title, original_language, created_at, updated_at)
+   VALUES (:platform, :video_id, :channel, :title, :started_at,
+   :duration_sec, :duration_string, :views, :thumbnail_url, :kind,
+   :original_title, :original_language, :created_at, :updated_at)
+   ON CONFLICT(platform, video_id) DO UPDATE SET
+     channel=excluded.channel, title=excluded.title,
+     started_at=excluded.started_at,
+     duration_sec=excluded.duration_sec,
+     duration_string=excluded.duration_string,
+     views=excluded.views, thumbnail_url=excluded.thumbnail_url,
+     kind=excluded.kind,
+     -- WS-4: an absent original key (plain list refresh) must never
+     -- clobber a backfilled original title/language.
+     original_title=COALESCE(excluded.original_title, videos.original_title),
+     original_language=COALESCE(excluded.original_language, videos.original_language),
+     updated_at=excluded.updated_at"""
 
-    The channel view accumulates every VOD it has ever seen for a channel
-    (perma, never pruned). On conflict only list metadata is updated —
-    archive_path, canonical_key, status and ended_at belong to the archive
-    pipeline and must survive intact (a download in flight is never
-    clobbered by a list refresh)."""
-    now = _now_iso()
-    row = {
+
+def _channel_video_row(video: dict, now: str) -> dict:
+    """Normalise a channel-list metadata dict into a videos upsert row."""
+    return {
         "platform": video["platform"],
         "video_id": video["video_id"],
         "channel": video.get("channel", ""),
@@ -1927,30 +1963,39 @@ def upsert_channel_video(video: dict) -> None:
         "thumbnail_url": video.get("thumbnail_url"),
         "original_title": video.get("original_title"),
         "original_language": video.get("original_language"),
+        "created_at": now,
         "updated_at": now,
     }
-    execute(
-        """INSERT INTO videos (platform, video_id, channel, title, started_at,
-           duration_sec, duration_string, views, thumbnail_url, kind,
-           original_title, original_language, created_at, updated_at)
-           VALUES (:platform, :video_id, :channel, :title, :started_at,
-           :duration_sec, :duration_string, :views, :thumbnail_url, :kind,
-           :original_title, :original_language, :created_at, :updated_at)
-           ON CONFLICT(platform, video_id) DO UPDATE SET
-             channel=excluded.channel, title=excluded.title,
-             started_at=excluded.started_at,
-             duration_sec=excluded.duration_sec,
-             duration_string=excluded.duration_string,
-             views=excluded.views, thumbnail_url=excluded.thumbnail_url,
-             kind=excluded.kind,
-             -- WS-4: an absent original key (plain list refresh) must never
-             -- clobber a backfilled original title/language.
-             original_title=COALESCE(excluded.original_title, videos.original_title),
-             original_language=COALESCE(excluded.original_language, videos.original_language),
-             updated_at=excluded.updated_at""",
-        {**row, "created_at": now},
-    )
+
+
+def upsert_channel_videos_bulk(videos: list[dict], chunk: int = 500) -> int:
+    """Upsert many channel-list metadata rows in ONE transaction.
+
+    Identical semantics to upsert_channel_video, but the per-row round-trip
+    cost disappears: a 2005-video deep sweep used to issue 2005 separate
+    INSERTs — each its own commit on the shared write connection (~6.6s) —
+    and now lands in a handful of executemany batches inside a single commit.
+    Returns the number of rows written."""
+    rows = [_channel_video_row(v, _now_iso()) for v in videos]
+    if not rows:
+        return 0
+    with _lock:
+        with get_conn() as conn:
+            for i in range(0, len(rows), chunk):
+                conn.executemany(_CHANNEL_VIDEO_UPSERT_SQL, rows[i : i + chunk])
     _bump_content_ref("videos")
+    return len(rows)
+
+
+def upsert_channel_video(video: dict) -> None:
+    """Upsert a channel-list metadata row WITHOUT touching archive fields.
+
+    The channel view accumulates every VOD it has ever seen for a channel
+    (perma, never pruned). On conflict only list metadata is updated —
+    archive_path, canonical_key, status and ended_at belong to the archive
+    pipeline and must survive intact (a download in flight is never
+    clobbered by a list refresh)."""
+    upsert_channel_videos_bulk([video])
 
 
 def touch_channel_snapshot(platform: str, channel_key: str) -> None:

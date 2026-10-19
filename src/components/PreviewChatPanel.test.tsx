@@ -151,7 +151,7 @@ describe('PreviewChatPanel', () => {
   it('fetches the panel payload and renders chat rows with a ×N spam badge', async () => {
     const fetchMock = mockPanelFetch(PAYLOAD);
     render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
-    expect(fetchMock).toHaveBeenCalled();
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
     expect(String(fetchMock.mock.calls[0][0])).toContain('/api/preview/panel/twitch/v1?limit=');
 
     await waitFor(() => {
@@ -179,8 +179,9 @@ describe('PreviewChatPanel', () => {
     render(<PreviewChatPanel platform="twitch" videoId="v1" currentTime={0} />);
     // Session created → the archive payload fetches immediately; nothing the
     // panel fetches waits for canplay (the Twitch chat backfill must kick
-    // off before playback starts).
-    expect(fetchMock).toHaveBeenCalled();
+    // off before playback starts). The fetch goes through the concurrency
+    // lane, so wait for it rather than asserting synchronously.
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
     expect(String(fetchMock.mock.calls[0][0])).toContain('/api/preview/panel/twitch/v1?limit=');
     await waitFor(() => expect(screen.getByText('LETS GO')).toBeTruthy());
   });

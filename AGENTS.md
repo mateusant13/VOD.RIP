@@ -141,6 +141,27 @@ codeintel search "callers of schedule_youtube_window_hls_mux"
 - Use `--` to separate flags from question: `gpt -f a.py -- "review this"`
 - Progress prints to stderr, response to stdout
 
+## Testing rule: the FULL user path — never test the backend in isolation
+
+**Testing preview timing or any user-facing behaviour through the backend alone is
+misleading.** The backend is one link of a chain; the user's real experience is
+`browser → Vite proxy → backend → external (YouTube/Kick/Twitch)`, and every link
+adds variables an isolated test silently drops:
+
+- the **Vite dev proxy** — cold transforms, the fail-fast 8s lanes, connection reuse, the IPv4/IPv6 bind
+- the **browser** — connection pool, Happy Eyeballs IPv4/IPv6 fallback, cached modules, the pre-React loader
+- the **app's own background state** — the startup warm wave, the archive scheduler, rate budgets, the archive cache
+- **real concurrency** — the owner plays a game; Steady Watcher throttles; other tabs are open
+
+**So: when you measure a user-facing path (preview start, archive freshness,
+download start, search), drive it the way the user does** — the browser, through
+the proxy, against the *running* app — and read the real timings from the page's
+own network timeline (`chrome-devtools` → `list_network_requests`, or the page's
+Performance API). Backend-only checks are for *unit* questions ("does this
+function return the right thing?"), never for *latency or freshness* claims.
+If you must isolate a link, say so in the same breath as the number and label it
+backend-only.
+
 ## Browser Extensions
 
 - Kick Overlay (Twitch ad-kill): `vendor/kick-overlay/`

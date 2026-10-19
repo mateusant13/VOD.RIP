@@ -1786,7 +1786,11 @@ def _deep_marker_fresh_s() -> float:
 def _deep_seed_video_rows(handle: str, videos: list[dict]) -> None:
     """Ensure every swept video has a videos row so the no-captions marker
     (UPDATE-only) can stick on it and hits carry title/date. Only missing
-    ids are upserted — archive fields are never touched either way."""
+    ids are upserted — archive fields are never touched either way.
+
+    The missing rows go out in ONE batched upsert (archive_db executemany in
+    a single transaction), not one INSERT per video: a 2005-video sweep used
+    to pay 2005 round-trips (~6.6s) before it could start fetching captions."""
     ids = [str(v.get("id") or "") for v in videos if v.get("id")]
     existing: set[str] = set()
     for i in range(0, len(ids), _DEEP_SQL_CHUNK):
@@ -1797,6 +1801,7 @@ def _deep_seed_video_rows(handle: str, videos: list[dict]) -> None:
             chunk,
         ):
             existing.add(str(r["video_id"]))
+    missing: list[dict] = []
     for v in videos:
         vid = str(v.get("id") or "")
         if not vid or vid in existing:
@@ -1804,21 +1809,24 @@ def _deep_seed_video_rows(handle: str, videos: list[dict]) -> None:
         kind = {"video": "vod", "short": "short", "stream": "stream"}.get(
             str(v.get("content_kind") or ""), "vod"
         )
-        try:
-            archive_db.upsert_channel_video({
-                "platform": "youtube",
-                "video_id": vid,
-                "channel": str(v.get("channel") or handle),
-                "title": str(v.get("title") or ""),
-                "kind": kind,
-                "started_at": v.get("created_at"),
-                "duration_sec": v.get("duration"),
-                "duration_string": v.get("duration_string"),
-                "views": v.get("views"),
-                "thumbnail_url": v.get("thumbnail_url"),
-            })
-        except Exception as exc:
-            logger.debug("deep seed row failed for %s: %s", vid, exc)
+        missing.append({
+            "platform": "youtube",
+            "video_id": vid,
+            "channel": str(v.get("channel") or handle),
+            "title": str(v.get("title") or ""),
+            "kind": kind,
+            "started_at": v.get("created_at"),
+            "duration_sec": v.get("duration"),
+            "duration_string": v.get("duration_string"),
+            "views": v.get("views"),
+            "thumbnail_url": v.get("thumbnail_url"),
+        })
+    if not missing:
+        return
+    try:
+        archive_db.upsert_channel_videos_bulk(missing)
+    except Exception as exc:
+        logger.debug("deep seed batch failed (%d rows): %s", len(missing), exc)
 
 
 # --- deep_jobs persistence table --------------------------------------------
@@ -2531,6 +2539,14 @@ def _run_deep_job(job_id: str, handle: str, query: str) -> None:
             _add_source_hits(videos_by_id, _deep_match_titles(query, ids))
             _add_source_hits(videos_by_id, _deep_match_chat(query, ids))
             _flush()
+
+        # Early exit: Pass 0 already hit the per-source result cap. Fetching
+        # transcripts for the remaining videos would only add more hits beyond
+        # the cap — the UI already shows truncated_results, so stop here.
+        if _truncated_results:
+            _deep_set(job, status="done")
+            _persist()
+            return
 
         # Pass 1 — cached transcripts: match straight from the DB, zero
         # network. Marker-fresh videos are pre-skipped and counted.
