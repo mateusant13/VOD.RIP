@@ -51,6 +51,13 @@ logger = logging.getLogger(__name__)
 
 # At-most-once-per-boot guard for the startup chat dedupe (see lifespan).
 _chat_dedupe_done = False
+# Defer the chat dedupe past the startup click burst: a pass over the live
+# archive is minutes of reads (see _boot_maintenance) and the app must be
+# instant in the first seconds after a restart, which is exactly when it runs.
+_CHAT_DEDUPE_DELAY_SEC = 300.0
+# Same idea for the display-name warm: it runs yt-dlp extractions and nothing
+# reads its cache until a search, so keep it out of the startup click window.
+_DISPLAY_NAME_WARM_DELAY_SEC = 120.0
 
 # Heavy boot work (live warm, yt warm, embed backfill, ASR worker boot)
 # waits this long after lifespan start so the API serves in ~2-3s and the
@@ -280,26 +287,6 @@ async def _app_lifespan(_app: FastAPI):
         except Exception:
             logger.debug("startup archive retention skipped", exc_info=True)
 
-        # One-time boot cleanup: collapse exact-duplicate chat rows left behind
-        # by pre-fix multi-writer capture (watchdog live sink vs GQL backfill vs
-        # replay ingest writing the same message at the same offset, plus the
-        # yt_live post-rename full re-send). Idempotent (second run deletes
-        # nothing) and bounded; guarded so it runs at most once per boot.
-        global _chat_dedupe_done
-        if not _chat_dedupe_done:
-            _chat_dedupe_done = True
-            try:
-                from services.archive_db import dedupe_messages
-
-                _chat_dupes = dedupe_messages()
-                if _chat_dupes:
-                    logger.info(
-                        "startup chat dedupe: removed %d duplicate message row(s)",
-                        _chat_dupes,
-                    )
-            except Exception:
-                logger.debug("startup chat dedupe skipped", exc_info=True)
-
         # Keep FTS5 search fast as the archive grows: PRAGMA optimize merges
         # fragmented FTS index b-tree pages and refreshes stats. Cheap no-op
         # when nothing is pending; no exclusive lock (safe with live readers).
@@ -322,14 +309,56 @@ async def _app_lifespan(_app: FastAPI):
         except Exception:
             logger.debug("startup embed warm skipped", exc_info=True)
 
+        # Collapse exact-duplicate chat rows left behind by pre-fix multi-writer
+        # capture (watchdog live sink vs GQL backfill vs replay ingest writing the
+        # same message at the same offset, plus the yt_live post-rename full
+        # re-send).
+        #
+        # It runs LAST and after a delay on purpose. On this box's live archive
+        # (~17M chat rows, 9.6 GB DB) a pass is minutes of reads that evicts the
+        # page cache, and it used to start the instant the server bound - i.e.
+        # exactly when the first clicks arrive. Measured 2026-10-20: a Twitch
+        # preview click that resolves in 2.6 s in isolation answered in 7.1 s
+        # inside the app, with py-spy showing this thread holding the GIL. The
+        # job is idempotent and now skips outright when no chat row was written
+        # since the last pass (see dedupe_messages), so deferring it costs
+        # nothing but removes it from the startup click burst.
+        global _chat_dedupe_done
+        if not _chat_dedupe_done:
+            _chat_dedupe_done = True
+            try:
+                import time as _time
+
+                _time.sleep(_CHAT_DEDUPE_DELAY_SEC)
+                from services.archive_db import dedupe_messages
+
+                _started = _time.perf_counter()
+                _chat_dupes = dedupe_messages()
+                logger.info(
+                    "startup chat dedupe: %d duplicate row(s) removed in %.1fs",
+                    _chat_dupes,
+                    _time.perf_counter() - _started,
+                )
+            except Exception:
+                logger.debug("startup chat dedupe skipped", exc_info=True)
+
     threading.Thread(target=_boot_maintenance, daemon=True, name="boot-maintenance").start()
 
     # Warm the YouTube chat display-name cache: resolve a bounded batch of
     # UC channel ids (the @handle-only rows) to the names viewers see, so
     # the USER search filter matches displayed names from the first search.
     # Fire-and-forget; bot-walled ids stay NULL and retry on later searches.
+    #
+    # Deferred on purpose: resolving 20 names runs 20 yt-dlp extractions, and
+    # firing them the instant the server binds puts a CPU/GIL storm in front of
+    # the first preview clicks (py-spy, 2026-10-20: yt_dlp/_video.py dictcomp
+    # holding the GIL while a cold Twitch click was in flight). Nothing reads
+    # this cache until a search happens, so 2 minutes of patience costs nothing.
     def _warm_display_names() -> None:
         try:
+            import time as _time
+
+            _time.sleep(_DISPLAY_NAME_WARM_DELAY_SEC)
             from services.archive_ytdlp import resolve_youtube_display_names
 
             n = resolve_youtube_display_names(20)

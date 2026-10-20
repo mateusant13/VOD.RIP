@@ -140,6 +140,58 @@ def test_dedupe_messages_keeps_min_rowid_exact_key() -> None:
     assert len(_stored()) == 3
 
 
+def test_dedupe_routine_pass_collapses_the_new_window() -> None:
+    """Only rows written since the last clean run are scanned routinely.
+
+    On the live archive a full pass is minutes of reads over ~17M rows, so a
+    routine run scans the window since the watermark. Twins are written by the
+    same ingest a few rows apart, so they share a window.
+    """
+    archive_db.insert_messages(PLATFORM, VIDEO, [
+        {"offset_sec": 1.0, "username": "alice", "text": "one"},
+    ])
+    assert archive_db.dedupe_messages() == 0, "establishes the watermark"
+
+    conn = archive_db.get_conn()
+    with archive_db._lock:
+        with conn:
+            for _ in range(2):
+                conn.execute(
+                    "INSERT INTO messages (platform, video_id, offset_sec,"
+                    " username, text) VALUES (?, ?, ?, ?, ?)",
+                    (PLATFORM, VIDEO, 1.0, "alice", "one"),
+                )
+
+    assert archive_db.dedupe_messages() == 1, (
+        "the pair written after the watermark must collapse to one row"
+    )
+    assert len(_stored()) == 2
+
+
+def test_dedupe_deep_pass_collapses_across_the_watermark() -> None:
+    """The weekly deep pass still collapses a twin older than the watermark."""
+    archive_db.insert_messages(PLATFORM, VIDEO, [
+        {"offset_sec": 1.0, "username": "alice", "text": "one"},
+    ])
+    assert archive_db.dedupe_messages() == 0, "establishes the watermark"
+
+    conn = archive_db.get_conn()
+    with archive_db._lock:
+        with conn:
+            conn.execute(
+                "INSERT INTO messages (platform, video_id, offset_sec,"
+                " username, text) VALUES (?, ?, ?, ?, ?)",
+                (PLATFORM, VIDEO, 1.0, "alice", "one"),
+            )
+    # Force the next run down the deep path, as the once-a-week pass is.
+    archive_db.execute(
+        "DELETE FROM semantic_meta WHERE key='chat_dedupe_full_at'"
+    )
+
+    assert archive_db.dedupe_messages() == 1
+    assert len(_stored()) == 1
+
+
 def test_dedupe_messages_untouched_without_duplicates() -> None:
     archive_db.insert_messages(PLATFORM, VIDEO, [
         {"offset_sec": 1.0, "username": "alice", "text": "one"},

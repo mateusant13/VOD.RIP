@@ -35,6 +35,24 @@ CHANNEL_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="channe
 # Preview operations (session create/seek/quality/stream) run on their own
 # pool so the user's click is never queued behind batch warm tasks.
 PREVIEW_EXECUTOR = ThreadPoolExecutor(max_workers=12, thread_name_prefix="preview")
+# Media proxying - every HLS fragment, key, init segment, rewritten playlist and
+# the master manifest the player pulls - runs on its OWN pool.
+#
+# It used to share PREVIEW_EXECUTOR with create_session, and that is a queue the
+# user feels: a playing preview keeps 6-10 workers busy with upstream transfers,
+# a couple of open popups fill the rest, and the next click waits behind all of
+# it. Measured 2026-10-20 on the live app: POST /api/preview/session took 52.7 s
+# cold for a Twitch VOD whose own resolve is 0.86 s in isolation, while the
+# identical request 30 s later answered in 3.1 s. The work was never slow; it
+# was queued behind segment I/O.
+#
+# Segment fetches are also the calls that can legitimately sit on a socket for
+# a long time (a CDN stall), which is exactly what must never happen in front
+# of a click. 32 workers: a browser opens ~6 connections per host and users run
+# several previews at once; the work is I/O-bound and mostly waiting.
+PREVIEW_STREAM_EXECUTOR = ThreadPoolExecutor(
+    max_workers=32, thread_name_prefix="preview-stream"
+)
 # Preview panel reads may wait on SQLite's 10s busy timeout while archive
 # backfill writes are active. Keep that wait isolated from metadata and
 # user-facing preview pools; the FastAPI event loop must never run panel DB IO.

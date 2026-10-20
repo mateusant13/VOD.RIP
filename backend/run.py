@@ -2,9 +2,12 @@
 import atexit
 import faulthandler
 import logging
+import socket
 import subprocess
 import sys
 import os
+import threading
+import time
 import traceback
 
 # ponytail: YTDLP_NO_PLUGINS=1 set in services/ytdlp_env.py — silences the
@@ -23,6 +26,89 @@ def _install_fatal_hooks() -> None:
         traceback.print_exception(exc_type, exc, tb)
 
     sys.excepthook = _excepthook
+
+
+# How long to leave a starting server alone, how often to look, and how many
+# consecutive misses mean "this process no longer serves anything".
+_WATCHDOG_GRACE_SEC = 60.0
+_WATCHDOG_INTERVAL_SEC = 5.0
+_WATCHDOG_STRIKES = 3
+
+
+def _start_listener_watchdog(host: str, port: int) -> None:
+    """Exit this process once it stops owning its listening socket.
+
+    Uvicorn's accept loop can die on Windows without stopping the process. The
+    real signature, captured 2026-10-20 from the dev log:
+
+        OSError: [WinError 64] The specified network name is no longer available
+        ERROR asyncio: Accept failed on a socket
+        socket: <asyncio.TransportSocket fd=1992 ... laddr=('127.0.0.1', 7897)>
+
+    After that line the process kept running, kept its 367 MB RSS, and kept the
+    archive DB open - while nothing was listening. `uvicorn.run()` never
+    returned, so nothing ever tore it down.
+
+    That zombie is worse than a crash, because a supervisor cannot tell it from
+    a healthy instance: it is a SECOND writer on the same SQLite file, so the
+    healthy process hits `database is locked` on its first write, its health
+    check fails, and it gets restarted into the same wall. Observed on this box:
+    two `run.py` processes, one without a listener, `database is locked` in
+    `worker_heartbeat`, and a `GET /api/channel/outcome-parks` that never
+    answered until the zombie was killed.
+
+    A refused connection means no listener - a busy one still accepts into its
+    backlog - and three refusals 5 s apart cannot be a reload blip.
+    """
+    if os.environ.get("VODRIP_NO_LISTENER_WATCHDOG") == "1":
+        return
+    probe_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+
+    def _probe() -> bool:
+        try:
+            with socket.create_connection((probe_host, port), timeout=2.0):
+                return True
+        except OSError:
+            return False
+
+    def _watch() -> None:
+        started = time.monotonic()
+        strikes = 0
+        # Arm only after the listener has answered once. A cold boot on this box
+        # takes longer than the grace period (archive open + WAL checkpoint), and
+        # a watchdog that counts boot seconds as strikes would kill a perfectly
+        # healthy process mid-startup - a restart loop that looks exactly like
+        # the bug it is meant to prevent.
+        armed = False
+        while True:
+            time.sleep(_WATCHDOG_INTERVAL_SEC)
+            if not armed:
+                if _probe():
+                    armed = True
+                    started = time.monotonic()
+                continue
+            if time.monotonic() - started < _WATCHDOG_GRACE_SEC:
+                continue
+            if _probe():
+                strikes = 0
+                continue
+            strikes += 1
+            if strikes >= _WATCHDOG_STRIKES:
+                logging.getLogger("VOD.RIP").error(
+                    "listener watchdog: nothing is listening on %s:%d after %d "
+                    "checks - exiting so the supervisor restarts a clean process "
+                    "instead of leaving a DB-holding zombie",
+                    probe_host,
+                    port,
+                    strikes,
+                )
+                sys.stdout.flush()
+                sys.stderr.flush()
+                # os._exit, not sys.exit: the accept loop is already broken and a
+                # graceful shutdown would wait on the same dead loop.
+                os._exit(1)
+
+    threading.Thread(target=_watch, name="listener-watchdog", daemon=True).start()
 
 
 def _install_logging() -> None:
@@ -130,6 +216,10 @@ def main():
     import time as _time
 
     bind_host = (os.environ.get("VODRIP_BIND") or "127.0.0.1").strip() or "127.0.0.1"
+
+    # One watchdog for the process, started before the first bind attempt so a
+    # process that loses its listener later cannot outlive it (see the docstring).
+    _start_listener_watchdog(bind_host, port)
 
     max_bind_attempts = 3
     for attempt in range(1, max_bind_attempts + 1):

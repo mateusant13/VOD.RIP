@@ -2489,6 +2489,11 @@ def insert_messages(platform: str, video_id: str, rows: Iterable[dict]) -> int:
     return accepted
 
 
+# How often the chat dedupe may do a full-table pass. Every other run scans
+# only the rows written since the previous run (see dedupe_messages).
+_CHAT_DEDUPE_FULL_INTERVAL_SEC = 7 * 24 * 3600.0
+
+
 def dedupe_messages() -> int:
     """Delete exact-duplicate chat rows, keeping the MIN rowid per
     (platform, video_id, offset_sec, username, text); returns the deleted
@@ -2501,19 +2506,99 @@ def dedupe_messages() -> int:
     so two genuinely distinct messages never merge, and the operation is
     idempotent: a second run finds nothing and deletes 0 rows.
 
-    Bounded: one grouped pass over messages (cheap at the real ~215k-row
-    scale; FTS entries cascade via the AFTER DELETE triggers). Called once
-    per boot from the app lifespan."""
+    Bounded, and scheduled rather than obligatory. ``semantic_meta`` keeps the
+    high-water mark of the last clean run (``chat_dedupe_max_id``) and the time
+    of the last deep pass (``chat_dedupe_full_at``):
+
+    * nothing written since the last run -> skip outright (an index lookup, not
+      a scan); duplicates always have a newer twin, so "nothing new" means
+      "nothing to do";
+    * a routine run scans only the rows written since that watermark;
+    * a deep pass over the whole table runs once a week (and on the first run
+      after this change), because a twin that straddles a watermark keeps the
+      newer row and only the deep pass collapses it.
+
+    That matters on the live archive: ~17M chat rows in a 9.6 GB database made
+    every boot pay a minutes-long full pass that evicted the page cache.
+    Measured 2026-10-20: a Twitch preview click that resolves in 2.6 s in
+    isolation answered in 7.1 s inside the app, with py-spy showing this
+    thread holding the GIL.
+    """
     conn = get_conn()
     with _lock:
-        with conn:  # transaction
-            cur = conn.execute(
-                """DELETE FROM messages WHERE id NOT IN (
-                     SELECT MIN(id) FROM messages
-                     GROUP BY platform, video_id, offset_sec, username, text
-                   )"""
+        try:
+            row = conn.execute("SELECT MAX(id) FROM messages").fetchone()
+            current_max = int(row[0] or 0) if row else 0
+        except sqlite3.Error:
+            current_max = -1
+        try:
+            stored = conn.execute(
+                "SELECT value FROM semantic_meta WHERE key='chat_dedupe_max_id'"
+            ).fetchone()
+            stored_max = int(stored[0]) if stored and stored[0] not in (None, "") else None
+        except (sqlite3.Error, ValueError):
+            stored_max = None
+        if current_max >= 0 and stored_max is not None and stored_max == current_max:
+            return 0
+        try:
+            row = conn.execute(
+                "SELECT value FROM semantic_meta WHERE key='chat_dedupe_full_at'"
+            ).fetchone()
+            stored_full_at = float(row[0]) if row and row[0] else 0.0
+        except (sqlite3.Error, ValueError):
+            stored_full_at = 0.0
+        need_full = (
+            stored_max is None
+            or (time.time() - stored_full_at) >= _CHAT_DEDUPE_FULL_INTERVAL_SEC
+        )
+        if need_full:
+            # First pass, or the periodic deep one: clean the whole table and
+            # keep the MIN rowid per key. This is the O(table) run, and it is
+            # why it is rare - once a week instead of once per boot.
+            sql = (
+                "DELETE FROM messages WHERE id NOT IN ("
+                "  SELECT MIN(id) FROM messages"
+                "  GROUP BY platform, video_id, offset_sec, username, text)"
             )
+            params: tuple = ()
+        else:
+            # Routine pass: only rows written since the last clean run can carry
+            # a duplicate twin, so scan that window instead of the whole table.
+            # Twins are written by the same ingest a few rows apart, so they
+            # share a window; a twin that straddles the watermark keeps the
+            # newer row (same offset, username and text - only the id differs)
+            # and the weekly deep pass collapses it.
+            sql = (
+                "DELETE FROM messages WHERE id IN ("
+                "  SELECT id FROM ("
+                "    SELECT id, ROW_NUMBER() OVER ("
+                "      PARTITION BY platform, video_id, offset_sec, username, text"
+                "      ORDER BY id) AS rn"
+                "    FROM messages WHERE id > ?"
+                "  ) WHERE rn > 1)"
+            )
+            params = (stored_max,)
+        with conn:  # transaction
+            cur = conn.execute(sql, params)
             deleted = cur.rowcount
+        # Record the watermark AFTER the delete: a deleted row may itself have
+        # held MAX(id), and re-reading is a cheap index lookup that keeps the
+        # next boot from re-running a pass it has nothing to do.
+        try:
+            row = conn.execute("SELECT MAX(id) FROM messages").fetchone()
+            after_max = int(row[0] or 0) if row else 0
+            marks = [("chat_dedupe_max_id", str(after_max))]
+            if need_full:
+                marks.append(("chat_dedupe_full_at", str(time.time())))
+            with conn:
+                for key, value in marks:
+                    conn.execute(
+                        "INSERT INTO semantic_meta (key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (key, value),
+                    )
+        except sqlite3.Error:
+            logger.debug("chat dedupe watermark not stored", exc_info=True)
     if deleted:
         # Bulk delete leaves the FTS index fragmented — merge it like the
         # post-backfill path does so searches stay fast.

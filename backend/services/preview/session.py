@@ -476,6 +476,33 @@ _ALLOWED_HOST_SUFFIXES = (
     "ytimg.com",
 )
 _URI_IN_TAG = re.compile(r'URI="([^"]+)"')
+# scheme://host[:port] - everything before the first path slash of a URL.
+_ORIGIN_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.\-]*://[^/]+)")
+
+
+def _resolve_playlist_uri(uri: str, base: str, playlist_url: str) -> str:
+    """``urljoin`` without urllib's parser for the shapes playlists use.
+
+    A Twitch DVR playlist for a 29-hour VOD carries ~32k segment lines, and
+    resolving each one with ``urljoin`` + ``urlparse`` cost **4.0 s of pure CPU**
+    inside the click that creates the session (profiled 2026-10-20: 32,324
+    ``_rewrite_playlist_line`` calls, 2.2 s in ``urlparse`` alone). Almost every
+    line is a bare filename, which needs only concatenation; the shapes that
+    genuinely need the parser still get it.
+    """
+    if "://" in uri:
+        return uri
+    if uri.startswith("//"):
+        return playlist_url.split(":", 1)[0] + ":" + uri
+    if uri.startswith("/"):
+        m = _ORIGIN_RE.match(playlist_url)
+        return (m.group(1) + uri) if m else urljoin(base, uri)
+    if uri.startswith("?"):
+        return urljoin(playlist_url, uri)
+    if uri.startswith("./") or "../" in uri:
+        return urljoin(base, uri)
+    return base + uri
+
 _BANDWIDTH_RE = re.compile(r"BANDWIDTH=(\d+)")
 _RESOLUTION_RE = re.compile(r"RESOLUTION=(\d+)x(\d+)")
 _MAX_SESSIONS = 20
@@ -816,6 +843,7 @@ class PreviewManager:
         crop_start: float = 0.0,
         crop_end: float = 0.0,
         prefer_height: int = 360,
+        origin: str = "user",
     ) -> PreviewSession:
         self._cleanup_stale_sessions()
         # ponytail: _resolve_and_cache_youtube_snapshot stores at key (vid, int(height or 0)).
@@ -992,6 +1020,7 @@ class PreviewManager:
             resolve_stream_info(
                 url,
                 prefer_height=prefer_height,
+                origin=origin,
             )
         )
 
@@ -4579,6 +4608,7 @@ def resolve_stream_info(
     *,
     force_fresh: bool = False,
     warm_light: bool = False,
+    origin: str = "auto",
 ) -> Tuple[str, dict, str, List[dict], str, Optional[dict]]:
     """Return (master_url, headers, platform, variant_formats, kind, yt_info).
 
@@ -4952,7 +4982,9 @@ def resolve_stream_info(
             if cached is not None:
                 return cached
         try:
-            master_url, vod_headers, vod_variants = get_vod_playback_sync(url)
+            master_url, vod_headers, vod_variants = get_vod_playback_sync(
+                url, origin=origin
+            )
             with_height = [v for v in vod_variants if int(v.get("height") or 0) > 0]
             if master_url:
                 result = (
@@ -5248,6 +5280,7 @@ def _rewrite_playlist_line(
     session: PreviewSession,
     playlist_url: str,
     base: str,
+    base_host: str = "",
 ) -> str:
     stripped = line.strip()
     if not stripped:
@@ -5264,15 +5297,24 @@ def _rewrite_playlist_line(
 
             return _URI_IN_TAG.sub(_sub, line)
         return line
-    abs_url = urljoin(base, stripped)
-    host = urlparse(abs_url).hostname
+    abs_url = _resolve_playlist_uri(stripped, base, playlist_url)
+    # A relative segment shares the playlist's host; only an absolute URI can
+    # bring in a new one, and that test is a cheap prefix compare.
+    if base_host and abs_url.startswith(base):
+        host = base_host
+    else:
+        host = urlparse(abs_url).hostname or ""
     if host:
         session.allowed_hosts.add(host)
     return _proxy_url(session, abs_url)
+
+
 def _rewrite_playlist(content: str, session: PreviewSession, playlist_url: str) -> str:
     base = playlist_url.rsplit("/", 1)[0] + "/"
+    m = _ORIGIN_RE.match(playlist_url)
+    base_host = (urlparse(m.group(1)).hostname or "") if m else ""
     out = [
-        _rewrite_playlist_line(line, session, playlist_url, base)
+        _rewrite_playlist_line(line, session, playlist_url, base, base_host)
         for line in content.splitlines()
     ]
     return "\n".join(out) + "\n"
@@ -5287,10 +5329,16 @@ def _fetch_and_rewrite_playlist_streaming(
     )
 
     base = upstream_url.rsplit("/", 1)[0] + "/"
+    _m = _ORIGIN_RE.match(upstream_url)
+    base_host = (urlparse(_m.group(1)).hostname or "") if _m else ""
     resp = _open_upstream_stream(session, upstream_url)
     out = bytearray()
     status = resp.status_code
-    pending = ""
+    # A list of fragments, not `pending += chunk`: a 29-hour Twitch DVR
+    # playlist is megabytes of text, and repeated += rebuilt the whole string
+    # per chunk (quadratic). Join once per batch and keep only the unterminated
+    # tail for the next one.
+    pending: list[str] = []
     try:
         # Wall-clock watchdog: a stalled upstream (no bytes for 20s) aborts
         # the read instead of pinning a PREVIEW_EXECUTOR worker for libcurl's
@@ -5300,18 +5348,28 @@ def _fetch_and_rewrite_playlist_streaming(
         ):
             if not chunk:
                 continue
-            pending += chunk.decode("utf-8", errors="replace")
-            while "\n" in pending:
-                line, pending = pending.split("\n", 1)
-                rewritten = _rewrite_playlist_line(line, session, upstream_url, base)
+            pending.append(chunk.decode("utf-8", errors="replace"))
+            buf = "".join(pending)
+            if "\n" not in buf:
+                pending = [buf]
+                continue
+            *lines, tail = buf.split("\n")
+            pending = [tail]
+            for line in lines:
+                rewritten = _rewrite_playlist_line(
+                    line, session, upstream_url, base, base_host
+                )
                 row = (rewritten + "\n").encode("utf-8")
                 if len(out) + len(row) > _MAX_REWRITTEN_PLAYLIST_BYTES:
                     raise RuntimeError(
                         f"Rewritten playlist exceeds {_MAX_REWRITTEN_PLAYLIST_BYTES} byte cap",
                     )
                 out.extend(row)
-        if pending:
-            rewritten = _rewrite_playlist_line(pending, session, upstream_url, base)
+        rest = "".join(pending)
+        if rest:
+            rewritten = _rewrite_playlist_line(
+                rest, session, upstream_url, base, base_host
+            )
             row = (rewritten + "\n").encode("utf-8")
             if len(out) + len(row) > _MAX_REWRITTEN_PLAYLIST_BYTES:
                 raise RuntimeError(

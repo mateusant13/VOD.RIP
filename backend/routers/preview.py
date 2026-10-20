@@ -17,7 +17,13 @@ from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 from models.schemas import LivePreviewRequest, LiveRotateRequest, PreviewQualityUpdateRequest, PreviewSeekRequest, PreviewSessionCreateRequest, PreviewSessionResponse, PreviewSessionStatusResponse, PreviewTimingRequest, PreviewWarmRequest, PreviewBatchWarmRequest
 
-from deps import INFO_EXECUTOR, LIVE_EXECUTOR, PANEL_EXECUTOR, PREVIEW_EXECUTOR
+from deps import (
+    INFO_EXECUTOR,
+    LIVE_EXECUTOR,
+    PANEL_EXECUTOR,
+    PREVIEW_EXECUTOR,
+    PREVIEW_STREAM_EXECUTOR,
+)
 from services.preview_service import (
     PreviewMuxPending,
     REPLAY_HLS_MARKER,
@@ -988,7 +994,7 @@ async def _preview_master_response(
     if force_streaming:
         try:
             generate, ctype, extra_headers, status, cleanup = await loop.run_in_executor(
-                PREVIEW_EXECUTOR,
+                PREVIEW_STREAM_EXECUTOR,
                 lambda: open_progressive_proxy(session_id, range_header),
             )
         except ValueError as e:
@@ -1009,7 +1015,7 @@ async def _preview_master_response(
         )
     try:
         data, ctype, extra_headers, status = await loop.run_in_executor(
-            PREVIEW_EXECUTOR, proxy_master, session_id, range_header
+            PREVIEW_STREAM_EXECUTOR, proxy_master, session_id, range_header
         )
     except UpstreamPreviewUnavailable as e:
         raise HTTPException(
@@ -1063,7 +1069,7 @@ async def preview_hls_resource(session_id: str, request: Request, id: Optional[s
     loop = asyncio.get_running_loop()
     try:
         upstream = await loop.run_in_executor(
-            PREVIEW_EXECUTOR, lambda: resolve_upstream(session_id, id),
+            PREVIEW_STREAM_EXECUTOR, lambda: resolve_upstream(session_id, id),
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -1073,7 +1079,7 @@ async def preview_hls_resource(session_id: str, request: Request, id: Optional[s
         if upstream.startswith(WINDOW_HLS_MARKER):
             # window-playlist → dynamic media playlist, window-seg-NNN → local .ts
             generate, ctype, extra_headers, status, cleanup = await loop.run_in_executor(
-                PREVIEW_EXECUTOR,
+                PREVIEW_STREAM_EXECUTOR,
                 lambda: open_youtube_window_hls_proxy(session_id, id, range_header),
             )
             response_headers = dict(extra_headers or {})
@@ -1089,7 +1095,7 @@ async def preview_hls_resource(session_id: str, request: Request, id: Optional[s
         if upstream.startswith(REPLAY_HLS_MARKER):
             # replay-playlist → ENDLIST snapshot of the archive media playlist
             generate, ctype, extra_headers, status, cleanup = await loop.run_in_executor(
-                PREVIEW_EXECUTOR,
+                PREVIEW_STREAM_EXECUTOR,
                 lambda: open_replay_hls_proxy(session_id, id, range_header),
             )
             response_headers = dict(extra_headers or {})
@@ -1104,13 +1110,13 @@ async def preview_hls_resource(session_id: str, request: Request, id: Optional[s
             )
         if _is_playlist_url(upstream):
             data, ctype, extra_headers, status = await loop.run_in_executor(
-                PREVIEW_EXECUTOR,
+                PREVIEW_STREAM_EXECUTOR,
                 lambda: proxy_playlist(session_id, upstream),
             )
             return Response(content=data, media_type=ctype, status_code=status, headers=extra_headers)
         if _is_rangeable_cdn_media(upstream):
             generate, ctype, extra_headers, status, cleanup = await loop.run_in_executor(
-                PREVIEW_EXECUTOR,
+                PREVIEW_STREAM_EXECUTOR,
                 lambda: open_segment_proxy(session_id, upstream, range_header),
             )
             response_headers = dict(extra_headers or {})
@@ -1124,7 +1130,7 @@ async def preview_hls_resource(session_id: str, request: Request, id: Optional[s
                 background=BackgroundTask(cleanup),
             )
         data, ctype, extra_headers, status = await loop.run_in_executor(
-            PREVIEW_EXECUTOR,
+            PREVIEW_STREAM_EXECUTOR,
             lambda: proxy_segment(session_id, upstream, range_header),
         )
         response_headers = dict(extra_headers or {})

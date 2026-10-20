@@ -437,7 +437,9 @@ def _parse_hls_master_variants(master_url: str, master_text: str) -> List[Dict[s
     return out
 
 
-def _get_vod_meta_sync(vod_id: str, token_refused: bool = True) -> dict:
+def _get_vod_meta_sync(
+    vod_id: str, token_refused: bool = True, *, source: str = "auto"
+) -> dict:
     """Fetch video metadata needed for cloudfront CDN bypass.
 
     Twitch answers this inline (non-persisted) query even for sub-only VODs.
@@ -446,6 +448,7 @@ def _get_vod_meta_sync(vod_id: str, token_refused: bool = True) -> dict:
     data = _gql_request(
         VOD_META_QUERY,
         {"id": vod_id},
+        source=source,
     )
     video = (data or {}).get("video") or {}
     if not video.get("seekPreviewsURL"):
@@ -563,8 +566,17 @@ def _resolve_cloudfront_variants(vod_id: str, video_data: dict) -> List[Dict[str
     return variants
 
 
-def get_vod_playback_sync(url_or_id: str) -> Tuple[str, dict, List[Dict[str, Any]]]:
+def get_vod_playback_sync(
+    url_or_id: str, *, origin: str = "auto"
+) -> Tuple[str, dict, List[Dict[str, Any]]]:
     """Fast Twitch VOD playback URL via GQL + Usher (no yt-dlp).
+
+    ``origin`` is the rate-budget tag. ``"auto"`` (background: warms, the
+    archive scheduler) is paced against the learned Twitch budget and may sleep
+    up to ``MAX_AUTO_WAIT_S``. ``"user"`` is never paced - somebody is staring
+    at a spinner. Measured 2026-10-20: a preview click on a Twitch VOD took
+    49-57 s because it was admitted as AUTO and slept in the queue, while the
+    same resolve is 0.6-1.4 s with no pacing.
 
     Returns (master_m3u8_url, headers, variant_formats).
     """
@@ -583,6 +595,7 @@ def get_vod_playback_sync(url_or_id: str) -> Tuple[str, dict, List[Dict[str, Any
             "playerType": "embed",
             "platform": "site",
         },
+        source=origin,
     )
     token_node = data.get("videoPlaybackAccessToken") or data.get("playbackAccessToken") or {}
     sig = token_node.get("signature")
@@ -612,7 +625,9 @@ def get_vod_playback_sync(url_or_id: str) -> Tuple[str, dict, List[Dict[str, Any
             logger.info("Usher fetch failed for %s — trying cloudfront bypass", vid)
 
     logger.info("Trying cloudfront CDN bypass for VOD %s", vid)
-    video_data = _get_vod_meta_sync(vid, token_refused=not bool(sig and token))
+    video_data = _get_vod_meta_sync(
+        vid, token_refused=not bool(sig and token), source=origin
+    )
     cf_variants = _resolve_cloudfront_variants(vid, video_data)
     if not cf_variants:
         raise RuntimeError(f"No playable variants for VOD {vid}")
