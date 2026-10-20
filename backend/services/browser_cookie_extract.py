@@ -258,6 +258,22 @@ def _profiles_to_scan(profile_dir: Path | None) -> list[tuple[Path, Path]]:
     return pairs
 
 
+def _cookies_db_path(profile_dir: Path) -> Path | None:
+    """Locate a profile's cookie SQLite file.
+
+    Modern Chromium keeps it at ``<profile>/Network/Cookies``; older builds
+    used ``<profile>/Cookies``. Both are checked, newest layout first, so a
+    profile that has not migrated is still readable.
+    """
+    for candidate in (
+        profile_dir / "Network" / "Cookies",
+        profile_dir / "Cookies",
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def _extract(profile_dir: Path | str | None) -> tuple[dict[str, list[dict]], str]:
     now = time.time()
     collected: dict[str, list[dict]] = {}
@@ -268,8 +284,14 @@ def _extract(profile_dir: Path | str | None) -> tuple[dict[str, list[dict]], str
     for prof, user_data in _profiles_to_scan(
         Path(profile_dir) if profile_dir is not None else None
     ):
-        cookies_path = prof / "Cookies"
-        if not cookies_path.is_file():
+        # Chromium moved the cookie store to <profile>/Network/Cookies in
+        # Chrome 96+ (Edge/Brave/Vivaldi follow). Reading only the legacy
+        # <profile>/Cookies found NOTHING on a modern install and reported
+        # "no browser Cookies database found" while three browsers sat there
+        # fully signed in - the fixture in the tests encoded the old layout,
+        # so the suite passed while the real path was dead.
+        cookies_path = _cookies_db_path(prof)
+        if cookies_path is None:
             continue
         scanned_db = True
         # Real layout: <User Data>/Local State beside <User Data>/Default.
@@ -277,8 +299,19 @@ def _extract(profile_dir: Path | str | None) -> tuple[dict[str, list[dict]], str
         aes_key = _extract_aes_key([user_data / "Local State", prof / "Local State"])
         try:
             rows = _read_cookie_rows(cookies_path)
-        except sqlite3.Error as exc:
-            reasons.append(f"unreadable Cookies database: {exc}")
+        except (sqlite3.Error, OSError) as exc:
+            # OSError matters as much as sqlite3.Error: a RUNNING Chrome holds
+            # <profile>/Network/Cookies with a share mode that denies even a
+            # read, and one locked browser must not abort the scan for the
+            # others (Edge/Brave were readable on the same box at the same
+            # moment). The reason is surfaced so the UI can say so.
+            if isinstance(exc, PermissionError):
+                reasons.append(
+                    f"locked by a running {user_data.name or 'browser'} "
+                    "(close it or use another browser)"
+                )
+            else:
+                reasons.append(f"unreadable Cookies database: {exc}")
             continue
         if not rows:
             continue

@@ -50,7 +50,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse
 
 from deps import settings_mgr
-from services import cookie_store
+from services import browser_cookie_extract, cookie_store
 from services.disk_hygiene import data_dir
 from services.settings import _get_appdata_dir
 from services.yt_gate import gate_remaining_sec
@@ -1186,3 +1186,82 @@ async def session_cookies_clear(request: Request, token: Optional[str] = None):
     _require_bridge_auth(request, token)
     cleared = cookie_store.clear()
     return {"cleared": cleared}
+
+
+_BROWSER_USER_DATA = {
+    "chrome": ("Google", "Chrome", "User Data"),
+    "edge": ("Microsoft", "Edge", "User Data"),
+    "brave": ("BraveSoftware", "Brave-Browser", "User Data"),
+    "vivaldi": ("Vivaldi", "User Data"),
+}
+
+
+@router.post("/api/session/cookies/import-browser")
+async def session_cookies_import_browser(request: Request, body: Optional[dict] = None):
+    """Import cookies straight from THIS machine's Chromium profile.
+
+    Why this exists: the extension path needs the extension installed *and* a
+    signed-in profile exported before a single cookie arrives - and
+    ``installed: true`` does not mean ``platforms`` is non-empty (see
+    AGENTS.md). A user who never installs anything gets no authenticated
+    session at all, so the InnerTube ladder collapses to a single 360 rung.
+
+    This path needs neither an extension nor an export: it reads the browser's
+    own Cookies store, which is already signed in, decrypts it with the key in
+    that profile's ``Local State``, and upserts into the same cookie_store the
+    extension feeds. It is the same store, so every downstream consumer
+    (yt-dlp, the InnerTube probe, the HLS mux) is unchanged.
+
+    Loopback only. Returns COUNTS, never a cookie value or a name.
+    """
+    _require_loopback(request)
+    # "Disabling blocks all cookie ingestion" is documented on the Settings
+    # panel, and this is ingestion - honour the same switch as the bridge.
+    if not getattr(settings_mgr.get(), "cookie_bridge_enabled", True):
+        raise HTTPException(status_code=403, detail="cookie bridge disabled")
+    body = body or {}
+    browser = str(body.get("browser") or "").strip().lower()
+    profile_dir = None
+    if browser:
+        parts = _BROWSER_USER_DATA.get(browser)
+        if not parts:
+            raise HTTPException(
+                status_code=422,
+                detail=f"unknown browser {browser!r}; expected one of {sorted(_BROWSER_USER_DATA)}",
+            )
+        local_appdata = os.environ.get("LOCALAPPDATA") or ""
+        if not local_appdata:
+            raise HTTPException(status_code=409, detail="LOCALAPPDATA is not set")
+        # Only ever a path under the platform's own browser root: a caller
+        # cannot point this at an arbitrary directory.
+        candidate = Path(local_appdata).joinpath(*parts)
+        if not candidate.is_dir():
+            raise HTTPException(status_code=404, detail=f"{browser} user data not found")
+        profile_dir = candidate
+
+    cookies, reason = browser_cookie_extract.extract_platform_cookies(profile_dir)
+    if not cookies:
+        return {
+            "ok": False,
+            "reason": reason or "no matching cookies",
+            "platforms": {},
+            "accepted": 0,
+            "dropped": 0,
+        }
+
+    flat = [c for group in cookies.values() for c in group]
+    accepted, dropped = cookie_store.upsert_cookies(flat)
+    counts = cookie_store.counts()
+    logger.info(
+        "browser cookie import: accepted=%d dropped=%d platforms=%s",
+        accepted,
+        dropped,
+        sorted(counts),
+    )
+    return {
+        "ok": accepted > 0,
+        "reason": "" if accepted else (reason or "nothing accepted"),
+        "platforms": counts,
+        "accepted": accepted,
+        "dropped": dropped,
+    }

@@ -658,3 +658,125 @@ class TestNeverRaises:
 
         assert result == {}
         assert reason != ""
+
+# ---------------------------------------------------------------------------
+# Real-world layout: <profile>/Network/Cookies (Chrome 96+, Edge, Brave)
+# ---------------------------------------------------------------------------
+#
+# The original fixtures wrote <profile>/Cookies - the pre-96 layout. Every test
+# passed while the real path returned "no browser Cookies database found" on a
+# box with three signed-in browsers. Measured 2026-10-20: Chrome, Edge and
+# Brave all store the DB under Network/, so reading only the legacy path found
+# nothing at all. These pin the layout the product actually meets.
+
+
+class TestModernNetworkLayout:
+    def test_reads_network_cookies_db(self, tmp_path: Path):
+        user_data = tmp_path / "user_data"
+        profile = user_data / "Default"
+        _write_local_state(user_data)
+        plaintext = b"sid_from_modern_layout"
+        _make_cookies_db(
+            profile / "Network" / "Cookies",
+            [
+                _base_row(
+                    host_key=".youtube.com",
+                    name="SID",
+                    encrypted_value=_encrypt(plaintext),
+                )
+            ],
+        )
+
+        result, reason = browser_cookie_extract.extract_platform_cookies(
+            profile_dir=profile
+        )
+
+        assert reason == ""
+        assert result["youtube"][0]["value"] == plaintext.decode("utf-8")
+
+    def test_network_layout_wins_over_a_stale_legacy_copy(self, tmp_path: Path):
+        """A migrated profile can hold both; the live one is under Network/."""
+        user_data = tmp_path / "user_data"
+        profile = user_data / "Default"
+        _write_local_state(user_data)
+        _make_cookies_db(
+            profile / "Cookies",
+            [
+                _base_row(
+                    host_key=".youtube.com",
+                    name="OLD",
+                    encrypted_value=_encrypt(b"stale"),
+                )
+            ],
+        )
+        _make_cookies_db(
+            profile / "Network" / "Cookies",
+            [
+                _base_row(
+                    host_key=".youtube.com",
+                    name="NEW",
+                    encrypted_value=_encrypt(b"live"),
+                )
+            ],
+        )
+
+        result, _reason = browser_cookie_extract.extract_platform_cookies(
+            profile_dir=profile
+        )
+
+        names = {c["name"] for c in result["youtube"]}
+        assert names == {"NEW"}
+
+    def test_legacy_layout_still_reads(self, tmp_path: Path):
+        user_data = tmp_path / "user_data"
+        profile = user_data / "Default"
+        _write_local_state(user_data)
+        _make_cookies_db(
+            profile / "Cookies",
+            [
+                _base_row(
+                    host_key=".youtube.com",
+                    name="LEGACY",
+                    encrypted_value=_encrypt(b"x"),
+                )
+            ],
+        )
+
+        result, _reason = browser_cookie_extract.extract_platform_cookies(
+            profile_dir=profile
+        )
+
+        assert {c["name"] for c in result["youtube"]} == {"LEGACY"}
+
+
+class TestLockedProfileDoesNotAbortTheScan:
+    """A running Chrome denies even a read of Network/Cookies (measured
+    2026-10-20: CreateFileW with FILE_SHARE_READ|WRITE|DELETE returns
+    INVALID_HANDLE_VALUE). One locked browser must not hide the others."""
+
+    def test_locked_cookies_db_is_reported_not_raised(self, tmp_path: Path, monkeypatch):
+        user_data = tmp_path / "user_data"
+        profile = user_data / "Default"
+        _write_local_state(user_data)
+        _make_cookies_db(
+            profile / "Network" / "Cookies",
+            [
+                _base_row(
+                    host_key=".youtube.com",
+                    name="SID",
+                    encrypted_value=_encrypt(b"x"),
+                )
+            ],
+        )
+
+        def boom(_path):
+            raise PermissionError(13, "denied", str(_path))
+
+        monkeypatch.setattr(browser_cookie_extract, "_read_cookie_rows", boom)
+
+        result, reason = browser_cookie_extract.extract_platform_cookies(
+            profile_dir=profile
+        )
+
+        assert result == {}
+        assert "locked" in reason

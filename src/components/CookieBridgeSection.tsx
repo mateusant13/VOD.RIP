@@ -79,6 +79,7 @@ export default function CookieBridgeSection({
   const [waitOpen, setWaitOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const [clearing, setClearing] = useState(false);
+  const [importing, setImporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const { t } = useI18n();
 
@@ -109,6 +110,39 @@ export default function CookieBridgeSection({
     void refresh();
   }, [refresh]);
 
+
+  /**
+   * Import straight from this machine's browser profile.
+   *
+   * The extension path needs the extension AND a signed-in profile exported
+   * before a single cookie arrives. This path reads the browser's own store,
+   * which is already signed in - no extension, no export, no drag-and-drop.
+   */
+  const importFromBrowser = async () => {
+    if (importing) return;
+    setImporting(true);
+    setError(null);
+    try {
+      const res = await apiPost<{
+        ok: boolean;
+        reason: string;
+        platforms: Record<string, { count: number }>;
+      }>('/api/session/cookies/import-browser', {});
+      if (!res.ok) {
+        setError(res.reason || t('Nenhum cookie encontrado no navegador.'));
+      }
+      await refresh();
+    } catch (err: unknown) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : t('Nao foi possivel ler os cookies do navegador.'),
+      );
+      setImporting(false);
+      return;
+    }
+    setImporting(false);
+  };
 
   const clearStored = async () => {
     if (!status || busy || clearing || !token) return;
@@ -252,6 +286,16 @@ export default function CookieBridgeSection({
       </div>
 
       {error ? <p className="text-[11px] text-red-400 font-mono">{error}</p> : null}
+
+      <button
+        type="button"
+        onClick={() => void importFromBrowser()}
+        disabled={!status || importing || !enabled}
+        className="self-start bg-zinc-900 text-emerald-300 font-black uppercase px-3 py-2 text-[11px] border-2 border-emerald-900 hover:border-emerald-500 disabled:opacity-50"
+      >
+        {importing ? <Loader2 size={13} className="animate-spin inline" /> : null}
+        {t('Importar cookies do navegador')}
+      </button>
 
       <button
         type="button"
