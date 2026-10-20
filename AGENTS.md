@@ -177,13 +177,14 @@ backend-only.
 
 ## The live archive.db lives on H: (learned 2026-10-04)
 
-**There are three `archive.db` files on this machine and the app opens exactly one: `H:\VOD.RIP-data\archive.db`.** The other two are orphaned predecessors. Every count read from either of them is wrong.
+**As of 2026-10-19 there is exactly ONE `archive.db` on this machine: `H:\VOD.RIP-data\archive.db`.** The two orphaned predecessors this section used to document were merged and deleted (owner-approved — see "The orphans — GONE" below for the exact row counts that were carried over). Before that they were read by mistake repeatedly, and every count from either was wrong.
 
 | path | size | last write | status |
 |---|---|---|---|
-| `H:\VOD.RIP-data\archive.db` | 7.5 GB | written continuously | **LIVE — the one the app opens** |
-| `G:\VOD.RIP-data\archive.db` | 486 MB | 2026-09-17 | orphan (migrated away) |
-| `%APPDATA%\VOD.RIP\archive.db` | 139 MB | 2026-09-16 | orphan (migrated away) |
+| `H:\VOD.RIP-data\archive.db` | **9.63 GB** (measured 2026-10-19 22:38) | written continuously | **LIVE — the only one left** |
+| `C:\VOD.RIP-data\archive.db` | — | — | **deleted 2026-10-19** (293 videos merged first) |
+| `G:\VOD.RIP-data\archive.db` | — | — | **deleted 2026-10-19** (244 videos merged first) |
+| `%APPDATA%\VOD.RIP\archive.db` | — | — | **deleted 2026-10-19** (nothing unique) |
 
 This has already caused three wrong reports. An orchestrator read the `%APPDATA%` orphan, found no `rate_limit_events` table, and reported twice — with a formatted table — that rate history was inert in production. It is not: the live archive has that table with 33 rows. A backlog plan was then built on the orphan (1,161 videos / 3,723.6 hours). The live archive holds 12,715 videos / 27,631 hours / 1,216 videos with transcripts. A third agent re-read the orphan and repeated the first error. (Measured read-only on 2026-10-04. The live DB keeps growing — re-measure, do not reuse these totals.)
 
@@ -305,9 +306,44 @@ Get-ChildItem "$env:APPDATA\VOD.RIP\archive.db","G:\VOD.RIP-data\archive.db","H:
 
 The newest write is the live archive. On 2026-10-04 that was `H:\VOD.RIP-data\archive.db`, 7,537 MB, 2026-10-04 22:25 — the two orphans were 17 days and 18 days stale respectively. This command only stats files; it opens nothing and writes nothing.
 
-### The orphans
+### The orphans — GONE, merged and deleted 2026-10-19 (owner-approved)
 
-Both predecessors are still on disk and still mislead readers. **Deleting them is the owner's decision, not a worker's** — do not clear them as part of "cleanup" or disk-pressure work. Report their existence; let the owner choose.
+**Status as of 2026-10-19: only `H:\VOD.RIP-data\archive.db` exists.** The two
+predecessor files were merged and then deleted, on the owner's explicit
+instruction, after a set-difference proved what each held:
+
+| file | unique videos | carried into H: | now |
+|---|---|---|---|
+| `C:\VOD.RIP-data\archive.db` | 293 | 293 videos, 103,499 messages, 20 archive_jobs | **deleted** |
+| `G:\VOD.RIP-data\archive.db` | 244 | 244 videos, 98,687 messages, 1 alias, 2 archive_jobs | **deleted** |
+| `%APPDATA%\VOD.RIP\archive.db` | 0 | nothing | **deleted** |
+
+Live archive afterwards: **18,696 videos · 4,051,807 transcript segments ·
+16,969,566 chat messages.** DB files freed 1.67 GB; the now-orphaned data-root
+caches (`C:\VOD.RIP-data` 0.49 GB, `G:\VOD.RIP-data` 1.65 GB — preview caches,
+pytest scratch and three redundant Parakeet Redux copies verified byte-size
+identical to `H:\VOD.RIP-models\parakeet-models\sherpa-onnx-nemo-parakeet-redux`)
+were removed too. Nothing outside `H:` remains.
+
+**The cause is now pinned shut, and that is the part that matters.**
+`settings.data_dir` was `""`, so every boot went through the auto tier and
+`fastest_disk()`; the 2026-10-19 dev boot answered `C:` instead of `H:`, so the
+day's ingest landed in a fresh 1 GB archive while the 9.6 GB live one went
+untouched — a different, smaller archive in the same UI. That is the same class
+as the "wrong file" trap below, not a historical curiosity. `settings.data_dir`
+is now the literal `H:\VOD.RIP-data`, which the resolver reads **before** the
+probe (`disk_hygiene.data_dir()`: env → settings → auto tier), so a transient
+free-space probe miss can no longer choose the system drive.
+
+The text below is kept as the generic warning, not as a description of files
+that exist. **Deleting or merging any archive is still the owner's decision, not
+a worker's** — and `grep`-ing the tree is still not how you find a reader of a
+stale file.
+
+Both predecessors were still on disk until 2026-10-19 and misled readers for
+weeks. **Deleting them is the owner's decision, not a worker's** — do not clear
+them as part of "cleanup" or disk-pressure work. Report their existence; let the
+owner choose.
 
 **The two are NOT equally safe to delete — check before recommending either.** Comparing `(platform, video_id)` sets against the live archive on 2026-10-05:
 
