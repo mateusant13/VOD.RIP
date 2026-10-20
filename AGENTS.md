@@ -168,6 +168,34 @@ backend-only.
 - Cookies (VOD.RIP cookie/po_token): `vendor/cookie-extension/src/` — installed from the `VOD.RIP-cookies` subfolder (staging: `%APPDATA%\VOD.RIP\cookie-extension\VOD.RIP-cookies\`)
 - **Install/update mechanism** (silent UIA installer + zero-window reload, every trap): `docs/extension-auto-install.md`. Read it before touching `backend/scripts/cookie_extension_auto_install.ps1` or the `/api/session/cookies/auto-install` route.
 
+### Auto-install, verified 2026-10-20
+
+**It is UIA automation of the manual flow, not a Chrome-policy bypass**, and that distinction is the whole design: Chrome/Edge refuse sideloading except through Developer mode → `Load unpacked`. The script opens `chrome://extensions`, turns Developer mode on, clicks *Load unpacked*, drives the folder picker and verifies. The user never drags a folder; Chrome still sees a normal unpacked developer load.
+
+Pieces (all in-tree; this used to live only in the manager repo):
+
+| piece | path |
+|---|---|
+| route + orchestration | `backend/routers/cookie_bridge.py` (`POST /api/session/cookies/auto-install`) |
+| silent installer | `backend/scripts/cookie_extension_auto_install.ps1` |
+| visible fallback | `backend/scripts/manual_extension_manager_tab.ps1` |
+| browser detection | `backend/services/browser_detect.py` |
+| frontend trigger | `src/lib/cookieAutoInstall.ts` |
+
+Flow: `_materialize_ext_src()` stages the unpacked folder → `_find_browser()` (chrome/msedge/brave) → thread → `powershell -File cookie_extension_auto_install.ps1 -ExtensionDir <dir> -Browser <browser>` → the script prints ONE JSON line → the route records it in `auto_install`. Nothing runs browser-side afterwards: a fresh install fires `chrome.runtime.onInstalled`, and the service worker pushes cookies by itself (`cookies.onChanged`, `tabs.onUpdated`, a 10-min alarm, a 30-s poll of `/api/extension/status`). There is deliberately no "wake tab" — the old `_wake_extension_browser()` looked the browser up by PLATFORM name and never ran.
+
+**`installed: true` does NOT mean cookies exist.** These are separate facts and conflating them cost real debugging time:
+
+```jsonc
+// GET /api/session/cookies/status — measured 2026-10-20 01:05
+{"paired": true, "enabled": true, "bridge_ready": true,   // bridge + SW alive
+ "auto_install": {"state":"done","installed":true},        // extension IS loaded
+ "platforms": {},                                          // NO cookies stored
+ "youtube_authenticated": false}
+```
+
+With `platforms: {}` the authenticated InnerTube race still answers, but with **`formats=1 heights=[360]`** — no 720/1080 tier — and yt-dlp logs `Sign in to confirm your age`. The extension is only useful once a logged-in profile exports: the popup's export (or the SW alarm) is what fills `platforms`. **Installing it is not the fix; exporting a signed-in session is.** Verify with `platforms` being non-empty and `youtube_authenticated: true`, never with `installed`.
+
 
 ## Runtime logs
 
