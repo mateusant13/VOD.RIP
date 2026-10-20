@@ -29,6 +29,20 @@ def previews_status() -> dict:
     return {"previews": instant_preview.list_previews()}
 
 
+@router.get("/heavy-cache")
+def previews_heavy_cache() -> dict:
+    """Orphaned channels whose heavy media is still inside its grace window.
+
+    Policy: a removed channel keeps its preview media for 48h; if that already
+    elapsed when the app opened, a 1h countdown runs before deletion, and
+    re-adding the channel cancels it. This endpoint is the read-only view of
+    that ledger — it never deletes anything.
+    """
+    from services import heavy_cache
+
+    return {"orphans": heavy_cache.status()}
+
+
 @router.get("/{channel_id}/media")
 def preview_media(channel_id: str, request: Request):
     # ponytail: path traversal guard — channel_id is URL-decoded by FastAPI;

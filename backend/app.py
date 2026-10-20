@@ -855,7 +855,21 @@ async def _app_lifespan(_app: FastAPI):
     except Exception:
         logger.debug("Archive chat watchdog start skipped", exc_info=True)
 
-    # Archive scheduler — proactively ingests VOD metadata for every saved
+    # Heavy per-channel cache lifecycle (owner policy, 2026-10-20): a channel
+    # removed from saved_channels keeps its instant-preview media for 48h, and
+    # if that window already elapsed while the app was closed, a ONE-HOUR
+    # countdown starts at boot and the files go when it expires. Re-adding the
+    # channel cancels it. The sweeper thread is what makes the countdown fire
+    # while the app stays open, so it starts with the other boot daemons.
+    try:
+        from services.heavy_cache import start_sweeper
+
+        if start_sweeper():
+            logger.info("Heavy cache sweeper started")
+    except Exception:
+        logger.debug("Heavy cache sweeper start skipped", exc_info=True)
+
+    # Archive scheduler - proactively ingests VOD metadata for every saved
     # channel (Twitch/Kick), backfills Twitch VOD chat, fetches YouTube
     # captions/subtitles, and tops up the low-priority whisper queue. First
     # pass runs immediately at boot; later passes every ~3 min and right

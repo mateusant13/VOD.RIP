@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 
 os.environ["VODRIP_ARCHIVE_DB"] = str(
@@ -291,7 +292,12 @@ async def test_previews_media_404_for_unknown_channel(_previews):
 
 
 @pytest.mark.asyncio
-async def test_settings_update_removes_previews_of_removed_channels(_previews):
+async def test_settings_update_keeps_previews_of_removed_channels_in_grace(_previews):
+    """Owner policy (2026-10-20): removing a channel does NOT delete its heavy
+    media on the spot - it enters a 48h grace window, and only the sweeper that
+    runs after grace + countdown deletes it."""
+    from services import heavy_cache
+
     (_previews).mkdir(parents=True, exist_ok=True)
     (_previews / "gone.mp4").write_bytes(_MP4_MAGIC)
     (_previews / "gone.json").write_text("{}", encoding="utf-8")
@@ -302,9 +308,20 @@ async def test_settings_update_removes_previews_of_removed_channels(_previews):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         first = await client.post("/api/settings", json={"saved_channels": [ch("gone"), ch("kept")]})
         assert first.status_code == 200
-        # Removing "gone" from the saved list must delete its preview files.
         second = await client.post("/api/settings", json={"saved_channels": [ch("kept")]})
     assert second.status_code == 200
+
+    # Kept, and recorded as an orphan so the boot/periodic sweep owns it.
+    assert (_previews / "gone.mp4").exists()
+    assert (_previews / "gone.json").exists()
+    assert "gone" in heavy_cache.pending_ids()
+    assert "kept" not in heavy_cache.pending_ids()
+
+    # The lifecycle still ends in a delete, just not now.
+    now = time.time()
+    heavy_cache.sweep(now=now + 48 * 3600 + 1)     # countdown starts
+    assert (_previews / "gone.mp4").exists()
+    heavy_cache.sweep(now=now + 48 * 3600 + 3601)  # countdown expires
     assert not (_previews / "gone.mp4").exists()
     assert not (_previews / "gone.json").exists()
     assert (_previews / "kept.mp4").exists(), "saved channel previews must survive"

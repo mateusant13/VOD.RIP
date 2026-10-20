@@ -240,18 +240,25 @@ def _apply_settings_update(update: SettingsUpdate) -> AppSettings:
         # `current.saved_channels = update.saved_channels` overwrite would
         # otherwise see the NEW list and never flag an addition).
         prior_cids = {str(c.get("id") or "") for c in (current.saved_channels or [])}
-        # Instant previews are keyed by channel id — drop preview files of
-        # channels removed from the saved list so stale media never lingers.
+        # Instant previews are keyed by channel id. A removed channel keeps its
+        # HEAVY cache for 48h (heavy_cache policy) instead of losing it on the
+        # spot: removal is often a mistake, and re-downloading 5 MB to undo it
+        # is exactly the wait this app exists to remove. Light cache is not
+        # part of that policy and is never touched here.
         try:
-            from services.instant_preview import remove_channel_previews
+            from services.heavy_cache import note_added, note_removed
 
             old_ids = {str(c.get("id") or "") for c in (current.saved_channels or [])}
             for ch in (update.saved_channels or []):
                 old_ids.discard(str(ch.get("id") or ""))
             for cid in old_ids:
-                remove_channel_previews(cid)
-        except Exception:  # noqa: BLE001 — cleanup must never fail the save
-            logger.debug("instant preview cleanup skipped", exc_info=True)
+                note_removed(cid)
+            for ch in (update.saved_channels or []):
+                cid = str(ch.get("id") or "")
+                if cid and cid not in prior_cids:
+                    note_added(cid)  # re-add cancels a pending deletion
+        except Exception:  # noqa: BLE001 - cleanup must never fail the save
+            logger.debug("heavy cache bookkeeping skipped", exc_info=True)
         current.saved_channels = update.saved_channels
         # Forgetting an indexed channel: removing an idx_* entry from the
         # saved list must stick — delete its channel_snapshots rows so the

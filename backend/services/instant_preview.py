@@ -199,10 +199,19 @@ def _drop_orphan_previews(known: set) -> int:
     d = previews_dir()
     if not d.is_dir():
         return 0
+    # A channel the heavy_cache policy is holding (48h grace / 1h countdown) is
+    # NOT an orphan yet: deleting it here would make the grace window dead code,
+    # because this pass runs minutes after the removal.
+    try:
+        from services.heavy_cache import pending_ids
+
+        protected = pending_ids()
+    except Exception:  # noqa: BLE001 - policy unavailable => no protection
+        protected = set()
     freed = 0
     for jp in list(d.glob("*.json")):
         cid = jp.stem
-        if cid in known:
+        if cid in known or cid in protected:
             continue
         mp4 = d / f"{cid}.mp4"
         for path in (jp, mp4):
@@ -213,7 +222,7 @@ def _drop_orphan_previews(known: set) -> int:
             except OSError:
                 logger.debug("orphan preview cleanup failed for %s", path, exc_info=True)
     for mp4 in list(d.glob("*.mp4")):
-        if mp4.stem in known:
+        if mp4.stem in known or mp4.stem in protected:
             continue
         try:
             if mp4.is_file():
