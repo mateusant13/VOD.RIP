@@ -567,13 +567,29 @@ def _init_schema() -> None:
         schema_applied = True
         _conn.commit()
         # Disk hygiene (fresh open only): checkpoint a stale -wal left by a
-        # killed process, then VACUUM when the freelist outgrows 10% of the
-        # file (heavy insert/delete churn). Both are best-effort — a
-        # busy/locked DB fails and is retried next start.
+        # killed process. PASSIVE, never TRUNCATE: TRUNCATE has to wait for
+        # EVERY reader to drain first, and a live archive always has one (the
+        # app's own worker, a second VOD.RIP process, a read-only probe), so it
+        # spins for the whole busy_timeout and then gives up having moved
+        # nothing. Measured 2026-10-20 against H:\VOD.RIP-data\archive.db:
+        # PRAGMA wal_checkpoint(TRUNCATE) took 10,914 ms and answered
+        # (busy=1, log=209, checkpointed=0) - eleven seconds of boot cost for
+        # zero frames moved. PASSIVE takes whatever no reader is pinning and
+        # returns at once; the rest is checkpointed by the next writer.
         try:
-            _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            _busy, _log_frames, _moved = _conn.execute(
+                "PRAGMA wal_checkpoint(PASSIVE)"
+            ).fetchone()
+            if _moved:
+                logger.debug(
+                    "startup checkpoint moved %d/%d WAL frames", _moved, _log_frames
+                )
         except sqlite3.Error:
             pass
+        # Then VACUUM when the freelist outgrows 10% of the file (heavy
+        # insert/delete churn). VACUUM needs exclusivity, so it fails fast on a
+        # live DB and is retried next start - unlike the checkpoint above, it is
+        # never attempted while another writer holds the file.
         try:
             page_count = _conn.execute("PRAGMA page_count").fetchone()[0]
             freelist = _conn.execute("PRAGMA freelist_count").fetchone()[0]
@@ -581,7 +597,13 @@ def _init_schema() -> None:
                 _conn.execute("VACUUM")
                 # In WAL mode VACUUM rewrites through the -wal, so the main
                 # file only shrinks once the new frames are checkpointed back.
-                _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                # Drain passively first, then TRUNCATE only when nothing is
+                # pinning the WAL - TRUNCATE on a busy file is the 10 s stall.
+                busy, _log_frames, _moved = _conn.execute(
+                    "PRAGMA wal_checkpoint(PASSIVE)"
+                ).fetchone()
+                if not busy:
+                    _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except sqlite3.Error:
             pass
     if not _schema_ready:
@@ -640,7 +662,11 @@ def _init_schema() -> None:
             # (same pattern as the fresh-open hygiene above).
             try:
                 _conn.execute("VACUUM")
-                _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                busy, _log_frames, _moved = _conn.execute(
+                    "PRAGMA wal_checkpoint(PASSIVE)"
+                ).fetchone()
+                if not busy:
+                    _conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             except sqlite3.Error:
                 pass
         _schema_ready = True
