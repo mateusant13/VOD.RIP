@@ -1286,6 +1286,20 @@ def cached_extract_info(url: str, opts: dict) -> dict:
             raise err
         result = box.get("result")
         if result is not None:
+            if box.get("warm_light") and not opts.get("_warm_light"):
+                # Accept the light warm's result when it is playable.
+                #
+                # The light warm runs _try_innertube_info(preview_fast=True) —
+                # the SAME race the click's first branch runs — so a playable
+                # result is precisely what the click would have produced on its
+                # own first attempt. Re-extracting unconditionally doubled the
+                # work and burned a second InnerTube hash/quota grant for
+                # identical bytes (measured 2026-10-19: one cold click logged
+                # two identical `extract ok` lines in the same millisecond).
+                # A non-playable light result still gets the full chain.
+                if _youtube_info_playable(result):
+                    return result
+                return cached_extract_info(url, opts)
             return result
         return cached_extract_info(url, opts)
 

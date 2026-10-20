@@ -7,6 +7,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Optional
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -37,6 +38,10 @@ _TV_TIMEOUT_SEC = 1.1
 _RACE_TIMEOUT_SEC = 2.5
 _PREVIEW_INNERTUBE_READ_SEC = 1.5
 _PREVIEW_INNERTUBE_RACE_SEC = 2.0
+# The publish-date backfill is metadata, not playback: a preview keeps whatever
+# lands inside this wall bound and moves on. Measured 2026-10-19 — an unbounded
+# backfill put ~2.7 s inside a 4.6 s cold click while the race itself took 250 ms.
+_PREVIEW_CREATED_AT_WALL_SEC = 1.0
 
 if TYPE_CHECKING:
     from services.youtube_session import YouTubeSession
@@ -1599,11 +1604,49 @@ def _ensure_info_created_at(
     info: Optional[dict[str, Any]],
     video_id: str,
     session: Optional["YouTubeSession"],
+    *,
+    wall_timeout: Optional[float] = None,
 ) -> None:
-    """IOS race winners often lack publishDate — backfill from WEB microformat."""
+    """IOS race winners often lack publishDate — backfill from WEB microformat.
+
+    ``wall_timeout`` bounds the whole backfill, not each socket read. The
+    metadata call's own ``read_timeout`` is per-READ, so a slow microformat
+    response overruns it without limit: measured 2026-10-19 on a cold preview,
+    the InnerTube race itself finished in ~250 ms (8 profiles in parallel) and
+    this backfill then took ~2.7 s of a 4.6 s click. Playback does not need
+    ``created_at`` — only list rows do, and every consumer already treats it as
+    optional (``preview/warm.py`` falls back through published_at/upload_date/"").
+    Preview callers therefore pass a bound and keep whatever arrives in time.
+    """
     if not info or info.get("created_at") or info.get("upload_date"):
         return
-    meta = innertube_video_row_metadata(video_id, session=session, read_timeout=2.5)
+    meta: Optional[dict[str, Any]] = None
+    if wall_timeout is None:
+        meta = innertube_video_row_metadata(video_id, session=session, read_timeout=2.5)
+    else:
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="yt-created")
+        try:
+            fut = pool.submit(
+                innertube_video_row_metadata,
+                video_id,
+                session=session,
+                read_timeout=2.5,
+            )
+            try:
+                meta = fut.result(timeout=wall_timeout)
+            except FuturesTimeoutError:
+                logger.debug(
+                    "created_at backfill exceeded %.1fs for %s — leaving it unset",
+                    wall_timeout,
+                    video_id,
+                )
+                meta = None
+            except Exception:
+                meta = None
+        finally:
+            # Abandon a still-running metadata call: it cannot be cancelled, but
+            # it must not hold the click. Its own read_timeout ends it.
+            pool.shutdown(wait=False, cancel_futures=True)
     if not meta or not meta.get("created_at"):
         return
     info["created_at"] = meta["created_at"]
@@ -1663,7 +1706,15 @@ def innertube_extract_info(
     profiles = _profiles_for_session(session)
     info = _race_profiles(profiles, video_id, session, read_timeout, wall_timeout, source)
     if info:
-        _ensure_info_created_at(info, video_id, session)
+        # A preview is opening a player, not filling a list row: bound the
+        # metadata backfill so a slow microformat cannot add seconds that the
+        # race itself never spent.
+        _ensure_info_created_at(
+            info,
+            video_id,
+            session,
+            wall_timeout=_PREVIEW_CREATED_AT_WALL_SEC if preview_fast else None,
+        )
         from services.youtube_diag import log_extract_ok
         log_extract_ok(video_id, "innertube_race", info, session)
         return info

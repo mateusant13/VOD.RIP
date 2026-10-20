@@ -82,6 +82,18 @@ class KickRateLimitError(RuntimeError):
     """429 retries exhausted — Kick rate-limited this IP/session."""
 
 
+class KickNotFound(ValueError):
+    """Kick answered 404: the channel/VOD/clip asked for does not exist.
+
+    A subclass of ``ValueError`` on purpose so every existing
+    ``except ValueError`` site keeps working; it exists so the preview router
+    can answer 404 (gone) instead of 400 (bad request) and say WHICH thing is
+    gone. The merged archive holds 293 Kick live recordings Kick has since
+    removed — those rows are valid archive records with a dead upstream, not
+    malformed requests.
+    """
+
+
 def _governor_admit(origin: str, path: str) -> None:
     """Pace this call against the learned Kick budget. Never raises.
 
@@ -111,6 +123,7 @@ def _get_json(
     *,
     timeout: float = 15.0,
     origin: str = "auto",
+    not_found: str = "Kick channel",
 ) -> Any:
     """One Kick API GET — the chokepoint for 100% of Kick JSON egress,
     with the retry/backoff ladder.
@@ -161,7 +174,13 @@ def _get_json(
             backoff = min(backoff * 2.0, _BACKOFF_MAX_SEC)
             continue
         if resp.status_code == 404:
-            raise ValueError(f"Kick channel not found: {referer}")
+            # A 404 means "the thing you asked for is not there" — and what was
+            # asked for depends on the path. Calling a deleted VOD a missing
+            # CHANNEL is a lie the user sees: 293 archived Kick recordings whose
+            # upstream Kick has since removed answered "Kick channel not found",
+            # which reads as "your channel is gone" instead of "that recording
+            # expired". The caller labels the entity; the router maps this type.
+            raise KickNotFound(f"{not_found} not found: {referer}")
         if resp.status_code == 403:
             # Cloudflare classification (bot block): record the event and
             # arm the gate cooldown; consecutive events escalate to a long
@@ -448,7 +467,7 @@ def get_clip_info_api(url: str, *, origin: str = "auto") -> KickVideo:
         raise ValueError(f"Not a Kick clip URL: {url}")
     slug = extract_slug(url)
     referer = url if url.startswith("http") else f"{_BASE}/{slug}/clips/{clip_id}"
-    data = _get_json(f"/api/v2/clips/{clip_id}", referer, origin=origin)
+    data = _get_json(f"/api/v2/clips/{clip_id}", referer, origin=origin, not_found="Kick clip")
     clip = data.get("clip") if isinstance(data, dict) else None
     if not isinstance(clip, dict):
         raise RuntimeError("Unexpected Kick clip API response")
@@ -481,7 +500,7 @@ def get_video_info_api(url: str, *, origin: str = "auto") -> KickVideo:
         raise ValueError(f"Not a Kick VOD URL: {url}")
     slug = extract_slug(url)
     referer = url if url.startswith("http") else f"{_BASE}/{slug}/videos/{video_id}"
-    data = _get_json(f"/api/v1/video/{video_id}", referer, origin=origin)
+    data = _get_json(f"/api/v1/video/{video_id}", referer, origin=origin, not_found="Kick VOD")
     if not isinstance(data, dict):
         raise RuntimeError("Unexpected Kick video API response")
     v = _video_from_v1(data, slug)

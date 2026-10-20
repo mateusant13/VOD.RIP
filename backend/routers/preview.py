@@ -65,6 +65,7 @@ from services.preview_timing import log_preview_timing
 # finally errored (live report 2026-10-12 04:02 local, errors.jsonl http_502 x8).
 from services.preview import WINDOW_HLS_MARKER
 from services import archive_db, queue_policy
+from services.kick_api_service import KickNotFound
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["preview"])
@@ -675,6 +676,12 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
         # Already-shaped responses (e.g. the 504 create hard-timeout) must not
         # be re-wrapped by the generic handler below into a 500.
         raise
+    except KickNotFound as e:
+        # Kick said 404 for a thing that does exist in our archive (293 merged
+        # live recordings had their upstream removed). That is "gone", not a
+        # bad request, and the message must name the VOD — not the channel.
+        logger.info("preview: upstream gone url=%s: %s", preview_url[:100], e)
+        raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         logger.warning("preview session rejected url=%s: %s", preview_url[:100], e)
         raise HTTPException(status_code=400, detail=str(e))
