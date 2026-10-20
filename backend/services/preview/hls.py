@@ -44,6 +44,8 @@ from services.preview.session import (
     _host_allowed,
     _is_playlist_url,
     _hosts_for_url,
+    _cache_playlist,
+    _MAX_PLAYLIST_CACHE_BYTES,
     _playlist_cache,
     _read_cache,
     _request_headers,
@@ -58,6 +60,12 @@ from services.preview._state import _validate_proxy_url
 # avoids forcing the whole preview to rebuild from scratch.
 _transplant_inflight: set = set()
 _transplant_lock = threading.Lock()
+
+# A master URL pointing at a media container instead of a playlist. Matched on
+# the path only: query strings on googlevideo URLs contain arbitrary segments.
+_MEDIA_FILE_RE = re.compile(
+    r"\.(mp4|m4s|m4a|m4v|webm|mkv|ts)(?:$|[?#])", re.IGNORECASE
+)
 
 
 def _twitch_refresh_and_remap(session, expired_url: str):
@@ -502,7 +510,7 @@ def proxy_playlist(session_id: str, upstream_url: str) -> Tuple[bytes, str, dict
 
     prefetched_pl = lookup_prefetched_playlist(session, upstream_url)
     if prefetched_pl is not None:
-        cache[upstream_url] = (prefetched_pl, now)
+        _cache_playlist(session, upstream_url, prefetched_pl, now)
         return (
             prefetched_pl,
             "application/vnd.apple.mpegurl",
@@ -514,7 +522,7 @@ def proxy_playlist(session_id: str, upstream_url: str) -> Tuple[bytes, str, dict
         data, status = _fetch_and_rewrite_playlist_streaming(session, upstream_url)
         if not data.lstrip().startswith(b"#EXTM3U"):
             raise RuntimeError("Upstream playlist body is not HLS m3u8")
-        cache[upstream_url] = (data, now)
+        _cache_playlist(session, upstream_url, data, now)
         return (
             data,
             "application/vnd.apple.mpegurl",
@@ -522,9 +530,23 @@ def proxy_playlist(session_id: str, upstream_url: str) -> Tuple[bytes, str, dict
             status,
         )
 
+    # A master URL that is not a playlist is a MEDIA file. Fetching it here
+    # buffers the whole thing into RSS and then hands it to FastAPI as
+    # Response(content=...) - it is held twice. Measured 2026-10-20: a GET
+    # /master.m3u8 answered with a 92MB MP4. Media has its own route
+    # (/stream.mp4) which is Range-capable and streams; buffering it on the
+    # manifest route is a defect, not a fallback.
+    if _MEDIA_FILE_RE.search(upstream_url):
+        raise ValueError(
+            "Preview master is a media file, not a playlist - use /stream.mp4"
+        )
     data, _, _, status = _http_get_bytes(session, upstream_url)
     if not data:
         raise RuntimeError("Upstream playlist is empty")
+    if len(data) > _MAX_PLAYLIST_CACHE_BYTES:
+        raise RuntimeError(
+            f"Upstream master is {len(data)} bytes - not an HLS playlist"
+        )
     ctype = _guess_content_type(upstream_url)
     return data, ctype, {"Cache-Control": "no-cache"}, status
 def proxy_segment(

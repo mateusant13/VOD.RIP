@@ -1503,6 +1503,54 @@ def _playlist_cache(session: PreviewSession) -> Dict[str, Tuple[bytes, float]]:
         cache = {}
         session.rewritten_playlists = cache
     return cache
+
+
+# A rewritten playlist is a few KB, and even a multi-hour VOD media playlist is
+# 0.5-2 MB. The cache used to be unbounded: every distinct playlist URL kept
+# its body for the life of the session, and nothing stopped a NON-playlist
+# body (an MP4 served from a master URL) from being pinned there too. That is
+# an unbounded resident set per session, multiplied by however many sessions
+# are live - the shape of a multi-GB RSS.
+_MAX_PLAYLIST_CACHE_ENTRIES = 12
+_MAX_PLAYLIST_CACHE_BYTES = 6_000_000
+
+
+def _playlist_cache_evict(session: PreviewSession) -> None:
+    """Enforce both bounds, oldest first (dicts keep insertion order)."""
+    cache = _playlist_cache(session)
+    while len(cache) > _MAX_PLAYLIST_CACHE_ENTRIES:
+        cache.pop(next(iter(cache)), None)
+    total = sum(len(v[0]) for v in cache.values())
+    while total > _MAX_PLAYLIST_CACHE_BYTES and len(cache) > 1:
+        oldest = next(iter(cache))
+        body = cache.pop(oldest, None)
+        if body is not None:
+            total -= len(body[0])
+
+
+def _cache_playlist(
+    session: PreviewSession, url: str, body: bytes, now: float
+) -> bool:
+    """Store a rewritten playlist body. False when it was refused.
+
+    Refusal matters as much as storage: a body over the byte budget is not a
+    playlist, and pinning it is how a single malformed session turned into a
+    resident 92MB.
+    """
+    if not body:
+        return False
+    if len(body) > _MAX_PLAYLIST_CACHE_BYTES:
+        logger.warning(
+            "playlist cache refused a %d byte body for session=%s (not a playlist)",
+            len(body),
+            getattr(session, "session_id", "?")[:8],
+        )
+        return False
+    cache = _playlist_cache(session)
+    cache.pop(url, None)  # re-insert at the end = most recently used
+    cache[url] = (body, now)
+    _playlist_cache_evict(session)
+    return True
 def _hosts_for_url(url: str) -> Set[str]:
     host = urlparse(url).hostname
     return {host} if host else set()
