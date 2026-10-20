@@ -1287,17 +1287,23 @@ def cached_extract_info(url: str, opts: dict) -> dict:
         result = box.get("result")
         if result is not None:
             if box.get("warm_light") and not opts.get("_warm_light"):
-                # Accept the light warm's result when it is playable.
+                # Accept the light warm's result when it is playable AND not
+                # degenerate.
                 #
                 # The light warm runs _try_innertube_info(preview_fast=True) —
                 # the SAME race the click's first branch runs — so a playable
-                # result is precisely what the click would have produced on its
+                # result is usually what the click would have produced on its
                 # own first attempt. Re-extracting unconditionally doubled the
                 # work and burned a second InnerTube hash/quota grant for
                 # identical bytes (measured 2026-10-19: one cold click logged
                 # two identical `extract ok` lines in the same millisecond).
-                # A non-playable light result still gets the full chain.
-                if _youtube_info_playable(result):
+                #
+                # BUT a <=1-format result is what this module already classifies
+                # as a degenerate/bot-wall extract (:1184, :1234). Accepting
+                # that would hand a concurrent click a 360p-only ladder and
+                # give up its own yt-dlp leg, so the thin case still re-extracts.
+                formats = result.get("formats") or []
+                if _youtube_info_playable(result) and len(formats) > 1:
                     return result
                 return cached_extract_info(url, opts)
             return result

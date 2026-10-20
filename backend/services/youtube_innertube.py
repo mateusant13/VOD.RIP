@@ -1642,6 +1642,11 @@ def _ensure_info_created_at(
                 )
                 meta = None
             except Exception:
+                logger.debug(
+                    "created_at backfill failed for %s — leaving it unset",
+                    video_id,
+                    exc_info=True,
+                )
                 meta = None
         finally:
             # Abandon a still-running metadata call: it cannot be cancelled, but

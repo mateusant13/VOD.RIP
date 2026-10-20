@@ -87,11 +87,11 @@ describe("DiskSection", () => {
     expect(screen.queryByLabelText("clean logs")).not.toBeInTheDocument();
   });
 
-  it("defaults the keep input to 5 when the backend field is absent", async () => {
+  it("defaults the keep input to 8 when the backend field is absent", async () => {
     stubFetch({ low: false, free_bytes: 120 * 1024 ** 3, keep_count: 5 });
     render(<DiskSection settings={BASE_SETTINGS} setSettings={() => {}} />);
     await waitFor(() => expect(screen.getByLabelText("archive vods keep count")).toBeInTheDocument());
-    expect((screen.getByLabelText("archive vods keep count") as HTMLInputElement).value).toBe("5");
+    expect((screen.getByLabelText("archive vods keep count") as HTMLInputElement).value).toBe("8");
   });
 
   it("clamps keep input changes to 1-50 via setSettings", async () => {

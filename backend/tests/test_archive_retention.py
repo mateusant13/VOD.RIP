@@ -240,14 +240,87 @@ def test_settings_driven_keep_count(scratch_db, tmp_path):
     assert not (keep_dir / "v0.mp4").exists()
 
 
-def test_settings_without_flag_defaults_to_5(scratch_db, tmp_path):
-    """Pre-settings builds / tests without the flag fall back to keep=5."""
+def test_settings_without_flag_defaults_to_8(scratch_db, tmp_path):
+    """Pre-settings builds / tests without the flag fall back to keep=8."""
     keep_dir = tmp_path / "vods"
     keep_dir.mkdir()
-    _seed_archived(keep_dir, "kick", 7)
+    _seed_archived(keep_dir, "kick", 11)  # days 1..11, newest = v10
 
     with patch("deps.settings_mgr") as mgr:
         mgr.get.return_value = SimpleNamespace()
         stats = enforce_archive_vod_retention()
 
+    assert stats == {"deleted_files": 3, "cleared_rows": 3}
+    assert not (keep_dir / "v0.mp4").exists()
+    assert (keep_dir / "v8.mp4").is_file()
+
+
+def test_keep_is_per_channel_not_per_platform(scratch_db, tmp_path):
+    """A busy channel must not evict a quiet channel's files on the same platform."""
+    keep_dir = tmp_path / "vods"
+    keep_dir.mkdir()
+    for i in range(4):
+        p = keep_dir / f"busy{i}.mp4"
+        p.write_bytes(b"x")
+        archive_db.upsert_video({**_video("kick", f"busy{i}", 1 + i, p),
+                                 "channel": "busy", "canonical_key": f"busy-{i}"})
+    for i in range(2):
+        p = keep_dir / f"quiet{i}.mp4"
+        p.write_bytes(b"x")
+        archive_db.upsert_video({**_video("kick", f"quiet{i}", 1 + i, p),
+                                 "channel": "quiet", "canonical_key": f"quiet-{i}"})
+
+    stats = enforce_archive_vod_retention(keep_count=2)
+
     assert stats == {"deleted_files": 2, "cleared_rows": 2}
+    # each channel independently keeps its newest 2
+    assert not (keep_dir / "busy0.mp4").exists() and not (keep_dir / "busy1.mp4").exists()
+    for name in ("busy2", "busy3", "quiet0", "quiet1"):
+        assert _row("kick", name)["status"] == "ready"
+        assert (keep_dir / f"{name}.mp4").is_file()
+
+
+def test_cross_platform_duplicate_keeps_one_file(scratch_db, tmp_path):
+    """The same VOD on two platforms keeps a single file — the higher-priority
+    platform (youtube > twitch > kick) wins, even when both are within the
+    keep count, and the loser's transcripts/chat survive."""
+    keep_dir = tmp_path / "vods"
+    keep_dir.mkdir()
+    yt = keep_dir / "yt.mp4"
+    tw = keep_dir / "tw.mp4"
+    yt.write_bytes(b"y")
+    tw.write_bytes(b"t")
+    shared = "same-live|2026-07-04"
+    archive_db.upsert_video({**_video("youtube", "yt1", 4, yt), "canonical_key": shared})
+    archive_db.upsert_video({**_video("twitch", "tw1", 4, tw), "canonical_key": shared})
+    _seed_chat_transcript("twitch", "tw1")
+
+    stats = enforce_archive_vod_retention(keep_count=8)
+
+    assert stats == {"deleted_files": 1, "cleared_rows": 1}
+    assert (keep_dir / "yt.mp4").is_file()
+    assert _row("youtube", "yt1")["status"] == "ready"
+    # the twitch mirror loses the FILE, never the row, chat, or transcript
+    assert not (keep_dir / "tw.mp4").exists()
+    assert _row("twitch", "tw1")["status"] == "known"
+    assert _row("twitch", "tw1")["archive_path"] is None
+    assert _count("messages", "twitch", "tw1") == 2
+    assert _count("transcripts", "twitch", "tw1") == 2
+
+
+def test_shared_file_deleted_only_when_last_reference_goes(scratch_db, tmp_path):
+    """Two rows may share one file (content dedup); retention must not unlink
+    the file while a surviving row still points at it."""
+    keep_dir = tmp_path / "vods"
+    keep_dir.mkdir()
+    shared = keep_dir / "shared.mp4"
+    shared.write_bytes(b"same bytes")
+    archive_db.upsert_video({**_video("kick", "old", 1, shared), "canonical_key": "old-key"})
+    archive_db.upsert_video({**_video("kick", "new", 2, shared), "canonical_key": "new-key"})
+
+    stats = enforce_archive_vod_retention(keep_count=1)
+
+    assert stats == {"deleted_files": 0, "cleared_rows": 1}
+    assert shared.is_file()  # still referenced by the surviving row
+    assert _row("kick", "old")["archive_path"] is None
+    assert _row("kick", "new")["archive_path"] == str(shared)

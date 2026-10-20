@@ -124,9 +124,10 @@ class AppSettings(BaseModel):
     # (cookie_extension_auto_install.ps1); OFF = manual drag-and-drop only. Absent on older backends -> ON (getattr).
     auto_install_extension: bool = True
     entity_watch_enabled: bool = True
-    # Archived VOD retention: keep only the newest N video FILES per platform;
-    # older files are deleted but DB rows/transcripts/chat stay forever.
-    archive_vod_keep_count: int = Field(default=5, ge=1, le=50)
+    # Archived VOD retention: keep only the newest N video FILES per
+    # (platform, channel); older files are deleted but DB rows/transcripts/chat
+    # stay forever. A VOD mirrored on two platforms keeps one file only.
+    archive_vod_keep_count: int = Field(default=8, ge=1, le=50)
     # AI-models folder: home of every model weight — sherpa-onnx parakeet,
     # ONNX embedders, PANNs + tokenizers, the SLID NLLB translator
     # (parakeet/embed/PANNs/translate resolve as siblings under it).

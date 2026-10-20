@@ -113,8 +113,8 @@ export default function DiskSection({ settings, setSettings }: Props) {
     }
   }, [refresh, t]);
 
-  const keepCount = settings.archive_vod_keep_count ?? 5;
-  const keepValue = Number.isFinite(keepCount) ? Math.max(1, Math.min(50, keepCount)) : 5;
+  const keepCount = settings.archive_vod_keep_count ?? 8;
+  const keepValue = Number.isFinite(keepCount) ? Math.max(1, Math.min(50, keepCount)) : 8;
 
   const cacheDir = settings.cache_dir ?? '';
   const dataDir = settings.data_dir ?? '';
@@ -265,7 +265,7 @@ export default function DiskSection({ settings, setSettings }: Props) {
       </div>
 
       <div className="flex flex-col gap-1.5 pt-1">
-        <FieldCaption noWrap info={t('Oldest VODs kept per platform — applies on Save Settings')}>
+        <FieldCaption noWrap info={t('Oldest VODs kept per platform + channel — a VOD mirrored on two platforms keeps one file — applies on Save Settings')}>
           {t('Archive VODs Keep')}
         </FieldCaption>
         <div className="flex items-center gap-2">
