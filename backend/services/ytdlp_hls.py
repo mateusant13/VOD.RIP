@@ -14,24 +14,36 @@ import shutil
 import subprocess as sp
 import sys
 import tempfile
+from typing import Any, Optional
 
 
 # All throwaway scratch (fragments, mux staging) must land on the same drive
 # cache_root() picks - the drive with the most free space. Using the system
 # temp instead broke downloads on this box: G:\Temp is on a full drive, so
 # yt-dlp died with [Errno 28] No space left on device mid-download.
-def _tmpdir(prefix: str) -> str:
-    """mkdtemp pinned to cache_root() so scratch never lands on a full drive."""
+def _tmpdir(prefix: str, dir: Optional[str] = None) -> str:
+    """mkdtemp pinned to ``dir`` (when given) or cache_root() so scratch never
+    lands on a full drive. The ``dir`` argument lets a caller pin scratch next
+    to its output folder — the HLS clip path needs the temp dir observable to
+    the download manager so a cancel can wipe it, which the cache root is not."""
     try:
         from services.settings import cache_root
 
+        if dir:
+            os.makedirs(dir, exist_ok=True)
+            return tempfile.mkdtemp(prefix=prefix, dir=dir)
         root = cache_root()
         if root is not None:
             root.mkdir(parents=True, exist_ok=True)
             return tempfile.mkdtemp(prefix=prefix, dir=str(root))
     except Exception:
         pass
-    return tempfile.mkdtemp(prefix=prefix)
+    try:
+        return tempfile.mkdtemp(prefix=prefix, dir=dir)
+    except Exception:
+        # A caller-supplied dir that vanished must not turn staging into a
+        # hard failure — the system temp is still better than no scratch.
+        return tempfile.mkdtemp(prefix=prefix)
 import threading
 import time
 import uuid

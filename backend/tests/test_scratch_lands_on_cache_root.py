@@ -67,3 +67,28 @@ def test_falls_back_to_the_system_temp_when_there_is_no_cache_root(monkeypatch):
         import shutil
 
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_explicit_dir_wins_over_the_cache_root(monkeypatch):
+    """The HLS clip path passes dir= so a cancel can wipe its staging.
+
+    RED: drop the ``dir`` parameter (the shape that shipped before) and the
+    call site raises ``TypeError: _tmpdir() got an unexpected keyword
+    argument 'dir'`` — which is exactly how the instant-preview path stayed
+    disabled while every channel logged a skip.
+    """
+    import shutil
+
+    cache = BACKEND.parent / "tmp" / "scratch-test-cache-root"
+    out = BACKEND.parent / "tmp" / "scratch-test-output"
+    for p in (cache, out):
+        shutil.rmtree(p, ignore_errors=True)
+        p.mkdir(parents=True)
+    monkeypatch.setattr("services.settings.cache_root", lambda: cache)
+    d = ytdlp_hls._tmpdir("hls_clip_", dir=str(out))
+    try:
+        assert Path(d).parent == out, "dir= was ignored: %s (cache root %s)" % (d, cache)
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+        shutil.rmtree(cache, ignore_errors=True)
+

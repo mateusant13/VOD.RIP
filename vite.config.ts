@@ -111,12 +111,28 @@ export default defineConfig({
         // session=null, because it fell into the no-timeout "/api" lane
         // below — the 2026-09-13 failure mode: an upstream that accepts but
         // never answers leaves these pending FOREVER and the UI never
-        // paints. 8s is ~18x the measured max and still bounded, so a wedged
-        // upstream costs a 500 instead of a dead tab.
+        // paints.
+        //
+        // 2026-10-19: the 8s cap was measured to be INSIDE the normal cold
+        // path, not above it. A cold YouTube resolve (no warm snapshot yet —
+        // the state right after a restart, or for any video the warm batch
+        // has not touched) took 9.75s on the server, which logged
+        // session_created and answered 200 AFTER this proxy had already
+        // destroyed the socket: the page saw 500 + `socket hang up` and a
+        // console error for a preview the backend had successfully built.
+        // Measured cold/warm the same day, direct against :7897:
+        //   cold YouTube 5.26s · warm 12ms · warm (other vid) 0.21s
+        //   Twitch 0.85s · Kick 1.59s
+        // So cold resolves legitimately take seconds while the app's own
+        // create budget is 45s (routers/preview.py `_PREVIEW_CREATE_HARD_TIMEOUT_SEC`).
+        // 30s stays bounded (a wedged upstream still costs a 500, not a dead
+        // tab) and sits above every measured cold resolve, so slowness is no
+        // longer converted into an error. It must stay below the backend's
+        // 45s budget so the client never outlives the server's own timeout.
         // Matched BEFORE "/api" (insertion order) so it wins for these URLs.
         "^/api/preview/(?:session|invalidate|warm(?:/batch)?|seek|quality)([?].*)?$": {
           ...base,
-          proxyTimeout: 8_000,
+          proxyTimeout: 30_000,
         },
         // Everything else (SSE streams with 15s backend keepalives, HLS/MP4
         // proxies, yt-dlp extraction, folder pickers, scans) keeps the old
