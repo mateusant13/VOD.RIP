@@ -50,7 +50,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse
 
 from deps import settings_mgr
-from services import browser_cookie_extract, cookie_store
+from services import browser_cookie_cdp, browser_cookie_extract, cookie_store
 from services.disk_hygiene import data_dir
 from services.settings import _get_appdata_dir
 from services.yt_gate import gate_remaining_sec
@@ -1239,7 +1239,31 @@ async def session_cookies_import_browser(request: Request, body: Optional[dict] 
             raise HTTPException(status_code=404, detail=f"{browser} user data not found")
         profile_dir = candidate
 
-    cookies, reason = browser_cookie_extract.extract_platform_cookies(profile_dir)
+    cookies: dict[str, list[dict]]
+    reason: str
+    source: str
+    if profile_dir is not None:
+        # An explicit browser was requested: honour it rather than silently
+        # answering from a different browser's DevTools port.
+        cookies, reason = browser_cookie_extract.extract_platform_cookies(profile_dir)
+        source = "profile"
+    else:
+        # Preferred: ask a running browser over the DevTools Protocol. The
+        # browser hands back plaintext, so this works on profiles whose file
+        # store is app-bound encrypted (v20) or locked by the running browser
+        # - the two reasons the on-disk reader returns nothing on a modern
+        # install. Measured 2026-10-20: 26 youtube + 18 kick + 14 twitch
+        # cookies from a Chrome on :9222 while its file store was unreadable.
+        cookies, reason = browser_cookie_cdp.fetch_platform_cookies()
+        source = "cdp"
+        if not cookies:
+            file_cookies, file_reason = browser_cookie_extract.extract_platform_cookies(
+                None
+            )
+            if file_cookies:
+                cookies, reason, source = file_cookies, "", "profile"
+            else:
+                reason = reason or file_reason
     if not cookies:
         return {
             "ok": False,
@@ -1260,6 +1284,7 @@ async def session_cookies_import_browser(request: Request, body: Optional[dict] 
     )
     return {
         "ok": accepted > 0,
+        "source": source,
         "reason": "" if accepted else (reason or "nothing accepted"),
         "platforms": counts,
         "accepted": accepted,

@@ -159,3 +159,77 @@ def test_the_profile_read_is_confined_to_the_browser_root(extracted, store, monk
     _run(cb.session_cookies_import_browser(_Req(), {"browser": "chrome"}))
 
     assert extracted == [root], "must read the browser root, never a caller-supplied path"
+
+
+class TestCdpIsPreferred:
+    """The DevTools path is preferred because it is the only one that works on
+    a modern profile: the file store is locked while the browser runs and its
+    values are app-bound encrypted. Measured 2026-10-20 on this box: the CDP
+    path returned 26 youtube + 18 kick + 14 twitch cookies while the on-disk
+    reader returned nothing for the same browser."""
+
+    def test_cdp_cookies_win_and_the_file_reader_is_not_touched(
+        self, extracted, store, monkeypatch
+    ):
+        monkeypatch.setattr(
+            cb.browser_cookie_cdp,
+            "fetch_platform_cookies",
+            lambda ports=None: (
+                {
+                    "youtube": [
+                        {
+                            "name": "SID",
+                            "value": "from-cdp",
+                            "domain": ".youtube.com",
+                            "path": "/",
+                            "is_session": False,
+                            "expires": 4102444800,
+                            "secure": True,
+                            "httponly": True,
+                        }
+                    ]
+                },
+                "",
+            ),
+        )
+
+        out = _run(cb.session_cookies_import_browser(_Req(), {}))
+
+        assert out["ok"] is True
+        assert out["source"] == "cdp"
+        assert store["cookies"][0]["value"] == "from-cdp"
+        assert extracted == [], "the on-disk reader must not run when CDP answers"
+
+    def test_falls_back_to_the_file_reader_when_no_devtools_port_is_open(
+        self, extracted, store, monkeypatch
+    ):
+        monkeypatch.setattr(
+            cb.browser_cookie_cdp,
+            "fetch_platform_cookies",
+            lambda ports=None: ({}, "no browser DevTools port is open"),
+        )
+
+        out = _run(cb.session_cookies_import_browser(_Req(), {}))
+
+        assert out["ok"] is True
+        assert out["source"] == "profile"
+        assert len(extracted) == 1, "the fallback scans the default user-data roots"
+
+    def test_reports_both_reasons_when_neither_path_finds_anything(
+        self, extracted, store, monkeypatch
+    ):
+        monkeypatch.setattr(
+            cb.browser_cookie_cdp,
+            "fetch_platform_cookies",
+            lambda ports=None: ({}, "no browser DevTools port is open"),
+        )
+        monkeypatch.setattr(
+            cb.browser_cookie_extract,
+            "extract_platform_cookies",
+            lambda profile_dir=None: ({}, "app-bound encryption detected: youtube"),
+        )
+
+        out = _run(cb.session_cookies_import_browser(_Req(), {}))
+
+        assert out["ok"] is False
+        assert "DevTools" in out["reason"]
