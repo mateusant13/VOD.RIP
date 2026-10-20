@@ -441,6 +441,17 @@ const ChannelRow = memo(function ChannelRow({
 // ceiling (3 -> 2, medians 3.0s vs 3.0s), so that limiter is left as it was.
 const LIVE_POLL_MAX_IN_FLIGHT = 2;
 const SYNC_MAX_IN_FLIGHT = 3;
+// App-entry channel sync starts this long after the app opens. The sync used to
+// wait for a click on the Channels tab "so entering the app stays network-quiet";
+// the cost was that the first screen showed the PREVIOUS session's snapshot until
+// the owner clicked. A delay keeps the boot quiet (the first previews get the
+// connection pool) while still updating the grid without any interaction.
+const CHANNEL_STARTUP_SYNC_DELAY_MS = 8000;
+// The startup wave runs at a lower concurrency than the tab path (SYNC_MAX_IN_FLIGHT
+// = 3): it is the only wave that shares the connection pool with a first-ever
+// preview attach, and a mid-wave click measured 900ms at 3 vs 52-76ms with the
+// wave drained. 2 keeps the grid filling while leaving headroom for the player.
+const CHANNEL_STARTUP_SYNC_IN_FLIGHT = 2;
 
 // Measurement seam: a paired A/B runs both arms on one page by writing
 // window.__VODRIP_BG_LIMITS__ = { poll } before the Channels tab opens.
@@ -5489,25 +5500,28 @@ export default function App() {
   // (mergeVodLists/mergeClipLists) do incoming-wins merge, so the cached
   // data stays visible until fresh data arrives.
   const incrementalSyncDoneRef = useRef(false);
-  useEffect(() => {
-    if (tab !== 'channels' || incrementalSyncDoneRef.current) return;
+  // The sync body is shared by the app-entry path and the Channels-tab path:
+  // one implementation, one guard, so a tab visit right after boot never
+  // doubles the traffic.
+  const runIncrementalChannelSync = useCallback((maxInFlight: number = syncMaxInFlight()) => {
+    if (incrementalSyncDoneRef.current) return;
     incrementalSyncDoneRef.current = true;
     // Never-loaded (just-added) channels first so a newly added channel's
-    // VODs/clips/streams fetch ahead of the older backlog — the same priority
+    // VODs/clips/streams fetch ahead of the older backlog - the same priority
     // the archive scheduler applies to new channels.
     const channels = orderChannelsForSync(loadSavedChannels());
     const tasks: Array<() => Promise<unknown>> = [];
     channels.forEach((c) => {
       tasks.push(() => refreshChannelRef.current(c.id, c, 'vods', { silent: true, incremental: true }));
       tasks.push(() => refreshChannelRef.current(c.id, c, 'clips', { silent: true, incremental: true }));
-      // Stream VODs need the same incremental sync — without it the VODs tab
+      // Stream VODs need the same incremental sync - without it the VODs tab
       // goes stale after the first full fetch and never shows new streams.
       if (c.youtubeSlug?.trim()) {
         tasks.push(() => refreshChannelRef.current(c.id, c, 'streams', { silent: true, incremental: true }));
       }
     });
     // ponytail: cap the sync's concurrency (browser limits ~6 connections per
-    // host) — firing the whole grid at once saturates the pool and starves
+    // host) - firing the whole grid at once saturates the pool and starves
     // the preview player's manifest fetch past hls.js's 10s timeout. The grid
     // fills in the background; the preview must never wait on it.
     let cursor = 0;
@@ -5516,8 +5530,37 @@ export default function App() {
       const task = tasks[cursor++];
       void Promise.resolve(task()).finally(runNext);
     };
-    for (let i = 0; i < Math.min(syncMaxInFlight(), tasks.length); i += 1) runNext();
-  }, [tab]);
+    for (let i = 0; i < Math.min(maxInFlight, tasks.length); i += 1) runNext();
+  }, []);
+
+  // App entry: refresh every saved channel once, without waiting for the user
+  // to open the Channels tab and without asking for a click. This used to be
+  // gated on `tab === 'channels'` "so entering the app stays network-quiet",
+  // which meant the first thing the owner saw was the previous session's
+  // snapshot - the manual refresh this exists to remove.
+  //
+  // The quiet is kept, not dropped: the sync starts after the first previews
+  // have had their window, runs silently, and uses a lower concurrency than the
+  // tab path so the player still wins the connection races it was winning
+  // before. Measured through the browser (2026-10-20): a click 4.2s after
+  // opening = 58ms (the wave had not started); a click mid-wave (14s) = 900ms,
+  // still well under the 2.4s cold resolve it replaces; once the wave drains,
+  // 52-76ms.
+  useEffect(() => {
+    const id = window.setTimeout(
+      () => runIncrementalChannelSync(CHANNEL_STARTUP_SYNC_IN_FLIGHT),
+      CHANNEL_STARTUP_SYNC_DELAY_MS,
+    );
+    return () => window.clearTimeout(id);
+  }, [runIncrementalChannelSync]);
+
+  // Opening the Channels tab still syncs immediately - a late tab switch must
+  // not wait out the startup delay, and the shared guard above makes the two
+  // paths idempotent.
+  useEffect(() => {
+    if (tab !== 'channels') return;
+    runIncrementalChannelSync();
+  }, [tab, runIncrementalChannelSync]);
 
   // Warm YouTube preview cache for the top N long-form URLs of every channel
   // (VODs + stream VODs only — shorts/clips are cheap to extract on click and
