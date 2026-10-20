@@ -554,7 +554,14 @@ def _put_resolved_stream_cache(key: str, value: Tuple) -> None:
 def _get_session_snapshot(
     vid: str, height: int
 ) -> Optional[dict]:
-    """Return prebuilt session fields for (vid, height) or None on miss/expire."""
+    """Return prebuilt session fields for (vid, height) or None on miss/expire.
+
+    Two tiers: RAM first, then the disk store written by the warm. The disk
+    tier is what makes a click instant in a FRESH process — the warm shell used
+    to die with the process while its muxed head chunk stayed on disk, so the
+    first click of every restart paid the full resolve (1,639-2,402 ms measured
+    2026-10-20 through browser + Vite proxy).
+    """
     if not vid:
         return None
     key = (vid, int(height or 0))
@@ -565,7 +572,12 @@ def _get_session_snapshot(
             return hit[1]
         if hit:
             _SESSION_SNAPSHOT.pop(key, None)
-    return None
+    from services.preview import snapshot_store
+
+    snapshot = snapshot_store.load(vid, height, _SESSION_SNAPSHOT_TTL_SEC)
+    if snapshot is not None:
+        _put_session_snapshot(vid, height, snapshot)  # promote into RAM
+    return snapshot
 def _get_session_snapshot_closest(vid: str, height: int) -> Optional[Tuple[int, dict]]:
     """Return ``(stored_height, snapshot)`` for *vid* at the closest live height.
 
@@ -598,7 +610,9 @@ def _get_session_snapshot_closest(vid: str, height: int) -> Optional[Tuple[int, 
             if best is None or score < best[0]:
                 best = (score, stored, snap)
     if best is None:
-        return None
+        from services.preview import snapshot_store
+
+        return snapshot_store.load_closest(vid, want, _SESSION_SNAPSHOT_TTL_SEC)
     return best[1], best[2]
 
 
@@ -612,6 +626,12 @@ def _put_session_snapshot(vid: str, height: int, snapshot: dict) -> None:
             oldest = min(_SESSION_SNAPSHOT.items(), key=lambda item: item[1][0])
             _SESSION_SNAPSHOT.pop(oldest[0], None)
         _SESSION_SNAPSHOT[key] = (time.time(), snapshot)
+    # Disk tier: survives a restart. Only the newest few per channel are kept
+    # there — archive_retention.prune() enforces that window, so this write
+    # stays bounded instead of growing with every video ever previewed.
+    from services.preview import snapshot_store
+
+    snapshot_store.save(vid, height, snapshot)
 def invalidate_session_snapshot(vid: str, height: Optional[int] = None) -> None:
     """Drop snapshot(s) for *vid* — used when refresh forces a fresh resolve."""
     with _SESSION_SNAPSHOT_LOCK:

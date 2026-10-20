@@ -865,7 +865,7 @@ class PreviewManager:
                 # "snapshot expired" from "height mismatch" - and those have
                 # three different fixes.
                 logger.info(
-                    "preview snapshot MISS vid=%s h=%s pending_warm=%s so the click pays a cold resolve",
+                    "preview snapshot MISS vid=%s h=%s pending_warm=%s — trying closest height / disk tier",
                     vid[:11],
                     prefer_height,
                     youtube_warm_is_pending(url),
