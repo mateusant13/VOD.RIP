@@ -202,6 +202,10 @@ const ptBR: Record<string, string> = {
   'Sends keep-listed session cookies (Kick auth_token, YouTube SID family, Twitch auth-token) from your browser to the local VOD.RIP app on 127.0.0.1 only. Disabling blocks all cookie ingestion.':
     'Envia cookies de sessão da lista de permissão (Kick auth_token, família SID do YouTube, auth-token do Twitch) do seu navegador apenas para o aplicativo VOD.RIP local em 127.0.0.1. Desativar bloqueia toda ingestão de cookies.',
   'no cookies stored': 'nenhum cookie armazenado',
+  'Importar cookies do navegador': 'Importar cookies do navegador',
+  'Nenhum cookie encontrado no navegador.': 'Nenhum cookie encontrado no navegador.',
+  'Nao foi possivel ler os cookies do navegador.':
+    'Nao foi possivel ler os cookies do navegador.',
   '{count} expired': '{count} expirados',
   'Copied': 'Copiado',
   'Copy': 'Copiar',
@@ -1116,6 +1120,10 @@ const es: Record<string, string> = {
   'Local-only cookie sync — nothing leaves this machine.': 'Sincronización de cookies solo local — nada sale de esta máquina.',
   'Sends keep-listed session cookies (Kick auth_token, YouTube SID family, Twitch auth-token) from your browser to the local VOD.RIP app on 127.0.0.1 only. Disabling blocks all cookie ingestion.': 'Envía las cookies de sesión de la lista de conservación (Kick auth_token, familia SID de YouTube, Twitch auth-token) desde tu navegador a la app local de VOD.RIP solo en 127.0.0.1. Desactivar bloquea toda ingesta de cookies.',
   'no cookies stored': 'no hay cookies guardadas',
+  'Importar cookies do navegador': 'Importar cookies del navegador',
+  'Nenhum cookie encontrado no navegador.': 'No se encontraron cookies en el navegador.',
+  'Nao foi possivel ler os cookies do navegador.':
+    'No se pudieron leer las cookies del navegador.',
   '{count} expired': '{count} caducadas',
   'Copied': 'Copiado',
   'Copy': 'Copiar',

@@ -1241,7 +1241,6 @@ export function maxAvailablePreviewHeight(
   return heights.length ? heights[heights.length - 1] : PREVIEW_YOUTUBE_PREFER_HEIGHT;
 }
 
-/** First preview load: start at 360p for instant playback; quality menu can raise it. */
 /**
  * Head tier for a YouTube VOD preview - what opens instantly.
  *
@@ -1272,7 +1271,7 @@ export function initialPreviewPreferHeight(
   return Math.min(target, max || target, playerCap || target);
 }
 
-/** HLS manifest default tier — Twitch/Kick at 720p, YouTube at 360p. */
+/** HLS manifest default tier - Twitch/Kick at 720p, YouTube at the 480p head tier. */
 export function resolveInitialHlsPreviewHeight(
   _isClip: boolean,
   playerCap: number,
@@ -1787,13 +1786,17 @@ void (() => {
     'batch warm is fire-and-forget',
   );
   const cap = 360;
+  // Head tier is 480, not 360: the engaged tier (1080) rides the same
+  // multi-variant master, so opening at 480 costs one rung of bandwidth and
+  // removes the visible step when the preview is enlarged.
   console.assert(
-    initialPreviewPreferHeight(false, cap, { youtube: true, variantHeights: [720, 1080] }) === 360,
-    'YouTube VOD preview should fast-start at 360p',
+    initialPreviewPreferHeight(false, cap, { youtube: true, variantHeights: [720, 1080] }) ===
+      PREVIEW_YOUTUBE_HEAD_HEIGHT,
+    'YouTube VOD preview should fast-start at the head tier (480p)',
   );
   console.assert(
-    initialPreviewPreferHeight(true, cap, { youtube: true }) === 360,
-    'YouTube Shorts preview should fast-start at 360p',
+    initialPreviewPreferHeight(true, cap, { youtube: true }) === PREVIEW_YOUTUBE_HEAD_HEIGHT,
+    'YouTube Shorts preview should fast-start at the head tier (480p)',
   );
   console.assert(
     initialPreviewPreferHeight(true, cap, { variantHeights: [1080] }) === 360,
