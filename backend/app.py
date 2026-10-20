@@ -63,6 +63,23 @@ _DISPLAY_NAME_WARM_DELAY_SEC = 120.0
 # waits this long after lifespan start so the API serves in ~2-3s and the
 # first Vite/UI window stays uncontended.
 _BOOT_WARM_GRACE_SEC = float(os.environ.get("VODRIP_BOOT_WARM_GRACE", "8"))
+
+# The archive scheduler's FIRST pass is not warm-up work: it walks every saved
+# channel with yt-dlp (Twitch GQL + YouTube extraction + chat backfill + a
+# transcribe top-up), and it holds the GIL in bursts for minutes. It used to
+# start after _BOOT_WARM_GRACE_SEC (8 s), i.e. in the same window the owner
+# opens the app - measured 2026-10-20: ingest began 20 s after boot while the
+# page was loading, /api/health went silent for 71 s and the supervisor
+# restarted the API under the open page, which then sat there with no channels
+# and no settings because every /api call had returned 500.
+#
+# 150 s buys the open-and-look window. Nothing is lost: a channel add still
+# kicks a pass immediately (kick_scheduler_pass), and the cadence after the
+# first pass is unchanged. Set VODRIP_ARCHIVE_FIRST_PASS_DELAY=0 to restore the
+# old immediate pass.
+_ARCHIVE_FIRST_PASS_DELAY_SEC = float(
+    os.environ.get("VODRIP_ARCHIVE_FIRST_PASS_DELAY", "150")
+)
 # The live-status warm waits much less: its burst (~10s for 19 channels)
 # must finish before the user's first Channels-tab poll so the LIVE badges
 # paint on the first round-trip. The yt/embed/ASR warms keep the long grace.
@@ -933,7 +950,7 @@ async def _app_lifespan(_app: FastAPI):
     try:
         from services.archive_scheduler import start_archive_scheduler
 
-        start_archive_scheduler(delay=_BOOT_WARM_GRACE_SEC)
+        start_archive_scheduler(delay=_ARCHIVE_FIRST_PASS_DELAY_SEC)
         logger.info("Archive scheduler started")
     except Exception:
         logger.debug("Archive scheduler start skipped", exc_info=True)
