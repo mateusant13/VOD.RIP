@@ -97,11 +97,19 @@ def _governor_pace(source: str, kind: str) -> None:
 
         if str(source or "").strip().lower() != "auto":
             return
+        # The owner outranks the archive. While a click is in flight, an AUTO
+        # extract waits for a quiet moment instead of starting another TLS
+        # handshake + POST (measured 2026-10-20: eight innerTube threads doing
+        # exactly that, GIL included, while a preview click waited). Bounded so
+        # background ingest still advances when the app is merely left open.
+        from services.user_activity import wait_until_idle
+
+        wait_until_idle(max_wait_s=10.0)
         wait = min(MAX_AUTO_WAIT_S, backoff_seconds("youtube", "auto"))
         if wait > 0:
             logger.debug("rate_budget: pacing YouTube %s for %.1fs (AUTO pool dry)", kind, wait)
             time.sleep(wait)
-    except Exception:  # noqa: BLE001 — advisory only, never a new failure mode
+    except Exception:  # noqa: BLE001 - advisory only, never a new failure mode
         logger.debug("rate_budget: pacing check failed", exc_info=True)
 
 

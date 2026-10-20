@@ -87,12 +87,28 @@ _pass2_idle_logged: Optional[bool] = None
 _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
+def _user_active() -> bool:
+    """True while the owner is using the app (see services.user_activity)."""
+    try:
+        from services.user_activity import user_is_active
+
+        return user_is_active()
+    except Exception:  # noqa: BLE001 - pacing must never break a pass
+        return False
+
+
 def _background() -> bool:
     """Quiet (autostart) mode: slower pass cadence, smaller per-pass
-    budgets — the machine belongs to whoever logged in, not the archive."""
+    budgets - the machine belongs to whoever logged in, not the archive.
+
+    A live click also counts: while the owner is using the app every pass runs
+    with the background budgets, so a preview never competes with three yt-dlp
+    extractions it did not ask for (measured 2026-10-20: the boot pass's
+    extraction held the GIL while a click waited).
+    """
     from services.autostart import background_mode
 
-    return background_mode()
+    return background_mode() or _user_active()
 
 
 def _yt_ingest_budget() -> int:
@@ -858,9 +874,18 @@ def _loop(*, interval: Optional[float] = None, delay: float = 0.0) -> None:
     if delay and _stop.wait(delay):
         return
     while not _stop.is_set():
+        # Never START a pass while the owner is clicking: a pass is minutes of
+        # yt-dlp/ASR work and it holds the GIL in bursts. Bounded, so the
+        # archive still advances when the app is merely left open.
+        try:
+            from services.user_activity import wait_until_idle
+
+            wait_until_idle(max_wait_s=20.0, stop=_stop)
+        except Exception:  # noqa: BLE001 - pacing must never kill the loop
+            pass
         try:
             _run_pass()
-        except Exception:  # noqa: BLE001 — a pass must never kill the daemon
+        except Exception:  # noqa: BLE001 - a pass must never kill the daemon
             logger.exception("archive scheduler pass failed")
         if _stop.is_set():
             break

@@ -359,6 +359,9 @@ async def _app_lifespan(_app: FastAPI):
             import time as _time
 
             _time.sleep(_DISPLAY_NAME_WARM_DELAY_SEC)
+            from services.user_activity import wait_until_idle
+
+            wait_until_idle(max_wait_s=60.0)
             from services.archive_ytdlp import resolve_youtube_display_names
 
             n = resolve_youtube_display_names(20)
@@ -442,6 +445,12 @@ async def _app_lifespan(_app: FastAPI):
         if getattr(s, 'skip_youtube_startup_warm', False):
             logger.info("STARTUP_SYNC_WARM: skipped (skip_youtube_startup_warm setting)")
             return
+        # Give the first clicks the machine: the sync wave is yt-dlp/InnerTube
+        # work and nothing on screen waits for it. Bounded, so a warm still runs
+        # when the app is simply left open.
+        from services.user_activity import wait_until_idle
+
+        wait_until_idle(max_wait_s=30.0)
 
         from services.preview_service import (
             _WARMED_URLS, _WARMED_URLS_LOCK,
@@ -629,6 +638,10 @@ async def _app_lifespan(_app: FastAPI):
         if getattr(s, 'skip_youtube_startup_warm', False):
             logger.info("STARTUP_WAVE: skipped (skip_youtube_startup_warm setting)")
             return
+
+        from services.user_activity import wait_until_idle
+
+        wait_until_idle(max_wait_s=30.0)
 
         from services.preview_service import (
             _WARMED_URLS,

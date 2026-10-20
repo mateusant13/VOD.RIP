@@ -159,7 +159,42 @@ function apiHealthy(port, timeoutMs = 2500) {
   });
 }
 
-/** POST /api/exit — the app's own graceful shutdown (flush watchdog sinks,
+/** Poll /api/health until the app reports it is not serving a person.
+ *
+ * A backend file save is the editor's business, never the owner's: POSTing
+ * /api/exit while a preview click is in flight kills that click (measured
+ * 2026-10-20 - the cold create needed seconds and every save restarted the
+ * API under it). The app reports `busy` from services/user_activity; wait for
+ * it to clear, bounded, then reload anyway. */
+function waitForApiIdle(maxWaitMs = 8000) {
+  const deadline = Date.now() + maxWaitMs;
+  return new Promise((resolve) => {
+    const tick = () => {
+      const req = http.get(`http://127.0.0.1:${apiPort}/api/health`, (res) => {
+        let data = "";
+        res.on("data", (c) => (data += c));
+        res.on("end", () => {
+          let busy = false;
+          try {
+            busy = JSON.parse(data).busy === true;
+          } catch {
+            /* unparseable health: treat as idle and let the reload proceed */
+          }
+          if (!busy || Date.now() >= deadline) return resolve(!busy);
+          setTimeout(tick, 250);
+        });
+      });
+      req.on("error", () => resolve(false));
+      req.setTimeout(2000, () => {
+        req.destroy();
+        resolve(false);
+      });
+    };
+    tick();
+  });
+}
+
+/** POST /api/exit - the app's own graceful shutdown (flush watchdog sinks,
  * cancel downloads cleanly). Resolves true when the app confirmed. */
 function gracefulApiExit(timeoutMs = 5000) {
   return new Promise((resolve) => {
@@ -873,6 +908,8 @@ async function reloadApi(changedFile) {
       healthMonitorStop();
       healthMonitorStop = null;
     }
+    // Never interrupt the owner: wait for the click/seek in flight to finish.
+    await waitForApiIdle(8000);
     const ok = await gracefulApiExit();
     if (!ok && apiProcess && apiProcess.exitCode === null) {
       // API unresponsive — force-kill its tree so the port frees.

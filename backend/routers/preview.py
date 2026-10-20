@@ -559,7 +559,14 @@ def _priority_transcribe_for_preview(session) -> None:
 
 @router.post("/api/preview/session")
 async def preview_create_session(req: PreviewSessionCreateRequest):
-    # ponytail: crop_end=0 means "unknown" — let create_session fall back to
+    # A person is waiting on this one. Background work (warm waves, the archive
+    # scheduler, yt-dlp extraction) checks this stamp before starting anything
+    # new - measured 2026-10-20, a click answered in 8-23 s while the startup
+    # warm wave held the GIL, and in 2.6 s in isolation.
+    from services.user_activity import mark_user_activity
+
+    mark_user_activity()
+    # ponytail: crop_end=0 means "unknown" - let create_session fall back to
     # the extract's vod_duration so the click isn't blocked on /api/info/video
     # (which costs 30-60s on a cold YouTube URL). crop_end > 0 must still be
     # strictly greater than crop_start to avoid degenerate sessions.
@@ -913,6 +920,10 @@ async def preview_session_seek(session_id: str, req: PreviewSeekRequest):
         raise HTTPException(status_code=404, detail="Preview session not found or expired")
     if not getattr(session, "dash_window_hls", False):
         return {"ok": True, "prewarmed": False, "remuxed": False}
+    # A seek is the owner dragging the rail: background work yields.
+    from services.user_activity import mark_user_activity
+
+    mark_user_activity()
     loop = asyncio.get_running_loop()
     position = float(req.position_sec)
 

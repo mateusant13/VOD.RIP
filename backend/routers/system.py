@@ -654,6 +654,8 @@ async def health():
             _HEALTH_PROBE_BUDGET_SEC,
         )
         pending, worker, background, activity_age, subs_pot = None, False, False, None, None
+    from services.user_activity import user_is_active
+
     return {
         "ok": True,
         "name": "VOD.RIP",
@@ -662,6 +664,12 @@ async def health():
         "background_alive": background,
         "app_activity_age_s": activity_age,
         "subs_pot_policy": subs_pot,
+        # In-memory, free, and the one field a supervisor needs before it is
+        # allowed to interrupt the app: true while a person is waiting on a
+        # click/seek (services.user_activity). dev-all waits for this to go
+        # false before POSTing /api/exit on a backend file change, so a
+        # reload can no longer kill an in-flight preview.
+        "busy": user_is_active(),
     }
 
 
