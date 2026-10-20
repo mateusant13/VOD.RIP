@@ -16,15 +16,18 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import Hls from 'hls.js';
 import {
   PREVIEW_CLIP_DEFAULT_HEIGHT,
+  PREVIEW_ENGAGED_HEIGHT,
   WINDOW_HLS_SEGMENT_SEC,
   applyHlsQualityLevel,
   attachProgressivePreview,
   effectiveHlsLevelIndex,
+  hlsLevelExistsForHeight,
   hlsNeedsApiQualitySwitch,
   inferLevelHeight,
   resolveInitialHlsPreviewHeight,
   levelIndexForHeight,
   playbackHeightFromRequest,
+  snapHeightToTier,
   mergeVariantHeights,
   resolveHlsPreviewLevels,
   resolveProgressivePreviewLevels,
@@ -110,6 +113,10 @@ export function usePreviewPlayer({
   const hlsRef = useRef<Hls | null>(null);
   const requestedHeightRef = useRef(0);
   const appliedHeightRef = useRef(0);
+  // True once the user picks a rung from the quality menu. Until then the
+  // preview is on its automatic tier, and enlarging it is the signal to go to
+  // the engaged tier - a deliberate pick is never overridden by a resize.
+  const qualityPinnedRef = useRef(false);
   const previewLevelsRef = useRef<PreviewLevelOption[]>([]);
   const viewportSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingViewportHeightRef = useRef(0);
@@ -211,12 +218,22 @@ export function usePreviewPlayer({
     const hlsLevel = hls.levels[hlsIndex] as { height?: number } | undefined;
     const hlsHeight = hlsLevel ? inferLevelHeight(hlsLevel) : 0;
     const trimTimeline = trimTimelineRef?.current === true;
-    const needsApiSwitch = hlsNeedsApiQualitySwitch(
-      playbackHeight,
-      appliedHeightRef.current,
-      hlsHeight,
-      trimTimeline,
-    );
+    // A multi-variant master already carries every tier the session can serve,
+    // so "the requested height is in hls.levels" is the whole test. Asking the
+    // API for a 1080 master when 1080 is already loaded re-muxed the window and
+    // stalled the video - the reason fullscreen felt broken.
+    const masterHeights = (hls.levels || [])
+      .map((l) => inferLevelHeight(l as { height?: number }))
+      .filter((h) => h > 0);
+    const canSwitchInPlace = hlsLevelExistsForHeight(masterHeights, playbackHeight);
+    const needsApiSwitch = canSwitchInPlace
+      ? false
+      : hlsNeedsApiQualitySwitch(
+          playbackHeight,
+          appliedHeightRef.current,
+          hlsHeight,
+          trimTimeline,
+        );
     const playbackUrl = playback?.url ?? '';
 
     if (userInitiated && hlsIndex >= 0 && hlsIndex < hls.levels.length && !needsApiSwitch) {
@@ -270,7 +287,14 @@ export function usePreviewPlayer({
     const requested = requestedHeightRef.current || levels[qualityLevel]?.height || PREVIEW_CLIP_DEFAULT_HEIGHT;
     const cap = measurePlayerCap();
     const available = levels.map((l) => l.height);
-    const playbackHeight = playbackHeightFromRequest(requested, available, cap, fullscreen);
+    let playbackHeight = playbackHeightFromRequest(requested, available, cap, fullscreen);
+    // Engaged tier. Enlarging the preview IS the request for the high tier:
+    // `playbackHeightFromRequest` otherwise keeps the small tier the preview
+    // opened at (that is correct while the panel is small, and wrong in
+    // fullscreen). A rung the user picked from the menu always wins.
+    if (fullscreen && !qualityPinnedRef.current) {
+      playbackHeight = snapHeightToTier(available, PREVIEW_ENGAGED_HEIGHT);
+    }
     if (!playbackHeight || playbackHeight === appliedHeightRef.current) {
       cancelViewportSync();
       return Promise.resolve();
@@ -303,6 +327,7 @@ export function usePreviewPlayer({
     // ponytail: skip if the same level is already applied (or in flight).
     if (levelIndex === qualityLevel && level.height === appliedHeightRef.current) return;
     requestedHeightRef.current = level.height;
+    qualityPinnedRef.current = true;
     setQualityLevel(levelIndex);
     await applyPlaybackHeight(level.height, { userInitiated: true });
   }, [applyPlaybackHeight, cancelViewportSync, qualityLevel]);
@@ -313,6 +338,7 @@ export function usePreviewPlayer({
   ) => {
     setLevels(mapped);
     setQualityLevel(defaultIndex);
+    qualityPinnedRef.current = false;
     const picked = mapped[defaultIndex];
     if (picked?.height) requestedHeightRef.current = picked.height;
   }, [setLevels]);
@@ -330,6 +356,7 @@ export function usePreviewPlayer({
   ) => {
     setLevels(mapped);
     setQualityLevel(defaultIndex);
+    qualityPinnedRef.current = false;
     const picked = mapped[defaultIndex];
     if (picked?.height) {
       requestedHeightRef.current = picked.height;

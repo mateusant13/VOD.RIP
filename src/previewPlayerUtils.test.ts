@@ -1,16 +1,22 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   applyPolicyHeights,
+  hlsLevelExistsForHeight,
   resolveHlsPreviewLevels,
   resolveProgressivePreviewLevels,
   shouldWaitForPreviewMux,
+  snapHeightToTier,
   waitForPreviewMuxReady,
   youtubePreviewAllowHeights,
 } from './previewPlayerUtils';
 
 describe('youtubePreviewAllowHeights (quality policy)', () => {
-  it('VOD previews stay 360p only', () => {
-    expect(youtubePreviewAllowHeights({ isLive: false, anonymous: false })).toEqual([360]);
+  it('VOD previews with cookies expose the two tiers: 480 head, 1080 engaged', () => {
+    expect(youtubePreviewAllowHeights({ isLive: false, anonymous: false })).toEqual([480, 1080]);
+  });
+
+  it('VOD anonymous stays 360p (the ladder collapses without cookies)', () => {
+    expect(youtubePreviewAllowHeights({ isLive: false, anonymous: true })).toEqual([360]);
   });
 
   it('live + anonymous session stays 360p only', () => {
@@ -19,6 +25,44 @@ describe('youtubePreviewAllowHeights (quality policy)', () => {
 
   it('live + user cookies allows up to 1080p', () => {
     expect(youtubePreviewAllowHeights({ isLive: true, anonymous: false })).toEqual([360, 720, 1080]);
+  });
+});
+
+/**
+ * The dual-tier master is what makes the fullscreen jump instant. These
+ * pin the decision that keeps it a local level change instead of a
+ * POST /quality + loadSource (which re-muxed the window and stalled).
+ */
+describe('hlsLevelExistsForHeight (switch in place vs ask the API)', () => {
+  it('the engaged tier exists in the master, so no API switch is needed', () => {
+    expect(hlsLevelExistsForHeight([480, 1080], 1080)).toBe(true);
+  });
+
+  it('the head tier is likewise a local change', () => {
+    expect(hlsLevelExistsForHeight([480, 1080], 480)).toBe(true);
+  });
+
+  it('a height the master does not carry still needs the API', () => {
+    expect(hlsLevelExistsForHeight([480, 1080], 720)).toBe(false);
+  });
+
+  it('ignores junk heights instead of matching them', () => {
+    expect(hlsLevelExistsForHeight([0, -1, 1080], 0)).toBe(false);
+    expect(hlsLevelExistsForHeight([], 1080)).toBe(false);
+  });
+});
+
+describe('snapHeightToTier (engaged tier selection)', () => {
+  it('fullscreen picks the highest tier under the 1080 ceiling', () => {
+    expect(snapHeightToTier([480, 1080], 1080)).toBe(1080);
+  });
+
+  it('without a 1080 rung it takes the best available, never overshoots', () => {
+    expect(snapHeightToTier([480, 720], 1080)).toBe(720);
+  });
+
+  it('a single-tier ladder keeps that tier', () => {
+    expect(snapHeightToTier([360], 1080)).toBe(360);
   });
 });
 

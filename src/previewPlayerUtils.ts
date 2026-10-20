@@ -290,6 +290,13 @@ export const PREVIEW_FAST_START_HEIGHT = 360;
 export const PREVIEW_SCRUB_HEIGHT = 160;
 /** Max prefer_height when variant list unknown. */
 export const PREVIEW_YOUTUBE_PREFER_HEIGHT = 1080;
+/**
+ * Engaged-tier ceiling. The preview opens small (instant) and must reach this
+ * the moment it is enlarged or made fullscreen - served from the SAME
+ * multi-variant master, so the jump is a level change, not a re-mux.
+ * Matches WINDOW_HLS_HD_TARGET_HEIGHT in services/preview/session.py.
+ */
+export const PREVIEW_ENGAGED_HEIGHT = 1080;
 /** Debounce resize-driven POST /api/preview/session/.../quality (viewport cap changes). */
 export const VIEWPORT_PREVIEW_QUALITY_DEBOUNCE_MS = 450;
 export const VIEWPORT_PREVIEW_FULLSCREEN_DEBOUNCE_MS = 120;
@@ -314,14 +321,25 @@ export function pinHlsToLowestLevel(hls: { startLevel?: number; currentLevel?: n
   }
 }
 
-/** YouTube preview tiers allowed under the quality policy: VOD (and any
- *  anonymous session — no user cookies) stays 360p-only; live sessions with
- *  user auth may raise to 1080p. */
+/** YouTube preview tiers allowed under the quality policy.
+ *
+ *  The preview is deliberately TWO tiers, not a ladder:
+ *    480  - the instant head tier (what opens; the small panel never needs more)
+ *    1080 - the engaged tier (enlarged / fullscreen)
+ *  Both come from ONE multi-variant master, so moving between them is a local
+ *  hls.js level change instead of a re-mux (see the engaged-tier mux in
+ *  services/preview/session.py).
+ *
+ *  An anonymous session (no user cookies) is capped at 360: without auth
+ *  YouTube serves a single 360 rung, so offering more would be a menu that
+ *  lies. Live sessions with auth keep the 360/720/1080 set.
+ */
 export function youtubePreviewAllowHeights(opts: {
   isLive: boolean;
   anonymous: boolean;
 }): number[] {
-  return opts.isLive && !opts.anonymous ? [360, 720, 1080] : [360];
+  if (opts.anonymous) return [360];
+  return opts.isLive ? [360, 720, 1080] : [480, 1080];
 }
 
 /** Filter a sorted height list to the policy-allowed set (union semantics
@@ -1224,14 +1242,25 @@ export function maxAvailablePreviewHeight(
 }
 
 /** First preview load: start at 360p for instant playback; quality menu can raise it. */
+/**
+ * Head tier for a YouTube VOD preview - what opens instantly.
+ *
+ * 480, not 360: the preview is meant to be small but watchable, and the
+ * fullscreen jump goes to the engaged tier (PREVIEW_ENGAGED_HEIGHT) from the
+ * same multi-variant master. Measured cost on the real path: the 480 rung is
+ * ~1.47 Mbps vs ~0.75 at 360, and the first segment stays inside the instant
+ * budget because the window mux serves 2s chunks.
+ */
+export const PREVIEW_YOUTUBE_HEAD_HEIGHT = 480;
+
 export function initialPreviewPreferHeight(
   _isClip: boolean,
   playerCap: number,
   opts?: PreviewPreferHeightOpts,
 ): number {
-  // YouTube (including Shorts) fast-starts at 360p.
+  // YouTube (including Shorts) fast-starts at the head tier (480p).
   if (opts?.youtube) {
-    const fast = PREVIEW_FAST_START_HEIGHT;
+    const fast = PREVIEW_YOUTUBE_HEAD_HEIGHT;
     if (opts.activeHeight && opts.activeHeight > 0) return Math.min(opts.activeHeight, fast);
     const max = maxAvailablePreviewHeight(opts.variantHeights, opts.qualityLabels);
     return Math.min(fast, max || fast);
@@ -1651,6 +1680,28 @@ export function effectiveHlsLevelIndex(hlsIndex: number, levelCount: number): nu
  * Whether POST /quality + manifest reload is needed.
  * YouTube DASH segment playlists expose one HLS level with height=0 — compare applied tier instead.
  */
+/**
+ * True when the requested height is already one of the master's variants.
+ *
+ * The session serves a MULTI-VARIANT master: the small tier (what opens
+ * instantly) and the engaged tier, both muxed from the same window bounds.
+ * When the requested height is in that list the switch is a local
+ * `hls.currentLevel` change - no API round-trip, no re-mux, no stall.
+ *
+ * This is deliberately separate from `hlsNeedsApiQualitySwitch`, which asks a
+ * different question ("is the ACTIVE level the requested height?"). Answering
+ * that one with "no" is what used to call POST /quality and reload the source
+ * on every fullscreen toggle, which is exactly the stall the dual-tier master
+ * exists to remove.
+ */
+export function hlsLevelExistsForHeight(
+  levelHeights: number[],
+  playbackHeight: number,
+): boolean {
+  if (!Number.isFinite(playbackHeight) || playbackHeight <= 0) return false;
+  return levelHeights.some((h) => h > 0 && h === playbackHeight);
+}
+
 export function hlsNeedsApiQualitySwitch(
   playbackHeight: number,
   appliedHeight: number,

@@ -94,6 +94,20 @@ WINDOW_HLS_MARKER = (
 YOUTUBE_WINDOW_HLS_MARKER = WINDOW_HLS_MARKER
 WINDOW_HLS_PLAYLIST_RESOURCE = "window-playlist"
 WINDOW_HLS_SEGMENT_RESOURCE_PREFIX = "window-seg-"
+# --- second tier (the "engaged" quality) -------------------------------------
+# Owner requirement: the preview opens at the small tier (fast, 480p) and must
+# reach 1080p the moment the user enlarges it or goes fullscreen, WITHOUT a
+# stall. A single-tier session is why that used to re-mux and freeze: the only
+# way to change quality was to throw the muxed window away.
+#
+# The HD tier is a SECOND mux of the SAME window bounds (`window_hls_mux_start/
+# end`), so every segment boundary is identical and hls.js can switch level
+# mid-playback without a discontinuity. It lives in its own directory because
+# segment numbering is shared by construction: seg_000 of the HD tier covers
+# exactly the same [start, start+SEG] interval as seg_000 of the small tier.
+WINDOW_HLS_HD_PLAYLIST_RESOURCE = "window-playlist-hd"
+WINDOW_HLS_HD_SEGMENT_RESOURCE_PREFIX = "window-hd-seg-"
+WINDOW_HLS_HD_TARGET_HEIGHT = 1080  # ceiling for the engaged tier
 WINDOW_HLS_INIT_RESOURCE = "window-init"  # fMP4 init segment (init.mp4)
 USE_FMP4 = os.getenv("VODRIP_PREVIEW_FMP4", "1") == "1"
 # REPLAY (DVR) — the live popup plays the channel's in-progress VOD via an
@@ -3384,21 +3398,83 @@ def _apply_youtube_custom_master(
     else:
         session.custom_master = None
 def _build_youtube_window_hls_master(session: PreviewSession) -> str:
-    """Single-variant master — HLS.js loads the window-playlist resource via /resource."""
-    height = _pick_mux_height(session, fast=True) or 720
-    width = int(height * 16 / 9)
-    bandwidth = 1_500_000
-    playlist_url = f"/api/preview/hls/{session.session_id}/resource?id={WINDOW_HLS_PLAYLIST_RESOURCE}"
+    """Two-variant master: the small (instant) tier first, the engaged tier second.
+
+    HLS.js picks index 0 on attach - that is the whole point of listing the
+    small tier first (measured 2026-10-14: loading 1080p first cost 5.04s to
+    loadedmetadata because the first segment *is* the whole 2s chunk at that
+    bitrate). The engaged tier is listed second and is only selected when the
+    player asks for it (see LivePlayerPopup: fullscreen / enlarged).
+    """
+    low = _pick_mux_height(session, fast=True) or 720
     lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:6",
         "#EXT-X-INDEPENDENT-SEGMENTS",
-        f"#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},RESOLUTION={width}x{height}",
-        playlist_url,
+        _window_hls_variant_line(session.session_id, low, WINDOW_HLS_PLAYLIST_RESOURCE),
     ]
+    hd = _window_hls_hd_height(session)
+    if hd > low:
+        lines.append(
+            _window_hls_variant_line(
+                session.session_id, hd, WINDOW_HLS_HD_PLAYLIST_RESOURCE
+            )
+        )
     return "\n".join(lines) + "\n"
+
+
+# Measured on real YouTube VODs (2026-10-20): 480p ~1.47 Mbps, 1080p ~6.4 Mbps.
+# BANDWIDTH is what hls.js uses to rank levels; a too-low value makes ABR think
+# the HD tier is nearly free and pick it on a small panel.
+_VARIANT_BANDWIDTH = {360: 745_000, 480: 1_465_000, 720: 3_419_000, 1080: 6_396_000}
+
+
+def _window_hls_variant_line(session_id: str, height: int, resource_id: str) -> str:
+    width = int(height * 16 / 9)
+    bandwidth = _VARIANT_BANDWIDTH.get(height, max(height * 3000, 500_000))
+    return (
+        f"#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},RESOLUTION={width}x{height}\n"
+        f"/api/preview/hls/{session_id}/resource?id={resource_id}"
+    )
+
+
 def _window_hls_dir(session: PreviewSession) -> Path:
     return session.cache_dir / "window_hls"
+
+
+def _window_hls_hd_dir(session: PreviewSession) -> Path:
+    """Engaged (high) tier - same window bounds, different height."""
+    return session.cache_dir / "window_hls_hd"
+
+
+def _window_hls_hd_height(session: PreviewSession) -> int:
+    """Highest available height at or below the engaged ceiling (0 = none)."""
+    heights = sorted({h for h, url in session.variant_entries if h > 0 and url})
+    if not heights:
+        return 0
+    at_or_below = [h for h in heights if h <= WINDOW_HLS_HD_TARGET_HEIGHT]
+    return at_or_below[-1] if at_or_below else heights[-1]
+
+
+def _window_hls_hd_ready(session: PreviewSession) -> bool:
+    """True once the engaged tier has segments on disk to serve."""
+    out_dir = _window_hls_hd_dir(session)
+    if not out_dir.is_dir():
+        return False
+    if USE_FMP4 and any(out_dir.glob("seg_[0-9][0-9][0-9].m4s")):
+        return True
+    return any(out_dir.glob("seg_[0-9][0-9][0-9].ts"))
+
+
+def _window_hls_hd_segments(session: PreviewSession) -> List[Path]:
+    out_dir = _window_hls_hd_dir(session)
+    if not out_dir.is_dir():
+        return []
+    if USE_FMP4:
+        m4s = sorted(out_dir.glob("seg_[0-9][0-9][0-9].m4s"))
+        if m4s:
+            return m4s
+    return sorted(out_dir.glob("seg_[0-9][0-9][0-9].ts"))
 def _window_hls_playlist_path(session: PreviewSession) -> Path:
     """Path to the locally muxed window HLS playlist (window.m3u8)."""
     return _window_hls_dir(session) / "window.m3u8"
@@ -3482,8 +3558,9 @@ def _window_hls_all_segments_done(
     return all(seg.stat().st_size >= MIN_VALID_OUTPUT_BYTES for seg in segs)
 def _clear_youtube_window_hls_cache(session: PreviewSession) -> None:
     try:
-        out_dir = _window_hls_dir(session)
-        if out_dir.is_dir():
+        for out_dir in (_window_hls_dir(session), _window_hls_hd_dir(session)):
+            if not out_dir.is_dir():
+                continue
             for child in out_dir.iterdir():
                 try:
                     if child.is_file():
@@ -3869,6 +3946,10 @@ def _ensure_youtube_window_hls_mux(session: PreviewSession) -> bool:
         raise last_exc
     _stamp_window_hls_mux_start(session, start)
     _register_youtube_window_hls_resources(session)
+    # The engaged tier is muxed in the background from HERE: the small tier is
+    # already playable, so the user is watching while the 1080 window is built
+    # against the same bounds. That is what makes the level switch instant.
+    schedule_youtube_window_hls_hd_mux(session.session_id)
     return _window_hls_seg0_matches_bounds(session)
 def schedule_youtube_window_hls_mux(session_id: str) -> None:
     """Idempotent — start (or join) the background window HLS mux thread."""
@@ -3948,6 +4029,95 @@ def schedule_youtube_window_hls_mux(session_id: str) -> None:
 def _is_youtube_window_hls_resource(upstream: str) -> bool:
     """True when *upstream* is a window HLS marker URL (resource_map entry)."""
     return bool(upstream) and upstream.startswith(WINDOW_HLS_MARKER)
+
+
+def _ensure_youtube_window_hls_hd_mux(session: PreviewSession) -> bool:
+    """Mux the engaged tier for the SAME window bounds as the small tier.
+
+    Same `window_hls_mux_start/end` is the whole trick: identical bounds give
+    identical segment boundaries, so hls.js can switch level mid-playback
+    without a discontinuity. Single attempt - this runs in the background while
+    the user is already watching the small tier, so a failure here must never
+    surface as a playback error.
+    """
+    from services.ytdlp_hls import _mux_dash_window_to_hls
+
+    if not getattr(session, "dash_window_hls", False):
+        return False
+    height = _window_hls_hd_height(session)
+    low = _pick_mux_height(session, fast=True) or 720
+    if height <= low:
+        return False  # the ladder has no tier above the small one
+    if _window_hls_hd_ready(session):
+        _register_youtube_window_hls_hd_resources(session)
+        return True
+    start = max(0.0, float(getattr(session, "window_hls_mux_start", 0.0)))
+    end = max(start + 0.5, float(getattr(session, "window_hls_mux_end", 0.0)))
+    if end <= start:
+        return False
+    out_dir = _window_hls_hd_dir(session)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _refresh_youtube_window_hls_urls(session, prefer_height=height)
+    video_url = _variant_url_for_height(session, height)
+    audio_url = session.preview_audio_url or ""
+    if not video_url or not audio_url:
+        return False
+    session.allowed_hosts.update(_hosts_for_url(video_url))
+    session.allowed_hosts.update(_hosts_for_url(audio_url))
+    _mux_dash_window_to_hls(
+        video_url,
+        audio_url,
+        str(out_dir),
+        start_sec=start,
+        end_sec=end,
+        headers=_merge_youtube_session_cookies(session.http_headers, session.vod_url),
+        video_fmt=getattr(session, "preview_video_fmt", None),
+        audio_fmt=getattr(session, "preview_audio_fmt", None),
+        vod_duration=float(session.vod_duration or 0),
+        mux_timeout_sec=WINDOW_HLS_MUX_TIMEOUT_SEC,
+    )
+    _register_youtube_window_hls_hd_resources(session)
+    ready = _window_hls_hd_ready(session)
+    if ready:
+        logger.info(
+            "window hls: engaged tier ready session=%s h=%d",
+            session.session_id[:8],
+            height,
+        )
+    return ready
+
+
+_WINDOW_HLS_HD_RUNNING: set = set()
+
+
+def schedule_youtube_window_hls_hd_mux(session_id: str) -> None:
+    """Idempotent - start (or join) the engaged-tier mux thread."""
+    with _WINDOW_HLS_LOCK:
+        if session_id in _WINDOW_HLS_HD_RUNNING:
+            return
+        _WINDOW_HLS_HD_RUNNING.add(session_id)
+
+    def _job() -> None:
+        try:
+            session = get_session(session_id)
+            if not session:
+                return
+            _ensure_youtube_window_hls_hd_mux(session)
+        except Exception:  # noqa: BLE001 - the small tier must keep playing
+            logger.debug(
+                "engaged tier mux failed session=%s", session_id[:8], exc_info=True
+            )
+        finally:
+            with _WINDOW_HLS_LOCK:
+                _WINDOW_HLS_HD_RUNNING.discard(session_id)
+
+    threading.Thread(
+        target=_job,
+        daemon=True,
+        name=f"yt-window-hls-hd-{session_id[:8]}",
+    ).start()
+
+
 def _register_youtube_window_hls_resources(session: PreviewSession) -> None:
     """Register the window-playlist and window-seg-NNN resource IDs in session.resource_map.
 
@@ -3978,7 +4148,35 @@ def _register_youtube_window_hls_resources(session: PreviewSession) -> None:
         rid = f"{WINDOW_HLS_SEGMENT_RESOURCE_PREFIX}{idx:03d}"
         ext = ".m4s" if USE_FMP4 else ".ts"
         session.resource_map[rid] = f"{WINDOW_HLS_MARKER}seg_{idx:03d}{ext}"
-def _build_youtube_window_hls_media_playlist(session: PreviewSession) -> bytes:
+def _register_youtube_window_hls_hd_resources(session: PreviewSession) -> None:
+    """Register the engaged-tier playlist / init / segment resource ids.
+
+    Mirrors `_register_youtube_window_hls_resources` for the second tier. Kept
+    separate on purpose: re-registering the small tier must not be able to
+    invalidate an HD that is already muxed (and vice versa).
+    """
+    session.resource_map = {
+        k: v
+        for k, v in session.resource_map.items()
+        if not k.startswith(WINDOW_HLS_HD_SEGMENT_RESOURCE_PREFIX)
+        and k not in (WINDOW_HLS_HD_PLAYLIST_RESOURCE, "window-hd-init")
+    }
+    session.resource_map[WINDOW_HLS_HD_PLAYLIST_RESOURCE] = f"{WINDOW_HLS_MARKER}hd/playlist"
+    if USE_FMP4:
+        session.resource_map["window-hd-init"] = f"{WINDOW_HLS_MARKER}hd/init.mp4"
+    for seg in _window_hls_hd_segments(session):
+        try:
+            idx = int(seg.stem.split("_", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        ext = ".m4s" if USE_FMP4 else ".ts"
+        rid = f"{WINDOW_HLS_HD_SEGMENT_RESOURCE_PREFIX}{idx:03d}"
+        session.resource_map[rid] = f"{WINDOW_HLS_MARKER}hd/seg_{idx:03d}{ext}"
+
+
+def _build_youtube_window_hls_media_playlist(
+    session: PreviewSession, hd: bool = False
+) -> bytes:
     """Build the window HLS media playlist on-the-fly from disk-state.
 
     Scans ``seg_*.ts`` (or ``seg_*.m4s`` when fMP4) files in the window_hls dir,
@@ -3994,7 +4192,11 @@ def _build_youtube_window_hls_media_playlist(session: PreviewSession) -> bytes:
     a6728b6: those tags advertised files and endpoints that don't exist).
     """
     base = f"/api/preview/hls/{session.session_id}/resource?id="
-    segs = _window_hls_existing_segments(session)
+    segs = _window_hls_hd_segments(session) if hd else _window_hls_existing_segments(session)
+    rid_prefix = (
+        WINDOW_HLS_HD_SEGMENT_RESOURCE_PREFIX if hd else WINDOW_HLS_SEGMENT_RESOURCE_PREFIX
+    )
+    init_rid = "window-hd-init" if hd else WINDOW_HLS_INIT_RESOURCE
     target_duration = max(int(WINDOW_HLS_SEGMENT_SEC) + 1, 5)
     if not segs:
         # mux not started — return a minimal valid playlist pointing at
@@ -4016,7 +4218,10 @@ def _build_youtube_window_hls_media_playlist(session: PreviewSession) -> bytes:
             f"#EXT-X-TARGETDURATION:{target_duration}",
             "#EXT-X-MEDIA-SEQUENCE:0",
             "#EXT-X-PLAYLIST-TYPE:VOD",
-            f"#EXT-X-MAP:URI=\"{base}init.mp4\"",
+            # The small tier keeps the literal "init.mp4" id it has always
+            # advertised (registered as an alias); the HD tier needs its own,
+            # or it would be handed the 480 init segment.
+            f"#EXT-X-MAP:URI=\"{base}window-hd-init\"" if hd else f"#EXT-X-MAP:URI=\"{base}init.mp4\"",
         ]
     else:
         lines = [
@@ -4032,7 +4237,7 @@ def _build_youtube_window_hls_media_playlist(session: PreviewSession) -> bytes:
             idx = int(seg.stem.split("_", 1)[1])
         except (IndexError, ValueError):
             continue
-        rid = f"{WINDOW_HLS_SEGMENT_RESOURCE_PREFIX}{idx:03d}"
+        rid = f"{rid_prefix}{idx:03d}"
         if USE_FMP4:
             session.resource_map[rid] = f"{WINDOW_HLS_MARKER}seg_{idx:03d}.m4s"
         else:
@@ -4053,17 +4258,41 @@ def open_youtube_window_hls_proxy(
         raise ValueError("Preview session not found or expired")
     if not getattr(session, "dash_window_hls", False):
         raise ValueError("Not a window HLS preview session")
-    if resource_id == WINDOW_HLS_PLAYLIST_RESOURCE:
-        # make sure mux is running even if client beats the warm thread to it
-        schedule_youtube_window_hls_mux(session_id)
-        _register_youtube_window_hls_resources(session)
-        body = _build_youtube_window_hls_media_playlist(session)
+    if resource_id in (WINDOW_HLS_PLAYLIST_RESOURCE, WINDOW_HLS_HD_PLAYLIST_RESOURCE):
+        hd = resource_id == WINDOW_HLS_HD_PLAYLIST_RESOURCE
+        if hd:
+            schedule_youtube_window_hls_hd_mux(session_id)
+            if _window_hls_hd_ready(session):
+                _register_youtube_window_hls_hd_resources(session)
+                body = _build_youtube_window_hls_media_playlist(session, hd=True)
+            else:
+                # The engaged tier is not muxed yet. Hand back the SMALL
+                # tier's playlist instead of an empty one: hls.js must keep
+                # playing through the level change, and a playlist with no
+                # segments is a hard error, not a graceful degrade.
+                schedule_youtube_window_hls_mux(session_id)
+                _register_youtube_window_hls_resources(session)
+                body = _build_youtube_window_hls_media_playlist(session, hd=False)
+        else:
+            # make sure mux is running even if client beats the warm thread to it
+            schedule_youtube_window_hls_mux(session_id)
+            _register_youtube_window_hls_resources(session)
+            body = _build_youtube_window_hls_media_playlist(session)
         generator, ctype, hdrs, status, cleanup = _open_memory_bytes_proxy(
             body,
             "application/vnd.apple.mpegurl",
             range_header,
         )
         return generator, ctype, hdrs, status, cleanup
+    # The engaged tier's own init segment. It must be a distinct id: the small
+    # tier's init.mp4 is a different byte stream (different resolution).
+    if resource_id == "window-hd-init":
+        hd_init = _window_hls_hd_dir(session) / "init.mp4"
+        if not hd_init.is_file():
+            schedule_youtube_window_hls_hd_mux(session_id)
+            raise PreviewMuxPending("window HLS hd init.mp4 not ready")
+        hd_gen, _hdc, hdh, hds, hdclean = _open_local_file_proxy(hd_init, range_header)
+        return hd_gen, "video/mp4", hdh, hds, hdclean
     # fMP4 init segment (init.mp4) — served either via the window-init resource
     # id or the literal "init.mp4" URI referenced by the playlist's EXT-X-MAP.
     if resource_id == WINDOW_HLS_INIT_RESOURCE or resource_id == "init.mp4":
@@ -4077,6 +4306,28 @@ def open_youtube_window_hls_proxy(
         )
         # fMP4 init segment — advertise as mp4 (iso.segment also acceptable).
         return init_gen, "video/mp4", init_hdrs, init_status, init_cleanup
+    # --- engaged tier segment ------------------------------------------------
+    # Same index, same [start, start+SEG] interval as the small tier: that
+    # alignment is what makes the mid-playback switch gapless.
+    if (resource_id or "").startswith(WINDOW_HLS_HD_SEGMENT_RESOURCE_PREFIX):
+        hm = re.match(
+            rf"^{re.escape(WINDOW_HLS_HD_SEGMENT_RESOURCE_PREFIX)}(\d+)$",
+            resource_id,
+        )
+        if not hm:
+            raise ValueError("Invalid HD window HLS segment resource id")
+        hidx = int(hm.group(1))
+        hd_path = _window_hls_hd_dir(session) / (
+            f"seg_{hidx:03d}.m4s" if USE_FMP4 else f"seg_{hidx:03d}.ts"
+        )
+        if USE_FMP4 and not hd_path.is_file():
+            fallback = _window_hls_hd_dir(session) / f"seg_{hidx:03d}.ts"
+            if fallback.is_file():
+                hd_path = fallback
+        if not hd_path.is_file():
+            schedule_youtube_window_hls_hd_mux(session_id)
+            raise PreviewMuxPending(f"window HD segment seg_{hidx:03d} not ready")
+        return _open_local_file_proxy(hd_path, range_header)
     # segment resource
     m = re.match(
         rf"^{re.escape(WINDOW_HLS_SEGMENT_RESOURCE_PREFIX)}(\d+)$", resource_id or ""
