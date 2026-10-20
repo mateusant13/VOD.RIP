@@ -869,6 +869,20 @@ async def _app_lifespan(_app: FastAPI):
     except Exception:
         logger.debug("Heavy cache sweeper start skipped", exc_info=True)
 
+    # Cookies, filled from the user's own browser at boot (owner policy,
+    # 2026-10-20): a preview with no cookies comes back as a single 360 rung,
+    # so the engaged 1080 tier has nothing to mux. This only fills platforms
+    # that have NO cookies - it never overwrites a session the extension is
+    # refreshing - and it runs on a daemon thread after the warm wave, so a
+    # slow browser cannot delay a boot or a preview.
+    try:
+        from services.browser_cookie_import import start_importer
+
+        if start_importer():
+            logger.info("Cookie auto-import scheduled")
+    except Exception:
+        logger.debug("Cookie auto-import start skipped", exc_info=True)
+
     # Archive scheduler - proactively ingests VOD metadata for every saved
     # channel (Twitch/Kick), backfills Twitch VOD chat, fetches YouTube
     # captions/subtitles, and tops up the low-priority whisper queue. First

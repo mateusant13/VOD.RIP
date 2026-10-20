@@ -1097,11 +1097,18 @@ def test_real_appdata_db_untouched():
         return  # real DB absent/unreadable — nothing leaked onto it
     try:
         with con:
-            hits = con.execute(
-                "SELECT COUNT(*) FROM videos WHERE video_id IN "
-                "('__archive_selfcheck__','filter-video-1','legacy-vid','orphan-vid') "
-                "OR video_id LIKE 'filter-%' OR video_id LIKE 'kind-%'"
-            ).fetchone()[0]
+            # Since 2026-10-19 the live archive is H:\VOD.RIP-data\archive.db;
+            # whatever sits in %APPDATA% is a husk with no schema. A husk
+            # cannot hold leaked rows, and asking it for `videos` turned this
+            # guard into an OperationalError instead of a pass.
+            try:
+                hits = con.execute(
+                    "SELECT COUNT(*) FROM videos WHERE video_id IN "
+                    "('__archive_selfcheck__','filter-video-1','legacy-vid','orphan-vid') "
+                    "OR video_id LIKE 'filter-%' OR video_id LIKE 'kind-%'"
+                ).fetchone()[0]
+            except sqlite3.OperationalError:
+                return  # no schema here -> nothing to leak onto
             msg_hits = con.execute(
                 "SELECT COUNT(*) FROM messages WHERE video_id IN "
                 "('__archive_selfcheck__','orphan-vid') OR video_id LIKE 'filter-%'"
