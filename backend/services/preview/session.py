@@ -2947,6 +2947,29 @@ def _recover_youtube_progressive_session(session: PreviewSession) -> bool:
         or _best_muxed_variant_url(session) is not None
         or (old_needs_mux and not _youtube_entry_needs_mux(session))
     )
+def _youtube_has_cookies() -> bool:
+    """True when the cookie store holds a youtube session.
+
+    Read from the store rather than a settings flag: the flag says the bridge
+    is enabled, not that a session exists. ``platforms: {}`` with
+    ``installed: true`` is the documented trap; this asks the question that
+    actually decides whether the auth ladder is worth waiting for.
+    """
+    try:
+        from services import cookie_store
+
+        return bool(cookie_store.counts().get("youtube"))
+    except Exception:  # noqa: BLE001 - a broken store means "no cookies"
+        return False
+
+
+def _youtube_ladder_size(info: dict) -> int:
+    """Distinct video heights in an extract result (0 when there are none)."""
+    heights = {int(f.get("height") or 0) for f in (info.get("formats") or [])}
+    heights.discard(0)
+    return len(heights)
+
+
 def _extract_youtube_preview_info(
     full_url: str, *, warm_light: bool = False
 ) -> dict:
@@ -2990,7 +3013,24 @@ def _extract_youtube_preview_info(
             anon_fut = None
             anon_info = None
         if anon_info and not _youtube_info_is_dash_only_progressive(anon_info):
-            return anon_info
+            # The anonymous ladder answers ONE muxed 360 rung. That is the
+            # whole point for a user with no cookies (it is ~150ms and survives
+            # the bot-gate), but for a user WITH cookies it throws the ladder
+            # away: the preview then has no 480 head tier and no 1080 engaged
+            # tier to mux, because its only variant is a progressive 360.
+            # Measured 2026-10-20: with cookies imported
+            # (youtube_authenticated: true) a preview still came back
+            # extract_source=innertube_anonymous_360p, kind=progressive,
+            # variant_heights=[360]. So accept a single-rung anonymous answer
+            # only when there are no cookies to lose.
+            if _youtube_has_cookies() and _youtube_ladder_size(anon_info) < 2:
+                logger.debug(
+                    "anonymous 360p gave a single rung for %s - cookies are "
+                    "present, continuing to the auth chain for the full ladder",
+                    vid,
+                )
+            else:
+                return anon_info
         if anon_fut is None:
             # Anonymous path failed — fall through to the full chain. It races
             # InnerTube with po_token/visitor_data + yt-dlp and succeeds on videos
