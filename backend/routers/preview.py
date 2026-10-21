@@ -86,11 +86,19 @@ router = APIRouter(tags=["preview"])
 # so a timed-out click still warms the cache and the client's bounded retry
 # (previewPlayerUtils.createPreviewSessionWithRetry: 3 attempts, 1.2s/2.4s
 # backoff, 5xx retryable) lands on a ready session instead of a spinner.
-# Twitch/Kick cold creates measured 0.56-3.36 s under gaming-mode load, so 4 s
-# covers the real work and cuts the dead wait by 6x.
+#
+# The cap must still be LONGER than the real cold work, or it guarantees the
+# failure it exists to bound. Measured 2026-10-21 on this box: a cold YouTube
+# create_session takes 3.20-3.38 s in isolation (backend-only) and 4.13-4.45 s
+# through the Vite proxy under the running app, while a WARM create takes
+# 0.02 s. A 4 s cap therefore turned every cold YouTube click into a 504 (three
+# in a row measured, 4.1/8.7/13.2 s as the abandoned resolves kept the GIL).
+# 8 s covers the measured cold cost with margin; Twitch/Kick cold creates
+# measured 0.56-3.36 s, so they are unaffected in the success case, where the
+# request returns as soon as the session is ready.
 _PREVIEW_CREATE_HARD_TIMEOUT_SEC = max(
     1.0,
-    float(os.environ.get("VODRIP_PREVIEW_CREATE_TIMEOUT_SEC", "4") or "4"),
+    float(os.environ.get("VODRIP_PREVIEW_CREATE_TIMEOUT_SEC", "8") or "8"),
 )
 # Panel reads may wait on SQLite's busy timeout and can queue behind another
 # panel request. A bounded wait prevents a wedged read from holding a request
