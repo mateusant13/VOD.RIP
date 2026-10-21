@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import threading
 import time
 import uuid
@@ -293,18 +294,33 @@ _LIVE_STATUS_CACHE: dict[str, tuple[float, dict]] = {}
 _LIVE_STATUS_TTL_SEC = 60.0
 # Serving a "LIVE" badge older than this is a lie: when refreshes keep
 # failing (platform outage, parse breakage) the stale-serve path must stop
-# returning ancient payloads and report unknown (empty) instead. Kept equal
-# to the TTL so a failed refresh at most one cycle behind (see endpoint).
-_LIVE_STATUS_MAX_STALE_SEC = 60.0
+# returning ancient payloads and report unknown (empty) instead.
+#
+# Was 60.0 - exactly the TTL - which made the bound meaningless: the poll that
+# crosses the TTL is exactly the one at 60s, so a refresh slower than
+# `_LIVE_REFRESH_WAIT_SEC` (a Kick extract alone is ~0.7s, YouTube ~6s) served
+# EMPTY for that poll and the LIVE badge blinked out. Measured 2026-10-20: the
+# owner saw "no channel is live" on a grid that had live channels, and the
+# empty payload then sat in the cache for the next 60s. Ten minutes keeps the
+# badge honest (a channel that went offline is corrected on the next
+# successful refresh) without ever blanking a confirmed-live badge because one
+# fetch was slow.
+_LIVE_STATUS_MAX_STALE_SEC = 600.0
 # How long a TTL-trip read waits for its kicked refresh before falling back
 # to the stale serve. This is a *threadpool-slot* bound, not a correctness
 # bound: `channel_live_status` is a sync `def` handler, so every second spent
 # here is a second held out of the shared anyio threadpool that all other
 # sync routes (disk/entities/subtitles/clips) need. At 20s with a 4-worker
 # warm pool, ~19 saved channels all burned the full 20s and starved every
-# other sync route. 4s covers the common 1-3s extract; the slow tail falls
-# through to the max-stale path below, which the badge already handles.
-_LIVE_REFRESH_WAIT_SEC = 4.0
+# other sync route.
+#
+# 4.0 -> 1.0 (measured 2026-10-20): the owner's requirement is a badge in
+# under a second, and with 39 saved channels a poll wave of TTL-trips each
+# holding a slot for up to 4s is what made the whole grid feel stuck. The
+# fresh payload still wins when the refresh is fast (Kick 0.7s, Twitch ~2s);
+# the slow tail returns the last-known payload, which is now allowed to be up
+# to `_LIVE_STATUS_MAX_STALE_SEC` old instead of blanking to empty.
+_LIVE_REFRESH_WAIT_SEC = 1.0
 # channel_id -> in-flight refresh Future. TTL-trip reads WAIT on the shared
 # future and return the FRESH payload — without this, the poll that crosses
 # the TTL serves the stale one and the frontend only sees the refresh on its
@@ -332,6 +348,88 @@ _LIVE_WARM_POOL = ThreadPoolExecutor(max_workers=16, thread_name_prefix="live-wa
 # queue onto 6 workers). Kick/Twitch/YouTube are independent CDNs/APIs, so
 # serializing them per channel only multiplied wall time for no reason.
 _PLATFORM_FETCH_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="live-platform")
+
+# --- persisted last-known live status -------------------------------------
+#
+# Why a file: the cache used to live only in memory, so every app start
+# re-derived all 39 channels from the platforms before a single badge could be
+# painted. Measured 2026-10-20: a cold /api/channels/{id}/live took 11-16 s per
+# channel, the boot warm burst fired ~117 remote fetches at once, the API
+# stopped answering, dev-all restarted it, and every restart launched ANOTHER
+# burst - five in two minutes. The page then had nothing to paint for minutes.
+#
+# Persisting the last-known payload means the first render after a start
+# answers from disk in microseconds and the (now paced) warm refreshes in the
+# background. Entries older than `_LIVE_STATUS_MAX_STALE_SEC` are dropped on
+# load, so a badge can never be resurrected from a stale file.
+_LIVE_CACHE_SAVE_MIN_INTERVAL_SEC = 5.0
+_live_cache_last_save = 0.0
+
+
+def _live_cache_path() -> "object":
+    from services.settings import _get_appdata_dir
+
+    return _get_appdata_dir() / "live_status_cache.json"
+
+
+def _save_live_status_cache() -> None:
+    """Persist the cache (throttled, atomic). Never raises."""
+    global _live_cache_last_save
+    now_wall = time.time()
+    if now_wall - _live_cache_last_save < _LIVE_CACHE_SAVE_MIN_INTERVAL_SEC:
+        return
+    _live_cache_last_save = now_wall
+    try:
+        mono_now = time.monotonic()
+        with _LIVE_STATUS_LOCK:
+            snapshot = {
+                cid: {
+                    "fetched_at": now_wall - (mono_now - ts),
+                    "payload": payload,
+                }
+                for cid, (ts, payload) in _LIVE_STATUS_CACHE.items()
+            }
+        path = _live_cache_path()
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(snapshot), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001 - a cache write must never fail a request
+        logger.debug("live status cache save failed", exc_info=True)
+
+
+def _load_live_status_cache() -> None:
+    """Hydrate the in-memory cache from the last run. Never raises."""
+    try:
+        path = _live_cache_path()
+        if not path.exists():
+            return
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return
+        now_wall = time.time()
+        mono_now = time.monotonic()
+        loaded = 0
+        with _LIVE_STATUS_LOCK:
+            for cid, entry in raw.items():
+                try:
+                    fetched_at = float(entry["fetched_at"])
+                    payload = entry["payload"]
+                except (KeyError, TypeError, ValueError):
+                    continue
+                age = now_wall - fetched_at
+                if age < 0 or age >= _LIVE_STATUS_MAX_STALE_SEC:
+                    continue
+                _LIVE_STATUS_CACHE[str(cid)] = (mono_now - age, payload)
+                loaded += 1
+        if loaded:
+            logger.info("live status cache hydrated: %d channel(s) from disk", loaded)
+    except Exception:  # noqa: BLE001 - a cache read must never block startup
+        logger.debug("live status cache load failed", exc_info=True)
+
+
+# Hydrate at import so the very first /api/channels/{id}/live after a start
+# answers from the last run instead of waiting on a platform extract.
+_load_live_status_cache()
 
 
 def _fetch_channel_live_payload(
@@ -368,6 +466,7 @@ def _fetch_channel_live_payload(
     # verifier, so the user sees channels missing even when they are live.
     # Each platform's error is logged; succeeded platforms' entries survive.
     infos: dict[str, dict] = {}
+    ok_fetches = 0
     for plat, fut in jobs:
         try:
             info = fut.result()
@@ -377,8 +476,22 @@ def _fetch_channel_live_payload(
                 plat, channel.get("id") or "?", exc,
             )
             continue
+        # A fetch that RETURNED (even None = "not live") is a real answer; one
+        # that raised is not. Counting the difference is what stops the empty
+        # payload below from being cached as "this channel is offline" when in
+        # truth every platform refused us (rate limit, bot gate, network).
+        ok_fetches += 1
         if info and isinstance(info, dict):
             infos[plat] = info
+
+    if jobs and ok_fetches == 0:
+        # Every platform errored. Caching the empty payload here is how a
+        # grid of live channels renders as "nothing is live" for a whole TTL
+        # (measured 2026-10-20). Raise so the caller keeps the last-known
+        # payload instead of overwriting it with a false "offline".
+        raise RuntimeError(
+            f"all live fetches failed for channel {channel.get('id') or '?'}"
+        )
 
     live: list[dict] = []
     kick_info = infos.get("kick")
@@ -549,6 +662,7 @@ def _refresh_channel_live_cache(
     with _LIVE_STATUS_LOCK:
         _LIVE_STATUS_CACHE[channel_id] = (time.monotonic(), payload)
         _LIVE_RECENTLY_ADDED.pop(channel_id, None)  # fast-path consumed
+    _save_live_status_cache()
     return payload
 
 
@@ -624,13 +738,22 @@ def warm_all_saved_channel_live_status() -> None:
 
     Runs on the daemon warm thread spawned from app.py lifespan — never blocks
     the API. The first detection after boot is BURST: a temporary pool wide
-    enough to fetch every channel in ~1 wave, so the LIVE badges paint as
+    enough to fetch every channel in a few waves, so the LIVE badges paint
     soon as the user opens the Channels tab. The steady-state pools (4 warm /
     6 platform) stay small for periodic TTL-trip refreshes — those pace the
     rate-limited platform APIs. Measured on 19 channels (2026-08):
     4x6 = 18.6-24.5s, 8x12 = 10.6-14.2s, 12x18 = 12.5-13.7s, 16x24 = 29.7s
     (the widest burst thunders the herd and trips YouTube rate limits, so
-    bigger is NOT better). 8x12 is the sweet spot.
+    bigger is NOT better).
+
+    Re-measured 2026-10-20 on 39 channels, and the wide burst is now a
+    LIABILITY rather than a speed-up: 8x12 launched ~117 remote fetches in one
+    wave, the API stopped answering, dev-all reclaimed :7897, and the restart
+    launched another burst - five in two minutes. The page had nothing to
+    paint for minutes and every request behind the burst stalled. It is 4x8
+    now: the first screen fills in a couple of seconds from the PERSISTED
+    cache (`_load_live_status_cache`, so a restart paints instantly), and the
+    burst only refreshes, paced, without ever squeezing the request path.
 
     The burst is fire-and-forget: this function submits all channels then
     returns immediately (never waits on the pools — a slow yt-dlp retry
@@ -664,8 +787,8 @@ def warm_all_saved_channel_live_status() -> None:
         if count:
             logger.info("live warm: %d channel(s) queued", count)
         return
-    n_chan = min(len(channels), 8)
-    n_plat = min(len(channels) * 3, 12)
+    n_chan = min(len(channels), 4)
+    n_plat = min(len(channels) * 2, 8)
     warm_pool = ThreadPoolExecutor(max_workers=n_chan, thread_name_prefix="live-boot-warm")
     plat_pool = ThreadPoolExecutor(max_workers=n_plat, thread_name_prefix="live-boot-plat")
     count = 0

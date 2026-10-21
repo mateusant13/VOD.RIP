@@ -223,12 +223,21 @@ def warmup_if_indexed() -> None:
     try:
         from services import archive_db  # lazy: no import cycle at boot
 
-        n = archive_db.query(
-            "SELECT COUNT(*) AS n FROM transcript_embeddings WHERE vec IS NOT NULL"
-        )[0]["n"]
+        # EXISTENCE, not COUNT(*). `COUNT(*) ... WHERE vec IS NOT NULL` walks
+        # the whole 2.8 GB blob b-tree - archive_db.py says so itself
+        # (~21 s, which is why the matrix cache stamps MAX(transcript_id)
+        # instead). Called from _boot_maintenance, that 21 s landed in the
+        # middle of the boot window competing with the first clicks, and it
+        # was one of the three GIL holders py-spy caught while a preview that
+        # needs no work took 2.5 s to answer (measured 2026-10-20). The
+        # question here is only "does any vector exist?", and LIMIT 1 answers
+        # it from the first matching row.
+        row = archive_db.query(
+            "SELECT 1 AS n FROM transcript_embeddings WHERE vec IS NOT NULL LIMIT 1"
+        )
     except Exception:
         return
-    if not n:
+    if not row:
         return
 
     def _warm() -> None:
@@ -244,8 +253,9 @@ def warmup_if_indexed() -> None:
 def backfill_missing(
     interrupt: Optional[threading.Event] = None,
     min_missing: int = 0,
+    max_segments: int = 0,
 ) -> int:
-    """Background job: embed every transcript segment that lacks a vector.
+    """Background job: embed transcript segments that lack a vector.
 
     Returns the number of segments embedded (0 = nothing to do, model
     unavailable, or interrupted before the first batch). Batches follow
@@ -253,10 +263,19 @@ def backfill_missing(
     the work (tiny scratch archives aren't worth a model load) and the
     caller passes a shutdown interrupt to stop mid-pass. Idempotent: after
     a complete pass every later call returns 0 immediately.
+
+    ``max_segments`` bounds how many rows are READ in one pass. Unbounded,
+    ``missing_embedding_segments`` materialises every missing row of a
+    multi-million-segment archive as Python objects before embedding the
+    first one - a single ``LEFT JOIN`` over the whole transcripts table that
+    ran in the boot window and was one of the GIL holders py-spy caught
+    while a click that does no work took 2.5 s (measured 2026-10-20).
+    Callers loop over bounded passes and can yield to the owner between
+    them; the queue is recomputed per pass, so nothing is missed.
     """
     from services import archive_db  # lazy: no import cycle at module scope
 
-    missing = archive_db.missing_embedding_segments()
+    missing = archive_db.missing_embedding_segments(limit=max_segments)
     if not missing or len(missing) < min_missing:
         return 0
     # Model load is the expensive part — fail fast before any writes.

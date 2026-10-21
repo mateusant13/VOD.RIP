@@ -172,20 +172,30 @@ def test_cold_miss_returns_instantly_and_schedules_background_refresh(monkeypatc
     assert pool.calls[0][1] == ("ch_cold1", {"id": "ch_cold1", "twitchSlug": "t"})
 
 
-def test_stale_payload_served_empty_with_background_refresh(monkeypatch, _isolate_live_state):
+def test_stale_payload_served_while_refreshing_in_background(monkeypatch, _isolate_live_state):
+    """A stale-but-known payload is SERVED while it refreshes.
+
+    This test used to pin the opposite (stale -> empty) because max-stale was
+    equal to the TTL. That equality made the bound meaningless: the poll that
+    crosses the TTL sits exactly at 60s, so any refresh slower than
+    `_LIVE_REFRESH_WAIT_SEC` (YouTube alone is ~6s) returned EMPTY and the LIVE
+    badge blinked out - measured 2026-10-20, the owner's grid showed no live
+    channel while it had live channels. Max-stale is 10 minutes now, so a
+    confirmed-live badge survives a slow refresh and is corrected by the next
+    successful one; beyond that bound it still reports unknown (see
+    test_beyond_max_stale_serves_empty).
+    """
     pool = _isolate_live_state
     monkeypatch.setattr(
         live_router, "settings_mgr",
         _settings([{"id": "ch_stale1", "kickSlug": "k"}]),
     )
     old = {"live": [_live_entry("Kick")], "channel_id": "ch_stale1"}
-    # max-stale == TTL == 60s: a stale entry is never trusted — serve empty
-    # (never a stale "LIVE" lie) and refresh in the background.
     live_router._LIVE_STATUS_CACHE["ch_stale1"] = (
         time.monotonic() - live_router._LIVE_STATUS_TTL_SEC - 1.0, old,
     )
 
-    assert live_router.channel_live_status("ch_stale1") == {"live": [], "channel_id": "ch_stale1"}
+    assert live_router.channel_live_status("ch_stale1") == old
     assert len(pool.calls) == 1, "stale read must kick a background refresh"
 
 

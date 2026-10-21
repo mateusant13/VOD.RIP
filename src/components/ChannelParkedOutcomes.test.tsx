@@ -85,13 +85,18 @@ describe('ChannelParkedOutcomes - the states are distinct', () => {
     expect(q('[data-parked-empty]')).toBeNull();
   });
 
-  it('renders an EXPLICIT empty state for a read that found nothing', async () => {
+  it('renders nothing at all when the read found nothing', async () => {
+    // The owner asked for this: "Nenhum canal está pausado. A varredura está
+    // perguntando a todos os canais de verdade." is a sentence about the app's
+    // internals that nobody opens the panel to read. An empty panel is the
+    // honest rendering - and the state stays DISTINCT from `unavailable`
+    // below, which must still speak up.
     stubSnapshot([]);
-    render(<ChannelParkedOutcomes />);
-    await waitFor(() => expect(q('[data-parked-empty]')).toBeTruthy());
-    expect(q('[data-parked-empty]')?.textContent).toMatch(/no channel is parked/i);
-    expect(q('[data-parked-unavailable]')).toBeNull();
+    const { container } = render(<ChannelParkedOutcomes />);
+    await waitFor(() => expect(q('[data-parked-unavailable]')).toBeNull());
+    expect(q('[data-parked-empty]')).toBeNull();
     expect(q('[data-parked-list]')).toBeNull();
+    expect(container.textContent?.trim() ?? '').toBe('');
   });
 
   it('never renders the empty state when the read FAILED', async () => {

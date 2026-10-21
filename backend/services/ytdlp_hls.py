@@ -872,9 +872,22 @@ def _youtube_extract_pass(url: str, opts: dict) -> Optional[dict]:
 
     vid = extract_video_id(url) or url[:32]
     if opts.get("_preview_fast"):
+        started = time.monotonic()
         info = _youtube_extract_preview_race(url, opts)
         if info:
             return info
+        # ONE race per click, not two. The anon re-race below used to run
+        # unconditionally, so a click that met the bot wall paid the full race
+        # budget TWICE - measured 2026-10-20 on the live app: a YouTube click
+        # answered 503 after 28.4 s, which is 5.5 s race + grace, twice. If the
+        # first race already spent its whole budget the network/YouTube is the
+        # problem and a second identical race only makes the owner wait longer
+        # for the same answer. A race that failed FAST (a definitive answer, or
+        # a wall it hit immediately) still gets the anon retry, which is what it
+        # is for.
+        spent = time.monotonic() - started
+        if spent >= _PREVIEW_EXTRACT_RACE_SEC and _youtube_manual_auth_configured():
+            return None
         if _youtube_manual_auth_configured():
             anon_opts = _merge_fresh_youtube_session(_bare_ytdlp_opts(opts), url)
             info = _youtube_extract_preview_race(url, anon_opts)
@@ -1257,22 +1270,32 @@ def cached_extract_info(url: str, opts: dict) -> dict:
 
     if not leader:
         event, box = inflight
-        wait_sec = (
-            _PREVIEW_EXTRACT_WAIT_SEC
-            if opts.get("_preview_fast")
-            else _EXTRACT_WAIT_SEC
-        )
+        # A CLICK must not queue behind a bulk warm. Measured 2026-10-20: this
+        # branch waited `_PREVIEW_EXTRACT_WAIT_SEC` (24 s) TWICE for a leader that
+        # was a boot warm inside a ~250 s extract, so a YouTube click answered
+        # 503 after 28 s having done no work of its own. The click's own race is
+        # bounded (`_PREVIEW_EXTRACT_RACE_SEC` + grace), so after a short join it
+        # is better to fail with the real reason than to keep waiting on someone
+        # else's extract. Non-preview callers keep the long wait: they have no
+        # click to protect.
+        _click_join = bool(opts.get("_preview_fast"))
+        wait_sec = 4.0 if _click_join else _PREVIEW_EXTRACT_WAIT_SEC
         if preview_fast_only_mode():
             wait_sec = min(wait_sec, _PREVIEW_EXTRACT_MAX_WALL_SEC + 2.0)
         # Wait up to 2 rounds: a slow leader (4h VOD under load) often lands a
         # few seconds past the first timeout — failing the click then is the
         # worst outcome. On the second timeout give up for real.
-        for attempt in range(2):
+        for attempt in range(1 if _click_join else 2):
             if event.wait(timeout=wait_sec):
                 break
             if attempt == 1:
                 raise TimeoutError("YouTube metadata extract timed out")
             logger.info("extract inflight wait %ds elapsed for %s — waiting once more", int(wait_sec), url[:60])
+        if _click_join and not event.is_set():
+            raise TimeoutError(
+                "YouTube extract still running after %ds — not queueing a click "
+                "behind a bulk warm" % int(wait_sec)
+            )
         with _EXTRACT_CACHE_LOCK:
             hit = _EXTRACT_INFO_CACHE.get(key)
             if hit and _youtube_cache_ok(url, opts, hit[1]):

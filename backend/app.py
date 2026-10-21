@@ -80,15 +80,34 @@ _BOOT_WARM_GRACE_SEC = float(os.environ.get("VODRIP_BOOT_WARM_GRACE", "8"))
 _ARCHIVE_FIRST_PASS_DELAY_SEC = float(
     os.environ.get("VODRIP_ARCHIVE_FIRST_PASS_DELAY", "150")
 )
-# The live-status warm waits much less: its burst (~10s for 19 channels)
-# must finish before the user's first Channels-tab poll so the LIVE badges
-# paint on the first round-trip. The yt/embed/ASR warms keep the long grace.
-# Live-status warm fires at lifespan start (before uvicorn accepts requests),
+# The live-status warm waits much less: its burst must finish before the
+# user's first Channels-tab poll so the LIVE badges paint on the first
+# round-trip. It fires at lifespan start (before uvicorn accepts requests),
 # so the burst pool registers its futures in _LIVE_REFRESH_INFLIGHT first and
-# the frontend's first polls dedupe onto the 8x12 burst instead of the slow
-# 4-worker steady-state pool. A grace >0 loses that race (polls win, burst
-# no-ops) — keep 0 unless the boot burst must yield to something else.
+# the frontend's first polls dedupe onto the burst instead of the slow
+# steady-state pool. A grace >0 loses that race (polls win, burst no-ops) -
+# keep 0 unless the boot burst must yield to something else.
 _LIVE_WARM_GRACE_SEC = float(os.environ.get("VODRIP_LIVE_WARM_GRACE", "0"))
+
+# Semantic-embedding backfill: pure maintenance with no user-visible deadline,
+# and the single heaviest thing a boot could start. It reads the whole
+# `transcripts` table to build its work queue (LEFT JOIN against
+# transcript_embeddings) and then runs the ONNX model over the batches.
+# Measured 2026-10-20 with py-spy while the owner was clicking: the backfill
+# held the GIL inside `archive_db.query` at the same moment a preview POST that
+# did no work took 2.5 s. 300 s puts it past the open-and-look window, and each
+# bounded pass then waits for the owner to be quiet before reading the next
+# queue slice. Set VODRIP_EMBED_BACKFILL_DELAY=0 to restore the old start.
+_EMBED_BACKFILL_FIRST_PASS_DELAY_SEC = float(
+    os.environ.get("VODRIP_EMBED_BACKFILL_DELAY", "300")
+)
+# One pass reads at most this many rows. Unbounded, the queue for a
+# multi-million-segment archive is materialised as Python objects before the
+# first embed - a stall measured in tens of seconds, all of it in the click
+# window. The queue is recomputed per pass, so a small cap loses nothing.
+_EMBED_BACKFILL_PASS_SEGMENTS = int(
+    os.environ.get("VODRIP_EMBED_BACKFILL_PASS", "4000")
+)
 _archive_worker_started = False
 
 try:
@@ -505,13 +524,26 @@ async def _app_lifespan(_app: FastAPI):
             return
 
         # ponytail: warm the 4 most recent saved channels only
-        sorted_channels = sorted_channels[:4]
+        #
+        # 4 -> 2 and KINDS -> ("vods",) on 2026-10-20. The old selection was 4
+        # channels x 3 kinds = up to 12 URLs, and the per-URL cap (15s) only
+        # capped the WAIT - the abandoned extract thread kept running. Measured
+        # on the live app that day: every one of those warms logged
+        # "STARTUP_SYNC_WARM: <url> done in 248-261s". So a boot launched ~12
+        # four-minute YouTube extracts, and py-spy caught them holding the GIL
+        # while a preview POST that does no work took 2.5s and /api/health went
+        # silent for 18s. A warm that lands in 250s never beats the owner to the
+        # click, so spending twelve of them is pure contention: two URLs keep
+        # the newest VOD of the two newest channels warm for the cost of two.
+        sorted_channels = sorted_channels[:2]
 
         # ponytail: warm first-per-kind-per-channel so every tab's top row is
         # instant on click — not just the newest 2 of each channel. Matches the
         # frontend's KINDS = ['vods', 'clips', 'streams'] grouping; 'shorts'
         # live in clipVideos under YouTube-only filter (handled by clips kind).
-        KINDS = ("vods", "clips", "streams")
+        # Only 'vods' at boot (see above): the clips/streams tabs are warmed by
+        # the frontend when they are actually opened.
+        KINDS = ("vods",)
         first_urls: list[tuple[str, str]] = []
         seen_vids: set[str] = set()
         for ch_key, ch_videos in sorted_channels:
@@ -539,7 +571,8 @@ async def _app_lifespan(_app: FastAPI):
                     break
 
         logger.info(
-            "STARTUP_SYNC_WARM: resolving %d URLs in parallel",
+            "STARTUP_SYNC_WARM: resolving %d URL(s) sequentially, stopping on "
+            "the first slow extract or the owner becoming active",
             len(first_urls),
         )
 
@@ -556,15 +589,14 @@ async def _app_lifespan(_app: FastAPI):
         except Exception:
             logger.debug("STARTUP_SYNC_WARM: anonymous session bootstrap skipped", exc_info=True)
 
-        from concurrent.futures import ThreadPoolExecutor
-
         # Cap wall-clock per URL at ~15s: on a degraded network the light
         # extract alone can take 60s+, which pushed the startup wave to ~70s.
         # The abandoned thread keeps running in the background and still
         # lands its caches if it finishes.
         _SYNC_WARM_URL_CAP_SEC = 15.0
 
-        def _warm_one(item: tuple[str, str]) -> None:
+        def _warm_one(item: tuple[str, str]) -> bool:
+            """Warm one URL. Returns False when it breached the wall-clock cap."""
             u, ch_key = item
             done = threading.Event()
 
@@ -598,26 +630,24 @@ async def _app_lifespan(_app: FastAPI):
                     u[:50],
                     _SYNC_WARM_URL_CAP_SEC,
                 )
+                return False
+            return True
 
-        # ponytail: 6 workers = one URL per wave slot, so the whole wave is a
-        # single round. MEASURED 2026-10-13 on this box, real YouTube, governor
-        # ceiling pinned to the live boot value 6.8 rpm (harness:
-        # tmp/_gateprobe/battery4.py, wave = the 6 URLs the live settings.json
-        # actually selects): max_workers=2 -> mean 32.9 s wall, every round pays
-        # the governor's 12.61 s one-token pace again and URLs breach the 15 s
-        # cap; max_workers=6 -> mean 11.8 s wall, 0-1 cap hits. 4 sits between
-        # (mean 24.1 s), so 6 is the depth that actually reaches the floor.
-        # The bot-gate this comment used to fear did NOT fire at ANY depth:
-        # 19 wave runs / 114 warms / 1299 InnerTube /player POSTs at 2, 4 and 6
-        # workers produced ZERO gate arms and ZERO warm bot-gate pauses. The
-        # gate is a unanimous LOGIN_REQUIRED wall across >=3 client profiles
-        # (services/youtube_innertube.py:1227), not a burst signal: all 128
-        # 'bot_gate' rows in H:\\VOD.RIP-data\\archive.db.rate_limit_events had
-        # in_flight=0 and recent_requests<=6. 6 stays under WARM_WORK_SEMAPHORE
-        # (8), so the global heavy-work cap still holds, and user-click paths
-        # never take that semaphore -- clicks cannot queue behind this wave.
-        with ThreadPoolExecutor(max_workers=6, thread_name_prefix="yt-sync-warm") as pool:
-            list(pool.map(_warm_one, first_urls))
+        # Sequential, and it STOPS. The parallel 6-worker version existed to
+        # make the wave finish in one round (measured 2026-10-13: 11.8s wall),
+        # but re-measured 2026-10-20 each warm takes ~250s, so the round never
+        # ends and its abandoned threads are exactly what starved the click
+        # path. Two greeters: a slow extract means the network is degraded, and
+        # the owner becoming active means the wave has already lost.
+        from services.user_activity import user_is_active as _user_active
+
+        for item in first_urls:
+            if _user_active():
+                logger.info("STARTUP_SYNC_WARM: stopping — owner is using the app")
+                break
+            if not _warm_one(item):
+                logger.warning("STARTUP_SYNC_WARM: stopping after a slow extract")
+                break
 
     def _collect_saved_youtube_urls(saved_channels) -> list:
         """Pull YouTube URLs out of the saved channel list (any field that
@@ -699,20 +729,21 @@ async def _app_lifespan(_app: FastAPI):
             return
 
         # ponytail: warm the 4 most recent saved channels only
-        sorted_channels = sorted_channels[:4]
+        #
+        # 4 channels x 5 = 20 URLs at boot. Measured 2026-10-20: a YouTube warm
+        # on this box takes ~250s, so the wave cannot beat the owner to the
+        # click and its 20 concurrent extracts are what kept the API silent
+        # while the page was open. 2 channels x 1 URL keeps the very first
+        # click warm for the two newest channels; everything deeper is warmed
+        # by the frontend when the owner actually scrolls to it.
+        sorted_channels = sorted_channels[:2]
 
         # ponytail: 5/channel matches YOUTUBE_WARM_VOD_LIMIT; deeper scroll
-        # triggers the frontend per-scroll batch warm.
-        #
-        # KEPT AT 5. Measured 2026-10-15 in app.log (NOT the stdout redirect,
-        # which carries only uvicorn access lines): "STARTUP_WAVE: wave 1 firing
-        # 20 URLs" - four channels x five. When YouTube extracts SUCCEED the wave
-        # is harmless (extract ok, snapshot ready, panel stays at 0.02 s). When
-        # they FAIL with preview_race_exhausted (wall_ms=24093) the same 20 URLs
-        # become a ~100 s storm. Cutting BATCH would fix the storm by giving up
-        # warm coverage on the videos the fast-start click actually wants, so the
-        # bound belongs on CONCURRENCY (WARM_WORK_SEMAPHORE), not on coverage.
-        BATCH = 5
+        # triggers the frontend per-scroll batch warm. 5 -> 1 on 2026-10-20,
+        # see above: the bound belongs on how much the app does behind the
+        # owner's back at boot, and 250s-per-URL means more coverage is not
+        # coverage, it is contention.
+        BATCH = 1
         MAX_WAVES = 1
         submitted = 0
         wave_count = 0
@@ -790,6 +821,12 @@ async def _app_lifespan(_app: FastAPI):
         try:
             if _warm_shutdown.wait(_LIVE_WARM_GRACE_SEC):
                 return  # cold live cache is handled by the router's cold-miss path
+            # The owner outranks the warm: if the app is being used right now,
+            # let the click/seek finish before 39 channels of platform status
+            # start competing for the same connection pool and GIL.
+            from services.user_activity import wait_until_idle
+
+            wait_until_idle(max_wait_s=10.0)
             from routers.live import warm_all_saved_channel_live_status
 
             warm_all_saved_channel_live_status()
@@ -882,13 +919,33 @@ async def _app_lifespan(_app: FastAPI):
                 except Exception:
                     return
                 try:
-                    if _warm_shutdown.wait(_BOOT_WARM_GRACE_SEC):
+                    if _warm_shutdown.wait(_EMBED_BACKFILL_FIRST_PASS_DELAY_SEC):
                         return
                     from services.archive_embed import backfill_missing
+                    from services.user_activity import wait_until_idle
 
-                    done = backfill_missing(interrupt=_warm_shutdown, min_missing=500)
-                    if done:
-                        logger.info("semantic embed backfill: %d segments embedded", done)
+                    total = 0
+                    while not _warm_shutdown.is_set():
+                        # The owner outranks the archive: read the next queue
+                        # slice only when nothing is being clicked. Bounded, so
+                        # an app left open with a stray request still advances.
+                        if not wait_until_idle(
+                            max_wait_s=300.0, stop=_warm_shutdown
+                        ):
+                            if _warm_shutdown.is_set():
+                                return
+                        done = backfill_missing(
+                            interrupt=_warm_shutdown,
+                            min_missing=500,
+                            max_segments=_EMBED_BACKFILL_PASS_SEGMENTS,
+                        )
+                        if not done:
+                            break
+                        total += done
+                    if total:
+                        logger.info(
+                            "semantic embed backfill: %d segments embedded", total
+                        )
                 except Exception:
                     logger.debug("semantic embed backfill skipped", exc_info=True)
 

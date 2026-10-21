@@ -194,6 +194,14 @@ export default function ChannelParkedOutcomes({
   const state = loading && snapshot === null ? 'loading' : parkedState(snapshot);
   const rows = snapshot?.parked ?? [];
 
+  // Nothing parked = nothing to say. The owner asked for this message to go:
+  // "Nenhum canal está pausado. A varredura está perguntando a todos os canais
+  // de verdade." is a sentence about the app's internals that nobody opens the
+  // panel to read. An EMPTY panel is the honest rendering; the `unavailable`
+  // state below still speaks up, because a read that failed must never look
+  // like a read that succeeded and found nothing.
+  if (state === 'empty') return null;
+
   return (
     <section
       data-channel-parked
@@ -225,12 +233,8 @@ export default function ChannelParkedOutcomes({
         </p>
       )}
 
-      {/* A real answer: the read succeeded and there is genuinely nothing. */}
-      {state === 'empty' && (
-        <p data-parked-empty className="text-ui-xs font-mono text-zinc-500 leading-relaxed">
-          {t('channelPark.empty')}
-        </p>
-      )}
+      {/* A real answer with nothing to report renders nothing at all - see the
+          early return above. There is deliberately no empty-state paragraph. */}
 
       {state === 'rows' && (
         <>
