@@ -16,7 +16,7 @@ _URL = "https://www.twitch.tv/fastfail/videos/12345"
 
 
 def test_twitch_vod_unavailable_fails_fast_with_clear_message(monkeypatch):
-    def boom(url):
+    def boom(url, **_kw):
         raise tgs.TwitchVodUnavailable(
             "Twitch VOD 12345 has no playable stream — it is sub-only, "
             "geo-restricted, or removed (log in with Twitch cookies and retry)"
@@ -76,7 +76,7 @@ def test_router_maps_a_dead_twitch_vod_to_404(monkeypatch):
             "source for it (removed, expired, or sub-only)"
         )
 
-    monkeypatch.setattr(preview_router, "create_session", _dead)
+    monkeypatch.setattr(preview_router, "create_session_pending", _dead)
     with TestClient(app) as c:
         resp = c.post("/api/preview/session", json={"url": _URL})
     assert resp.status_code == 404, resp.text[:300]
@@ -115,7 +115,7 @@ def test_playback_sync_passes_the_measured_token_state(monkeypatch):
 
     seen = {}
 
-    def _meta(vod_id, token_refused=True):
+    def _meta(vod_id, token_refused=True, **_kw):
         seen["vod_id"] = vod_id
         seen["token_refused"] = token_refused
         raise RuntimeError("stop here")

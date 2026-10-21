@@ -825,6 +825,48 @@ export function attachPreviewBufferingListeners(
 }
 
 /**
+ * Instant create: how long the client waits for the upstream resolve.
+ *
+ * The POST no longer holds the resolve (a cold YouTube resolve is honestly
+ * 8-13 s; putting it in front of the click is what made every preview feel
+ * broken). This is the ceiling for the session stage, comfortably inside the
+ * 45 s first-output ceiling in previewRetry, and it is NOT the usual path: a
+ * warm session is already resolved and returns on the first poll.
+ */
+export function previewResolvePollMaxMs(): number {
+  return 30_000;
+}
+
+/**
+ * Poll until the instant-create session finishes resolving.
+ *
+ * Resolves as soon as `resolving` is false. `resolve_error` is a terminal
+ * ANSWER (the upstream said no), not a timeout — returning it immediately is
+ * what makes a dead VOD fail fast instead of burning the poll budget.
+ */
+export async function waitForPreviewSessionResolved(
+  sessionId: string,
+  apiGet: <T>(path: string) => Promise<T>,
+  maxMs = previewResolvePollMaxMs(),
+): Promise<{ ok: boolean; error?: string }> {
+  const deadline = Date.now() + maxMs;
+  const pollMs = 120;
+  while (Date.now() < deadline) {
+    try {
+      const st = await apiGet<PreviewSessionStatusResponse>(
+        `/api/preview/session/${sessionId}/status`,
+      );
+      if (st.resolve_error) return { ok: false, error: st.resolve_error };
+      if (st.resolving !== true) return { ok: true };
+    } catch {
+      /* keep polling until the deadline */
+    }
+    await new Promise<void>((resolve) => { window.setTimeout(resolve, pollMs); });
+  }
+  return { ok: false, error: 'preview resolve did not finish' };
+}
+
+/**
  * Poll the preview session until playlist/seg0 is ready (window-HLS path) or
  * the full file is muxed (progressive / very-long-window fallback).
  * Backend removed per-segment DASH mux — we never wait on individual segments.

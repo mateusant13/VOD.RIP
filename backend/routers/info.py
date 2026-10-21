@@ -38,6 +38,13 @@ def _info_error_detail(url: str, exc: Exception) -> str:
 
 @router.get("/api/info/video")
 async def info_video(id: str):
+    # The owner just pasted a link: background work (channel warm waves, the
+    # archive scheduler) must yield, not compete. Measured 2026-10-21: with a
+    # warm storm running, this route queued 24 s and then answered 404 while the
+    # identical extract took 1.2 s in a quiet process.
+    from services.user_activity import mark_user_activity
+
+    mark_user_activity()
     try:
         lowered = id.lower()
         if is_clip_url(id):

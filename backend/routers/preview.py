@@ -29,6 +29,7 @@ from services.preview_service import (
     REPLAY_HLS_MARKER,
     StalePreviewUrls,
     create_session,
+    create_session_pending,
     youtube_create_inflight,
     create_live_session,
     SESSION_TTL_SEC,
@@ -231,6 +232,8 @@ def _preview_session_response(session, resolve_ms: float = 0.0) -> PreviewSessio
         has_chat=has_chat,
         channel_language=_preview_channel_language(session),
         resolve_ms=resolve_ms,
+        resolving=bool(getattr(session, "resolving", False)),
+        resolve_error=str(getattr(session, "resolve_error", "") or ""),
     )
 
 
@@ -642,22 +645,25 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
     try:
         import time as _time
         t0 = _time.monotonic()
-        # Which budget applies: a leader does the extract and gets the short
-        # fail-fast cap; a follower only waits for a leader already resolving
-        # this video and gets the longer wait. Checked BEFORE the submit, so a
-        # missed race just falls back to the short cap (the old behaviour).
-        is_follower = False
-        try:
-            is_follower = bool(youtube_create_inflight(preview_url))
-        except Exception:  # noqa: BLE001 - never block a click on the probe
-            is_follower = False
-        budget_sec = (
-            _PREVIEW_CREATE_FOLLOW_TIMEOUT_SEC if is_follower
-            else _PREVIEW_CREATE_HARD_TIMEOUT_SEC
-        )
+        # INSTANT CREATE. The POST used to hold this response for the whole
+        # cold YouTube resolve (10.4-13.6 s measured through the Vite proxy).
+        # Every timeout tried on that wait made it worse — 4 s failed 100% of
+        # cold clicks, 8 s cut the 10-13 s ones, 15 s just made failure rarer.
+        # The wait was never the extract's fault: 8-13 s IS the honest cost of
+        # an unauthenticated resolve. The defect was putting it in front of the
+        # user's click.
+        #
+        # create_session_pending registers the session immediately and resolves
+        # on its own pool. It waits 2.5 s inline for a resolve that is already
+        # close (a warm snapshot lands in 0-47 ms; a dead Twitch VOD answers in
+        # ~2.7 s) so those keep returning a COMPLETE body, and a failure that
+        # lands in that window keeps its real status code. A cold YouTube
+        # resolve (8-13 s) exceeds it and the POST answers with
+        # resolving=true immediately; the client polls, then refetches
+        # GET /api/preview/session/{id} and continues with that body.
         create_future = asyncio.get_running_loop().run_in_executor(
             PREVIEW_EXECUTOR,
-            lambda: create_session(
+            lambda: create_session_pending(
                 preview_url,
                 req.crop_start,
                 req.crop_end,
@@ -665,24 +671,26 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
             ),
         )
         try:
-            session = await asyncio.wait_for(
-                create_future,
-                timeout=budget_sec,
-            )
+            # Pure watchdog: create_session_pending does no network I/O in this
+            # thread and cannot block past its own registration, so this only
+            # fires if the executor is starved by something else.
+            session = await asyncio.wait_for(create_future, timeout=10.0)
         except asyncio.TimeoutError:
             logger.warning(
-                "preview session create timed out url=%s after %.1fs (follower=%s)",
+                "preview session registration starved (executor busy) url=%s",
                 preview_url[:100],
-                budget_sec,
-                is_follower,
             )
-            # The executor thread keeps running (threads cannot be killed)
-            # and may still populate caches, but the client gets a terminal
-            # response instead of an unbounded spinner.
             raise HTTPException(
-                status_code=504,
-                detail="Preview timed out — try again.",
+                status_code=503,
+                detail="Preview is busy — try again.",
             )
+        # A resolve that FAILED inside the inline window still answers with its
+        # real status code and message (404 "VOD removed", 503 + Retry-After
+        # "temporarily restricted"). Deferring every failure to the poll would
+        # have turned all of them into one generic "no response" string.
+        resolve_exc = getattr(session, "resolve_exc", None)
+        if resolve_exc is not None:
+            raise resolve_exc
         resolve_ms = (_time.monotonic() - t0) * 1000.0
         from services.preview_timing import log_server_session_created
         log_server_session_created(session, resolve_ms=resolve_ms)
@@ -950,12 +958,41 @@ async def preview_session_status(session_id: str):
     usher/kick/googlevideo master must surface at the poll instead of leaving
     the player spinning on an all-green status.
     """
+    # A poll only happens while someone is waiting on THIS preview. Mark the
+    # user active so a background warm wave yields its budgets instead of
+    # competing with the click (see preview_hls_master).
+    from services.user_activity import mark_user_activity
+
+    mark_user_activity()
     try:
         status = await asyncio.get_running_loop().run_in_executor(
             PREVIEW_EXECUTOR,
             lambda: preview_session_mux_status(session_id),
         )
         return PreviewSessionStatusResponse(**status)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.get("/api/preview/session/{session_id}")
+async def preview_session_snapshot(session_id: str):
+    """The CURRENT full session body — same shape as the create response.
+
+    Instant create answers before the upstream resolve finishes, so the POST
+    body holds placeholders (no variants, trim_timeline=false, duration 0).
+    Once the status poll says the resolve landed, the client refetches here and
+    continues with THIS body: every downstream decision (playback URL kind,
+    quality menu, trim window, duration) depends on fields that only exist
+    after the resolve. One body-builder for both routes, so they cannot drift.
+    """
+    def _build():
+        session = get_session(session_id)
+        if not session:
+            raise ValueError("Preview session not found or expired")
+        return _preview_session_response(session, 0.0)
+
+    try:
+        return await asyncio.get_running_loop().run_in_executor(INFO_EXECUTOR, _build)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -1100,13 +1137,34 @@ async def _preview_master_response(
 
 @router.get("/api/preview/hls/{session_id}/master.m3u8")
 async def preview_hls_master(session_id: str, request: Request):
+    # The player pulling the manifest IS the person watching. Marking it makes
+    # every background loop (channel warm waves, the archive scheduler) yield:
+    # measured 2026-10-21, a warm storm held the app's own master request past
+    # hls.js's 10 s manifestLoadingTimeOut, so the preview died with "Sem
+    # resposta do servidor" while the backend was busy doing work nobody asked
+    # for.
+    from services.user_activity import mark_user_activity
+
+    mark_user_activity()
     loop = asyncio.get_running_loop()
     kind = await loop.run_in_executor(PREVIEW_EXECUTOR, preview_session_kind, session_id)
+    if kind == "progressive":
+        # A progressive session has NO master playlist: its media is the source
+        # MP4, and this endpoint used to answer by streaming that file. The
+        # browser got HTTP 200 and then hls.js waited for a playlist that never
+        # came, timing out at 10 s per attempt — measured 2026-10-21, with a
+        # 9 GB body queued behind a 291-byte header. Answer with the FACT
+        # instead: the client refetches the session body and switches to
+        # /stream.mp4, and a stale client fails in milliseconds.
+        raise HTTPException(
+            status_code=409,
+            detail="Preview session is progressive - use stream.mp4",
+        )
     return await _preview_master_response(
         session_id,
         request.headers.get("range"),
         _parse_prefer_height_query(request),
-        force_streaming=(kind == "progressive"),
+        force_streaming=False,
     )
 
 

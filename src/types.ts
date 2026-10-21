@@ -388,6 +388,15 @@ export interface PreviewSessionResponse {
   channel_language?: string;
   /** Gap 1: server-side create_session wall time (ms) — cold vs warm resolve cost. */
   resolve_ms?: number;
+  /**
+   * Instant create: the POST answered BEFORE the upstream resolve finished.
+   * While true every other field here is a placeholder (no variants, no trim
+   * window, duration 0). Poll /status until it flips false, then refetch
+   * GET /api/preview/session/{id} and continue with THAT body.
+   */
+  resolving?: boolean;
+  /** Terminal resolve failure (non-empty => stop polling, show retry UI). */
+  resolve_error?: string;
 }
 
 export interface PreviewSessionStatusResponse {
@@ -402,6 +411,10 @@ export interface PreviewSessionStatusResponse {
    *  ('' = healthy) — a dead usher/kick/googlevideo master surfaces here
    *  instead of leaving the player spinning on an all-green status. */
   live_upstream_error?: string;
+  /** Instant create: upstream resolve still running (fields are placeholders). */
+  resolving?: boolean;
+  /** Terminal resolve failure — stop polling, surface the retry UI. */
+  resolve_error?: string;
 }
 
 export type Tab = 'url' | 'channels' | 'queue' | 'settings';

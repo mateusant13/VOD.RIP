@@ -138,7 +138,7 @@ def test_503_carry_retry_after_header(monkeypatch):
     def _gated(*_a, **_k):
         raise RuntimeError("YouTube preview unavailable for this video")
 
-    monkeypatch.setattr(preview_router, "create_session", _gated)
+    monkeypatch.setattr(preview_router, "create_session_pending", _gated)
     with TestClient(app) as c:
         resp = c.post("/api/preview/session", json={"url": YT_URL})
     assert resp.status_code == 503, resp.text[:200]
@@ -185,7 +185,7 @@ def test_resolve_ms_surfaces_on_create(monkeypatch):
         time.sleep(0.25)
         return _FakeSession()
 
-    monkeypatch.setattr(preview_router, "create_session", _slow)
+    monkeypatch.setattr(preview_router, "create_session_pending", _slow)
     monkeypatch.setattr(
         preview_router, "_priority_transcribe_for_preview", lambda *_a, **_k: None
     )

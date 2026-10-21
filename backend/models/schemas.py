@@ -373,6 +373,14 @@ class PreviewSessionResponse(BaseModel):
     # Gap 1: server-side create_session wall time (ms) — surfaces cold vs warm
     # resolve cost to the client (console diagnostic; 0 for non-create paths).
     resolve_ms: float = 0.0
+    # Instant create: the POST registers the session and returns BEFORE the
+    # upstream resolve finishes. While `resolving` is true the fields above are
+    # placeholders (no variants, no mux bounds, duration 0) — the client polls
+    # GET /api/preview/session/{id} until it flips false, then uses THAT body.
+    # `resolve_error` is the terminal failure (non-empty => stop polling, show
+    # the retry UI); it is never a timeout, it is a real answer.
+    resolving: bool = False
+    resolve_error: str = ""
 
 
 class PreviewSeekRequest(BaseModel):
@@ -433,6 +441,13 @@ class PreviewSessionStatusResponse(BaseModel):
     # client has; expires_in lets it see the end coming. 0 = already
     # eligible for the next cleanup sweep.
     expires_in: int = 0
+    # Instant create: the session is registered before the upstream resolve
+    # finishes. `resolving` is the ONE signal the poller needs (empty variants
+    # are normal while it is true); `resolve_error` is the terminal answer —
+    # non-empty means "never going to be ready", so the client fails fast
+    # instead of spending its poll budget.
+    resolving: bool = False
+    resolve_error: str = ""
 
 
 class PreviewQualityUpdateRequest(BaseModel):

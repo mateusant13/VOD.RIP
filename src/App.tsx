@@ -86,6 +86,7 @@ import {
   createPreviewSessionWithRetry,
   pinHlsToLowestLevel,
   waitForPreviewMuxReady,
+  waitForPreviewSessionResolved,
   shouldWaitForPreviewMux,
   previewPlaylistPollMaxMs,
   type PreviewLevelOption,
@@ -2008,12 +2009,31 @@ export default function App() {
           ? previewSessionPrefetchRef.current.session
           : null;
       if (prefetched) previewSessionPrefetchRef.current = null;
-      const res = prefetched ?? await createPreviewSessionWithRetry({
+      let res = prefetched ?? await createPreviewSessionWithRetry({
         url: trimmedUrl,
         crop_start: start,
         crop_end: end,
         prefer_height: previewPreferHeight,
       }, guard.signal ?? undefined);
+      // INSTANT CREATE: the POST answers before the upstream resolve finishes,
+      // so this body holds placeholders (no variants, trim_timeline=false,
+      // duration 0). Wait for the resolve, then refetch the full session and
+      // continue with THAT body — every downstream decision (playback kind,
+      // quality menu, trim window, duration clamp) reads fields that only
+      // exist after the resolve. Done BEFORE markCreateResolved so the start
+      // guard keeps us in the session stage, where it belongs.
+      if (res.resolving === true) {
+        timing.mark('session_pending');
+        const resolved = await waitForPreviewSessionResolved(res.session_id, apiGet);
+        if (bailIfSuperseded()) return false;
+        if (!resolved.ok) {
+          timing.mark('session_resolve_failed');
+          const deadline = previewDeadlineVerdict({ stage: 'session', firstOutputArrived: false });
+          throw new Error(t(deadline.messageKey));
+        }
+        res = await apiGet<PreviewSessionResponse>(`/api/preview/session/${res.session_id}`);
+        if (bailIfSuperseded()) return false;
+      }
       if (bailIfSuperseded()) return false;
       guard.markCreateResolved();
       timing.setSessionId(res.session_id);
@@ -2093,6 +2113,20 @@ export default function App() {
         timing.mark('mux_ready');
       } else if (youtubePreview && (res.trim_timeline || !res.segment_buffer_ready)) {
         timing.mark('attach_before_segments');
+      }
+      // Re-read the session ONCE the media is attachable. The backend can flip
+      // a session from HLS to progressive behind the create response (a
+      // single-rung resolve, a finished background mux), and the playback URL
+      // depends on `kind`: attaching the HLS manifest to a progressive session
+      // used to hang for hls.js's full 10 s manifest timeout, twice, and then
+      // report "Sem resposta do servidor". This read is ~20 ms and it is the
+      // difference between the right URL and a stalled player.
+      {
+        const latest = await apiGet<PreviewSessionResponse>(
+          `/api/preview/session/${res.session_id}`,
+        ).catch(() => null);
+        if (latest) res = latest;
+        if (bailIfSuperseded()) return false;
       }
       const playback = resolvePreviewPlayback(url.trim(), res);
       setPreviewPlayback({

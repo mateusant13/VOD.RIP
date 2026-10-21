@@ -1460,6 +1460,24 @@ class PreviewSession:
     # player spinning forever on a 403/404 upstream. Cleared on rotate.
     live_upstream_error: Optional[str] = None
 
+    # Instant (pending) create: the session is registered before the upstream
+    # resolve finishes, so the click answers in milliseconds instead of holding
+    # the HTTP response for the whole extract (measured 10-13 s cold through
+    # the Vite proxy). `resolving` is the ONE flag every readiness predicate
+    # must honour — without it a pending Twitch/Kick shell reads as
+    # "playlist ready" (those platforms are ready by default) and the player
+    # attaches to an empty playlist. `resolve_error` is the terminal failure
+    # the status poll surfaces (fail fast) instead of a 504 on the POST.
+    resolving: bool = False
+    resolve_error: Optional[str] = None
+    # The ORIGINAL exception, so a failure that lands inside the create's
+    # inline window can be re-raised through the router's existing error
+    # mapping (404 "VOD removed", 503 + Retry-After "temporarily restricted")
+    # instead of collapsing into a generic message.
+    resolve_exc: Optional[BaseException] = field(
+        default=None, repr=False, compare=False
+    )
+
     def touch(self) -> None:
         self.last_access = time.time()
 
@@ -2101,8 +2119,25 @@ def _youtube_mux_file_if_ready(session: PreviewSession) -> Optional[Path]:
     if path.is_file() and path.stat().st_size >= MIN_VALID_OUTPUT_BYTES:
         return path
     return None
+def _session_not_playable(session: PreviewSession) -> bool:
+    """True while an instant-create session has no upstream state to serve.
+
+    `resolving` = the resolve is still running (empty variants are normal).
+    `resolve_error` = the resolve already failed and will never fill them.
+    Both must read as "not playable": without this every non-YouTube shell
+    (Twitch/Kick short-circuit to ready) would hand the player an empty
+    playlist, and a FAILED shell would look playable forever.
+    """
+    return bool(
+        getattr(session, "resolving", False)
+        or getattr(session, "resolve_error", "")
+    )
+
+
 def preview_playlist_ready(session: PreviewSession) -> bool:
     """True when the player can attach (full VOD playlist or direct URL exists)."""
+    if _session_not_playable(session):
+        return False
     if getattr(session, "dash_window_hls", False):
         return _window_hls_seg0_matches_bounds(session)
     if session.platform == "YouTube" and _youtube_entry_needs_mux(session):
@@ -2112,6 +2147,8 @@ def preview_playlist_ready(session: PreviewSession) -> bool:
     return True
 def preview_segment_buffer_ready(session: PreviewSession) -> bool:
     """True when the first playback segment is on disk (window HLS seg0 ready)."""
+    if _session_not_playable(session):
+        return False
     if getattr(session, "dash_window_hls", False):
         return _window_hls_seg0_matches_bounds(session)
     return preview_playlist_ready(session)
@@ -2122,6 +2159,8 @@ def preview_mux_ready(session: PreviewSession) -> bool:
     ``#EXT-X-ENDLIST``) OR every contiguous segment the playlist declares is
     on disk.
     """
+    if _session_not_playable(session):
+        return False
     if getattr(session, "dash_window_hls", False):
         if _window_hls_playlist_complete(session):
             return True
@@ -2173,6 +2212,11 @@ def preview_session_mux_status(session_id: str) -> Dict[str, object]:
         "mux_error": session.mux_error or "",
         "window_hls_mux_start": float(getattr(session, "window_hls_mux_start", 0) or 0),
         "window_hls_mux_end": float(getattr(session, "window_hls_mux_end", 0) or 0),
+        # Instant-create truth: while the upstream resolve is still running the
+        # session is registered but holds no variants yet. The client polls on
+        # these two instead of guessing from an empty playlist.
+        "resolving": bool(getattr(session, "resolving", False)),
+        "resolve_error": str(getattr(session, "resolve_error", "") or ""),
     }
     # User-facing lifecycle truth: sessions die silently at SESSION_TTL_SEC
     # of no access (or LRU eviction) — the poll previously gave the client no
@@ -2432,6 +2476,16 @@ def _finalize_youtube_session(session: PreviewSession, crop_start: float) -> Pre
     and emits the diagnostic log line."""
     session_id = session.session_id
     from services.preview.hls import proxy_playlist
+
+    # crop_end=0 means "no trim" (the client did not / could not name an end).
+    # It MUST become the VOD's real length before any window bound is computed:
+    # _window_hls_mux_bounds() floors an empty range at `crop_lo + 0.5`, so a
+    # session left at 0 got a HALF-SECOND window, an empty media playlist and a
+    # player stuck at readyState 0 with no error (measured 2026-10-21 through
+    # the real browser: window 0.0-2.0, media playlist 98 B, zero segments).
+    if float(session.crop_end or 0) <= float(session.crop_start or 0):
+        dur = float(getattr(session, "vod_duration", 0) or 0)
+        session.crop_end = dur if dur > 0 else 7200.0
 
     if _youtube_entry_needs_mux(session):
         cached_full = _try_use_full_mux_cache(session)
@@ -5565,6 +5619,10 @@ def session_quality_labels(session: PreviewSession) -> List[str]:
             labels.append(label)
     return labels
 def session_variant_heights(session: PreviewSession) -> List[int]:
+    if _session_not_playable(session):
+        # Pending create: no upstream master exists yet. Without this guard the
+        # fallback below fetches an EMPTY master_url on every status/poll call.
+        return []
     heights = sorted({h for h, _ in session.variant_entries if h > 0})
     if heights:
         return heights
@@ -5774,6 +5832,222 @@ get_session = _manager.get_session
 create_session = _manager.create_session
 create_live_session = _manager.create_live_session
 peek_session = _manager.peek_session
+
+
+# --- Instant (pending) create ------------------------------------------------
+#
+# MEASURED 2026-10-21: a cold YouTube click held POST /api/preview/session for
+# 10.4-13.6 s through the Vite proxy (7.8 s in isolation). Every way of cutting
+# that on the *response* alone made it worse: the 4 s cap failed 100% of cold
+# clicks, the 8 s cap killed the 10-13 s ones, and 15 s only made the failure
+# rarer. The wait was never the extract's fault — it is the honest duration of
+# an unauthenticated YouTube resolve. The defect was putting it in front of the
+# user's click.
+#
+# So the click registers the session FIRST and answers immediately; the resolve
+# runs on its own small pool and its result is adopted under the same id. The
+# client already had to poll /status before attaching (window-HLS attaches an
+# EMPTY playlist otherwise), so nothing new is asked of it — and no budget is
+# guessed: `_PREVIEW_PENDING_INLINE_WAIT_SEC` is only how long the POST is
+# willing to wait for a WARM resolve to finish, not a timeout on the work.
+_PREVIEW_PENDING_INLINE_WAIT_SEC = 2.5
+# The resolve pool is deliberately separate from PREVIEW_EXECUTOR: a pending
+# resolve is not on any request's critical path, and PREVIEW_EXECUTOR workers
+# are what the attach/segment requests need.
+_PENDING_RESOLVE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="preview-pending"
+)
+_PENDING_ADOPT_LOCK = threading.Lock()
+
+
+def _pending_session_shell(
+    url: str,
+    crop_start: float,
+    crop_end: float,
+    prefer_height: int,
+) -> PreviewSession:
+    """A registered, not-yet-resolved session that the client can already hold."""
+    import tempfile
+
+    session_id = secrets.token_hex(8)
+    # A REAL directory, never the dataclass default `Path()` — that is ".", and
+    # _finalize_delete rmtrees cache_dir: deleting a pending session would have
+    # tried to wipe the process CWD. Cheap and disposable; adoption removes it.
+    shell_cache = Path(tempfile.mkdtemp(prefix="vodrip-pending-"))
+    shell = PreviewSession(
+        session_id=session_id,
+        vod_url=url,
+        master_url="",
+        entry_url="",
+        platform=detect_platform(url),
+        crop_start=crop_start,
+        crop_end=crop_end,
+        prefer_height=prefer_height or 360,
+        kind="hls",
+        mux_status="pending",
+        cache_dir=shell_cache,
+        resolving=True,
+        resolve_error=None,
+    )
+    shell.timing_created_mono = time.monotonic()
+    # NO _cleanup_stale_sessions() and NO _persist_sessions() here. Both take
+    # the manager lock and the second serialises every session to JSON; a
+    # channel warm wave keeps hundreds of sessions alive, so paying that on the
+    # user's click path bought nothing (create_session does its own sweep a few
+    # milliseconds later) and cost the media plane its responsiveness.
+    with _manager._lock:
+        _manager._sessions[session_id] = shell
+    return shell
+
+
+def _adopt_resolved_session(shell: PreviewSession, resolved: PreviewSession) -> None:
+    """Move a finished resolve's state onto the shell WITHOUT changing its id.
+
+    The id must survive: the client already holds master/playback URLs built
+    from it. The shell also keeps its own TTL clock and its closed flags.
+    """
+    keep = {
+        "session_id", "last_access", "closed", "closed_at",
+        "timing_created_mono", "resolving", "resolve_error", "resolve_exc",
+    }
+    shell_cache = shell.cache_dir
+    with _PENDING_ADOPT_LOCK:
+        state = {
+            k: v for k, v in vars(resolved).items() if k not in keep
+        }
+        vars(shell).update(state)
+        shell.resolving = False
+        shell.resolve_error = None
+    # The placeholder dir from the shell is not the resolved one — drop it, or
+    # every pending click leaves an empty temp directory behind.
+    try:
+        if shell_cache != shell.cache_dir and shell_cache.is_dir():
+            shutil.rmtree(shell_cache, ignore_errors=True)
+    except OSError:
+        pass
+    old_id = resolved.session_id
+    if old_id != shell.session_id:
+        # The resolve built several values with ITS OWN id baked in: the
+        # synthetic master's resource URLs and `master_url` (which the proxy
+        # re-fetches for sessions without a custom master). Adoption changes
+        # the id the client holds, so those must follow it — otherwise the
+        # master loads and every segment 404s: the player sits at readyState 0
+        # with no error (measured 2026-10-21 on the first browser click after
+        # adoption).
+        #
+        # EXPLICIT field list, never a blanket walk: `cache_dir` and
+        # `cached_progressive_path` are filesystem paths that contain the id as
+        # a DIRECTORY NAME, and rewriting them would point at a directory that
+        # does not exist.
+        for attr in ("master_url", "entry_url", "custom_master"):
+            value = getattr(shell, attr, None)
+            if isinstance(value, str) and old_id in value:
+                setattr(shell, attr, value.replace(old_id, shell.session_id))
+        resource_map = getattr(shell, "resource_map", None)
+        if isinstance(resource_map, dict):
+            shell.resource_map = {
+                key: (value.replace(old_id, shell.session_id)
+                      if isinstance(value, str) else value)
+                for key, value in resource_map.items()
+            }
+    # Drop the duplicate registration. Do NOT delete_session(): that schedules
+    # an rmtree of cache_dir, which the shell now owns (both point at the same
+    # directory). The background mux jobs the resolve started are re-armed
+    # below under the shell's id.
+    if resolved.session_id != shell.session_id:
+        with _manager._lock:
+            _manager._sessions.pop(resolved.session_id, None)
+    if getattr(shell, "closed", False):
+        # Closed while the resolve was landing: the registry no longer holds
+        # this object, so nothing will ever serve from it — free the bytes
+        # instead of leaking a full session until the TTL sweep.
+        shutil.rmtree(shell.cache_dir, ignore_errors=True)
+        return
+    if getattr(shell, "dash_window_hls", False):
+        schedule_youtube_window_hls_mux(shell.session_id)
+    elif _youtube_entry_needs_mux(shell):
+        schedule_youtube_preview_mux(shell.session_id)
+    # The resolve's own `_warm_and_prewarm_session` thread was keyed to the id
+    # we just dropped, so it no-ops on lookup. Re-arm the prewarm for the id the
+    # client actually holds — without it the first segment is fetched by the
+    # player's first playlist request instead of being on disk.
+    threading.Thread(
+        target=_warm_and_prewarm_session,
+        args=(shell.session_id, float(getattr(shell, "crop_start", 0.0) or 0.0)),
+        daemon=True,
+        name=f"pending-prewarm-{shell.session_id[:8]}",
+    ).start()
+
+
+def _resolve_pending_session(
+    shell: PreviewSession,
+    url: str,
+    crop_start: float,
+    crop_end: float,
+    prefer_height: int,
+) -> None:
+    try:
+        resolved = _manager.create_session(
+            url,
+            crop_start,
+            crop_end,
+            prefer_height=prefer_height,
+        )
+    except Exception as exc:  # noqa: BLE001 - surfaced through /status
+        logger.warning(
+            "preview pending resolve failed url=%s: %s: %s",
+            url[:100],
+            type(exc).__name__,
+            str(exc)[:300],
+        )
+        shell.resolve_error = f"{type(exc).__name__}: {exc}"[:400]
+        shell.resolve_exc = exc
+        shell.mux_status = "error"
+        shell.resolving = False
+        return
+    try:
+        _adopt_resolved_session(shell, resolved)
+    except Exception:  # noqa: BLE001 - never leave a shell resolving forever
+        logger.warning(
+            "preview pending adopt failed sid=%s", shell.session_id[:8], exc_info=True
+        )
+        shell.resolve_error = "preview session could not be adopted"
+        shell.mux_status = "error"
+        shell.resolving = False
+        return
+
+
+def create_session_pending(
+    url: str,
+    crop_start: float = 0.0,
+    crop_end: float = 0.0,
+    prefer_height: int = 360,
+    origin: str = "user",
+    inline_wait_sec: float = _PREVIEW_PENDING_INLINE_WAIT_SEC,
+) -> PreviewSession:
+    """Register a preview session NOW, resolve it on a worker.
+
+    Returns in ~inline_wait_sec worst case (2 s). The returned object mutates in
+    place: `resolving` flips to False when the resolve lands, and every field
+    the response builder reads (variant_heights, trim_timeline, mux bounds,
+    duration) is filled then. A warm click — snapshot hit, Twitch, Kick — still
+    completes inline and returns a fully-resolved session, so no client path
+    changes for it.
+    """
+    prefer_height = prefer_height or 360
+    shell = _pending_session_shell(url, crop_start, crop_end, prefer_height)
+    done = threading.Event()
+
+    def _job() -> None:
+        try:
+            _resolve_pending_session(shell, url, crop_start, crop_end, prefer_height)
+        finally:
+            done.set()
+
+    _PENDING_RESOLVE_EXECUTOR.submit(_job)
+    done.wait(max(0.0, inline_wait_sec))
+    return shell
+
 if __name__ == "__main__":
     assert _formats_are_dash_https([{"protocol": "https", "url": "https://x/v.mp4"}])
     assert not _formats_are_dash_https(

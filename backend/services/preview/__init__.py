@@ -175,6 +175,7 @@ from services.preview.session import (
     _youtube_prog_head_warm,
     _youtube_refresh_and_remap,
     create_live_session,
+    create_session_pending,
     create_session,
     youtube_create_inflight,
     delete_session,    get_master_playlist,

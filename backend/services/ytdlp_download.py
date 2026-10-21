@@ -261,7 +261,20 @@ async def get_video_info(url: str, settings_mgr=None) -> VideoInfo:
         rich_task = (
             loop.run_in_executor(INFO_EXECUTOR, _enrich) if _ladder_capped() else None
         )
-        rich = await rich_task if rich_task is not None else None
+        if rich_task is not None:
+            # The enrichment is a QUALITY-ONLY pass (720/1080 tiers on top of a
+            # capped ladder) and it fans out several InnerTube clients at up to
+            # 12 s. Blocking the paste on it is what made /api/info/video answer
+            # in 14-24 s (measured 2026-10-21). The owner's rule is <=3 s or
+            # fail, and a capped ladder is a perfectly usable answer: keep it,
+            # cap the enrichment, and let the preview's own resolve supply the
+            # full ladder (it runs the same multi-client pass).
+            try:
+                rich = await asyncio.wait_for(rich_task, timeout=3.0)
+            except Exception:  # noqa: BLE001 - timeout or enrichment failure
+                rich = None
+        else:
+            rich = None
     else:
         info = await loop.run_in_executor(INFO_EXECUTOR, _extract)
         rich = None

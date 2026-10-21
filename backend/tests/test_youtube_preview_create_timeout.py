@@ -1,205 +1,179 @@
-"""Regression: preview session create POSTs must never hang forever.
+"""Instant create: the preview POST never waits for the upstream resolve.
 
-The 'Starting preview…' spinner had no terminal event when
-`create_session` wedged (stuck yt-dlp/InnerTube/CDN pass occupying a
-PREVIEW_EXECUTOR worker): the request hung until the client's own 60s fetch
-timeout. The router now wraps every preview create in a hard wall-clock
-timeout (VODRIP_PREVIEW_CREATE_TIMEOUT_SEC, default 45s) and returns 504.
+Rewritten 2026-10-21. The previous contract was "the POST waits, and a wedged
+resolve is cut by a wall-clock timeout (504)". That contract could not deliver
+the owner's requirement — a cold click answering in <=3 s — because the wait it
+bounded IS the honest duration of an unauthenticated YouTube resolve (measured
+10.4-13.6 s through the Vite proxy). Every cap tried made it worse: 4 s failed
+100% of cold clicks, 8 s cut the 10-13 s ones, 15 s only made the failure rarer.
+
+The contract now: the POST registers the session and answers immediately
+(`resolving: true`), the resolve runs on its own pool, and its result is
+adopted under the SAME session id. Failure is not a timeout — it is a terminal
+`resolve_error` on the status poll. There is no 504 path left to test.
 
 Run from anywhere: `python backend/tests/test_youtube_preview_create_timeout.py`
 """
 from __future__ import annotations
 
-# ponytail: anchor to backend/ so `from app import app` resolves.
 import os
 import sys
 import time
-
-# Set BEFORE importing the app — the router reads the constant at import time.
-os.environ["VODRIP_PREVIEW_CREATE_TIMEOUT_SEC"] = "0.5"
 
 _backend_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 if _backend_root not in sys.path:
     sys.path.insert(0, _backend_root)
 
 from fastapi.testclient import TestClient
+
 from app import app
-from routers import preview as preview_router
+from routers import preview as preview_router  # noqa: F401  (import keeps wiring honest)
+from services.preview import session as preview_session
 
 YT_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 TWITCH_URL = "https://www.twitch.tv/videos/123456789"
 
 
-def test_preview_create_returns_504_when_create_session_hangs():
-    """A wedged create_session must produce a prompt 504, not a hanging POST."""
+class _Resolved:
+    """A resolved session, shaped enough for adoption + response building.
 
-    def _stuck(*_args, **_kwargs):
-        time.sleep(60)  # simulates a wedged extract — must never return here
-        raise AssertionError("stubbed create_session returned — timeout failed")
+    Everything is set on the INSTANCE: adoption copies `vars(resolved)`, so
+    class attributes (or a __getattr__ fallback) would silently vanish.
+    """
 
-    # The env var is read at app-import time; in a full-suite run another
-    # test imports the app first and the 0.5 never applies. Pin the module
-    # constant directly so this test is order-independent (5.0 = the clamp
-    # floor the env path would produce for 0.5).
-    original_timeout = preview_router._PREVIEW_CREATE_HARD_TIMEOUT_SEC
-    preview_router._PREVIEW_CREATE_HARD_TIMEOUT_SEC = 5.0
-    original = preview_router.create_session
-    preview_router.create_session = _stuck
+    def __init__(self, delay: float = 0.0):
+        self.session_id = "internal-resolve-id"
+        self.vod_url = TWITCH_URL
+        self.master_url = "https://cdn.example/master.m3u8"
+        self.entry_url = "https://cdn.example/master.m3u8"
+        self.kind = "hls"
+        self.platform = "Twitch"
+        self.variant_entries = [(720, "https://cdn.example/720.m3u8")]
+        self.variant_muxed = {}
+        self.custom_master = None
+        self.mux_status = "unnecessary"
+        self.mux_error = None
+        self.crop_start = 0.0
+        self.crop_end = 30.0
+        self.vod_duration = 90.0
+        self.prefer_height = 360
+        self.closed = False
+        self.closed_at = 0.0
+        self.is_live = False
+        self.growing_vod = False
+        self.anonymous = False
+        self.http_headers = {}
+        self.resource_map = {}
+        self.cache_dir = preview_session.Path("G:/Temp/instant-create-fixture")
+        self.last_access = time.time()
+        self.delay = delay
+
+
+def _wait_resolved(session_id: str, timeout: float = 10.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        shell = preview_session.peek_session(session_id)
+        if shell is not None and not shell.resolving:
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"session {session_id} never finished resolving")
+
+
+def test_pending_create_answers_immediately_while_the_resolve_is_slow(monkeypatch):
+    """A 4 s resolve must not hold the POST: the contract is <=3 s, always."""
+    def _slow(*_args, **_kwargs):
+        time.sleep(4.0)  # a cold YouTube resolve, in miniature
+        return _Resolved()
+
+    monkeypatch.setattr(preview_session._manager, "create_session", _slow)
+    with TestClient(app) as c:
+        t0 = time.monotonic()
+        resp = c.post("/api/preview/session", json={"url": TWITCH_URL})
+        elapsed = time.monotonic() - t0
+        assert resp.status_code == 200, (resp.status_code, resp.text[:256])
+        body = resp.json()
+        assert body["resolving"] is True, body
+        assert body["variant_heights"] == [], body
+        # The owner's hard rule: a click answers in <=3 s, or fails. The inline
+        # window (2.5 s) is what this bounds — NOT the resolve.
+        assert elapsed < 3.0, f"POST held the resolve for {elapsed:.2f}s"
+        # ... and the session it returned is already addressable.
+        st = c.get(f"/api/preview/session/{body['session_id']}/status").json()
+        assert st["resolving"] is True
+        assert st["playlist_ready"] is False
+        assert st["mux_ready"] is False
+        _wait_resolved(body["session_id"])
+        # The refetch the client does after the poll: full body, same id.
+        full = c.get(f"/api/preview/session/{body['session_id']}").json()
+        assert full["session_id"] == body["session_id"]
+        assert full["resolving"] is False
+        assert full["variant_heights"] == [720]
+        c.delete(f"/api/preview/session/{body['session_id']}")
+
+
+def test_a_pending_shell_never_reads_as_ready():
+    """The Twitch/Kick landmine: with no variants, those platforms are "ready".
+
+    `preview_playlist_ready` returns True for every non-YouTube session, so an
+    unresolved shell would have let the client attach an empty playlist and
+    stall. All three predicates must refuse while `resolving` is true.
+    """
+    shell = preview_session._pending_session_shell(TWITCH_URL, 0.0, 0.0, 360)
     try:
-        with TestClient(app) as c:
-            for label, url in (("YouTube", YT_URL), ("Twitch", TWITCH_URL)):
-                t0 = time.monotonic()
-                resp = c.post("/api/preview/session", json={"url": url})
-                elapsed = time.monotonic() - t0
-                assert resp.status_code == 504, (
-                    f"expected 504 from timed-out {label} create, got "
-                    f"{resp.status_code}: {resp.text[:256]}"
-                )
-                assert elapsed < 12.0, f"{label} 504 arrived after {elapsed:.1f}s"
-                assert "timed out" in resp.json().get("detail", "").lower()
+        assert shell.resolving is True
+        assert preview_session.preview_playlist_ready(shell) is False
+        assert preview_session.preview_segment_buffer_ready(shell) is False
+        assert preview_session.preview_mux_ready(shell) is False
+        assert preview_session.session_variant_heights(shell) == []
+        # A real directory, never the dataclass default `Path()` ("."): the
+        # delete path rmtrees cache_dir, so "." would mean the process CWD.
+        assert str(shell.cache_dir) not in ("", "."), shell.cache_dir
     finally:
-        preview_router.create_session = original
-        preview_router._PREVIEW_CREATE_HARD_TIMEOUT_SEC = original_timeout
+        preview_session._manager._sessions.pop(shell.session_id, None)
 
 
-def test_youtube_create_passthrough_when_fast():
-    """A fast YouTube create still returns 200 (timeout must not clip success)."""
+def test_resolve_failure_is_a_terminal_status_not_a_timeout(monkeypatch):
+    """A dead VOD says so at the poll, immediately — no 15 s spinner, no 504."""
 
-    class _FakeSession:
-        session_id = "sess-test-timeout-0001"
-        kind = "hls"
-        platform = "YouTube"
-        vod_url = YT_URL
-        master_url = "/api/preview/hls/sess-test-timeout-0001/master.m3u8"
-        entry_url = "/api/preview/hls/sess-test-timeout-0001/master.m3u8"
-        crop_start = 0.0
-        crop_end = 0.0
-        vod_duration = 120.0
-        variant_entries = [(360, "/api/preview/hls/sess-test-timeout-0001/master.m3u8")]
-        http_headers = {}
-        cache_dir = None
-        active_height = 360
-        anonymous = True
-        is_live = False
-        channel_language = ""
-        trim_timeline = False
-        window_hls_mux_start = 0
-        window_hls_mux_end = 0
-        cached_progressive = False
-        segment_buffer_ready = True
-        playlist_ready = True
-        mux_status = "ready"
-        extract_source = "test"
+    def _boom(*_args, **_kwargs):
+        raise ValueError("upstream says gone")
 
-    def _fast(*_args, **_kwargs):
-        return _FakeSession()
-
-    original = preview_router.create_session
-    preview_router.create_session = _fast
-    try:
-        with TestClient(app) as c:
-            resp = c.post("/api/preview/session", json={"url": YT_URL})
-    finally:
-        preview_router.create_session = original
-
-    assert resp.status_code == 200, (
-        f"expected 200 from fast stub create, got {resp.status_code}: "
-        f"{resp.text[:256]}"
+    monkeypatch.setattr(preview_session._manager, "create_session", _boom)
+    shell = preview_session.create_session_pending(
+        "https://www.twitch.tv/videos/1", inline_wait_sec=0.0
     )
+    _wait_resolved(shell.session_id)
+    st = preview_session.preview_session_mux_status(shell.session_id)
+    assert st["resolving"] is False
+    assert "upstream says gone" in str(st["resolve_error"])
+    assert st["mux_ready"] is False
+    preview_session._manager._sessions.pop(shell.session_id, None)
+
+
+def test_a_fast_resolve_is_adopted_under_the_same_session_id(monkeypatch):
+    """The client already holds URLs built from the id it was given."""
+    monkeypatch.setattr(
+        preview_session._manager, "create_session", lambda *a, **kw: _Resolved()
+    )
+    shell = preview_session.create_session_pending(TWITCH_URL, inline_wait_sec=0.0)
+    given_id = shell.session_id
+    _wait_resolved(given_id)
+    try:
+        assert shell.session_id == given_id, "adoption must not change the id"
+        assert shell.variant_entries == [(720, "https://cdn.example/720.m3u8")]
+        assert preview_session.session_variant_heights(shell) == [720]
+        assert preview_session.preview_playlist_ready(shell) is True
+        assert "internal-resolve-id" not in preview_session._manager._sessions
+    finally:
+        preview_session._manager._sessions.pop(given_id, None)
 
 
 if __name__ == "__main__":
-    test_preview_create_returns_504_when_create_session_hangs()
-    test_youtube_create_passthrough_when_fast()
-    print("OK: youtube preview create timeout tests passed")
+    import inspect
 
-
-def test_a_follower_gets_the_longer_budget(monkeypatch):
-    """Retry after a 504 must be allowed to wait for the leader it joined.
-
-    Measured 2026-10-21: a cold YouTube click answered 504 at 8.0s and the SAME
-    video answered in 0.04s two minutes later, from the snapshot the abandoned
-    resolve filled. The client's retry arrives 1.2s after the 504 - while the
-    leader is still working - so capping it with the leader's short budget
-    guarantees a second failure for work that is already being done.
-    """
-    import threading
-
-    class _FakeSession:
-        session_id = "sess-follower-0001"
-        kind = "progressive"
-        platform = "YouTube"
-        vod_url = YT_URL
-        master_url = "/api/preview/hls/sess-follower-0001/master.m3u8"
-        entry_url = "/api/preview/hls/sess-follower-0001/master.m3u8"
-        crop_start = 0.0
-        crop_end = 0.0
-        vod_duration = 120.0
-        variant_entries = [(360, "/api/preview/hls/sess-follower-0001/master.m3u8")]
-        http_headers = {}
-        cache_dir = None
-        active_height = 360
-        anonymous = False
-        is_live = False
-        channel_language = ""
-        trim_timeline = False
-        window_hls_mux_start = 0
-        window_hls_mux_end = 0
-        cached_progressive = False
-        segment_buffer_ready = True
-        playlist_ready = True
-        mux_status = "ready"
-        extract_source = "test"
-        custom_master = False
-        dash_window_hls = False
-        prefer_height = 480
-        stale = False
-
-        def __getattr__(self, name):  # any other field reads as unset
-            if name.startswith("__"):
-                raise AttributeError(name)
-            return None
-
-    started = threading.Event()
-
-    def _slow(*_args, **_kwargs):
-        started.set()
-        time.sleep(1.2)          # longer than the short cap, shorter than the follow budget
-        return _FakeSession()
-
-    monkeypatch.setattr(preview_router, "create_session", _slow)
-    monkeypatch.setattr(preview_router, "youtube_create_inflight", lambda url: True)
-    monkeypatch.setattr(preview_router, "_PREVIEW_CREATE_HARD_TIMEOUT_SEC", 0.4)
-    monkeypatch.setattr(preview_router, "_PREVIEW_CREATE_FOLLOW_TIMEOUT_SEC", 10.0)
-    with TestClient(app) as c:
-        t0 = time.monotonic()
-        resp = c.post("/api/preview/session", json={"url": YT_URL})
-        elapsed = time.monotonic() - t0
-    # What this pins is the BUDGET CHOICE: the follower outlived the 0.4s short
-    # cap instead of being cut by it. The response shape is not the subject here
-    # (the fake session is deliberately incomplete, and
-    # test_youtube_create_passthrough_when_fast covers the 200 path with a
-    # complete one), so any status but 504 passes.
-    assert resp.status_code != 504, (
-        f"follower was cut by the leader's short cap after {elapsed:.2f}s: "
-        f"{resp.status_code} {resp.text[:160]}"
-    )
-    assert elapsed >= 1.0, f"follower returned before the leader finished ({elapsed:.2f}s)"
-
-
-def test_a_leader_still_fails_fast(monkeypatch):
-    """No leader in flight -> the short cap applies, so the UI never hangs."""
-    def _stuck(*_args, **_kwargs):
-        time.sleep(30)
-        raise AssertionError("stub returned - the timeout failed to cut it")
-
-    monkeypatch.setattr(preview_router, "create_session", _stuck)
-    monkeypatch.setattr(preview_router, "youtube_create_inflight", lambda url: False)
-    monkeypatch.setattr(preview_router, "_PREVIEW_CREATE_HARD_TIMEOUT_SEC", 0.4)
-    monkeypatch.setattr(preview_router, "_PREVIEW_CREATE_FOLLOW_TIMEOUT_SEC", 10.0)
-    with TestClient(app) as c:
-        t0 = time.monotonic()
-        resp = c.post("/api/preview/session", json={"url": YT_URL})
-        elapsed = time.monotonic() - t0
-    assert resp.status_code == 504, (resp.status_code, resp.text[:200])
-    assert elapsed < 5.0, f"leader 504 arrived after {elapsed:.2f}s (short cap was 0.4s)"
+    for name, fn in list(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            if inspect.signature(fn).parameters:
+                continue  # monkeypatch-based, run under pytest
+            fn()
+    print("OK: instant preview create tests passed")
