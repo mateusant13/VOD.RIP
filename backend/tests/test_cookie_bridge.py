@@ -752,8 +752,14 @@ async def test_settings_does_not_return_bridge_token(client):
     assert resp.status_code == 200
     assert resp.json()["cookie_bridge_token"] == ""
 
-async def test_auto_install_short_circuits_when_paired(client, monkeypatch):
-    """Already-paired -> {alreadyInstalled:true} and NO automation thread."""
+async def test_auto_install_short_circuits_when_extension_proven(client, monkeypatch):
+    """Paired AND positively loaded -> {alreadyInstalled:true}, NO thread.
+
+    The pair (token + proof) is the contract. A token alone used to be enough,
+    and that is how an extension that had never been loaded was reported as
+    installed (measured 2026-10-20) - see the test below, which pins the other
+    half of the same decision.
+    """
     from routers import cookie_bridge as cb
 
     resp = await client.post("/api/session/cookies", json={
@@ -761,6 +767,7 @@ async def test_auto_install_short_circuits_when_paired(client, monkeypatch):
     })
     assert resp.status_code == 200
 
+    monkeypatch.setattr(cb, "_extension_is_loaded", lambda: True)
     captured: list = []
     monkeypatch.setattr("routers.cookie_bridge.threading.Thread", _capture_thread(captured))
     resp = await client.post("/api/session/cookies/auto-install")
@@ -769,10 +776,101 @@ async def test_auto_install_short_circuits_when_paired(client, monkeypatch):
     assert body["ok"] is True
     assert body["alreadyInstalled"] is True
     assert body["installed"] is True
-    assert _auto_install_threads(captured) == [], "no thread may spawn when already paired"
+    assert _auto_install_threads(captured) == [], "no thread may spawn when the extension is proven loaded"
 
     status = (await client.get("/api/session/cookies/status")).json()
     assert status["auto_install"]["installed"] is True
+
+
+async def test_auto_install_runs_when_paired_but_extension_unproven(client, monkeypatch, tmp_path):
+    """Paired token WITHOUT proof the extension is loaded -> run the driver.
+
+    This is the regression that cost the owner a working cookie bridge: the
+    route short-circuited on `_paired_token()` alone, CDP's target list carried
+    seven extensions and not ours, and nothing ever installed it.
+    """
+    from routers import cookie_bridge as cb
+
+    resp = await client.post("/api/session/cookies", json={
+        "token": "tok-1", "cookies": [],
+    })
+    assert resp.status_code == 200
+
+    src = tmp_path / "ext-src"
+    src.mkdir()
+    (src / "manifest.json").write_text('{"name": "x"}', encoding="utf-8")
+    monkeypatch.setattr(cb, "_materialize_ext_src", lambda: src)
+    monkeypatch.setattr(cb, "_find_browser", lambda name: Path("C:/chrome.exe") if name == "chrome" else None)
+    monkeypatch.setattr(cb, "_extension_is_loaded", lambda: False)
+
+    captured: list = []
+    monkeypatch.setattr("routers.cookie_bridge.threading.Thread", _capture_thread(captured))
+    resp = await client.post("/api/session/cookies/auto-install")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["started"] is True
+    assert len(_auto_install_threads(captured)) == 1, "a paired token alone must not skip the install"
+
+
+_EXT_ORIGIN = "chrome-extension://dhigalkfljfbfhakdbimadcamcmeimon"
+
+
+async def test_extension_origin_can_repair_a_mismatched_token(client):
+    """A push from chrome-extension:// re-pairs itself instead of 403ing forever.
+
+    Measured 2026-10-20 in the API access log, every ~30 s:
+      GET  /api/session/cookies/token 403
+      POST /api/session/cookies       403
+    The extension's token (its own chrome.storage.local UUID) never matched the
+    backend's, and the endpoint it uses to ADOPT the backend token was behind
+    the same check - an unrecoverable loop that looked like a working install
+    because `paired` was true from a CDP import.
+    """
+    from routers import cookie_bridge as cb
+
+    first = await client.post("/api/session/cookies", json={"token": "tok-1", "cookies": []})
+    assert first.status_code == 200
+
+    resp = await client.post(
+        "/api/session/cookies",
+        json={"token": "tok-2", "cookies": []},
+        headers={"Origin": _EXT_ORIGIN},
+    )
+    assert resp.status_code == 200, resp.text
+    assert cb._paired_token() == "tok-2", "the extension's token is adopted"
+    status = (await client.get("/api/session/cookies/status")).json()
+    assert status["paired"] is True
+    assert status["auto_install"]["installed"] is True, "an accepted push proves the install"
+    assert status["auto_install"]["extension_id"] == _EXT_ORIGIN.rsplit("/", 1)[-1]
+
+
+async def test_plain_web_origin_still_cannot_repair(client):
+    """The repair is extension-only: a web page's Origin must not re-pair."""
+    first = await client.post("/api/session/cookies", json={"token": "tok-1", "cookies": []})
+    assert first.status_code == 200
+
+    resp = await client.post(
+        "/api/session/cookies",
+        json={"token": "tok-2", "cookies": []},
+        headers={"Origin": "http://localhost:5173"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "token mismatch"
+
+
+async def test_token_endpoint_serves_extension_origin(client):
+    """The extension must be able to LEARN the token; pages still need it."""
+    first = await client.post("/api/session/cookies", json={"token": "tok-1", "cookies": []})
+    assert first.status_code == 200
+
+    ok = await client.get("/api/session/cookies/token", headers={"Origin": _EXT_ORIGIN})
+    assert ok.status_code == 200
+    assert ok.json()["token"] == "tok-1"
+
+    denied = await client.get(
+        "/api/session/cookies/token", headers={"Origin": "http://localhost:5173"}
+    )
+    assert denied.status_code == 403
 
 
 async def test_auto_install_skips_when_extension_active_but_depaired(client, monkeypatch):
@@ -1118,3 +1216,53 @@ def test_real_appdata_db_untouched():
     assert hits == 0 and msg_hits == 0, (
         "test-only marker rows found in the real archive.db — the suite leaked"
     )
+
+# --- reload directive: the status version and the clear condition -------------
+# Both of these regressed in production on 2026-10-21: a REAL, successful
+# zero-window reload to 0.8.35 was reported as "reload directive not cleared
+# within 90s" because _ext_bundled_version() answered dist/'s stale 0.8.34 and
+# reload-done compared the fresh SW's (correct) 0.8.35 against it.
+
+def _staged_manifest(tmp_path, version):
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    (staged / "manifest.json").write_text(json.dumps({"version": version}), encoding="utf-8")
+    return staged
+
+
+def test_bundled_version_prefers_the_folder_chrome_actually_loads(monkeypatch, tmp_path):
+    from routers import cookie_bridge as cb
+
+    monkeypatch.setattr(cb, "_ext_src_dir", lambda: _staged_manifest(tmp_path, "0.8.35"))
+    assert cb._ext_bundled_version() == "0.8.35"
+
+
+async def test_reload_done_clears_when_the_fresh_sw_reports_the_directive_target(
+    monkeypatch, tmp_path
+):
+    """A reload that HAPPENED must clear, even when dist/ is not rebuilt yet."""
+    from routers import cookie_bridge as cb
+
+    monkeypatch.setattr(cb, "_reload_directive_path", lambda: tmp_path / "reload.json")
+    monkeypatch.setattr(cb, "_ext_src_dir", lambda: _staged_manifest(tmp_path, "0.8.34"))
+    await cb.extension_reload({"to": "0.8.35"})
+    assert cb._read_reload_directive() == "0.8.35"
+
+    body = await cb.extension_reload_done({"version": "0.8.35"})
+    assert body["cleared"] is True
+    assert cb._read_reload_directive() is None
+
+
+async def test_reload_done_ignores_a_version_the_directive_did_not_ask_for(
+    monkeypatch, tmp_path
+):
+    """The stale SW still running the old build must not clear the directive."""
+    from routers import cookie_bridge as cb
+
+    monkeypatch.setattr(cb, "_reload_directive_path", lambda: tmp_path / "reload.json")
+    monkeypatch.setattr(cb, "_ext_src_dir", lambda: _staged_manifest(tmp_path, "0.8.34"))
+    await cb.extension_reload({"to": "0.8.35"})
+
+    body = await cb.extension_reload_done({"version": "0.8.34"})
+    assert body["cleared"] is False
+    assert cb._read_reload_directive() == "0.8.35"

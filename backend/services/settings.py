@@ -29,6 +29,11 @@ def _get_appdata_dir() -> Path:
     return base / "VOD.RIP"
 
 
+def app_data_dir() -> Path:
+    """Public name for the %APPDATA%\\VOD.RIP root that every store binds to."""
+    return _get_appdata_dir()
+
+
 def cache_root() -> Optional[Path]:
     """Effective root for the large ephemeral on-disk caches (yt-dlp cache,
     transcript-fix cache, temp files). AI model weights do NOT live here —

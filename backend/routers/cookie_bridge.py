@@ -95,6 +95,33 @@ def _require_loopback(request: Request) -> None:
         raise HTTPException(status_code=403, detail="loopback host required")
 
 
+def _extension_origin(request: Request) -> str:
+    """Extension id from the request's Origin, or '' when it is not one.
+
+    THE PAIRING DEADLOCK THIS BREAKS (measured 2026-10-20): the extension keeps
+    a token in chrome.storage.local that it generates on first run; the backend
+    keeps its own in settings. When they differ, every POST /api/session/cookies
+    is 403 "token mismatch", and the extension's recovery path — GET
+    /api/session/cookies/token to adopt the backend's — was behind the SAME
+    token check, so it answered 403 forever too. Access logs showed the loop
+    repeating every ~30 s: `GET /token 403`, `POST /cookies 403`, with the
+    cookie store never receiving a single extension push. The bridge reported
+    `paired: true` the whole time (a CDP import had set the token), which is why
+    this looked like a working install.
+
+    A web page cannot forge `Origin: chrome-extension://<id>` — the browser sets
+    it — so a request carrying one IS an extension, and re-pairing to the token
+    it presents is safe. Local processes could forge the header, but they can
+    already read settings.json where the token lives, so this does not widen the
+    trust boundary; it only stops a legitimate extension from being locked out.
+    """
+    origin = (request.headers.get("origin") or "").strip().lower()
+    prefix = "chrome-extension://"
+    if not origin.startswith(prefix):
+        return ""
+    return origin[len(prefix):].strip("/")
+
+
 def _require_bridge_auth(request: Request, token: Optional[str] = None) -> None:
     s = settings_mgr.get()
     if not s.cookie_bridge_enabled:
@@ -228,14 +255,27 @@ def _ext_version() -> str:
 
 
 def _ext_bundled_version() -> str:
-    """Version of the extension copy the APP ships — the target a live
-    unpacked install should be reloaded to. Mirrors where the codebase
-    stages the folder: dist/VOD-RIP/cookie-extension/src in dev
-    (scripts/stage-cookie-extension.mjs), <install>/cookie-extension/src in
-    a frozen onedir (the path __main_launcher__._materialize_cookie_extension
-    writes), falling back to the vendored source the release builds from.
+    """Version of the extension copy that is ACTUALLY LOADED, then of the
+    copies the app ships — the target a live unpacked install should be
+    reloaded to.
+
+    Order matters and it used to be wrong: the staged folder under the app
+    data dir (``_ext_src_dir()``) is the one Chrome has loaded, so it is the
+    FIRST candidate. It came last-and-absent before, which made this function
+    answer ``dist/``'s stale ``0.8.34`` while the browser was already running
+    the staged ``0.8.35`` — and ``/api/extension/reload-done`` compares
+    against this value, so a SUCCESSFUL reload was reported as a failure and
+    the 90 s poll in ``cookie_extension_auto_install.ps1 -ReloadOnly``
+    reported "reload directive not cleared" for a reload that had already
+    happened.
+
+    Then the packaged layouts: <install>/cookie-extension/src in a frozen
+    onedir (what __main_launcher__._materialize_cookie_extension writes),
+    dist/VOD-RIP/cookie-extension/src in dev (scripts/stage-cookie-extension.mjs),
+    and finally the vendored source the release builds from.
     """
     candidates: list[Path] = []
+    candidates.append(_ext_src_dir())
     if getattr(sys, "frozen", False):
         candidates.append(Path(sys.executable).resolve().parent / "cookie-extension" / "src")
     candidates.append(Path(__file__).resolve().parents[2] / "dist" / "VOD-RIP" / "cookie-extension" / "src")
@@ -661,10 +701,21 @@ async def extension_reload(body: dict):
 @router.post("/api/extension/reload-done")
 async def extension_reload_done(body: dict):
     """Fresh-SW confirmation: clears the directive when the reported version
-    matches the app's staged copy. The SW only confirms after matching, so a
-    clear IS the proof the new version is live."""
+    is the version the directive ASKED FOR (or, with no directive armed, when
+    it is the loaded/staged copy). The SW only confirms after matching, so a
+    clear IS the proof the new version is live.
+
+    Comparing against ``_ext_bundled_version()`` alone was the bug: with a
+    directive armed to a version that is staged in the app data folder but
+    not yet rebuilt into ``dist/``, the fresh SW reported the RIGHT version
+    and this handler refused to clear, so the caller's poll timed out and
+    told the operator the reload failed after it had succeeded.
+    """
     version = (body.get("version") or "").strip()
-    cleared = bool(version) and version == _ext_bundled_version()
+    target = _read_reload_directive()
+    cleared = bool(version) and (
+        version == target if target else version == _ext_bundled_version()
+    )
     if cleared:
         _clear_reload_directive()
         logger.info("cookie extension reload confirmed at %s — directive cleared", version)
@@ -700,6 +751,120 @@ _AUTO_INSTALL_STATE = {
     "finished_at": None,
 }
 
+# --- install marker ----------------------------------------------------------
+# The install fact used to live only in this process dict, so every restart
+# forgot it: the route fell back to `_ext_id()` (the PACKED crx key, which is
+# NOT the id Chrome assigns to an unpacked folder that carries no `key` in its
+# manifest - measured 2026-10-20: installed `dhigalkfljfbfhakdbimadcamcmeimon`
+# vs `_ext_id()` `gmdghhhegfcggalimbdaladmebaokcgd`), concluded "not
+# installed", and re-ran the UIA driver on every boot.
+_INSTALL_MARKER_NAME = "cookie-extension-install.json"
+
+
+def _install_marker_path() -> Path:
+    from services.settings import app_data_dir
+
+    return app_data_dir() / _INSTALL_MARKER_NAME
+
+
+def _write_install_marker() -> None:
+    with _AUTO_INSTALL_LOCK:
+        payload = {
+            "installed": bool(_AUTO_INSTALL_STATE.get("installed")),
+            "extension_id": str(_AUTO_INSTALL_STATE.get("extension_id") or ""),
+            "finished_at": _AUTO_INSTALL_STATE.get("finished_at"),
+        }
+    try:
+        path = _install_marker_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    except OSError:
+        logger.debug("cookie install marker not written", exc_info=True)
+
+
+def _load_install_marker() -> None:
+    """Hydrate the install fact from the marker written by a verified install."""
+    try:
+        data = json.loads(_install_marker_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict) or not data.get("installed"):
+        return
+    with _AUTO_INSTALL_LOCK:
+        _AUTO_INSTALL_STATE["installed"] = True
+        _AUTO_INSTALL_STATE["extension_id"] = str(data.get("extension_id") or "")
+        _AUTO_INSTALL_STATE["finished_at"] = data.get("finished_at")
+
+
+def _extension_is_loaded() -> bool:
+    """Positive evidence the cookie extension is loaded in a live browser.
+
+    A paired token is NOT that evidence. Measured 2026-10-20: status said
+    ``paired: true, installed: false``, CDP's target list carried seven other
+    extensions and NOT ours, and this route short-circuited on the token alone
+    - so the UI was told "already installed" about an extension that had never
+    been loaded, the owner was never offered the install, and the YouTube bot
+    wall stayed up.
+
+    Two facts can prove it: a completed install recorded in this process (or in
+    the marker it writes), or an extension target visible over CDP. The CDP
+    check is preferred whenever a browser answers, because a marker alone would
+    keep claiming "installed" after the owner removed the extension; a browser
+    that does not answer is "cannot prove it", and the marker is then the only
+    evidence there is.
+    """
+    with _AUTO_INSTALL_LOCK:
+        installed = bool(_AUTO_INSTALL_STATE.get("installed"))
+        recorded = str(_AUTO_INSTALL_STATE.get("extension_id") or "")
+    if installed:
+        # The marker is written only by a driver run that verified the profile's
+        # Secure Preferences, so it is positive evidence - and it has to be
+        # trusted across restarts, because ABSENCE from CDP proves nothing: an
+        # MV3 service worker is killed when idle and only re-registers on an
+        # event (measured 2026-10-20: the extension's target was present right
+        # after install and gone minutes later). "Not in the target list" is
+        # therefore not "uninstalled", and clearing on it would reinstall on
+        # every idle boot.
+        return True
+    try:
+        from services.browser_cookie_cdp import extension_loaded
+    except Exception:  # noqa: BLE001
+        return False
+    # An unpacked load gets an id derived from its FOLDER, so the recorded id is
+    # the truth; `_ext_id()` (the packed crx key) only matches an install that
+    # shipped a manifest `key`, which the staged folder does not.
+    ids = [i for i in (recorded, _ext_id()) if i]
+    return any(extension_loaded(cid) is True for cid in ids)
+
+
+_load_install_marker()
+
+
+def _extension_is_loaded() -> bool:
+    """Positive evidence the cookie extension is loaded in a live browser.
+
+    A paired token is NOT that evidence. Measured 2026-10-20: status said
+    ``paired: true, installed: false``, CDP's target list carried seven other
+    extensions and NOT ``_ext_id()``, and this route short-circuited on the
+    token alone - so the UI was told "already installed" about an extension
+    that had never been loaded, the owner was never offered the install, and
+    the YouTube bot wall stayed up.
+
+    ``installed`` in the mirrored worker state counts only when the driver
+    actually finished; otherwise ask the browser itself (a loaded MV3 extension
+    exposes its service-worker target). Unknown from CDP counts as "no
+    evidence" so the driver runs - installing is idempotent.
+    """
+    with _AUTO_INSTALL_LOCK:
+        if _AUTO_INSTALL_STATE.get("installed"):
+            return True
+    try:
+        from services.browser_cookie_cdp import extension_loaded
+
+        return extension_loaded(_ext_id()) is True
+    except Exception:  # noqa: BLE001 - decide to install, never to crash
+        return False
+
 
 def _mark_auto_install_done() -> None:
     """Mirror the short-circuit verdict into the shared state.
@@ -716,6 +881,7 @@ def _mark_auto_install_done() -> None:
         _AUTO_INSTALL_STATE["state"] = "done"
         _AUTO_INSTALL_STATE["installed"] = True
         _AUTO_INSTALL_STATE["finished_at"] = time.time()
+    _write_install_marker()
 
 def _ext_src_override() -> Optional[Path]:
     """Env override for the unpacked extension folder (mirrors VODRIP_EXT_CRX)."""
@@ -842,6 +1008,7 @@ def _auto_install_worker(
         _AUTO_INSTALL_STATE["error"] = error
         _AUTO_INSTALL_STATE["finished_at"] = time.time()
         logger.info("extension auto-install finished: %s", _AUTO_INSTALL_STATE["state"])
+    _write_install_marker()
     # No browser is spawned to rouse the extension. A fresh install fires
     # chrome.runtime.onInstalled inside the extension, which pushes cookies
     # itself; the service worker needs no page renderer for that. The removed
@@ -896,7 +1063,14 @@ async def session_cookies_extension_id():
             status_code=404,
             detail="cookie extension key not installed — restart the app to refresh the drag-drop folder in Settings",
         )
-    return {"extension_id": ext_id}
+    # An UNPACKED load gets its id from the folder path unless the manifest
+    # carries a `key`, and the staged one does not — so the id Chrome actually
+    # assigned (recorded by the install driver) is the answer, and `_ext_id()`
+    # (derived from the packed crx key) is only the fallback for an install
+    # that shipped that key.
+    with _AUTO_INSTALL_LOCK:
+        recorded = str(_AUTO_INSTALL_STATE.get("extension_id") or "")
+    return {"extension_id": recorded or ext_id}
 
 
 @router.get("/api/session/cookies/extension/source")
@@ -975,7 +1149,7 @@ async def session_cookies_enable(request: Request):
 async def session_cookies_auto_install(body: Optional[dict] = None):
     """Install the cookie bridge and, when requested, the Kick Overlay."""
     include_kick_overlay = bool(body and body.get("include_kick_overlay"))
-    if _paired_token() and not include_kick_overlay:
+    if _paired_token() and not include_kick_overlay and _extension_is_loaded():
         _mark_auto_install_done()
         return {"ok": True, "installed": True, "alreadyInstalled": True, "state": "done"}
     # Extension running but bridge de-paired (token emptied while the extension
@@ -1150,11 +1324,34 @@ async def session_cookies_ingest(request: Request, body: dict):
             paired = token
             logger.info("cookie bridge paired (token set)")
         if token != paired:
-            raise HTTPException(status_code=403, detail="token mismatch")
+            # An extension can always re-pair itself (see _extension_origin):
+            # its token is the authoritative one for its own storage, and
+            # refusing it left the bridge stuck at 403 forever.
+            ext_id = _extension_origin(request)
+            if not ext_id:
+                raise HTTPException(status_code=403, detail="token mismatch")
+            s = settings_mgr.get()
+            s.cookie_bridge_token = token
+            settings_mgr.save(s)
+            logger.info("cookie bridge re-paired from extension origin=%s", ext_id)
     cookies = body.get("cookies")
     if not isinstance(cookies, list):
         raise HTTPException(status_code=422, detail="cookies must be a list")
     accepted, dropped = cookie_store.upsert_cookies(cookies)
+    # A push that carried an extension Origin is the strongest install proof
+    # there is: the extension IS loaded, it just talked to us. Record the id it
+    # actually has (folder-derived for an unpacked load, and different from
+    # _ext_id()) and persist it, so /extension/id and the auto-install
+    # short-circuit stop guessing after the next restart.
+    ext_id = _extension_origin(request)
+    if ext_id:
+        with _AUTO_INSTALL_LOCK:
+            _AUTO_INSTALL_STATE["installed"] = True
+            _AUTO_INSTALL_STATE["extension_id"] = ext_id
+            _AUTO_INSTALL_STATE["state"] = "idle"
+            _AUTO_INSTALL_STATE["finished_at"] = time.time()
+            _AUTO_INSTALL_STATE["error"] = None
+        _write_install_marker()
     return {"ok": True, "accepted": accepted, "dropped": dropped}
 
 
@@ -1171,11 +1368,20 @@ async def session_cookies_pull(request: Request, platform: str, token: Optional[
 
 @router.get("/api/session/cookies/token")
 async def session_cookies_token(request: Request, token: Optional[str] = None):
-    """Return the paired bridge token (Settings diagnostics). Same auth as pull."""
+    """Return the paired bridge token (Settings diagnostics + extension pairing)."""
     _require_loopback(request)
-    _require_bridge_auth(request, token)
-    ip = request.client.host if request.client else "unknown"
-    logger.info("token endpoint accessed by %s", ip)
+    ext_id = _extension_origin(request)
+    if ext_id:
+        # The extension must be able to LEARN the token, otherwise a token
+        # mismatch is unrecoverable (it asks for the token, the token check
+        # rejects it, forever). See _extension_origin.
+        if not settings_mgr.get().cookie_bridge_enabled:
+            raise HTTPException(status_code=403, detail="cookie bridge disabled")
+        logger.info("token endpoint served to extension origin=%s", ext_id)
+    else:
+        _require_bridge_auth(request, token)
+        ip = request.client.host if request.client else "unknown"
+        logger.info("token endpoint accessed by %s", ip)
     return {"token": _paired_token()}
 
 

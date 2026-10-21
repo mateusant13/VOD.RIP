@@ -67,7 +67,8 @@ param(
     [switch]$DryRun,
     [switch]$ReloadOnly,
     [switch]$Force,
-    [string]$ExpectedVersion = ''
+    [string]$ExpectedVersion = '',
+    [string]$UserDataDir = ''   # profile to install into; '' = auto-detect the RUNNING instance
 )
 
 $ErrorActionPreference = 'Stop'
@@ -88,6 +89,16 @@ function Write-ProgressLog([string]$msg) {
 # via the profile's Secure Preferences: extensions.settings holds one entry
 # per extension keyed by ID, with "path" == the staged folder.
 function Get-SecurePrefsPath([string]$udd) {
+    # $udd is either a default-profile NAME relative to %LOCALAPPDATA%
+    # ('Google\Chrome\User Data') or an ABSOLUTE --user-data-dir. The second
+    # form is not hypothetical: the browser this app reads cookies from runs as
+    #   chrome.exe --user-data-dir="C:\ChromeDebugProfile" --remote-debugging-port=9222
+    # (measured 2026-10-20) and join-path'ing that under %LOCALAPPDATA% produced
+    # a path that never exists, so the install was written to one profile and
+    # verified against another.
+    if ([System.IO.Path]::IsPathRooted($udd)) {
+        return Join-Path (Join-Path $udd 'Default') 'Secure Preferences'
+    }
     return Join-Path (Join-Path $env:LOCALAPPDATA $udd) 'Default\Secure Preferences'
 }
 function Test-ExtInProfile([string]$udd, [string]$dir) {
@@ -209,6 +220,49 @@ if (-not $browserMap.ContainsKey($Browser)) {
     exit 1
 }
 $binfo = $browserMap[$Browser]
+
+# --- which PROFILE does the install belong in? -------------------------------
+# The install MUST land in the profile whose cookies this app reads, and
+# "the default profile" is not necessarily it. Measured 2026-10-20 on this box:
+#
+#   chrome.exe --user-data-dir="C:\ChromeDebugProfile" --remote-debugging-port=9222
+#
+# is the browser holding the owner's YouTube/Kick logins (CDP :9222 is where
+# browser_cookie_cdp reads them), while a bare `chrome --new-window` spawns a
+# SECOND instance on the untouched default profile. Two consequences, both
+# observed: the driver reported "new browser window not found" (the new
+# instance's window belongs to a PID created after the pre-spawn PID snapshot,
+# so the discovery filter rejected it), and an install that did land would have
+# exported cookies from a profile with no sessions — exactly the
+# "installed:true, platforms:{}" trap in AGENTS.md, one layer down.
+#
+# Passing --user-data-dir forwards `--new-window` to the RUNNING instance
+# instead of starting another one, so the window (and the extension) belong to
+# the profile the app already reads.
+function Get-RunningUserDataDir([string]$exeName) {
+    try {
+        $procs = @(Get-CimInstance Win32_Process -Filter "Name='$exeName'" -ErrorAction Stop)
+    } catch { return '' }
+    $fallback = ''
+    foreach ($pr in $procs) {
+        $cl = [string]$pr.CommandLine
+        if ($cl -notmatch '--user-data-dir=') { continue }
+        $dir = ''
+        if ($cl -match '--user-data-dir="([^"]+)"') { $dir = $Matches[1] }
+        elseif ($cl -match '--user-data-dir=([^\s"]+)') { $dir = $Matches[1] }
+        if (-not $dir) { continue }
+        # Prefer the instance the app can actually talk to (debug port).
+        if ($cl -match '--remote-debugging-port') { return $dir }
+        if (-not $fallback) { $fallback = $dir }
+    }
+    return $fallback
+}
+
+if (-not $UserDataDir) {
+    $UserDataDir = Get-RunningUserDataDir $binfo.exe
+    if ($UserDataDir) { Write-ProgressLog "auto-install: target profile from the RUNNING instance: $UserDataDir" }
+}
+if ($UserDataDir) { $binfo.udd = $UserDataDir }
 
 $exe = $null
 foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
@@ -651,8 +705,24 @@ try {
     # makes frame #1 already transparent.
     $chromePids = @(Get-Process $Browser -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
     [ExtWin]::BeginWaitWindow($before, [int[]]$chromePids, 1) | Out-Null
-    $p = Start-Process -FilePath $exe -ArgumentList '--new-window', '--window-position=32000,32000', $binfo.url -PassThru
+    # --user-data-dir must match the RUNNING instance or Chrome forks a second
+    # browser on the default profile (see the profile-selection block above).
+    $spawnArgs = @('--new-window', '--window-position=32000,32000')
+    if ($UserDataDir) { $spawnArgs += "--user-data-dir=$UserDataDir" }
+    $spawnArgs += $binfo.url
+    $p = Start-Process -FilePath $exe -ArgumentList $spawnArgs -PassThru
     $newWin = [ExtWin]::EndWaitWindow(10000)
+    if ($newWin -eq [IntPtr]::Zero) {
+        # The spawn may have STARTED a new browser instance (no matching
+        # instance to forward to). Its window belongs to a PID that did not
+        # exist before the spawn, so the pre-spawn PID filter below could never
+        # accept it — ask the spawned process itself first.
+        for ($i = 0; $i -lt 100 -and $newWin -eq [IntPtr]::Zero; $i++) {
+            try { $p.Refresh(); $mainWin = $p.MainWindowHandle } catch { $mainWin = [IntPtr]::Zero }
+            if ($mainWin -ne [IntPtr]::Zero) { $newWin = $mainWin; break }
+            Start-Sleep -Milliseconds 40
+        }
+    }
     if ($newWin -eq [IntPtr]::Zero) {
         # Fallback (rare event miss): one bounded scan, then give up.
         $swF = [System.Diagnostics.Stopwatch]::StartNew()

@@ -73,6 +73,47 @@ class _CdpError(RuntimeError):
     pass
 
 
+def extension_loaded(extension_id: str) -> Optional[bool]:
+    """Is ``extension_id`` actually loaded in a live browser? ``None`` = unknown.
+
+    "Paired token" is NOT proof an extension is installed, and the two were
+    conflated: measured 2026-10-20 the cookie bridge reported
+    ``paired: true, installed: false``, the auto-install route short-circuited
+    on the token alone, and CDP's target list showed SEVEN other extensions and
+    not ours (``gmdghhhegfcggalimbdaladmebaokcgd``). So the extension had never
+    been installed while the UI was told there was nothing to do.
+
+    A loaded MV3 extension exposes its service worker as a target
+    (``chrome-extension://<id>/background.js``). Reading the target list is the
+    only cheap, positive evidence available from outside the browser; a browser
+    without the debug port answers ``None``, which callers must treat as
+    "cannot prove it" rather than "not installed".
+    """
+    import httpx
+
+    want = (extension_id or "").strip().lower()
+    if not want:
+        return None
+    seen_any = False
+    for port in DEFAULT_PORTS:
+        try:
+            r = httpx.get(f"http://127.0.0.1:{port}/json/list", timeout=_HTTP_TIMEOUT)
+        except Exception:  # noqa: BLE001 - a closed port is the normal case
+            continue
+        if r.status_code != 200:
+            continue
+        seen_any = True
+        try:
+            targets = r.json()
+        except ValueError:
+            continue
+        for target in targets or []:
+            url = str((target or {}).get("url") or "").lower()
+            if url.startswith(f"chrome-extension://{want}/"):
+                return True
+    return False if seen_any else None
+
+
 def _call(ws, method: str, params: Optional[dict] = None, *, msg_id: int = 1) -> dict:
     """One request/response round trip on an open DevTools websocket."""
     ws.send(json.dumps({"id": msg_id, "method": method, "params": params or {}}))

@@ -76,13 +76,21 @@ from services.kick_api_service import KickNotFound
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["preview"])
 
-# Hard wall-clock cap for every preview session-create POST. The extract
-# chain can stall on a dead CDN, wedged JS runtime, or DNS; a bounded request
-# must return a retryable error instead of pinning the UI and an executor
-# worker indefinitely.
+# Hard wall-clock cap for every preview session-create POST: FAIL FAST OR
+# SUCCEED. Measured 2026-10-20 against a gated YouTube IP, a cold click sat in
+# this handler for ~26 s (`all_fallbacks_exhausted`) before answering 503 — the
+# owner sees a dead UI, and the answer was never going to be yes.
+#
+# 45 s was never a budget, it was an absence of one. The resolve chain keeps
+# running on its executor thread after the timeout (threads cannot be killed),
+# so a timed-out click still warms the cache and the client's bounded retry
+# (previewPlayerUtils.createPreviewSessionWithRetry: 3 attempts, 1.2s/2.4s
+# backoff, 5xx retryable) lands on a ready session instead of a spinner.
+# Twitch/Kick cold creates measured 0.56-3.36 s under gaming-mode load, so 4 s
+# covers the real work and cuts the dead wait by 6x.
 _PREVIEW_CREATE_HARD_TIMEOUT_SEC = max(
-    5.0,
-    float(os.environ.get("VODRIP_PREVIEW_CREATE_TIMEOUT_SEC", "45") or "45"),
+    1.0,
+    float(os.environ.get("VODRIP_PREVIEW_CREATE_TIMEOUT_SEC", "4") or "4"),
 )
 # Panel reads may wait on SQLite's busy timeout and can queue behind another
 # panel request. A bounded wait prevents a wedged read from holding a request

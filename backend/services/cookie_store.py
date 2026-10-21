@@ -45,6 +45,16 @@ KEEP_LISTS: dict[str, frozenset[str]] = {
     "youtube": frozenset({
         "SID", "__Secure-1PAPISID", "__Secure-3PAPISID", "APISID", "SAPISID",
         "HSID", "SSID", "__Secure-1PSID", "__Secure-3PSID", "VISITOR_INFO1_LIVE",
+        # Rotation + continuity cookies. Measured in the owner's profile on
+        # 2026-10-21 (CDP, names only): the browser holds __Secure-1PSIDTS,
+        # __Secure-3PSIDTS, __Secure-1PSIDCC, __Secure-3PSIDCC, SIDCC and
+        # LOGIN_INFO, and this list dropped ALL of them. Google rotates
+        # PSIDTS to keep a session alive; an exported jar carrying only the
+        # static login cookies (SID/HSID/SSID/APISID/SAPISID/PSID) is the
+        # documented shape of a session that "looks logged out", and this app
+        # answers that with a bot gate and a 360p-only ladder.
+        "__Secure-1PSIDTS", "__Secure-3PSIDTS",
+        "__Secure-1PSIDCC", "__Secure-3PSIDCC", "SIDCC", "LOGIN_INFO",
     }),
     "twitch": frozenset({"auth-token", "sp"}),
 }

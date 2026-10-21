@@ -40,6 +40,15 @@ export const KEEP_LISTS = {
     '__Secure-1PSID',
     '__Secure-3PSID',
     'VISITOR_INFO1_LIVE',
+    // Rotation + continuity cookies, mirroring cookie_store.py KEEP_LISTS.
+    // Google rotates PSIDTS to keep a session alive; exporting only the
+    // static login cookies is what makes a real session look logged out.
+    '__Secure-1PSIDTS',
+    '__Secure-3PSIDTS',
+    '__Secure-1PSIDCC',
+    '__Secure-3PSIDCC',
+    'SIDCC',
+    'LOGIN_INFO',
   ]),
   twitch: new Set(['auth-token', 'sp']),
 };
