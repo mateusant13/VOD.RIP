@@ -29,6 +29,7 @@ from services.preview_service import (
     REPLAY_HLS_MARKER,
     StalePreviewUrls,
     create_session,
+    youtube_create_inflight,
     create_live_session,
     SESSION_TTL_SEC,
     delete_session,
@@ -88,17 +89,33 @@ router = APIRouter(tags=["preview"])
 # backoff, 5xx retryable) lands on a ready session instead of a spinner.
 #
 # The cap must still be LONGER than the real cold work, or it guarantees the
-# failure it exists to bound. Measured 2026-10-21 on this box: a cold YouTube
-# create_session takes 3.20-3.38 s in isolation (backend-only) and 4.13-4.45 s
-# through the Vite proxy under the running app, while a WARM create takes
-# 0.02 s. A 4 s cap therefore turned every cold YouTube click into a 504 (three
-# in a row measured, 4.1/8.7/13.2 s as the abandoned resolves kept the GIL).
-# 8 s covers the measured cold cost with margin; Twitch/Kick cold creates
-# measured 0.56-3.36 s, so they are unaffected in the success case, where the
-# request returns as soon as the session is ready.
+# failure it exists to bound. Measured 2026-10-21 on this box:
+#   * a cold YouTube create_session takes 7.76s in isolation (backend-only,
+#     never-seen video) and 10.4-13.6s through the Vite proxy in the running
+#     app, where the extract race (5.5s) plus the post-race playlist/mux work
+#     share one GIL with the archive daemons;
+#   * a WARM create takes 0.02-0.17s.
+# A 4s cap turned every cold YouTube click into a 504 (three in a row measured
+# at 4.1/4.4s) and an 8s cap still cut a resolve that needed 10-13s. 15s lets
+# the FIRST click succeed on a never-seen video instead of paying 504 + a
+# follower wait (~25s measured) and is still nearly half the 26s dead UI that
+# started this. Twitch/Kick cold creates measured 0.56-3.36s, so they are
+# unaffected: a request returns as soon as the session is ready.
 _PREVIEW_CREATE_HARD_TIMEOUT_SEC = max(
     1.0,
-    float(os.environ.get("VODRIP_PREVIEW_CREATE_TIMEOUT_SEC", "8") or "8"),
+    float(os.environ.get("VODRIP_PREVIEW_CREATE_TIMEOUT_SEC", "15") or "15"),
+)
+# A FOLLOWER is not doing the work — it is waiting for a leader that is already
+# resolving the same video (services/preview/session.py `_CREATE_INFLIGHT`), and
+# its wait is bounded there by _CREATE_FOLLOW_WAIT_SEC (35s). Capping a follower
+# with the leader's short budget is what made the client's own retry — sent 1.2s
+# after a 504 — fail too, while the answer was being computed the whole time.
+# Measured 2026-10-21: a cold YouTube click answered 504 at 8.0s, and the SAME
+# video answered in 0.04s two minutes later, from the snapshot the abandoned
+# resolve had filled.
+_PREVIEW_CREATE_FOLLOW_TIMEOUT_SEC = max(
+    _PREVIEW_CREATE_HARD_TIMEOUT_SEC,
+    float(os.environ.get("VODRIP_PREVIEW_CREATE_FOLLOW_TIMEOUT_SEC", "38") or "38"),
 )
 # Panel reads may wait on SQLite's busy timeout and can queue behind another
 # panel request. A bounded wait prevents a wedged read from holding a request
@@ -625,6 +642,19 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
     try:
         import time as _time
         t0 = _time.monotonic()
+        # Which budget applies: a leader does the extract and gets the short
+        # fail-fast cap; a follower only waits for a leader already resolving
+        # this video and gets the longer wait. Checked BEFORE the submit, so a
+        # missed race just falls back to the short cap (the old behaviour).
+        is_follower = False
+        try:
+            is_follower = bool(youtube_create_inflight(preview_url))
+        except Exception:  # noqa: BLE001 - never block a click on the probe
+            is_follower = False
+        budget_sec = (
+            _PREVIEW_CREATE_FOLLOW_TIMEOUT_SEC if is_follower
+            else _PREVIEW_CREATE_HARD_TIMEOUT_SEC
+        )
         create_future = asyncio.get_running_loop().run_in_executor(
             PREVIEW_EXECUTOR,
             lambda: create_session(
@@ -637,13 +667,14 @@ async def preview_create_session(req: PreviewSessionCreateRequest):
         try:
             session = await asyncio.wait_for(
                 create_future,
-                timeout=_PREVIEW_CREATE_HARD_TIMEOUT_SEC,
+                timeout=budget_sec,
             )
         except asyncio.TimeoutError:
             logger.warning(
-                "preview session create timed out url=%s after %.1fs",
+                "preview session create timed out url=%s after %.1fs (follower=%s)",
                 preview_url[:100],
-                _PREVIEW_CREATE_HARD_TIMEOUT_SEC,
+                budget_sec,
+                is_follower,
             )
             # The executor thread keeps running (threads cannot be killed)
             # and may still populate caches, but the client gets a terminal

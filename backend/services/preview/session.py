@@ -160,8 +160,34 @@ def _full_mux_cache_dir() -> Path:
     return preview_root() / "full_mux_cache"
 
 # Gap 1: bounded follower wait for a concurrent cold create on the same video.
-# Kept under the 45s router hard timeout so a follower never 504s.
+# Kept under the router hard timeout so a follower never 504s. That invariant is
+# load-bearing and was broken once: the router cap was cut to 4s (then 8s) to
+# stop a 26s dead UI, which silently turned every FOLLOWER into a 504 as well,
+# even though a follower is only waiting for work somebody else is already
+# doing. routers/preview.py now grants a follower its own longer budget
+# (_PREVIEW_CREATE_FOLLOW_TIMEOUT_SEC) and keeps the short cap for the leader.
 _CREATE_FOLLOW_WAIT_SEC = 35.0
+
+
+def youtube_create_inflight(url: str) -> bool:
+    """Is another create_session already resolving this very video?
+
+    The router asks this BEFORE it starts one, to decide which budget applies:
+    a leader does the work, so it gets the short fail-fast cap; a follower only
+    waits for the leader's snapshot, so it gets the longer wait. Without the
+    distinction, the retry the client sends 1.2s after a 504 is capped by the
+    same short budget even though the answer is already being computed.
+    """
+    try:
+        from services.youtube_innertube import extract_video_id
+
+        vid = extract_video_id(url or "")
+    except Exception:  # noqa: BLE001 - a non-YouTube URL has no inflight leader
+        return False
+    if not vid:
+        return False
+    with _CREATE_INFLIGHT_LOCK:
+        return vid in _CREATE_INFLIGHT
 
 FULL_MUX_CACHE_TTL_SEC = 86400 * 7  # 7 days
 def _prog_head_dir() -> Path:

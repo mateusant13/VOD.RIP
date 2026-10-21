@@ -701,6 +701,41 @@ def _youtube_extract_preview_race(url: str, opts: dict) -> Optional[dict]:
     cookie_opts = {**opts, "socket_timeout": sock}
     bare_opts = {**_bare_ytdlp_opts(opts), "socket_timeout": sock}
 
+    # A bare (cookie-less) extract answers the bot-gated ladder: it is usually
+    # the FASTEST lane and it returns ONE muxed 360 rung. Letting it win while
+    # the authenticated lanes are still working is why a signed-in jar still
+    # produced 360p-only YouTube previews — measured 2026-10-21 through the Vite
+    # proxy: extract_source=ytdlp_bare, kind=progressive, variant_heights=[360],
+    # while the same cookies produced a 2160p, 4-audio-only ladder through the
+    # guarded seam. "First playable wins" is the right SLA, but a single-rung
+    # bare answer is not "better" than an authenticated one still in flight, so
+    # with cookies present it is kept as a FALLBACK: returned when every other
+    # lane fails or the race runs out, never as an early winner.
+    has_cookies = bool(opts.get("cookiefile") or opts.get("cookiesfrombrowser"))
+    bare_fallback: Optional[dict] = None
+
+    def _distinct_heights(info: dict) -> int:
+        try:
+            return len({int(f.get("height") or 0) for f in (info.get("formats") or [])} - {0})
+        except Exception:  # noqa: BLE001 - an odd format list is not a failure
+            return 0
+
+    def _wins(info: dict, src: str, *, last_lane: bool) -> bool:
+        """Would this result win, or is it only the fallback for now?"""
+        nonlocal bare_fallback
+        if not has_cookies or _distinct_heights(info) >= 2:
+            return True
+        if last_lane:
+            return True
+        # A single-rung answer from ANY lane is the gated ladder, not a
+        # quality choice. InnerTube answers it too: measured 2026-10-21 a cold
+        # click won with extract_source=innertube_slow and variant_heights=[360]
+        # while the authenticated lanes were still working. The same rule as
+        # the bare lane applies — hold it, keep waiting, return it only if
+        # nothing better lands.
+        bare_fallback = info
+        return False
+
     def _inn() -> Optional[dict]:
         return _try_innertube_info(
             url,
@@ -746,6 +781,11 @@ def _youtube_extract_preview_race(url: str, opts: dict) -> Optional[dict]:
                     logger.debug("preview race %s %s: %s", vid, futures[fut], exc)
                     continue
                 if info and _youtube_info_playable(info):
+                    if not _wins(info, futures[fut], last_lane=not pending):
+                        logger.debug(
+                            "preview race %s/%s: single-rung held as fallback (cookies present)", vid, futures[fut]
+                        )
+                        continue
                     winner = info
                     source = futures[fut]
                     pending.clear()
@@ -774,6 +814,11 @@ def _youtube_extract_preview_race(url: str, opts: dict) -> Optional[dict]:
                         )
                         continue
                     if info and _youtube_info_playable(info):
+                        if not _wins(info, futures[fut], last_lane=not pending):
+                            logger.debug(
+                                "preview race grace %s/%s: single-rung held as fallback (cookies present)", vid, futures[fut],
+                            )
+                            continue
                         winner = info
                         source = futures[fut]
                         pending.clear()
@@ -787,6 +832,12 @@ def _youtube_extract_preview_race(url: str, opts: dict) -> Optional[dict]:
     if winner:
         log_extract_ok(vid, source, winner, yt_session)
         return winner
+    if bare_fallback is not None:
+        # Nothing authenticated landed inside the race budget. The bare ladder
+        # is still playable (one 360 rung), so a click gets a picture rather
+        # than a spinner — the same answer the race used to give instantly.
+        log_extract_ok(vid, "ytdlp_bare_fallback", bare_fallback, yt_session)
+        return bare_fallback
     if fatal is not None:
         raise fatal
     return None
