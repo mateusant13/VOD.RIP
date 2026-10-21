@@ -3135,6 +3135,21 @@ def _extract_youtube_preview_info(
             if late and not _youtube_info_is_dash_only_progressive(late):
                 logger.info("anonymous 360p late win for %s after chain failure", vid)
                 return late
+        # Turn THIS failure into the next click's instant start. Measured
+        # 2026-10-20 on the live app: a background warm resolved the exact video
+        # a click had just failed on (extract ok ... formats=6
+        # heights=[144,240,360,480,720,1080]) seconds later, but the click had
+        # no snapshot for it, so the follow-up click paid the whole chain again
+        # - 27 s to the same 503 - and the log line was
+        # "preview snapshot MISS vid=... h=480 pending_warm=False". Asking for
+        # the warm here means the SECOND click hits the snapshot instead of the
+        # bot wall, which is the only way a walled video ever becomes usable.
+        try:
+            from services.preview.warm import kickoff_youtube_warm
+
+            kickoff_youtube_warm(full_url, cookies_file=cookies, prefer_height=360)
+        except Exception:  # noqa: BLE001 - a warm must never mask the real error
+            logger.debug("post-failure warm kickoff skipped for %s", vid, exc_info=True)
         raise
 def _deduped_hls_variants(info: dict) -> List[dict]:
     formats = info.get("formats") or []

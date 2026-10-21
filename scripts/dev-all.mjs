@@ -23,6 +23,28 @@ const fastPreview =
   process.env.VODRIP_PREVIEW_FAST_ONLY === "1";
 const previewFastEnv = fastPreview ? { VODRIP_PREVIEW_FAST_ONLY: "1" } : {};
 
+// Owner-authorised JS challenge solver (AGENTS.md, 2026-10-05), and the reason
+// it is a DEV DEFAULT rather than a documented switch nobody sets.
+//
+// MEASURED 2026-10-20 on this box, not taken from the doc: yt-dlp logged
+//
+//   [jsc] Remote components challenge solver script (bun, deno, node) and NPM
+//   package ... were skipped. These may be required to solve JS challenges.
+//   Edvjekz4lgs: n challenge solving failed: Some formats may be missing.
+//
+// and the same minute the format ladder came back degenerate and every YouTube
+// preview answered 503 ("YouTube preview is temporarily restricted") after
+// 28 s. node 22 and deno are both installed here, so the only missing half is
+// the ejs script the grant fetches. yt-dlp verifies it against a sha3-512 hash
+// vendored inside the installed package before executing it.
+//
+// Still one variable to turn off: VODRIP_YT_EXECUTE_REMOTE_CHALLENGE_SOLVER=0
+// (or unset it in the environment) restores the previous behaviour exactly -
+// the guard overwrites remote_components with [] and purges the cached script.
+if (!("VODRIP_YT_EXECUTE_REMOTE_CHALLENGE_SOLVER" in process.env)) {
+  process.env.VODRIP_YT_EXECUTE_REMOTE_CHALLENGE_SOLVER = "1";
+}
+
 const children = [];
 let apiProcess = null; // current API child — health monitor + graceful exit target
 let apiSpec = null; // last API launch spec — hot-reload respawn source
